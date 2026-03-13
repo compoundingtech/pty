@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pty</title>
+  <link rel="stylesheet" href="/vendor/xterm.css" />
+  <script type="importmap">
+  { "imports": {
+      "@xterm/xterm": "/vendor/xterm.mjs",
+      "@xterm/addon-fit": "/vendor/addon-fit.mjs"
+  } }
+  </script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1e1e1e;
+      color: #ccc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Login view */
+    #login-view {
+      display: none;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    #login-view form {
+      background: #2a2a2a;
+      padding: 2rem;
+      border-radius: 8px;
+      min-width: 300px;
+      text-align: center;
+    }
+    #login-view label {
+      display: block;
+      margin-bottom: 0.5rem;
+      font-size: 1.1rem;
+    }
+    #login-view input {
+      width: 100%;
+      padding: 0.75rem;
+      font-size: 1.2rem;
+      background: #1e1e1e;
+      color: #fff;
+      border: 1px solid #555;
+      border-radius: 4px;
+      margin-bottom: 1rem;
+      text-align: center;
+      letter-spacing: 0.2em;
+    }
+    #login-view input:focus {
+      outline: none;
+      border-color: #888;
+    }
+    #login-view button {
+      width: 100%;
+      padding: 0.75rem;
+      font-size: 1rem;
+      background: #444;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #login-view button:hover { background: #555; }
+    #login-error {
+      display: none;
+      color: #f66;
+      margin-top: 0.5rem;
+      font-size: 0.9rem;
+    }
+
+    /* Session list view */
+    #list-view {
+      display: none;
+      flex-direction: column;
+      height: 100vh;
+      padding: 1.5rem;
+    }
+    #list-view h1 {
+      font-size: 1.4rem;
+      font-weight: 500;
+      margin-bottom: 1rem;
+      color: #eee;
+    }
+    .session-item {
+      background: #2a2a2a;
+      padding: 1rem 1.25rem;
+      border-radius: 6px;
+      margin-bottom: 0.5rem;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .session-item:hover { background: #333; }
+    .session-name {
+      font-weight: 600;
+      color: #fff;
+      font-size: 1.05rem;
+    }
+    .session-command {
+      color: #999;
+      font-size: 0.9rem;
+      margin-top: 0.2rem;
+    }
+    .session-status {
+      font-size: 0.85rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 3px;
+    }
+    .status-running {
+      background: #1a3a1a;
+      color: #6f6;
+    }
+    .status-exited {
+      background: #3a1a1a;
+      color: #f66;
+    }
+    #no-sessions {
+      color: #666;
+      font-style: italic;
+      margin-top: 1rem;
+    }
+
+    /* Terminal view */
+    #terminal-view {
+      display: none;
+      flex-direction: column;
+      height: 100vh;
+    }
+    #toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.4rem 0.75rem;
+      background: #2a2a2a;
+      border-bottom: 1px solid #444;
+      flex-shrink: 0;
+    }
+    #session-label {
+      font-weight: 600;
+      color: #eee;
+    }
+    #detach-btn {
+      padding: 0.3rem 0.8rem;
+      font-size: 0.85rem;
+      background: #444;
+      color: #ccc;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    #detach-btn:hover { background: #555; }
+    #terminal-container {
+      flex: 1;
+      overflow: hidden;
+    }
+    #exit-overlay {
+      display: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.85);
+      padding: 1.5rem 2.5rem;
+      border-radius: 8px;
+      color: #f66;
+      font-size: 1.1rem;
+      text-align: center;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+
+<div id="login-view">
+  <div id="login-form">
+    <label for="code-input">Connect Code</label>
+    <input id="code-input" type="text" autocomplete="off" />
+    <button id="login-btn">Connect</button>
+    <p id="login-error"></p>
+  </div>
+</div>
+
+<div id="list-view">
+  <h1>pty sessions</h1>
+  <div id="session-list"></div>
+  <p id="no-sessions">No sessions</p>
+</div>
+
+<div id="terminal-view">
+  <div id="toolbar">
+    <span id="session-label"></span>
+    <button id="detach-btn">Detach</button>
+  </div>
+  <div id="terminal-container"></div>
+  <div id="exit-overlay"></div>
+</div>
+
+<script type="module">
+  import { Terminal } from "@xterm/xterm";
+  import { FitAddon } from "@xterm/addon-fit";
+
+  // ── Protocol ──
+
+  const MSG = { DATA: 0, ATTACH: 1, DETACH: 2, RESIZE: 3, EXIT: 4, SCREEN: 5, PEEK: 6 };
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  function makePacket(type, payload) {
+    const buf = new ArrayBuffer(5 + payload.byteLength);
+    const view = new DataView(buf);
+    view.setUint8(0, type);
+    view.setUint32(1, payload.byteLength, false);
+    new Uint8Array(buf, 5).set(new Uint8Array(payload));
+    return buf;
+  }
+
+  function attachPacket(rows, cols) {
+    const p = new ArrayBuffer(4);
+    const v = new DataView(p);
+    v.setUint16(0, rows, false);
+    v.setUint16(2, cols, false);
+    return makePacket(MSG.ATTACH, p);
+  }
+
+  function dataPacket(text) {
+    const p = encoder.encode(text);
+    return makePacket(MSG.DATA, p.buffer);
+  }
+
+  function resizePacket(rows, cols) {
+    const p = new ArrayBuffer(4);
+    const v = new DataView(p);
+    v.setUint16(0, rows, false);
+    v.setUint16(2, cols, false);
+    return makePacket(MSG.RESIZE, p);
+  }
+
+  function detachPacket() {
+    return makePacket(MSG.DETACH, new ArrayBuffer(0));
+  }
+
+  function parsePacket(buf) {
+    const view = new DataView(buf);
+    const type = view.getUint8(0);
+    const length = view.getUint32(1, false);
+    const payload = buf.slice(5, 5 + length);
+    return { type, payload };
+  }
+
+  // ── DOM refs ──
+
+  const loginView = document.getElementById("login-view");
+  const loginBtn = document.getElementById("login-btn");
+  const codeInput = document.getElementById("code-input");
+  const loginError = document.getElementById("login-error");
+
+  const listView = document.getElementById("list-view");
+  const sessionList = document.getElementById("session-list");
+  const noSessions = document.getElementById("no-sessions");
+
+  const terminalView = document.getElementById("terminal-view");
+  const sessionLabel = document.getElementById("session-label");
+  const detachBtn = document.getElementById("detach-btn");
+  const terminalContainer = document.getElementById("terminal-container");
+  const exitOverlay = document.getElementById("exit-overlay");
+
+  let refreshTimer = null;
+  let currentWs = null;
+  let currentTerm = null;
+  let currentFit = null;
+  let resizeObserver = null;
+
+  // ── Views ──
+
+  function showView(id) {
+    loginView.style.display = id === "login" ? "flex" : "none";
+    listView.style.display = id === "list" ? "flex" : "none";
+    terminalView.style.display = id === "terminal" ? "flex" : "none";
+    exitOverlay.style.display = "none";
+  }
+
+  // ── Auth ──
+
+  function configureCodeInput(numeric) {
+    if (numeric) {
+      codeInput.inputMode = "numeric";
+      codeInput.pattern = "[0-9]*";
+    } else {
+      codeInput.inputMode = "text";
+      codeInput.removeAttribute("pattern");
+    }
+  }
+
+  async function submitCode() {
+    loginError.style.display = "none";
+    const code = codeInput.value;
+    try {
+      const res = await fetch("/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "code=" + encodeURIComponent(code),
+      });
+      const json = await res.json();
+      if (json.ok) {
+        codeInput.value = "";
+        loadSessions();
+      } else {
+        loginError.textContent = "Invalid code";
+        loginError.style.display = "block";
+        if (json.numeric != null) configureCodeInput(json.numeric);
+      }
+    } catch {
+      loginError.textContent = "Connection error";
+      loginError.style.display = "block";
+    }
+  }
+
+  loginBtn.addEventListener("click", submitCode);
+  codeInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitCode();
+  });
+
+  // ── Session List ──
+
+  async function loadSessions() {
+    let res;
+    try {
+      res = await fetch("/api/sessions");
+    } catch {
+      return;
+    }
+
+    if (res.status === 401) {
+      const json = await res.json().catch(() => ({}));
+      configureCodeInput(!!json.numeric);
+      showView("login");
+      codeInput.focus();
+      stopRefresh();
+      return;
+    }
+
+    const sessions = await res.json();
+    showView("list");
+    renderSessions(sessions);
+    startRefresh();
+  }
+
+  function renderSessions(sessions) {
+    sessionList.innerHTML = "";
+    if (sessions.length === 0) {
+      noSessions.style.display = "block";
+      return;
+    }
+    noSessions.style.display = "none";
+
+    for (const s of sessions) {
+      const el = document.createElement("div");
+      el.className = "session-item";
+      el.innerHTML = `
+        <div>
+          <div class="session-name">${esc(s.name)}</div>
+          <div class="session-command">${esc(s.command || "")}</div>
+        </div>
+        <span class="session-status ${s.status === "running" ? "status-running" : "status-exited"}">${esc(s.status)}</span>
+      `;
+      el.addEventListener("click", () => connectSession(s.name));
+      sessionList.appendChild(el);
+    }
+  }
+
+  function esc(str) {
+    const d = document.createElement("div");
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  function startRefresh() {
+    stopRefresh();
+    refreshTimer = setInterval(loadSessions, 3000);
+  }
+
+  function stopRefresh() {
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  // ── Terminal ──
+
+  function connectSession(name) {
+    stopRefresh();
+    showView("terminal");
+    sessionLabel.textContent = name;
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      theme: { background: "#1e1e1e" },
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(terminalContainer);
+    fitAddon.fit();
+
+    currentTerm = term;
+    currentFit = fitAddon;
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${location.host}/ws/${encodeURIComponent(name)}`;
+    const socket = new WebSocket(wsUrl);
+    socket.binaryType = "arraybuffer";
+    currentWs = socket;
+
+    socket.addEventListener("open", () => {
+      socket.send(attachPacket(term.rows, term.cols));
+    });
+
+    socket.addEventListener("message", (event) => {
+      const pkt = parsePacket(event.data);
+      switch (pkt.type) {
+        case MSG.SCREEN:
+          term.reset();
+          term.write(decoder.decode(pkt.payload));
+          break;
+        case MSG.DATA:
+          term.write(new Uint8Array(pkt.payload));
+          break;
+        case MSG.EXIT: {
+          const view = new DataView(pkt.payload);
+          const code = pkt.payload.byteLength >= 4 ? view.getInt32(0, false) : -1;
+          exitOverlay.textContent = `Process exited (code ${code})`;
+          exitOverlay.style.display = "block";
+          setTimeout(() => disconnect(), 2000);
+          break;
+        }
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      // If we didn't trigger the close, go back to list
+      if (currentWs === socket) disconnect();
+    });
+
+    socket.addEventListener("error", () => {
+      if (currentWs === socket) disconnect();
+    });
+
+    // Input
+    term.onData((data) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(dataPacket(data));
+      }
+    });
+
+    // Resize
+    resizeObserver = new ResizeObserver(() => {
+      fitAddon.fit();
+    });
+    resizeObserver.observe(terminalContainer);
+
+    term.onResize(({ rows, cols }) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(resizePacket(rows, cols));
+      }
+    });
+
+    // Detach via button
+    detachBtn.addEventListener("click", doDetach);
+
+    // Detach via Ctrl+backslash
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === "keydown" && event.ctrlKey && event.key === "\\") {
+        doDetach();
+        return false;
+      }
+      return true;
+    });
+
+    term.focus();
+  }
+
+  function doDetach() {
+    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+      currentWs.send(detachPacket());
+    }
+    disconnect();
+  }
+
+  function disconnect() {
+    if (resizeObserver) {
+      resizeObserver.disconnect();
+      resizeObserver = null;
+    }
+    if (currentWs) {
+      const ws = currentWs;
+      currentWs = null;
+      try { ws.close(); } catch {}
+    }
+    if (currentTerm) {
+      currentTerm.dispose();
+      currentTerm = null;
+      currentFit = null;
+    }
+    detachBtn.removeEventListener("click", doDetach);
+    loadSessions();
+  }
+
+  // ── Init ──
+
+  loadSessions();
+</script>
+</body>
+</html>

@@ -3,9 +3,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
 
-const SESSION_DIR =
-  process.env.PTY_SESSION_DIR ??
-  path.join(os.homedir(), ".local", "state", "pty");
+function sessionDir(): string {
+  return (
+    process.env.PTY_SESSION_DIR ??
+    path.join(os.homedir(), ".local", "state", "pty")
+  );
+}
 
 const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -26,23 +29,23 @@ export function validateName(name: string): void {
 }
 
 export function getSessionDir(): string {
-  return SESSION_DIR;
+  return sessionDir();
 }
 
 export function ensureSessionDir(): void {
-  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  fs.mkdirSync(sessionDir(), { recursive: true });
 }
 
 export function getSocketPath(name: string): string {
-  return path.join(SESSION_DIR, `${name}.sock`);
+  return path.join(sessionDir(), `${name}.sock`);
 }
 
 export function getPidPath(name: string): string {
-  return path.join(SESSION_DIR, `${name}.pid`);
+  return path.join(sessionDir(), `${name}.pid`);
 }
 
 export function getMetadataPath(name: string): string {
-  return path.join(SESSION_DIR, `${name}.json`);
+  return path.join(sessionDir(), `${name}.json`);
 }
 
 export interface SessionMetadata {
@@ -83,7 +86,7 @@ export async function listSessions(): Promise<SessionInfo[]> {
 
   let entries: string[];
   try {
-    entries = fs.readdirSync(SESSION_DIR);
+    entries = fs.readdirSync(sessionDir());
   } catch {
     return [];
   }
@@ -213,7 +216,7 @@ export function cleanupAll(name: string): void {
 }
 
 function getLockPath(name: string): string {
-  return path.join(SESSION_DIR, `${name}.lock`);
+  return path.join(sessionDir(), `${name}.lock`);
 }
 
 /**

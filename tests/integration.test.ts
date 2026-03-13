@@ -28,8 +28,11 @@ import {
 
 // All tests run in a tmp directory to avoid polluting the project
 const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pty-int-"));
+const testSessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-int-state-"));
+process.env.PTY_SESSION_DIR = testSessionDir;
 afterAll(() => {
   fs.rmSync(testCwd, { recursive: true, force: true });
+  fs.rmSync(testSessionDir, { recursive: true, force: true });
 });
 
 let servers: PtyServer[] = [];

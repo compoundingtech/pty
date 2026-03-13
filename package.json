@@ -10,17 +10,23 @@
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run --exclude tests/web.test.ts",
+    "test:watch": "vitest",
+    "test:web": "npx playwright test"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
+    "@xterm/xterm": "^6.0.0",
     "node-pty": "^1.0.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "^25.3.5",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.7.0",
     "vitest": "^4.0.18"
   }

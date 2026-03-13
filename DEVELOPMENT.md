@@ -34,6 +34,9 @@ npx tsx src/cli.ts peek -f <name>
 npx tsx src/cli.ts list
 npx tsx src/cli.ts restart <name>
 npx tsx src/cli.ts kill <name>
+npx tsx src/cli.ts web
+npx tsx src/cli.ts web --port 8080
+npx tsx src/cli.ts web --code SECRET
 ```
 
 Detach from any attached/following session with **Ctrl+\\**. Press Ctrl+\\ twice quickly to send it to the process.
@@ -66,6 +69,17 @@ This project ships TypeScript source directly — there is no compile step. All 
      Client     Client       Peek
      (attach)   (attach)     (read-only)
 ```
+
+### Web UI
+
+```
+Browser (xterm.js) ←WebSocket→ Web Server (127.0.0.1) ←Unix Socket→ PtyServer daemons
+                   ←HTTP→       pty web process
+```
+
+The `pty web` command starts a separate web server process. It does not modify PtyServer — it connects to Unix sockets as a client on behalf of browsers. Each WebSocket maps 1:1 to a Unix socket connection. The server re-frames PtyServer packets (using `PacketReader`) so each WebSocket message contains exactly one complete protocol packet. The browser uses `DataView` on `ArrayBuffer` to encode/decode the same binary protocol.
+
+Auth is optional (`--code` flag). When set, a connect code must be entered before accessing sessions. The code is validated via `POST /auth`, which sets an HttpOnly cookie. All subsequent requests and WebSocket upgrades check this cookie. When the code is all digits, the login form uses `inputmode="numeric"` for a numeric keyboard on mobile.
 
 Each session is a detached Node.js process running `src/server.ts` via tsx. It spawns the command in a PTY, feeds all output through xterm-headless to maintain a screen buffer, and listens on a Unix socket for client connections.
 
@@ -151,6 +165,7 @@ Tests use **vitest** and live in `tests/`.
 
 - `protocol.test.ts` — Unit tests for packet encoding, decoding, and streaming reassembly (partial reads, split packets, large payloads)
 - `integration.test.ts` — Full integration tests that spawn real PTY sessions, connect clients via sockets, and verify behavior
+- `web.test.ts` — Playwright browser tests for the web UI (run separately via `npm run test:web`)
 - `screenshot.test.ts` — Screenshot-based tests that capture terminal state (ANSI and plain text) and assert on visual output from real programs (vim, nano, ls, bash). Covers control characters, terminal resize, alternate screen buffer, multiple clients, unicode, and daemon spawning.
 
 All tests run in `/tmp/` directories to avoid polluting the project folder (e.g., vim swap files). Integration and screenshot tests use real processes and real Unix sockets. Each test creates a uniquely-named session and cleans up afterward. There is a `200ms` delay in some tests to allow xterm-headless to process async writes before checking screen state — this is a known characteristic of xterm's write pipeline, not a flaky test.
@@ -161,6 +176,7 @@ All tests run in `/tmp/` directories to avoid polluting the project folder (e.g.
 npm test                       # run once
 npm run test:watch             # watch mode
 npx vitest run -t "peek"      # run tests matching "peek"
+npm run test:web               # run web UI tests (Playwright)
 ```
 
 ### node-pty on macOS
@@ -180,10 +196,15 @@ src/
   client.ts       attach() and peek() functions
   protocol.ts     Packet types, encoding, decoding, PacketReader
   sessions.ts     Session discovery, socket/PID file management
+  web/
+    server.ts     WebServer class (HTTP + WebSocket bridge)
+    static/
+      index.html  Single-page browser app (xterm.js)
 tests/
   protocol.test.ts
   integration.test.ts
   screenshot.test.ts
+  web.test.ts
 completions/
   pty.bash        Bash tab completion
   pty.zsh         Zsh tab completion

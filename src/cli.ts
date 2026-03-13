@@ -39,6 +39,9 @@ function usage(): void {
   pty list                                 List active sessions
   pty list --json                          List sessions as JSON
   pty kill <name>                          Kill or remove a session
+  pty web                                  Start web UI
+  pty web --port 8080                      Start on a different port
+  pty web --code SECRET                    Require a connect code
 
 Detach from a session with Ctrl+\\ (press twice to send Ctrl+\\ to the process)`);
 }
@@ -237,6 +240,34 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       await cmdKill(args[1]);
+      break;
+    }
+
+    case "web": {
+      let port = 7681;
+      let connectCode: string | undefined;
+      let wi = 1;
+      while (wi < args.length && args[wi].startsWith("-")) {
+        if (args[wi] === "--port" || args[wi] === "-p") {
+          wi++;
+          port = parseInt(args[wi], 10);
+          if (isNaN(port)) {
+            console.error("--port requires a number.");
+            process.exit(1);
+          }
+        } else if (args[wi] === "--code" || args[wi] === "-c") {
+          wi++;
+          connectCode = args[wi];
+          if (!connectCode) {
+            console.error("--code requires a value.");
+            process.exit(1);
+          }
+        } else {
+          break;
+        }
+        wi++;
+      }
+      await cmdWeb(port, connectCode);
       break;
     }
 
@@ -654,6 +685,27 @@ function timeAgo(date: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+async function cmdWeb(port: number, connectCode?: string): Promise<void> {
+  const { WebServer } = await import("./web/server.ts");
+  const server = new WebServer({ port, connectCode });
+  const addr = await server.ready;
+
+  console.log(`Web UI: http://${addr.host}:${addr.port}`);
+  if (connectCode) {
+    console.log(`Connect code: ${connectCode}`);
+  }
+  console.log("Press Ctrl+C to stop.");
+
+  await new Promise<void>((resolve) => {
+    process.on("SIGINT", () => {
+      server.close().then(resolve);
+    });
+    process.on("SIGTERM", () => {
+      server.close().then(resolve);
+    });
+  });
 }
 
 main().catch((err) => {
