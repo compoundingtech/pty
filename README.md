@@ -19,7 +19,9 @@ npm link
 pty run myserver -- node server.js    # start a session and attach
 pty run -d myserver -- node server.js # start in the background
 
+pty # no args runs list
 pty list                              # show active sessions
+
 pty attach myserver                   # reconnect
 pty peek myserver                     # print current screen and exit
 pty peek -f myserver                  # follow output read-only
@@ -41,6 +43,15 @@ Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
 brew install bash-completion  # required for bash; zsh works out of the box
 npm run install-completions
 ```
+
+## Prior Art
+
+pty focuses on session persistence only — no splits, no panes, no window management. On mobile we don't need or want splits, and on desktop we have kitty/ghostty/native terminal splits. Keep things simple.
+
+- [abduco](https://github.com/martanne/abduco) — minimal session management for terminal programs, handling detach and reattach cleanly. A major inspiration for pty.
+- [dtach](https://github.com/crigler/dtach) — emulates the detach feature of screen with minimal overhead.
+- [GNU Screen](https://www.gnu.org/software/screen/) — the original terminal multiplexer that pioneered session persistence.
+- [tmux](https://github.com/tmux/tmux) — modern terminal multiplexer with session, window, and pane management.
 
 ## License
 
