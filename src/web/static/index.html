@@ -174,6 +174,75 @@
       text-align: center;
       z-index: 10;
     }
+
+    /* Mobile keyboard containers */
+    #quick-bar, #key-panel, #text-input-bar {
+      display: none;
+      background: #2a2a2a;
+      border-top: 1px solid #444;
+      flex-shrink: 0;
+    }
+
+    #quick-bar {
+      overflow-x: auto;
+      white-space: nowrap;
+      padding: 4px 6px;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+    #quick-bar::-webkit-scrollbar { display: none; }
+
+    #quick-bar button, #key-panel button {
+      min-width: 44px;
+      min-height: 44px;
+      margin: 2px;
+      background: #444;
+      color: #ccc;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    #quick-bar button:active, #key-panel button:active { background: #666; }
+    #quick-bar button.active { background: #668; color: #fff; }
+    #quick-bar button.locked { background: #88a; color: #fff; }
+
+    #key-panel {
+      display: none;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 4px;
+      padding: 6px;
+      max-height: 50vh;
+      overflow-y: auto;
+    }
+
+    #text-input-bar {
+      display: none;
+      flex-direction: row;
+      padding: 6px;
+      gap: 6px;
+      align-items: center;
+    }
+    #text-input {
+      flex: 1;
+      font-size: 16px;
+      padding: 8px;
+      background: #1e1e1e;
+      color: #fff;
+      border: 1px solid #555;
+      border-radius: 4px;
+    }
+    #text-send-btn, #text-back-btn {
+      padding: 8px 16px;
+      background: #558;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      min-height: 44px;
+    }
   </style>
 </head>
 <body>
@@ -200,6 +269,77 @@
   </div>
   <div id="terminal-container"></div>
   <div id="exit-overlay"></div>
+
+  <div id="quick-bar">
+    <button data-key="\x1b">Esc</button>
+    <button data-key="\t">Tab</button>
+    <button data-mod="ctrl" class="mod-btn">Ctrl</button>
+    <button data-mod="alt" class="mod-btn">Alt</button>
+    <button data-key="|">|</button>
+    <button data-key="-">-</button>
+    <button data-key="/">/</button>
+    <button data-key="~">~</button>
+    <button data-key="\x1b[D">&larr;</button>
+    <button data-key="\x1b[C">&rarr;</button>
+    <button data-key="\x1b[A">&uarr;</button>
+    <button data-key="\x1b[B">&darr;</button>
+    <button data-key="\x1b[H">Home</button>
+    <button data-key="\x1b[F">End</button>
+    <button id="show-panel-btn" class="mode-btn">&#x2328;</button>
+    <button id="show-text-btn" class="mode-btn">Aa</button>
+  </div>
+
+  <div id="key-panel">
+    <button data-key="\x1b[Z">&#x21e5;Tab</button>
+    <button data-key="\x1b[2~">Ins</button>
+    <button data-key="\x1b[3~">Del</button>
+    <button data-key="\x1b[5~">PgUp</button>
+    <button data-key="\x1b[6~">PgDn</button>
+    <button data-action="paste">Paste</button>
+    <button data-key="\x03">^C</button>
+    <button data-key="\x04">^D</button>
+    <button data-key="\x1a">^Z</button>
+    <button data-key="\x0c">^L</button>
+    <button data-key="\x01">^A</button>
+    <button data-key="\x05">^E</button>
+    <button data-key="\x13">^S</button>
+    <button data-key="\x11">^Q</button>
+    <button data-key="\x12">^R</button>
+    <button data-key="\x17">^W</button>
+    <button data-key="\x15">^U</button>
+    <button data-key="\x0b">^K</button>
+    <button data-key="\x1bOP">F1</button>
+    <button data-key="\x1bOQ">F2</button>
+    <button data-key="\x1bOR">F3</button>
+    <button data-key="\x1bOS">F4</button>
+    <button data-key="\x1b[15~">F5</button>
+    <button data-key="\x1b[17~">F6</button>
+    <button data-key="\x1b[18~">F7</button>
+    <button data-key="\x1b[19~">F8</button>
+    <button data-key="\x1b[20~">F9</button>
+    <button data-key="\x1b[21~">F10</button>
+    <button data-key="\x1b[23~">F11</button>
+    <button data-key="\x1b[24~">F12</button>
+    <button data-key="\x1b\x1b[D">Alt+&larr;</button>
+    <button data-key="\x1b\x1b[C">Alt+&rarr;</button>
+    <button data-key="\x1b\x1b[A">Alt+&uarr;</button>
+    <button data-key="\x1b\x1b[B">Alt+&darr;</button>
+    <button data-key="{">{</button>
+    <button data-key="}">}</button>
+    <button data-key="[">[</button>
+    <button data-key="]">]</button>
+    <button data-key="<">&lt;</button>
+    <button data-key=">">&gt;</button>
+    <button data-key="`">`</button>
+    <button data-key="\">\</button>
+    <button id="panel-back-btn" class="mode-btn">&#x25be; bar</button>
+  </div>
+
+  <div id="text-input-bar">
+    <input id="text-input" type="text" autocomplete="off" autocorrect="on" autocapitalize="sentences" placeholder="Type text..." />
+    <button id="text-send-btn">Send</button>
+    <button id="text-back-btn" class="mode-btn">&#x25be; bar</button>
+  </div>
 </div>
 
 <script type="module">
@@ -485,6 +625,7 @@
     });
 
     term.focus();
+    showKeyboardMode("bar");
   }
 
   function doDetach() {
@@ -510,7 +651,190 @@
       currentFit = null;
     }
     detachBtn.removeEventListener("click", doDetach);
+    resetKeyboardState();
     loadSessions();
+  }
+
+  // ── Mobile Keyboard ──
+
+  const isMobile = 'ontouchstart' in window;
+  const nativeKeys = new URLSearchParams(location.search).has('nativeKeys');
+  if (isMobile && !nativeKeys) document.body.classList.add('mobile-device');
+
+  let kbMode = "bar"; // "bar" | "panel" | "text"
+  let stickyCtrl = false;
+  let stickyAlt = false;
+  let ctrlLocked = false;
+  let altLocked = false;
+  let lastCtrlTap = 0;
+  let lastAltTap = 0;
+
+  const quickBar = document.getElementById("quick-bar");
+  const keyPanel = document.getElementById("key-panel");
+  const textInputBar = document.getElementById("text-input-bar");
+  const textInput = document.getElementById("text-input");
+
+  function showKeyboardMode(mode) {
+    kbMode = mode;
+    const isMobileDevice = document.body.classList.contains('mobile-device');
+    quickBar.style.display = (mode === "bar" && isMobileDevice) ? "block" : "none";
+    keyPanel.style.display = (mode === "panel" && isMobileDevice) ? "grid" : "none";
+    textInputBar.style.display = (mode === "text" && isMobileDevice) ? "flex" : "none";
+    if (mode === "text") {
+      textInput.focus();
+    } else if (currentTerm) {
+      currentTerm.focus();
+    }
+  }
+
+  function updateModButtons() {
+    for (const btn of quickBar.querySelectorAll('.mod-btn')) {
+      const mod = btn.dataset.mod;
+      if (!mod) continue;
+      const isActive = mod === 'ctrl' ? stickyCtrl : stickyAlt;
+      const isLocked = mod === 'ctrl' ? ctrlLocked : altLocked;
+      btn.classList.toggle('active', isActive && !isLocked);
+      btn.classList.toggle('locked', isLocked);
+    }
+  }
+
+  function handleModTap(mod) {
+    const now = Date.now();
+    if (mod === 'ctrl') {
+      if (now - lastCtrlTap < 400) {
+        ctrlLocked = !ctrlLocked;
+        stickyCtrl = ctrlLocked;
+      } else {
+        if (ctrlLocked) { ctrlLocked = false; stickyCtrl = false; }
+        else { stickyCtrl = !stickyCtrl; }
+      }
+      lastCtrlTap = now;
+    } else if (mod === 'alt') {
+      if (now - lastAltTap < 400) {
+        altLocked = !altLocked;
+        stickyAlt = altLocked;
+      } else {
+        if (altLocked) { altLocked = false; stickyAlt = false; }
+        else { stickyAlt = !stickyAlt; }
+      }
+      lastAltTap = now;
+    }
+    updateModButtons();
+  }
+
+  function parseDataKey(raw) {
+    return raw.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    ).replace(/\\t/g, '\t').replace(/\\r/g, '\r').replace(/\\n/g, '\n');
+  }
+
+  function sendKey(seq) {
+    if (stickyCtrl && seq.length === 1) {
+      const lower = seq.toLowerCase();
+      if (lower >= 'a' && lower <= 'z') {
+        seq = String.fromCharCode(lower.charCodeAt(0) - 96);
+      }
+    }
+    if (stickyAlt) {
+      seq = '\x1b' + seq;
+    }
+    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+      currentWs.send(dataPacket(seq));
+    }
+    if (!ctrlLocked) { stickyCtrl = false; updateModButtons(); }
+    if (!altLocked) { stickyAlt = false; updateModButtons(); }
+    if (currentTerm) currentTerm.focus();
+  }
+
+  // Prevent focus steal on all keyboard buttons
+  function preventFocusSteal(e) {
+    e.preventDefault();
+  }
+
+  for (const btn of quickBar.querySelectorAll('button')) {
+    btn.addEventListener('mousedown', preventFocusSteal);
+    btn.addEventListener('touchstart', preventFocusSteal);
+  }
+  for (const btn of keyPanel.querySelectorAll('button')) {
+    btn.addEventListener('mousedown', preventFocusSteal);
+    btn.addEventListener('touchstart', preventFocusSteal);
+  }
+
+  // Quick bar button clicks
+  quickBar.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    if (btn.dataset.mod) {
+      handleModTap(btn.dataset.mod);
+      return;
+    }
+    if (btn.id === 'show-panel-btn') {
+      showKeyboardMode('panel');
+      return;
+    }
+    if (btn.id === 'show-text-btn') {
+      showKeyboardMode('text');
+      return;
+    }
+    if (btn.dataset.key) {
+      sendKey(parseDataKey(btn.dataset.key));
+    }
+  });
+
+  // Key panel button clicks
+  keyPanel.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    if (btn.id === 'panel-back-btn') {
+      showKeyboardMode('bar');
+      return;
+    }
+    if (btn.dataset.action === 'paste') {
+      navigator.clipboard.readText().then((text) => {
+        if (text && currentWs && currentWs.readyState === WebSocket.OPEN) {
+          currentWs.send(dataPacket(text));
+        }
+        if (currentTerm) currentTerm.focus();
+      }).catch(() => {});
+      return;
+    }
+    if (btn.dataset.key) {
+      sendKey(parseDataKey(btn.dataset.key));
+    }
+  });
+
+  // Text input bar
+  document.getElementById('text-send-btn').addEventListener('mousedown', preventFocusSteal);
+  document.getElementById('text-back-btn').addEventListener('mousedown', preventFocusSteal);
+
+  document.getElementById('text-send-btn').addEventListener('click', () => {
+    const val = textInput.value;
+    if (val && currentWs && currentWs.readyState === WebSocket.OPEN) {
+      currentWs.send(dataPacket(val + '\r'));
+    }
+    textInput.value = '';
+    showKeyboardMode('bar');
+  });
+
+  document.getElementById('text-back-btn').addEventListener('click', () => {
+    showKeyboardMode('bar');
+  });
+
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      document.getElementById('text-send-btn').click();
+    }
+  });
+
+  function resetKeyboardState() {
+    kbMode = "bar";
+    stickyCtrl = false;
+    stickyAlt = false;
+    ctrlLocked = false;
+    altLocked = false;
+    updateModButtons();
+    showKeyboardMode("bar");
   }
 
   // ── Init ──
