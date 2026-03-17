@@ -278,10 +278,12 @@ export class PtyServer {
 
     socket.on("close", () => {
       this.clients.delete(socket);
+      this.negotiateSize();
     });
 
     socket.on("error", () => {
       this.clients.delete(socket);
+      this.negotiateSize();
     });
   }
 

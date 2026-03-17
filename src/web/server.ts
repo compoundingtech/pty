@@ -35,7 +35,7 @@ export class WebServer {
   private connections = new Set<{ ws: WSType; unix: net.Socket }>();
 
   constructor(options: WebServerOptions = {}) {
-    const host = options.host ?? "127.0.0.1";
+    const host = options.host ?? "0.0.0.0";
     const port = options.port ?? 7681;
     this.connectCode = options.connectCode;
 

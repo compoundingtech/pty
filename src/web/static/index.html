@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
   <title>pty</title>
   <link rel="stylesheet" href="/vendor/xterm.css" />
   <script type="importmap">
@@ -12,13 +12,15 @@
   } }
   </script>
   <style>
+    :root { --vh: 100vh; }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       background: #1e1e1e;
       color: #ccc;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      height: 100vh;
+      height: var(--vh);
       overflow: hidden;
+      overscroll-behavior: none;
     }
 
     /* Login view */
@@ -26,7 +28,7 @@
       display: none;
       justify-content: center;
       align-items: center;
-      height: 100vh;
+      height: var(--vh);
     }
     #login-view form {
       background: #2a2a2a;
@@ -78,7 +80,7 @@
     #list-view {
       display: none;
       flex-direction: column;
-      height: 100vh;
+      height: var(--vh);
       padding: 1.5rem;
     }
     #list-view h1 {
@@ -131,7 +133,7 @@
     #terminal-view {
       display: none;
       flex-direction: column;
-      height: 100vh;
+      height: var(--vh);
     }
     #toolbar {
       display: flex;
@@ -234,6 +236,24 @@
       border: 1px solid #555;
       border-radius: 4px;
     }
+    #show-kb-btn {
+      display: none;
+      position: absolute;
+      bottom: 8px;
+      right: 8px;
+      width: 44px;
+      height: 44px;
+      background: rgba(68, 68, 68, 0.8);
+      color: #ccc;
+      border: none;
+      border-radius: 22px;
+      font-size: 20px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      z-index: 5;
+    }
+
     #text-send-btn, #text-back-btn {
       padding: 8px 16px;
       background: #558;
@@ -271,6 +291,7 @@
   <div id="exit-overlay"></div>
 
   <div id="quick-bar">
+    <button id="show-text-btn" class="mode-btn">&#x1F4AC;</button>
     <button data-key="\x1b">Esc</button>
     <button data-key="\t">Tab</button>
     <button data-mod="ctrl" class="mod-btn">Ctrl</button>
@@ -286,10 +307,11 @@
     <button data-key="\x1b[H">Home</button>
     <button data-key="\x1b[F">End</button>
     <button id="show-panel-btn" class="mode-btn">&#x2328;</button>
-    <button id="show-text-btn" class="mode-btn">Aa</button>
+    <button id="hide-kb-btn" class="mode-btn">&#x2715;</button>
   </div>
 
   <div id="key-panel">
+    <button id="panel-back-btn" class="mode-btn">&#x25be; bar</button>
     <button data-key="\x1b[Z">&#x21e5;Tab</button>
     <button data-key="\x1b[2~">Ins</button>
     <button data-key="\x1b[3~">Del</button>
@@ -332,7 +354,6 @@
     <button data-key=">">&gt;</button>
     <button data-key="`">`</button>
     <button data-key="\">\</button>
-    <button id="panel-back-btn" class="mode-btn">&#x25be; bar</button>
   </div>
 
   <div id="text-input-bar">
@@ -340,6 +361,8 @@
     <button id="text-send-btn">Send</button>
     <button id="text-back-btn" class="mode-btn">&#x25be; bar</button>
   </div>
+
+  <button id="show-kb-btn">&#x2328;</button>
 </div>
 
 <script type="module">
@@ -543,6 +566,7 @@
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
+      smoothScrollDuration: 80,
       theme: { background: "#1e1e1e" },
     });
     const fitAddon = new FitAddon();
@@ -673,6 +697,7 @@
   const keyPanel = document.getElementById("key-panel");
   const textInputBar = document.getElementById("text-input-bar");
   const textInput = document.getElementById("text-input");
+  const showKbBtn = document.getElementById("show-kb-btn");
 
   function showKeyboardMode(mode) {
     kbMode = mode;
@@ -680,8 +705,12 @@
     quickBar.style.display = (mode === "bar" && isMobileDevice) ? "block" : "none";
     keyPanel.style.display = (mode === "panel" && isMobileDevice) ? "grid" : "none";
     textInputBar.style.display = (mode === "text" && isMobileDevice) ? "flex" : "none";
+    showKbBtn.style.display = (mode === "hidden" && isMobileDevice) ? "block" : "none";
     if (mode === "text") {
       textInput.focus();
+    } else if (mode === "panel") {
+      // Hide native keyboard — user wants virtual keys only
+      if (document.activeElement) document.activeElement.blur();
     } else if (currentTerm) {
       currentTerm.focus();
     }
@@ -753,11 +782,9 @@
 
   for (const btn of quickBar.querySelectorAll('button')) {
     btn.addEventListener('mousedown', preventFocusSteal);
-    btn.addEventListener('touchstart', preventFocusSteal);
   }
   for (const btn of keyPanel.querySelectorAll('button')) {
     btn.addEventListener('mousedown', preventFocusSteal);
-    btn.addEventListener('touchstart', preventFocusSteal);
   }
 
   // Quick bar button clicks
@@ -774,6 +801,10 @@
     }
     if (btn.id === 'show-text-btn') {
       showKeyboardMode('text');
+      return;
+    }
+    if (btn.id === 'hide-kb-btn') {
+      showKeyboardMode('hidden');
       return;
     }
     if (btn.dataset.key) {
@@ -801,6 +832,12 @@
     if (btn.dataset.key) {
       sendKey(parseDataKey(btn.dataset.key));
     }
+  });
+
+  // Floating reopen button
+  showKbBtn.addEventListener('mousedown', preventFocusSteal);
+  showKbBtn.addEventListener('click', () => {
+    showKeyboardMode('bar');
   });
 
   // Text input bar
@@ -836,6 +873,138 @@
     updateModButtons();
     showKeyboardMode("bar");
   }
+
+  // ── Viewport height (mobile keyboard aware) ──
+
+  function updateViewportHeight() {
+    const vh = window.visualViewport
+      ? window.visualViewport.height
+      : window.innerHeight;
+    document.documentElement.style.setProperty('--vh', `${vh}px`);
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', updateViewportHeight);
+    window.visualViewport.addEventListener('scroll', updateViewportHeight);
+  }
+  window.addEventListener('resize', updateViewportHeight);
+  updateViewportHeight();
+
+  // ── Touch scrolling (xterm.js 6.0.x workaround) ──
+  // xterm.js 6.0 uses a VS Code SmoothScrollableElement that only handles
+  // wheel events. Touch scrolling was added in 6.1.0 (PR #5563) via the
+  // internal Gesture class dispatching '-xterm-gesturechange' events.
+  //
+  // This handler replicates the Gesture class physics (additive friction,
+  // rolling position tracking, pixel-level inertia) and will auto-disable
+  // when xterm.js handles touch scrolling natively (6.1.0+).
+
+  const SCROLL_FRICTION = -0.005;
+  let nativeTouchScroll = false; // set true when xterm 6.1.0+ detected
+  let touchId = -1;
+  let rollingPageY = [];
+  let rollingTimestamps = [];
+  let lastPageY = 0;
+  let inertiaHandle = 0;
+  let scrollPixelOffset = 0; // sub-line pixel accumulator
+
+  // Detect xterm.js 6.1.0+ by listening for its gesture events
+  terminalContainer.addEventListener('-xterm-gesturechange', () => {
+    nativeTouchScroll = true;
+    stopInertia();
+  });
+
+  function stopInertia() {
+    if (inertiaHandle) {
+      cancelAnimationFrame(inertiaHandle);
+      inertiaHandle = 0;
+    }
+  }
+
+  function getLineHeight() {
+    if (!currentTerm) return 16;
+    // Access cell height from the render dimensions if available
+    const el = terminalContainer.querySelector('.xterm-screen canvas');
+    if (el && currentTerm.rows > 0) {
+      return el.clientHeight / currentTerm.rows;
+    }
+    return currentTerm.options.fontSize * 1.2;
+  }
+
+  function scrollByPixels(deltaY) {
+    if (!currentTerm) return;
+    const lineHeight = getLineHeight();
+    scrollPixelOffset += deltaY;
+    const lines = Math.trunc(scrollPixelOffset / lineHeight);
+    if (lines !== 0) {
+      currentTerm.scrollLines(lines);
+      scrollPixelOffset -= lines * lineHeight;
+    }
+  }
+
+  function runInertia(t1, vY, dirY) {
+    inertiaHandle = requestAnimationFrame(() => {
+      const now = Date.now();
+      const deltaT = now - t1;
+
+      vY += SCROLL_FRICTION * deltaT;
+
+      if (vY <= 0) {
+        inertiaHandle = 0;
+        return;
+      }
+
+      const deltaPosY = dirY * vY * deltaT;
+      scrollByPixels(-deltaPosY);
+
+      runInertia(now, vY, dirY);
+    });
+  }
+
+  terminalContainer.addEventListener('touchstart', (e) => {
+    if (nativeTouchScroll || e.touches.length !== 1) return;
+    stopInertia();
+    const touch = e.touches[0];
+    touchId = touch.identifier;
+    lastPageY = touch.pageY;
+    scrollPixelOffset = 0;
+    rollingPageY = [touch.pageY];
+    rollingTimestamps = [Date.now()];
+  }, { passive: true });
+
+  terminalContainer.addEventListener('touchmove', (e) => {
+    if (nativeTouchScroll || !currentTerm || e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    if (touch.identifier !== touchId) return;
+
+    const deltaY = lastPageY - touch.pageY;
+    lastPageY = touch.pageY;
+    scrollByPixels(deltaY);
+
+    // Keep last 3 data points for velocity calculation
+    if (rollingPageY.length > 3) {
+      rollingPageY.shift();
+      rollingTimestamps.shift();
+    }
+    rollingPageY.push(touch.pageY);
+    rollingTimestamps.push(Date.now());
+  }, { passive: true });
+
+  terminalContainer.addEventListener('touchend', (e) => {
+    if (nativeTouchScroll || !currentTerm || rollingPageY.length < 2) return;
+
+    const finalY = rollingPageY[rollingPageY.length - 1];
+    const deltaT = rollingTimestamps[rollingTimestamps.length - 1] - rollingTimestamps[0];
+    const deltaY = finalY - rollingPageY[0];
+
+    if (deltaT > 0 && Math.abs(deltaY) > 5) {
+      const speed = Math.abs(deltaY) / deltaT;
+      const dir = deltaY > 0 ? 1 : -1;
+      runInertia(Date.now(), speed, dir);
+    }
+
+    touchId = -1;
+  }, { passive: true });
 
   // ── Init ──
 
