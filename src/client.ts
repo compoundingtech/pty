@@ -198,6 +198,8 @@ export function attach(options: AttachOptions): void {
   let detaching = false;
   let rawWasSet = false;
   let exitCode = 0;
+  let stdinDataHandler: ((data: Buffer) => void) | null = null;
+  let resizeHandler: (() => void) | null = null;
 
   function enterRawMode(): void {
     if (stdin.isTTY && !stdin.isRaw) {
@@ -213,6 +215,14 @@ export function attach(options: AttachOptions): void {
   }
 
   function cleanExit(): void {
+    if (stdinDataHandler) {
+      stdin.removeListener("data", stdinDataHandler);
+      stdinDataHandler = null;
+    }
+    if (resizeHandler && stdout instanceof tty.WriteStream) {
+      stdout.removeListener("resize", resizeHandler);
+      resizeHandler = null;
+    }
     exitRawMode();
     socket.destroy();
   }
@@ -230,7 +240,7 @@ export function attach(options: AttachOptions): void {
     let lastDetachKeyTime = 0;
     const DOUBLE_TAP_MS = 300;
 
-    stdin.on("data", (raw: Buffer) => {
+    stdinDataHandler = (raw: Buffer) => {
       const data = normalizeDetachKey(raw);
 
       // Fast path: no detach key in this chunk
@@ -270,7 +280,8 @@ export function attach(options: AttachOptions): void {
       if (forward.length > 0) {
         socket.write(encodeData(Buffer.from(forward).toString()));
       }
-    });
+    };
+    stdin.on("data", stdinDataHandler);
 
     // Explicitly resume stdin. We cannot rely on the auto-resume from
     // .on("data") because Node.js skips it when _readableState.flowing
@@ -281,11 +292,12 @@ export function attach(options: AttachOptions): void {
 
     // Handle terminal resize
     if (stdout instanceof tty.WriteStream) {
-      stdout.on("resize", () => {
+      resizeHandler = () => {
         const rows = stdout.rows;
         const cols = stdout.columns;
         socket.write(encodeResize(rows, cols));
-      });
+      };
+      stdout.on("resize", resizeHandler);
     }
   });
 
@@ -313,20 +325,33 @@ export function attach(options: AttachOptions): void {
     }
   });
 
+  let exitHandled = false;
+
   socket.on("error", (err: NodeJS.ErrnoException) => {
+    if (exitHandled) return;
+    exitHandled = true;
     cleanExit();
     if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
       console.error(`Session "${options.name}" not found or not running.`);
     } else {
       console.error(`Connection error: ${err.message}`);
     }
-    process.exit(1);
+    if (options.onExit) {
+      options.onExit(1);
+    } else {
+      process.exit(1);
+    }
   });
 
   socket.on("close", () => {
-    if (!detaching) {
+    if (!detaching && !exitHandled) {
+      exitHandled = true;
       cleanExit();
-      process.exit(exitCode);
+      if (options.onExit) {
+        options.onExit(exitCode);
+      } else {
+        process.exit(exitCode);
+      }
     }
   });
 }

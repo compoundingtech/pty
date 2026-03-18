@@ -1,16 +1,10 @@
-import { spawn, execFileSync } from "node:child_process";
-import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 import * as readline from "node:readline/promises";
-import * as tty from "node:tty";
-import { fileURLToPath } from "node:url";
 import { attach, peek, send } from "./client.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
   getSession,
-  getSocketPath,
   cleanupAll,
   cleanupSocket,
   validateName,
@@ -18,11 +12,12 @@ import {
   releaseLock,
   type SessionInfo,
 } from "./sessions.ts";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import { spawnDaemon, resolveCommand } from "./spawn.ts";
+import { runInteractive } from "./tui/interactive.ts";
 
 function usage(): void {
   console.log(`Usage:
+  pty                                       Interactive session manager
   pty run <name> <command> [args...]        Create a session and attach
   pty run -d <name> <command> [args...]    Create a session in the background
   pty run -a <name> <command> [args...]    Create or attach if already running
@@ -47,13 +42,19 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    await cmdList();
+    await runInteractive();
     return;
   }
 
   const command = args[0];
 
   switch (command) {
+    case "interactive":
+    case "i": {
+      await runInteractive();
+      break;
+    }
+
     case "run": {
       // Parse flags before positional args
       let detach = false;
@@ -97,7 +98,12 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       const displayCmd = cmd;
-      cmd = resolveCommand(cmd);
+      try {
+        cmd = resolveCommand(cmd);
+      } catch (e: any) {
+        console.error(e.message);
+        process.exit(1);
+      }
       await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd);
       break;
     }
@@ -506,98 +512,6 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   doAttach(name);
 }
 
-async function spawnDaemon(
-  name: string,
-  command: string,
-  args: string[],
-  displayCommand: string,
-  cwd?: string
-): Promise<void> {
-  const stdout = process.stdout as tty.WriteStream;
-  const rows = stdout.rows ?? 24;
-  const cols = stdout.columns ?? 80;
-
-  const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
-  const serverModule = path.join(__dirname, "server.ts");
-  const config = JSON.stringify({
-    name,
-    command,
-    args,
-    displayCommand,
-    cwd: cwd ?? process.cwd(),
-    rows,
-    cols,
-  });
-
-  const child = spawn(tsxBin, [serverModule], {
-    detached: true,
-    stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, PTY_SERVER_CONFIG: config },
-  });
-
-  // Capture stderr for better error reporting
-  let stderrOutput = "";
-  child.stderr?.on("data", (data: Buffer) => {
-    stderrOutput += data.toString();
-  });
-
-  // Detect early daemon crash before the socket appears
-  let earlyExit = false;
-  let earlyExitCode: number | null = null;
-  child.on("exit", (code) => {
-    earlyExit = true;
-    earlyExitCode = code;
-  });
-
-  (child.stderr as any)?.unref?.();
-  child.unref();
-
-  await waitForSocket(name, 3000, () => {
-    if (earlyExit) {
-      const details = stderrOutput.trim();
-      const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;
-      throw new Error(details ? `${msg}\n${details}` : `${msg} Is the command valid?`);
-    }
-  });
-}
-
-function waitForSocket(
-  name: string,
-  timeoutMs: number,
-  earlyCheck?: () => void
-): Promise<void> {
-  const socketPath = getSocketPath(name);
-  const start = Date.now();
-
-  return new Promise((resolve, reject) => {
-    function check(): void {
-      // Check for early daemon failure
-      try {
-        earlyCheck?.();
-      } catch (e) {
-        reject(e);
-        return;
-      }
-
-      if (Date.now() - start > timeoutMs) {
-        reject(new Error(`Timeout waiting for session "${name}" to start`));
-        return;
-      }
-
-      try {
-        const stat = fs.statSync(socketPath);
-        if (stat) {
-          setTimeout(resolve, 100);
-          return;
-        }
-      } catch {}
-
-      setTimeout(check, 50);
-    }
-    check();
-  });
-}
-
 function ask(prompt: string): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -607,35 +521,6 @@ function ask(prompt: string): Promise<string> {
     rl.close();
     return answer;
   });
-}
-
-function resolveCommand(cmd: string): string {
-  // Already absolute — just verify it exists
-  if (path.isAbsolute(cmd)) {
-    if (!fs.existsSync(cmd)) {
-      console.error(`Command not found: ${cmd}`);
-      process.exit(1);
-    }
-    return cmd;
-  }
-
-  // Relative path (contains /) — resolve against cwd
-  if (cmd.includes("/")) {
-    const resolved = path.resolve(cmd);
-    if (!fs.existsSync(resolved)) {
-      console.error(`Command not found: ${cmd}`);
-      process.exit(1);
-    }
-    return resolved;
-  }
-
-  // Bare command name — look up in PATH
-  try {
-    return execFileSync("which", [cmd], { encoding: "utf8" }).trim();
-  } catch {
-    console.error(`Command not found: ${cmd}`);
-    process.exit(1);
-  }
 }
 
 function shortPath(p: string): string {

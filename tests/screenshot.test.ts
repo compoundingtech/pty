@@ -19,8 +19,12 @@ import { getSocketPath, cleanupAll } from "../src/sessions.ts";
 
 // All tests run in a tmp directory to avoid polluting the project
 const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pty-ss-"));
+// Isolate session metadata/sockets from the real session directory
+const testSessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-ss-sd-"));
+process.env.PTY_SESSION_DIR = testSessionDir;
 afterAll(() => {
   fs.rmSync(testCwd, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  fs.rmSync(testSessionDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
 // ─── Types ───
