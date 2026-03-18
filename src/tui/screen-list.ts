@@ -51,9 +51,10 @@ export function updateSessions(state: ListState, sessions: SessionInfo[]): void 
 
 function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
   return [...sessions].sort((a, b) => {
-    const aTime = a.metadata?.createdAt ?? "";
-    const bTime = b.metadata?.createdAt ?? "";
-    return aTime.localeCompare(bTime);
+    const aRunning = a.status === "running" ? 0 : 1;
+    const bRunning = b.status === "running" ? 0 : 1;
+    if (aRunning !== bRunning) return aRunning - bRunning;
+    return a.name.localeCompare(b.name);
   });
 }
 
