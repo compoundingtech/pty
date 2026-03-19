@@ -1,5 +1,7 @@
 import * as os from "node:os";
+import * as path from "node:path";
 import * as readline from "node:readline/promises";
+import { spawnSync } from "node:child_process";
 import { attach, peek, send } from "./client.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
@@ -34,6 +36,9 @@ function usage(): void {
   pty list                                 List active sessions
   pty list --json                          List sessions as JSON
   pty kill <name>                          Kill or remove a session
+  pty test                                 Run tests (vitest)
+  pty test watch                           Watch mode
+  pty test -t "pattern"                    Run matching tests
 
 Detach from a session with Ctrl+\\ (press twice to send Ctrl+\\ to the process)`);
 }
@@ -243,6 +248,11 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       await cmdKill(args[1]);
+      break;
+    }
+
+    case "test": {
+      await cmdTest(args.slice(1));
       break;
     }
 
@@ -510,6 +520,22 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   await spawnDaemon(name, meta.command, meta.args, meta.displayCommand, meta.cwd);
   console.log(`Session "${name}" restarted.`);
   doAttach(name);
+}
+
+async function cmdTest(args: string[]): Promise<void> {
+  const vitestBin = path.join(
+    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    "..",
+    "node_modules",
+    ".bin",
+    "vitest"
+  );
+  const vitestArgs = args.length === 0 ? ["run"] : args;
+  const result = spawnSync(vitestBin, vitestArgs, {
+    stdio: "inherit",
+    env: process.env,
+  });
+  process.exit(result.status ?? 1);
 }
 
 function ask(prompt: string): Promise<string> {

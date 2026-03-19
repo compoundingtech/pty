@@ -1,17 +1,21 @@
 {
-  "name": "pty-manager",
+  "name": "ptym",
   "version": "0.1.0",
   "description": "Persistent terminal sessions with detach/attach support",
   "type": "module",
   "bin": {
     "pty": "./bin/pty"
   },
+  "exports": {
+    "./testing": "./src/testing/index.ts"
+  },
   "scripts": {
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "verify-docs": "tsx scripts/verify-docs.ts"
   },
   "dependencies": {
     "@xterm/addon-serialize": "^0.14.0",

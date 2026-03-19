@@ -2,7 +2,14 @@ import { describe, it, expect, afterEach, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { TuiSession, createBackgroundSession } from "./tui-harness.ts";
+import { fileURLToPath } from "node:url";
+import { spawn, type ChildProcess } from "node:child_process";
+import { Session } from "../src/testing/index.ts";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
+const cliPath = path.join(__dirname, "..", "src", "cli.ts");
+const serverModule = path.join(__dirname, "..", "src", "server.ts");
 
 // Each test gets its own temp session dir
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ptui-"));
@@ -10,7 +17,7 @@ afterAll(() => {
   fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
-let tuiSessions: TuiSession[] = [];
+let tuiSessions: Session[] = [];
 let bgPids: number[] = [];
 let sessionDirs: string[] = [];
 
@@ -22,7 +29,7 @@ function makeSessionDir(): string {
 
 afterEach(async () => {
   for (const s of tuiSessions) {
-    s.close();
+    await s.close();
   }
   tuiSessions = [];
   for (const pid of bgPids) {
@@ -49,6 +56,82 @@ function uniqueName(): string {
   return `s${++nameCounter}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+function createTuiSession(sessionDir: string, opts: { rows?: number; cols?: number } = {}): Session {
+  const rows = opts.rows ?? 24;
+  const cols = opts.cols ?? 80;
+  const session = Session.spawn(tsxBin, [cliPath], {
+    rows,
+    cols,
+    env: {
+      PTY_SESSION_DIR: sessionDir,
+      TERM: "xterm-256color",
+    },
+  });
+  tuiSessions.push(session);
+  return session;
+}
+
+/**
+ * Spawn a background session as a separate daemon process with PTY_SESSION_DIR set.
+ * Returns the child process PID for cleanup.
+ */
+async function createBackgroundSession(
+  sessionDir: string,
+  name: string,
+  command: string,
+  args: string[] = [],
+  cwd?: string
+): Promise<{ child: ChildProcess; pid: number }> {
+  const config = JSON.stringify({
+    name,
+    command,
+    args,
+    displayCommand: command,
+    cwd: cwd ?? os.tmpdir(),
+    rows: 24,
+    cols: 80,
+  });
+
+  const child = spawn(tsxBin, [serverModule], {
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PTY_SERVER_CONFIG: config,
+      PTY_SESSION_DIR: sessionDir,
+    },
+  });
+
+  let stderr = "";
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+
+  let exitCode: number | null = null;
+  child.on("exit", (code) => {
+    exitCode = code;
+  });
+
+  (child.stderr as any)?.unref?.();
+  child.unref();
+
+  // Wait for socket to appear
+  const socketPath = path.join(sessionDir, `${name}.sock`);
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    if (exitCode !== null) {
+      throw new Error(`Background session daemon exited with code ${exitCode}. stderr:\n${stderr}`);
+    }
+    try {
+      fs.statSync(socketPath);
+      await new Promise((r) => setTimeout(r, 100));
+      return { child, pid: child.pid! };
+    } catch {}
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`Timeout waiting for background session "${name}" socket at ${socketPath}. stderr:\n${stderr}`);
+}
+
 describe("interactive TUI layout", () => {
   for (const cols of [80, 120, 200]) {
     it(
@@ -66,8 +149,7 @@ describe("interactive TUI layout", () => {
         );
         bgPids.push(pid);
 
-        const tui = TuiSession.create({ sessionDir, cols, rows: 24 });
-        tuiSessions.push(tui);
+        const tui = createTuiSession(sessionDir, { cols, rows: 24 });
 
         const ss = await tui.waitForText(name, 10000);
 
@@ -111,8 +193,7 @@ describe("interactive TUI layout", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir, cols: 120, rows: 24 });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir, { cols: 120, rows: 24 });
 
       const ss = await tui.waitForText(name, 10000);
       const sessionLine = ss.lines.find((l) => l.includes(name));
@@ -136,8 +217,7 @@ describe("interactive TUI layout", () => {
     "session list renders correctly at narrow 60 columns",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir, cols: 60, rows: 24 });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir, { cols: 60, rows: 24 });
 
       const ss = await tui.waitForText("Create new session...", 10000);
 
@@ -157,8 +237,7 @@ describe("interactive TUI", () => {
     "renders session list with borders and 'Create new session...'",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       const ss = await tui.waitForText("Create new session...", 10000);
       expect(ss.text).toContain("pty");
@@ -184,8 +263,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       const ss = await tui.waitForText(name, 10000);
       expect(ss.text).toContain(name);
@@ -209,8 +287,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText(name, 10000);
 
@@ -239,8 +316,7 @@ describe("interactive TUI", () => {
       const bg2 = await createBackgroundSession(sessionDir, name2, "sh", ["-c", "sleep 300"], os.tmpdir());
       bgPids.push(bg2.pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText(name1, 10000);
       await tui.waitForText(name2, 10000);
@@ -282,8 +358,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText(name, 10000);
       tui.press("return");
@@ -309,8 +384,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText(name, 10000);
       tui.press("return");
@@ -329,8 +403,7 @@ describe("interactive TUI", () => {
     "create wizard: shows directory picker",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText("Create new session...", 10000);
       tui.press("return");
@@ -345,8 +418,7 @@ describe("interactive TUI", () => {
     "create wizard: name auto-fills from directory",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText("Create new session...", 10000);
       tui.press("return");
@@ -363,8 +435,7 @@ describe("interactive TUI", () => {
     "empty state shows only 'Create new session...'",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       const ss = await tui.waitForText("Create new session...", 10000);
       expect(ss.text).toContain("Create new session...");
@@ -377,8 +448,7 @@ describe("interactive TUI", () => {
     "q quits the interactive TUI",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText("Create new session...", 10000);
       tui.type("q");
@@ -394,8 +464,7 @@ describe("interactive TUI", () => {
     "escape clears filter, then quits",
     async () => {
       const sessionDir = makeSessionDir();
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText("Create new session...", 10000);
 
@@ -437,8 +506,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       // Cycle 1: attach and detach
       await tui.waitForText(name, 10000);
@@ -477,8 +545,7 @@ describe("interactive TUI", () => {
       );
       bgPids.push(pid);
 
-      const tui = TuiSession.create({ sessionDir });
-      tuiSessions.push(tui);
+      const tui = createTuiSession(sessionDir);
 
       await tui.waitForText(name, 10000);
 
@@ -491,6 +558,44 @@ describe("interactive TUI", () => {
       const ss = await tui.waitForText(name, 10000);
       expect(ss.text).toContain(name);
       expect(ss.text).toContain("Create new session...");
+    },
+    20000
+  );
+
+  it(
+    "exited session shows as exited when returning to list during cleanup window",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+
+      // Use a command that prints a marker then waits for input
+      const { pid } = await createBackgroundSession(
+        sessionDir,
+        name,
+        "sh",
+        ["-c", "echo EXIT_RACE; exec cat"],
+        os.tmpdir()
+      );
+      bgPids.push(pid);
+
+      const tui = createTuiSession(sessionDir);
+
+      // Attach to the session
+      await tui.waitForText(name, 10000);
+      tui.press("return");
+      await tui.waitForText("EXIT_RACE", 10000);
+
+      // Send EOF to make cat exit — triggers the race where the daemon
+      // is still alive (500ms cleanup delay) but metadata has exitedAt set
+      tui.sendKeys("\x04"); // Ctrl+D
+
+      // Wait for TUI to return to the list
+      await tui.waitForText("Create new session...", 10000);
+
+      // The session must show as exited, not running
+      const ss = tui.screenshot();
+      expect(ss.text).toContain("exited");
+      expect(ss.text).toContain(name);
     },
     20000
   );

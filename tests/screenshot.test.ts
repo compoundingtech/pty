@@ -5,9 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { Terminal } from "@xterm/headless";
-import { SerializeAddon } from "@xterm/addon-serialize";
-import { PtyServer, type ServerOptions } from "../src/server.ts";
+import { Session, type Screenshot } from "../src/testing/index.ts";
 import {
   MessageType,
   PacketReader,
@@ -27,230 +25,9 @@ afterAll(() => {
   fs.rmSync(testSessionDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
-// ─── Types ───
-
-interface Screenshot {
-  /** Plain text lines (trailing whitespace trimmed per line) */
-  lines: string[];
-  /** All lines joined with newline */
-  text: string;
-  /** ANSI-serialized terminal state (includes escape codes) */
-  ansi: string;
-}
-
-// ─── TestSession ───
-
-class TestSession {
-  server: PtyServer;
-  name: string;
-  rows: number;
-  cols: number;
-
-  private ownsServer: boolean;
-  private socket!: net.Socket;
-  private reader!: PacketReader;
-  private terminal: Terminal;
-  private serialize: SerializeAddon;
-  private screenCallbacks: Array<() => void> = [];
-  private exitCode: number | null = null;
-
-  private constructor(
-    server: PtyServer,
-    name: string,
-    rows: number,
-    cols: number,
-    ownsServer: boolean
-  ) {
-    this.server = server;
-    this.name = name;
-    this.rows = rows;
-    this.cols = cols;
-    this.ownsServer = ownsServer;
-    this.terminal = new Terminal({
-      rows,
-      cols,
-      scrollback: 1000,
-      allowProposedApi: true,
-    });
-    this.serialize = new SerializeAddon();
-    this.terminal.loadAddon(this.serialize);
-  }
-
-  static async create(
-    name: string,
-    command: string,
-    args: string[] = [],
-    opts: Partial<Pick<ServerOptions, "rows" | "cols">> & { cwd?: string } = {}
-  ): Promise<TestSession> {
-    const rows = opts.rows ?? 24;
-    const cols = opts.cols ?? 80;
-    const cwd = opts.cwd ?? testCwd;
-    const server = new PtyServer({
-      name,
-      command,
-      args,
-      displayCommand: command,
-      cwd,
-      rows,
-      cols,
-    });
-    await server.ready;
-    const session = new TestSession(server, name, rows, cols, true);
-    await session.connectSocket();
-    return session;
-  }
-
-  /** Connect to an existing server as a second client. */
-  static async connectToExisting(
-    name: string,
-    server: PtyServer,
-    opts: { rows?: number; cols?: number } = {}
-  ): Promise<TestSession> {
-    const rows = opts.rows ?? 24;
-    const cols = opts.cols ?? 80;
-    const session = new TestSession(server, name, rows, cols, false);
-    await session.connectSocket();
-    return session;
-  }
-
-  private async connectSocket(): Promise<void> {
-    this.reader = new PacketReader();
-    this.screenCallbacks = [];
-    this.exitCode = null;
-
-    this.socket = await new Promise<net.Socket>((resolve, reject) => {
-      const s = net.createConnection(getSocketPath(this.name));
-      s.on("connect", () => resolve(s));
-      s.on("error", reject);
-    });
-
-    this.socket.on("data", (data: Buffer) => {
-      const packets = this.reader.feed(data);
-      for (const packet of packets) {
-        switch (packet.type) {
-          case MessageType.SCREEN:
-            this.terminal.reset();
-            this.terminal.write(packet.payload.toString(), () => {
-              const cbs = this.screenCallbacks;
-              this.screenCallbacks = [];
-              for (const cb of cbs) cb();
-            });
-            break;
-          case MessageType.DATA:
-            this.terminal.write(packet.payload.toString());
-            break;
-          case MessageType.EXIT:
-            this.exitCode = packet.payload.readInt32BE(0);
-            break;
-        }
-      }
-    });
-  }
-
-  /** Send ATTACH and wait for the SCREEN response. */
-  async attach(): Promise<void> {
-    const screenPromise = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 5000);
-      this.screenCallbacks.push(() => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-    this.socket.write(encodeAttach(this.rows, this.cols));
-    await screenPromise;
-  }
-
-  /** Disconnect, create a new socket, and attach again. */
-  async reconnect(): Promise<void> {
-    this.socket.destroy();
-    await new Promise((r) => setTimeout(r, 100));
-    this.terminal.reset();
-    await this.connectSocket();
-    await this.attach();
-  }
-
-  /** Send keystrokes to the PTY process. */
-  sendKeys(keys: string): void {
-    this.socket.write(encodeData(keys));
-  }
-
-  /** Send a RESIZE message and update the local terminal dimensions. */
-  resize(rows: number, cols: number): void {
-    this.rows = rows;
-    this.cols = cols;
-    this.socket.write(encodeResize(rows, cols));
-    this.terminal.resize(cols, rows);
-  }
-
-  /** Whether the PTY process has exited. */
-  get hasExited(): boolean {
-    return this.exitCode !== null;
-  }
-
-  /** Capture the current terminal state. */
-  screenshot(): Screenshot {
-    const buffer = this.terminal.buffer.active;
-    const lines: string[] = [];
-    for (let i = 0; i < buffer.length; i++) {
-      const line = buffer.getLine(i);
-      if (line) {
-        lines.push(line.translateToString(true));
-      }
-    }
-    while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
-      lines.pop();
-    }
-    return {
-      lines,
-      text: lines.join("\n"),
-      ansi: this.serialize.serialize(),
-    };
-  }
-
-  /** Poll until the terminal contains the given text. */
-  async waitForText(text: string, timeoutMs = 5000): Promise<Screenshot> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await new Promise((r) => setTimeout(r, 50));
-      const ss = this.screenshot();
-      if (ss.text.includes(text)) return ss;
-    }
-    const ss = this.screenshot();
-    throw new Error(
-      `Timed out after ${timeoutMs}ms waiting for "${text}".\nScreen:\n${ss.text}`
-    );
-  }
-
-  /** Poll until a predicate on the screenshot returns true. */
-  async waitFor(
-    predicate: (ss: Screenshot) => boolean,
-    timeoutMs = 5000,
-    description = "predicate"
-  ): Promise<Screenshot> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await new Promise((r) => setTimeout(r, 50));
-      const ss = this.screenshot();
-      if (predicate(ss)) return ss;
-    }
-    const ss = this.screenshot();
-    throw new Error(
-      `Timed out after ${timeoutMs}ms waiting for ${description}.\nScreen:\n${ss.text}`
-    );
-  }
-
-  async close(): Promise<void> {
-    this.socket.destroy();
-    this.terminal.dispose();
-    if (this.ownsServer) {
-      await this.server.close();
-    }
-  }
-}
-
 // ─── Scaffolding ───
 
-let sessions: TestSession[] = [];
+let sessions: Session[] = [];
 let sessionNames: string[] = [];
 let tmpDirs: string[] = [];
 let daemonPids: number[] = [];
@@ -271,9 +48,9 @@ async function createSession(
   command: string,
   args: string[] = [],
   opts: { rows?: number; cols?: number; cwd?: string } = {}
-): Promise<TestSession> {
+): Promise<Session> {
   const name = uniqueName();
-  const session = await TestSession.create(name, command, args, opts);
+  const session = await Session.server(command, args, { name, cwd: opts.cwd ?? testCwd, rows: opts.rows, cols: opts.cols });
   sessions.push(session);
   await session.attach();
   return session;
@@ -1017,10 +794,7 @@ describe("screenshot: multiple clients", () => {
 
     await session.waitForText("Shared colored output");
 
-    const peer = await TestSession.connectToExisting(
-      session.name,
-      session.server
-    );
+    const peer = await Session.connectToExisting(session);
     sessions.push(peer);
     await peer.attach();
 
@@ -1034,10 +808,7 @@ describe("screenshot: multiple clients", () => {
   it("both clients receive live output from a new command", async () => {
     const session = await createSession("cat");
 
-    const peer = await TestSession.connectToExisting(
-      session.name,
-      session.server
-    );
+    const peer = await Session.connectToExisting(session);
     sessions.push(peer);
     await peer.attach();
 

@@ -102,13 +102,11 @@ export async function listSessions(): Promise<SessionInfo[]> {
       (await isSocketReachable(socketPath));
 
     if (alive) {
-      sessions.push({
-        name,
-        socketPath,
-        pid,
-        status: "running",
-        metadata: readMetadata(name),
-      });
+      const metadata = readMetadata(name);
+      // The daemon writes exit metadata before its cleanup delay, so a
+      // reachable socket can briefly coexist with exitedAt being set.
+      const status = metadata?.exitedAt ? "exited" : "running";
+      sessions.push({ name, socketPath, pid, status, metadata });
     } else {
       // Process died — clean up socket/pid but keep metadata
       cleanupSocket(name);

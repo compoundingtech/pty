@@ -19,7 +19,7 @@ Or install directly from GitHub:
 npm install -g github:myobie/pty
 ```
 
-Requires Node.js. Works on macOS and Linux.
+The npm package name is `ptym`. Requires Node.js. Works on macOS and Linux.
 
 ## Usage
 
@@ -71,6 +71,22 @@ pty kill myserver                         # terminate a session
 ```
 
 Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
+
+## Testing Library
+
+ptym includes a terminal testing library — like Playwright, but for the terminal.
+Spawn any process in a real PTY, send input, capture screenshots, assert on screen state.
+
+```typescript
+import { Session } from "ptym/testing";
+
+const session = Session.spawn("echo", ["hello world"]);
+const ss = await session.waitForText("hello world");
+console.log(ss.text); // "hello world"
+await session.close();
+```
+
+See [docs/testing.md](docs/testing.md) for the full API and examples.
 
 ## Tab Completion
 
