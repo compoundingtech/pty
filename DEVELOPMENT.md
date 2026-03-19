@@ -1,6 +1,6 @@
 # pty — Development Guide
 
-A persistent terminal session manager. Run long-lived processes, detach, reconnect later — from any machine over SSH.
+A persistent terminal session manager. Run long-lived processes, detach, reconnect later — from any machine over SSH. The npm package name is `ptym`; the CLI command remains `pty`.
 
 ## Objectives
 
@@ -20,10 +20,11 @@ A persistent terminal session manager. Run long-lived processes, detach, reconne
 ## Quick Reference
 
 ```sh
-npm install          # install dependencies
-npm run typecheck    # typecheck with tsc (no emit)
-npm test             # run all tests once
-npm run test:watch   # run tests in watch mode
+npm install            # install dependencies
+npm run typecheck      # typecheck with tsc (no emit)
+npm test               # run all tests once
+npm run test:watch     # run tests in watch mode
+npm run verify-docs    # run executable examples in docs/testing.md
 
 # Usage (during development)
 npx tsx src/cli.ts run <name> -- <command> [args...]
@@ -34,6 +35,8 @@ npx tsx src/cli.ts peek -f <name>
 npx tsx src/cli.ts list
 npx tsx src/cli.ts restart <name>
 npx tsx src/cli.ts kill <name>
+npx tsx src/cli.ts test                  # run tests via vitest
+npx tsx src/cli.ts test -t "pattern"     # run matching tests
 ```
 
 Detach from any attached/following session with **Ctrl+\\**. Press Ctrl+\\ twice quickly to send it to the process.
@@ -147,20 +150,24 @@ When `spawnDaemon` launches the daemon, it monitors the child for early exit. If
 
 ## Testing
 
-Tests use **vitest** and live in `tests/`.
+Tests use **vitest** and live in `tests/`. The `ptym/testing` library (`src/testing/`) provides a `Session` class used by the tests — see [docs/testing.md](docs/testing.md) for the full API.
 
 - `protocol.test.ts` — Unit tests for packet encoding, decoding, and streaming reassembly (partial reads, split packets, large payloads)
+- `keys.test.ts` — Unit tests for key name resolution (`resolveKey`, `parseSeqValue`)
+- `sanitize.test.ts` — Unit tests for terminal sanitization escape sequences
 - `integration.test.ts` — Full integration tests that spawn real PTY sessions, connect clients via sockets, and verify behavior
-- `screenshot.test.ts` — Screenshot-based tests that capture terminal state (ANSI and plain text) and assert on visual output from real programs (vim, nano, ls, bash). Covers control characters, terminal resize, alternate screen buffer, multiple clients, unicode, and daemon spawning.
+- `screenshot.test.ts` — Screenshot-based tests using `Session.server()` that capture terminal state (ANSI and plain text) and assert on visual output from real programs (vim, nano, ls, bash). Covers control characters, terminal resize, alternate screen buffer, multiple clients, unicode, and daemon spawning.
+- `tui.test.ts` — Interactive TUI tests using `Session.spawn()` that drive the `pty` session manager UI: session list rendering, filtering, keyboard navigation, attach/detach cycles, and the create wizard.
 
 All tests run in `/tmp/` directories to avoid polluting the project folder (e.g., vim swap files). Integration and screenshot tests use real processes and real Unix sockets. Each test creates a uniquely-named session and cleans up afterward. There is a `200ms` delay in some tests to allow xterm-headless to process async writes before checking screen state — this is a known characteristic of xterm's write pipeline, not a flaky test.
 
 ### Running tests
 
 ```sh
-npm test                       # run once
-npm run test:watch             # watch mode
+npm test                       # run once (or: pty test)
+npm run test:watch             # watch mode (or: pty test watch)
 npx vitest run -t "peek"      # run tests matching "peek"
+npm run verify-docs            # run executable examples in docs/testing.md
 ```
 
 ### node-pty on macOS
@@ -180,10 +187,25 @@ src/
   client.ts       attach() and peek() functions
   protocol.ts     Packet types, encoding, decoding, PacketReader
   sessions.ts     Session discovery, socket/PID file management
+  keys.ts         Key name resolution (e.g. "ctrl+c" → bytes)
+  spawn.ts        Daemon spawning logic
+  tui/            Interactive session manager UI
+  testing/        Testing library (exported as ptym/testing)
+    index.ts      Public re-exports
+    session.ts    Session class (spawn + server backends)
+    screenshot.ts Screenshot capture helper
+    types.ts      Screenshot, SpawnOptions, ServerOptions interfaces
 tests/
   protocol.test.ts
+  keys.test.ts
+  sanitize.test.ts
   integration.test.ts
   screenshot.test.ts
+  tui.test.ts
+docs/
+  testing.md      Testing library documentation (with executable examples)
+scripts/
+  verify-docs.ts  Extracts and runs doc examples via vitest
 completions/
   pty.bash        Bash tab completion
   pty.zsh         Zsh tab completion
