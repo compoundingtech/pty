@@ -4,10 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const tsx = join(__dirname, '..', 'node_modules', '.bin', 'tsx');
 const cli = join(__dirname, '..', 'src', 'cli.ts');
 
-const result = spawnSync(tsx, [cli, ...process.argv.slice(2)], {
+const result = spawnSync(process.execPath, [cli, ...process.argv.slice(2)], {
   stdio: 'inherit',
   env: process.env,
 });

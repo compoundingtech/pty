@@ -860,11 +860,11 @@ describe("screenshot: high-throughput output", () => {
 
 describe("daemon spawning", () => {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
+  const nodeBin = process.execPath;
   const serverModule = path.join(__dirname, "..", "src", "server.ts");
 
   it(
-    "daemon starts and serves a session via the tsx spawn mechanism",
+    "daemon starts and serves a session via the node spawn mechanism",
     async () => {
       const name = uniqueName();
       const config = JSON.stringify({
@@ -876,7 +876,7 @@ describe("daemon spawning", () => {
         cols: 80,
       });
 
-      const child = spawn(tsxBin, [serverModule], {
+      const child = spawn(nodeBin, [serverModule], {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
         env: { ...process.env, PTY_SERVER_CONFIG: config },
@@ -960,7 +960,7 @@ describe("daemon spawning", () => {
         cols: 80,
       });
 
-      const child = spawn(tsxBin, [serverModule], {
+      const child = spawn(nodeBin, [serverModule], {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
         env: { ...process.env, PTY_SERVER_CONFIG: config },
@@ -1033,7 +1033,7 @@ describe("daemon spawning", () => {
 
 describe("immediate attach after daemon start", () => {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
+  const nodeBin = process.execPath;
   const serverModule = path.join(__dirname, "..", "src", "server.ts");
 
   async function spawnDaemonAndWaitForSocket(
@@ -1051,7 +1051,7 @@ describe("immediate attach after daemon start", () => {
       cols: 80,
     });
 
-    const child = spawn(tsxBin, [serverModule], {
+    const child = spawn(nodeBin, [serverModule], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env, PTY_SERVER_CONFIG: config },
@@ -1170,7 +1170,7 @@ describe("immediate attach after daemon start", () => {
         cols: 80,
       });
 
-      const child = spawn(tsxBin, [serverModule], {
+      const child = spawn(nodeBin, [serverModule], {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
         env: { ...process.env, PTY_SERVER_CONFIG: config },

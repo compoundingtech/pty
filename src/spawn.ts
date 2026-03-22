@@ -18,7 +18,6 @@ export async function spawnDaemon(
   const rows = stdout.rows ?? 24;
   const cols = stdout.columns ?? 80;
 
-  const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
   const serverModule = path.join(__dirname, "server.ts");
   const config = JSON.stringify({
     name,
@@ -30,7 +29,7 @@ export async function spawnDaemon(
     cols,
   });
 
-  const child = spawn(tsxBin, [serverModule], {
+  const child = spawn(process.execPath, [serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
     env: { ...process.env, PTY_SERVER_CONFIG: config },

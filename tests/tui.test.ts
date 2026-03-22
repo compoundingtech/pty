@@ -7,7 +7,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { Session } from "../src/testing/index.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const tsxBin = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
+const nodeBin = process.execPath;
 const cliPath = path.join(__dirname, "..", "src", "cli.ts");
 const serverModule = path.join(__dirname, "..", "src", "server.ts");
 
@@ -59,7 +59,7 @@ function uniqueName(): string {
 function createTuiSession(sessionDir: string, opts: { rows?: number; cols?: number } = {}): Session {
   const rows = opts.rows ?? 24;
   const cols = opts.cols ?? 80;
-  const session = Session.spawn(tsxBin, [cliPath], {
+  const session = Session.spawn(nodeBin, [cliPath], {
     rows,
     cols,
     env: {
@@ -92,7 +92,7 @@ async function createBackgroundSession(
     cols: 80,
   });
 
-  const child = spawn(tsxBin, [serverModule], {
+  const child = spawn(nodeBin, [serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
     env: {

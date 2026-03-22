@@ -15,13 +15,12 @@
     "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify-docs": "tsx scripts/verify-docs.ts"
+    "verify-docs": "node scripts/verify-docs.ts"
   },
   "dependencies": {
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
-    "node-pty": "^1.0.0",
-    "tsx": "^4.19.0"
+    "node-pty": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.3.5",
