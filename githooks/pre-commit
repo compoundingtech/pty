@@ -1,0 +1,32 @@
+#!/bin/sh
+# Verify npmDepsHash in flake.nix matches package-lock.json.
+# Skips if nix isn't installed or if package-lock.json isn't staged.
+
+set -e
+
+# Only check if package-lock.json is being committed
+if ! git diff --cached --name-only | grep -q '^package-lock\.json$'; then
+  exit 0
+fi
+
+# Skip if nix isn't available
+if ! command -v nix >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Skip if there's no flake.nix
+if [ ! -f flake.nix ]; then
+  exit 0
+fi
+
+expected=$(nix run nixpkgs#prefetch-npm-deps -- package-lock.json 2>/dev/null) || exit 0
+current=$(grep 'npmDepsHash' flake.nix | sed 's/.*"\(.*\)".*/\1/')
+
+if [ "$expected" != "$current" ]; then
+  echo "error: npmDepsHash in flake.nix is stale."
+  echo "  current:  $current"
+  echo "  expected: $expected"
+  echo ""
+  echo "Run 'npm install' to update it, then stage flake.nix."
+  exit 1
+fi

@@ -10,7 +10,7 @@
     "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true",
+    "prepare": "git config core.hooksPath githooks 2>/dev/null || true; chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",
     "test": "vitest run",

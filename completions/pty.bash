@@ -23,6 +23,20 @@ _pty() {
         names=$(ls "${session_dir}"/*.json 2>/dev/null | xargs -I{} basename {} .json)
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
+      # Flags per subcommand
+      if [[ "${cur}" == -* ]]; then
+        case "${COMP_WORDS[1]}" in
+          attach|a) COMPREPLY=($(compgen -W "--auto-restart -r" -- "${cur}")) ;;
+          peek) COMPREPLY=($(compgen -W "--follow -f --plain" -- "${cur}")) ;;
+          send) COMPREPLY=($(compgen -W "--seq --with-delay" -- "${cur}")) ;;
+          restart) COMPREPLY=($(compgen -W "--yes -y" -- "${cur}")) ;;
+        esac
+      fi
+      ;;
+    list|ls)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--json" -- "${cur}"))
+      fi
       ;;
     run)
       # After --, fall back to default file completion

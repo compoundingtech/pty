@@ -21,6 +21,7 @@ _pty() {
     'send:Send text or keys to a session'
     'kill:Kill or remove a session'
     'list:List active sessions'
+    'ls:List active sessions'
     'restart:Restart an exited session'
     'help:Show usage information'
   )
@@ -59,6 +60,10 @@ _pty() {
           _arguments \
             '(-y --yes)'{-y,--yes}'[Skip confirmation for running sessions]' \
             '1:session:_pty_sessions'
+          ;;
+        list|ls)
+          _arguments \
+            '--json[Output as JSON]'
           ;;
         run)
           # After --, fall back to normal (command + file) completion

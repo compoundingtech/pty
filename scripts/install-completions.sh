@@ -24,3 +24,13 @@ for dir in /opt/homebrew/share/zsh/site-functions /usr/local/share/zsh/site-func
     break
   fi
 done
+
+# Fish completions
+for dir in "$HOME/.config/fish/completions" /opt/homebrew/share/fish/vendor_completions.d /usr/local/share/fish/vendor_completions.d; do
+  if [ -d "$dir" ] || [ -d "$(dirname "$dir")" -a "$(basename "$dir")" = "completions" ]; then
+    mkdir -p "$dir"
+    ln -sf "$COMPLETIONS_DIR/pty.fish" "$dir/pty.fish"
+    echo "Fish completions installed: $dir/pty.fish"
+    break
+  fi
+done
