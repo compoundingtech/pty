@@ -127,6 +127,39 @@ function waitForType(
   });
 }
 
+/** Collect DATA payloads until the accumulated text contains the pattern. */
+function waitForContent(
+  socket: net.Socket,
+  reader: PacketReader,
+  pattern: string,
+  timeoutMs = 5000
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let accumulated = "";
+    const timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for "${pattern}" in DATA (got: ${JSON.stringify(accumulated)})`)),
+      timeoutMs
+    );
+
+    function onData(data: Buffer) {
+      const packets = reader.feed(data);
+      for (const packet of packets) {
+        if (packet.type === MessageType.DATA) {
+          accumulated += packet.payload.toString();
+          if (accumulated.includes(pattern)) {
+            clearTimeout(timer);
+            socket.off("data", onData);
+            resolve(accumulated);
+            return;
+          }
+        }
+      }
+    }
+
+    socket.on("data", onData);
+  });
+}
+
 afterEach(async () => {
   for (const server of servers) {
     await server.close();
@@ -566,33 +599,148 @@ describe("integration", () => {
     releaseLock(name);
   });
 
-  it("last attached client wins for terminal size", async () => {
+  it("uses smallest connected client size", async () => {
     const name = uniqueName();
-    // Use tput to print terminal dimensions — it reads from the PTY
-    await startServer(name, "cat", [], { rows: 24, cols: 80 });
+    await startServer(name, "sh", [], { rows: 24, cols: 80 });
 
-    // Client 1 attaches with 30x100
+    // Client 1 attaches with 50x200
     const client1 = await connect(name);
     const reader1 = new PacketReader();
-    client1.write(encodeAttach(30, 100));
+    client1.write(encodeAttach(50, 200));
     await waitForType(client1, reader1, MessageType.SCREEN);
 
-    // Client 2 attaches with 40x120
+    // Ask for size — should be 50x200 (only client)
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "50 200");
+
+    // Client 2 attaches with smaller size 30x100
     const client2 = await connect(name);
     const reader2 = new PacketReader();
-    client2.write(encodeAttach(40, 120));
+    client2.write(encodeAttach(30, 100));
     await waitForType(client2, reader2, MessageType.SCREEN);
 
-    // Now client 1 re-attaches with 50x150 — should win because it's most recent
-    client1.write(encodeAttach(50, 150));
+    // Size should now be the minimum: 30x100
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "30 100");
+
+    client1.destroy();
+    client2.destroy();
+  });
+
+  it("uses minimum of each dimension independently", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [], { rows: 24, cols: 80 });
+
+    // Client 1: tall and narrow (60 rows, 80 cols)
+    const client1 = await connect(name);
+    const reader1 = new PacketReader();
+    client1.write(encodeAttach(60, 80));
     await waitForType(client1, reader1, MessageType.SCREEN);
 
-    // Verify the session still works and the size was applied
-    // (We can't easily read back the PTY size, but we can confirm no crash
-    // and that input/output still works after the re-attach)
-    client1.write(encodeData("size-test\n"));
-    const data = await waitForType(client1, reader1, MessageType.DATA, 3000);
-    expect(data.payload.toString()).toContain("size-test");
+    // Client 2: short and wide (30 rows, 200 cols)
+    const client2 = await connect(name);
+    const reader2 = new PacketReader();
+    client2.write(encodeAttach(30, 200));
+    await waitForType(client2, reader2, MessageType.SCREEN);
+
+    // Should be min of each: 30 rows, 80 cols
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "30 80");
+
+    client1.destroy();
+    client2.destroy();
+  });
+
+  it("recalculates size when a client disconnects", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [], { rows: 24, cols: 80 });
+
+    // Client 1: large terminal
+    const client1 = await connect(name);
+    const reader1 = new PacketReader();
+    client1.write(encodeAttach(50, 200));
+    await waitForType(client1, reader1, MessageType.SCREEN);
+
+    // Client 2: small terminal (phone)
+    const client2 = await connect(name);
+    const reader2 = new PacketReader();
+    client2.write(encodeAttach(30, 80));
+    await waitForType(client2, reader2, MessageType.SCREEN);
+
+    // Size should be 30x80 (smallest)
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "30 80");
+
+    // Phone disconnects
+    client2.destroy();
+    // Give the server a moment to process the disconnect
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Size should restore to 50x200 (only remaining client)
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "50 200");
+
+    client1.destroy();
+  });
+
+  it("recalculates size on clean detach", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [], { rows: 24, cols: 80 });
+
+    // Client 1: large terminal
+    const client1 = await connect(name);
+    const reader1 = new PacketReader();
+    client1.write(encodeAttach(50, 200));
+    await waitForType(client1, reader1, MessageType.SCREEN);
+
+    // Client 2: small terminal
+    const client2 = await connect(name);
+    const reader2 = new PacketReader();
+    client2.write(encodeAttach(25, 90));
+    await waitForType(client2, reader2, MessageType.SCREEN);
+
+    // Size should be 25x90 (smallest)
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "25 90");
+
+    // Client 2 detaches cleanly
+    client2.write(encodeDetach());
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Size should restore to 50x200
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "50 200");
+
+    client1.destroy();
+  });
+
+  it("resize message updates size negotiation", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [], { rows: 24, cols: 80 });
+
+    // Client 1: starts large
+    const client1 = await connect(name);
+    const reader1 = new PacketReader();
+    client1.write(encodeAttach(50, 200));
+    await waitForType(client1, reader1, MessageType.SCREEN);
+
+    // Client 2: starts small
+    const client2 = await connect(name);
+    const reader2 = new PacketReader();
+    client2.write(encodeAttach(30, 100));
+    await waitForType(client2, reader2, MessageType.SCREEN);
+
+    // Size should be 30x100
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "30 100");
+
+    // Client 2 resizes larger (rotated phone, etc.)
+    client2.write(encodeResize(60, 250));
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Now client 1 is the smallest: 50x200
+    client1.write(encodeData("stty size\n"));
+    await waitForContent(client1, reader1, "50 200");
 
     client1.destroy();
     client2.destroy();
