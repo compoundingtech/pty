@@ -278,10 +278,12 @@ export class PtyServer {
 
     socket.on("close", () => {
       this.clients.delete(socket);
+      this.negotiateSize();
     });
 
     socket.on("error", () => {
       this.clients.delete(socket);
+      this.negotiateSize();
     });
   }
 
@@ -295,21 +297,20 @@ export class PtyServer {
     return prefix;
   }
 
-  /** Resize the PTY to match the most recently attached client.
+  /** Resize the PTY to the smallest dimensions across all connected writable clients.
    *  Returns true if the size actually changed. */
   private negotiateSize(): boolean {
-    // Use the most recently attached/resized non-readonly client's size
-    let lastClient: Client | null = null;
+    let rows = 0;
+    let cols = 0;
+
     for (const client of this.clients.values()) {
       if (!client.readonly && client.attachSeq > 0) {
-        if (!lastClient || client.attachSeq > lastClient.attachSeq) {
-          lastClient = client;
-        }
+        rows = rows === 0 ? client.rows : Math.min(rows, client.rows);
+        cols = cols === 0 ? client.cols : Math.min(cols, client.cols);
       }
     }
 
-    if (lastClient) {
-      const { rows, cols } = lastClient;
+    if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
         this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
