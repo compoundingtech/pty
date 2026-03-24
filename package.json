@@ -7,7 +7,8 @@
     "pty": "./bin/pty"
   },
   "exports": {
-    "./testing": "./src/testing/index.ts"
+    "./testing": "./src/testing/index.ts",
+    "./tui": "./src/tui/index.ts"
   },
   "scripts": {
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true; chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
@@ -18,6 +19,7 @@
     "verify-docs": "node scripts/verify-docs.ts"
   },
   "dependencies": {
+    "@preact/signals-core": "^1.14.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "node-pty": "^1.0.0"

@@ -1,5 +1,7 @@
 # pty
 
+> **Beta** — the CLI and testing library are usable but the API may change before 1.0.
+
 Persistent terminal sessions. Run a process, detach, reconnect later. From anywhere, locally and over SSH.
 
 Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless) internally.
@@ -74,19 +76,44 @@ Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
 
 ## Testing Library
 
-ptym includes a terminal testing library — like Playwright, but for the terminal.
-Spawn any process in a real PTY, send input, capture screenshots, assert on screen state.
+ptym includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.
 
 ```typescript
 import { Session } from "ptym/testing";
 
-const session = Session.spawn("echo", ["hello world"]);
-const ss = await session.waitForText("hello world");
-console.log(ss.text); // "hello world"
+const session = Session.spawn("node", ["--experimental-strip-types", "my-app.ts"]);
+await session.waitForText("Ready");
+
+session.press("down");
+session.press("return");
+await session.waitForText("Selected!");
+
+const ss = session.screenshot();
+expect(ss.text).toContain("Selected!");
+expect(ss.lines[0]).toMatch(/My App/);
+
+session.press("ctrl+c");
+await session.waitForAbsent("My App");
 await session.close();
 ```
 
-See [docs/testing.md](docs/testing.md) for the full API and examples.
+Works with any process: CLI tools, interactive TUIs, shells, vim, even `top`. The test runs in a real PTY with a real xterm terminal emulator, so you test exactly what users see.
+
+See **[docs/testing.md](docs/testing.md)** for the full API reference, key names, patterns, and tips.
+
+## TUI Framework (alpha)
+
+ptym also includes an experimental declarative TUI framework for building terminal interfaces with reactive signals, layout, and efficient cell-buffer diffing. Import from `ptym/tui`.
+
+> **Alpha** — the TUI framework API is unstable and will change. Use it for experiments, not production.
+
+The `demos/` directory has three working apps built with the framework:
+
+- **file-browser** — two-pane directory tree + file preview with soft-wrap and markdown highlighting
+- **reminders** — full CRUD backed by `.md` files, three views (list, board, calendar), overlays
+- **agent-teams** — live dashboard of a simulated AI agent hierarchy with real-time updates
+
+Run them with `node --experimental-strip-types demos/{name}/main.ts`. Each demo includes unit tests and PTY integration tests that exercise the testing library.
 
 ## Tab Completion
 

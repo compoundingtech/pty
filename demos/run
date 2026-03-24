@@ -1,0 +1,28 @@
+#!/bin/sh
+# Run a demo app: ./demos/run file-browser [path]
+#                  ./demos/run reminders
+#                  ./demos/run agent-teams
+set -e
+
+demo="$1"
+shift 2>/dev/null || true
+
+if [ -z "$demo" ]; then
+  echo "Usage: ./demos/run <demo-name> [args...]"
+  echo ""
+  echo "Available demos:"
+  echo "  file-browser [path]   Two-pane file browser with preview"
+  echo "  reminders             CRUD reminders backed by .md files"
+  echo "  agent-teams           Live AI agent hierarchy dashboard (SPEED=6 for fast)"
+  exit 1
+fi
+
+script="$(dirname "$0")/$demo/main.ts"
+
+if [ ! -f "$script" ]; then
+  echo "Unknown demo: $demo"
+  echo "Available: file-browser, reminders, agent-teams"
+  exit 1
+fi
+
+exec node --experimental-strip-types --no-warnings "$script" "$@"

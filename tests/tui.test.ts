@@ -324,7 +324,7 @@ describe("interactive TUI", () => {
       // Type part of name1 to filter
       const filterText = name1.slice(-4);
       tui.type(filterText);
-      await new Promise((r) => setTimeout(r, 300));
+      await tui.waitForText(filterText, 5000);
 
       let ss = tui.screenshot();
       expect(ss.text).toContain(name1);
@@ -334,7 +334,7 @@ describe("interactive TUI", () => {
       for (let i = 0; i < filterText.length; i++) {
         tui.press("backspace");
       }
-      await new Promise((r) => setTimeout(r, 300));
+      await tui.waitForText(name2, 5000);
 
       ss = tui.screenshot();
       expect(ss.text).toContain(name1);

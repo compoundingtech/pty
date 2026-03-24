@@ -49,6 +49,17 @@ export class Session {
 
   // ── Factories ──
 
+  /**
+   * Spawn a process in a direct PTY. Use this for testing CLI tools, TUI apps,
+   * or any process where you send input and check screen output.
+   *
+   * ```typescript
+   * const session = Session.spawn("node", ["--experimental-strip-types", "my-app.ts"], { rows: 30, cols: 100 });
+   * await session.waitForText("Ready");
+   * session.press("ctrl+c");
+   * await session.close();
+   * ```
+   */
   static spawn(
     command: string,
     args: string[] = [],
@@ -88,6 +99,11 @@ export class Session {
     return new Session(terminal, serialize, backend, rows, cols);
   }
 
+  /**
+   * Create a persistent session backed by a PtyServer. Use this when testing
+   * detach/reattach behavior, multiple clients, or resize. Call `attach()`
+   * after creation to start receiving output.
+   */
   static async server(
     command: string,
     args: string[] = [],
@@ -133,6 +149,11 @@ export class Session {
     return session;
   }
 
+  /**
+   * Create a second client connected to the same server as an existing session.
+   * Use this to test multi-client scenarios (e.g., two terminals attached to
+   * the same process).
+   */
   static async connectToExisting(
     existing: Session,
     opts: { rows?: number; cols?: number } = {}
@@ -171,14 +192,17 @@ export class Session {
 
   // ── Properties ──
 
+  /** Current terminal height in rows. */
   get rows(): number {
     return this._rows;
   }
 
+  /** Current terminal width in columns. */
   get cols(): number {
     return this._cols;
   }
 
+  /** Whether the process has exited. Server-mode only; always false for spawn-mode. */
   get hasExited(): boolean {
     if (this.backend.kind === "server") {
       return this.backend.exitCode !== null;
@@ -204,6 +228,7 @@ export class Session {
 
   // ── Input ──
 
+  /** Send raw keystrokes to the process. Use for literal text or escape sequences. */
   sendKeys(keys: string): void {
     if (this.backend.kind === "spawn") {
       this.backend.ptyProcess.write(keys);
@@ -212,22 +237,29 @@ export class Session {
     }
   }
 
+  /**
+   * Send a named key. Supports modifiers: `"ctrl+c"`, `"alt+x"`, `"shift+a"`.
+   * See docs/testing.md for the full list of key names.
+   */
   press(keyName: string): void {
     this.sendKeys(resolveKey(keyName));
   }
 
+  /** Send text to the process. Alias for `sendKeys()`. */
   type(text: string): void {
     this.sendKeys(text);
   }
 
   // ── Screen ──
 
+  /** Capture the current terminal state. Returns plain text lines, joined text, and ANSI output. */
   screenshot(): Screenshot {
     return captureScreenshot(this.terminal, this.serialize);
   }
 
   // ── Waiting ──
 
+  /** Poll until the terminal contains the given text. Returns the matching screenshot. */
   async waitForText(text: string, timeoutMs = 5000): Promise<Screenshot> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -241,6 +273,7 @@ export class Session {
     );
   }
 
+  /** Poll until the terminal no longer contains the given text. */
   async waitForAbsent(text: string, timeoutMs = 5000): Promise<Screenshot> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -254,6 +287,7 @@ export class Session {
     );
   }
 
+  /** Poll until a custom predicate returns true. The `description` is used in timeout error messages. */
   async waitFor(
     predicate: (ss: Screenshot) => boolean,
     timeoutMs = 5000,
@@ -273,6 +307,7 @@ export class Session {
 
   // ── Server-mode only ──
 
+  /** Start receiving output from the server. Required after `Session.server()`. Server-mode only. */
   async attach(): Promise<void> {
     if (this.backend.kind !== "server") {
       throw new Error("attach() is only available in server mode");
@@ -289,6 +324,7 @@ export class Session {
     await screenPromise;
   }
 
+  /** Simulate a detach + reattach cycle. Destroys the socket, resets the terminal, and reconnects. Server-mode only. */
   async reconnect(): Promise<void> {
     if (this.backend.kind !== "server") {
       throw new Error("reconnect() is only available in server mode");
@@ -300,6 +336,7 @@ export class Session {
     await this.attach();
   }
 
+  /** Resize the terminal. Server-mode only. */
   resize(rows: number, cols: number): void {
     if (this.backend.kind !== "server") {
       throw new Error("resize() is only available in server mode");
@@ -312,6 +349,7 @@ export class Session {
 
   // ── Lifecycle ──
 
+  /** Clean up the session. Kills the process (spawn) or destroys the socket and server (server). Always call this in `afterEach`. */
   async close(): Promise<void> {
     if (this.backend.kind === "spawn") {
       try {

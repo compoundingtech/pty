@@ -295,6 +295,69 @@ session.sendKeys("exit\n");
 await session.close();
 ```
 
+## Server-Mode Methods
+
+These methods are only available on sessions created with `Session.server()`.
+
+### attach()
+
+Start receiving output from the server. Required after `Session.server()`:
+
+```typescript
+const session = await Session.server("bash", ["--norc"]);
+await session.attach();
+await session.waitForText("$");
+```
+
+### reconnect()
+
+Simulate a detach + reattach cycle. Destroys the connection, resets the
+terminal, and reconnects:
+
+```typescript
+const session = await Session.server("bash", ["--norc"]);
+await session.attach();
+await session.waitForText("$");
+session.sendKeys("echo hello\n");
+await session.waitForText("hello");
+
+// Simulate disconnect and reconnect
+await session.reconnect();
+// Screen state is replayed — "hello" should still be visible
+await session.waitForText("hello");
+```
+
+### resize(rows, cols)
+
+Resize the terminal dimensions:
+
+```typescript
+session.resize(40, 120);
+```
+
+### connectToExisting(session)
+
+Create a second client attached to the same server process:
+
+```typescript
+const session1 = await Session.server("bash", ["--norc"]);
+await session1.attach();
+
+const session2 = await Session.connectToExisting(session1);
+await session2.attach();
+
+// Both clients see the same terminal output
+session1.sendKeys("echo shared\n");
+await session2.waitForText("shared");
+```
+
+### Properties
+
+- `session.hasExited` — whether the process has exited (always `false` for spawn-mode)
+- `session.name` — the session name (server-mode only)
+- `session.server` — the underlying `PtyServer` instance (server-mode only)
+- `session.rows` / `session.cols` — current terminal dimensions
+
 ## Running Tests
 
 Use the `pty test` command (a thin vitest wrapper):
