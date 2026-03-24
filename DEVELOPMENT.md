@@ -1,6 +1,6 @@
 # pty — Development Guide
 
-A persistent terminal session manager. Run long-lived processes, detach, reconnect later — from any machine over SSH. The npm package name is `ptym`; the CLI command remains `pty`.
+A persistent terminal session manager. Run long-lived processes, detach, reconnect later — from any machine over SSH. The npm package name is `@myobie/pty`; the CLI command remains `pty`.
 
 ## Objectives
 
@@ -150,7 +150,7 @@ When `spawnDaemon` launches the daemon, it monitors the child for early exit. If
 
 ## Testing
 
-Tests use **vitest** and live in `tests/`. The `ptym/testing` library (`src/testing/`) provides a `Session` class used by the tests — see [docs/testing.md](docs/testing.md) for the full API.
+Tests use **vitest** and live in `tests/`. The `@myobie/pty/testing` library (`src/testing/`) provides a `Session` class used by the tests — see [docs/testing.md](docs/testing.md) for the full API.
 
 - `protocol.test.ts` — Unit tests for packet encoding, decoding, and streaming reassembly (partial reads, split packets, large payloads)
 - `keys.test.ts` — Unit tests for key name resolution (`resolveKey`, `parseSeqValue`)
@@ -190,7 +190,7 @@ src/
   keys.ts         Key name resolution (e.g. "ctrl+c" → bytes)
   spawn.ts        Daemon spawning logic
   tui/            Interactive session manager UI
-  testing/        Testing library (exported as ptym/testing)
+  testing/        Testing library (exported as @myobie/pty/testing)
     index.ts      Public re-exports
     session.ts    Session class (spawn + server backends)
     screenshot.ts Screenshot capture helper

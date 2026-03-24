@@ -1,8 +1,30 @@
 {
-  "name": "ptym",
+  "name": "@myobie/pty",
   "version": "0.1.0",
   "description": "Persistent terminal sessions with detach/attach support",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/myobie/pty.git"
+  },
+  "keywords": [
+    "terminal",
+    "pty",
+    "session",
+    "detach",
+    "attach",
+    "testing",
+    "tui"
+  ],
+  "files": [
+    "bin/",
+    "src/",
+    "completions/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "pty": "./bin/pty"
   },
@@ -19,14 +41,22 @@
     "verify-docs": "node scripts/verify-docs.ts"
   },
   "dependencies": {
-    "@preact/signals-core": "^1.14.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "node-pty": "^1.0.0"
   },
+  "peerDependencies": {
+    "@preact/signals-core": "^1.14.0"
+  },
+  "peerDependenciesMeta": {
+    "@preact/signals-core": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@preact/signals-core": "^1.14.0",
     "@types/node": "^25.3.5",
     "typescript": "^5.7.0",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.1"
   }
 }

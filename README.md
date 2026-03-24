@@ -9,19 +9,17 @@ Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless)
 ## Install
 
 ```sh
-git clone https://github.com/myobie/pty.git
-cd pty
-npm install
-npm link
+npm install -g @myobie/pty
 ```
 
-Or install directly from GitHub:
+Or with Nix:
 
 ```sh
-npm install -g github:myobie/pty
+nix profile install github:myobie/pty   # install the CLI
+nix develop github:myobie/pty           # dev shell with node, npm, native deps
 ```
 
-The npm package name is `ptym`. Requires Node.js. Works on macOS and Linux.
+Requires Node.js. Works on macOS and Linux.
 
 ## Usage
 
@@ -76,10 +74,10 @@ Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
 
 ## Testing Library
 
-ptym includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.
+@myobie/pty includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.
 
 ```typescript
-import { Session } from "ptym/testing";
+import { Session } from "@myobie/pty/testing";
 
 const session = Session.spawn("node", ["--experimental-strip-types", "my-app.ts"]);
 await session.waitForText("Ready");
@@ -103,7 +101,7 @@ See **[docs/testing.md](docs/testing.md)** for the full API reference, key names
 
 ## TUI Framework (alpha)
 
-ptym also includes an experimental declarative TUI framework for building terminal interfaces with reactive signals, layout, and efficient cell-buffer diffing. Import from `ptym/tui`.
+@myobie/pty also includes an experimental declarative TUI framework for building terminal interfaces with reactive signals, layout, and efficient cell-buffer diffing. Import from `@myobie/pty/tui`.
 
 > **Alpha** — the TUI framework API is unstable and will change. Use it for experiments, not production.
 
