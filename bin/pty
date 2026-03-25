@@ -5,10 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const cli = join(__dirname, 'cli.js');
+const cli = join(__dirname, '..', 'dist', 'cli.js');
 
 if (!existsSync(cli)) {
-  console.error('bin/cli.js not found. Run: npm run build');
+  console.error('dist/cli.js not found. Run: npm run build');
   process.exit(1);
 }
 

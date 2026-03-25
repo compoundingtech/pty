@@ -1,6 +1,6 @@
 {
   "name": "@myobie/pty",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Persistent terminal sessions with detach/attach support",
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,7 @@
   ],
   "files": [
     "bin/",
-    "src/",
+    "dist/",
     "completions/",
     "docs/",
     "README.md",
@@ -29,11 +29,17 @@
     "pty": "./bin/pty"
   },
   "exports": {
-    "./testing": "./src/testing/index.ts",
-    "./tui": "./src/tui/index.ts"
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui/index.d.ts",
+      "default": "./dist/tui/index.js"
+    }
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=bin/cli.js --external:node-pty --external:@xterm/headless --external:@xterm/addon-serialize --external:@preact/signals-core",
+    "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true; chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",

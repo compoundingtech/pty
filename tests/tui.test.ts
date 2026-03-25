@@ -8,8 +8,8 @@ import { Session } from "../src/testing/index.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
-const cliPath = path.join(__dirname, "..", "src", "cli.ts");
-const serverModule = path.join(__dirname, "..", "src", "server.ts");
+const cliPath = path.join(__dirname, "..", "dist", "cli.js");
+const serverModule = path.join(__dirname, "..", "dist", "server.js");
 
 // Each test gets its own temp session dir
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ptui-"));

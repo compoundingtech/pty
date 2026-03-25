@@ -861,7 +861,7 @@ describe("screenshot: high-throughput output", () => {
 describe("daemon spawning", () => {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const nodeBin = process.execPath;
-  const serverModule = path.join(__dirname, "..", "src", "server.ts");
+  const serverModule = path.join(__dirname, "..", "dist", "server.js");
 
   it(
     "daemon starts and serves a session via the node spawn mechanism",
@@ -1034,7 +1034,7 @@ describe("daemon spawning", () => {
 describe("immediate attach after daemon start", () => {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const nodeBin = process.execPath;
-  const serverModule = path.join(__dirname, "..", "src", "server.ts");
+  const serverModule = path.join(__dirname, "..", "dist", "server.js");
 
   async function spawnDaemonAndWaitForSocket(
     name: string,

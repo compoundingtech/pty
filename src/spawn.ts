@@ -18,7 +18,7 @@ export async function spawnDaemon(
   const rows = stdout.rows ?? 24;
   const cols = stdout.columns ?? 80;
 
-  const serverModule = path.join(__dirname, "server.ts");
+  const serverModule = path.join(__dirname, "server.js");
   const config = JSON.stringify({
     name,
     command,

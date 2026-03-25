@@ -390,7 +390,7 @@ export class PtyServer {
 }
 
 /** Entry point when this file is run as the daemon process. */
-if (process.argv[1]?.endsWith("/server.ts")) {
+if (process.argv[1]?.endsWith("/server.js")) {
   const config = JSON.parse(process.env.PTY_SERVER_CONFIG ?? "{}");
   if (!config.name || !config.command) {
     console.error("PTY_SERVER_CONFIG env var required");
