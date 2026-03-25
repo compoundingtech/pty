@@ -29,7 +29,7 @@
 
             # Generated from package-lock.json.
             # Regenerate with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-            npmDepsHash = "sha256-rl5s8czRezWu0Fri4xWoMUkazBQfVXfuUf9hvBGw3Qw=";
+            npmDepsHash = "sha256-ZE3elAZKDLlig0Pe6KrGvLO8xlmF+9WqYHl3v0KFfXs=";
 
             # node-pty has native code that needs these at build time
             nativeBuildInputs = with pkgs; [ python3 pkg-config ];
@@ -37,8 +37,11 @@
               pkgs.apple-sdk_15
             ];
 
-            # No compile step — Node runs TypeScript directly via type stripping.
-            dontNpmBuild = true;
+            buildPhase = ''
+              runHook preBuild
+              npm run build
+              runHook postBuild
+            '';
 
             # Install outside of node_modules so Node's TypeScript stripping works.
             # (Node refuses to strip types for files under node_modules/)

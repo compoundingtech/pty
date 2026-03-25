@@ -1,6 +1,6 @@
 {
   "name": "@myobie/pty",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent terminal sessions with detach/attach support",
   "type": "module",
   "license": "MIT",
@@ -33,6 +33,8 @@
     "./tui": "./src/tui/index.ts"
   },
   "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=bin/cli.js --external:node-pty --external:@xterm/headless --external:@xterm/addon-serialize --external:@preact/signals-core",
+    "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true; chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",
@@ -56,6 +58,7 @@
   "devDependencies": {
     "@preact/signals-core": "^1.14.0",
     "@types/node": "^25.3.5",
+    "esbuild": "^0.27.4",
     "typescript": "^5.7.0",
     "vitest": "^4.1.1"
   }
