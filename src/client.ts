@@ -317,6 +317,7 @@ export function attach(options: AttachOptions): void {
 
         case MessageType.EXIT:
           exitCode = decodeExit(packet.payload);
+          exitHandled = true;
           cleanExit();
           stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[session exited with code ${exitCode}]\r\n`);
           options.onExit?.(exitCode);

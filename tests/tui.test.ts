@@ -563,6 +563,52 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "after session exits and returning to list, keystrokes are not doubled",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+
+      // A session that exits immediately after printing a marker
+      const { pid } = await createBackgroundSession(
+        sessionDir,
+        name,
+        "sh",
+        ["-c", "echo WILL_EXIT; exec cat"],
+        os.tmpdir()
+      );
+      bgPids.push(pid);
+
+      const tui = createTuiSession(sessionDir);
+
+      // Attach
+      await tui.waitForText(name, 10000);
+      tui.press("return");
+      await tui.waitForText("WILL_EXIT", 10000);
+
+      // Make the session exit (Ctrl+D sends EOF to cat)
+      tui.sendKeys("\x04");
+
+      // Wait for return to list
+      await tui.waitForText("Create new session...", 10000);
+
+      // Type a filter string and verify each character appears exactly once.
+      // If stdin has duplicate listeners, each keystroke fires twice and
+      // the filter will contain doubled characters (e.g. "xxyz" instead of "xyz").
+      tui.type("x");
+      await new Promise(r => setTimeout(r, 300));
+      tui.type("y");
+      await new Promise(r => setTimeout(r, 300));
+      tui.type("z");
+      await new Promise(r => setTimeout(r, 300));
+
+      const ss = tui.screenshot();
+      expect(ss.text).toContain("xyz");
+      expect(ss.text).not.toContain("xxyyzz");
+    },
+    20000
+  );
+
+  it(
     "exited session shows as exited when returning to list during cleanup window",
     async () => {
       const sessionDir = makeSessionDir();
