@@ -67,7 +67,7 @@ function shortPath(p: string): string {
   return p;
 }
 
-function dedupName(base: string, existing: Set<string>): string {
+export function dedupName(base: string, existing: Set<string>): string {
   if (!existing.has(base)) return base;
   for (let i = 2; ; i++) {
     const candidate = `${base}-${i}`;
@@ -75,7 +75,7 @@ function dedupName(base: string, existing: Set<string>): string {
   }
 }
 
-function listDirs(dirPath: string, filter: string): string[] {
+export function listDirs(dirPath: string, filter: string): string[] {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dirPath, { withFileTypes: true });

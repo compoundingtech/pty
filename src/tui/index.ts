@@ -85,3 +85,6 @@ export {
 export {
   recordFrame, getCurrentFPS, isFPSVisible, toggleFPS,
 } from "./fps.ts";
+
+// App lifecycle
+export { app, type AppConfig, type App } from "./app.ts";

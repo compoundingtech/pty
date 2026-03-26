@@ -569,3 +569,29 @@ describe("text highlight", () => {
     expect(buf.cells[0][6].char).toBe("o");
   });
 });
+
+// ── App lifecycle wrapper ──
+describe("app()", () => {
+  it("returns an object with start/stop/pause/resume", () => {
+    const { app } = require("../src/tui/index.ts");
+    const dummyScreen = screen({
+      id: "dummy",
+      render() { return [text("hello")]; },
+    });
+    const a = app({ screen: dummyScreen });
+    expect(typeof a.start).toBe("function");
+    expect(typeof a.stop).toBe("function");
+    expect(typeof a.pause).toBe("function");
+    expect(typeof a.resume).toBe("function");
+  });
+
+  it("accepts a screen function for dynamic screens", () => {
+    const { app } = require("../src/tui/index.ts");
+    const dummyScreen = screen({
+      id: "dummy",
+      render() { return [text("hello")]; },
+    });
+    const a = app({ screen: () => dummyScreen });
+    expect(typeof a.start).toBe("function");
+  });
+});

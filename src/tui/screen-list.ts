@@ -49,7 +49,7 @@ export function updateSessions(state: ListState, sessions: SessionInfo[]): void 
   }
 }
 
-function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
+export function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
   return [...sessions].sort((a, b) => {
     const aRunning = a.status === "running" ? 0 : 1;
     const bRunning = b.status === "running" ? 0 : 1;
@@ -58,14 +58,14 @@ function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
   });
 }
 
-function shortPath(p: string): string {
+export function shortPath(p: string): string {
   const home = os.homedir();
   if (p === home) return "~";
   if (p.startsWith(home + "/")) return "~" + p.slice(home.length);
   return p;
 }
 
-function timeAgo(date: Date): string {
+export function timeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
