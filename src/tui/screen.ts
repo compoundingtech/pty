@@ -297,9 +297,11 @@ function writeStringBuf(
     if (row < 0 || row >= buf.rows) return;
     if (c >= buf.cols) return;
     if (c >= 0) {
-      buf.cells[row][c] = makeCell(ch, fgc, bgc, bold, dim, italic);
+      // Preserve existing bg when bgc is null (e.g. text inside a panel)
+      const effectiveBg = bgc ?? buf.cells[row][c]?.bg ?? null;
+      buf.cells[row][c] = makeCell(ch, fgc, effectiveBg, bold, dim, italic);
       if (cw === 2 && c + 1 < buf.cols) {
-        buf.cells[row][c + 1] = makeCell("", fgc, bgc, bold, dim, italic);
+        buf.cells[row][c + 1] = makeCell("", fgc, effectiveBg, bold, dim, italic);
       }
     }
     c += cw;
@@ -345,9 +347,10 @@ function writeSpannedBuf(
     }
 
     if (c >= 0) {
-      buf.cells[row][c] = makeCell(ch, fg, null, bold, dim, italic);
+      const effectiveBg = buf.cells[row][c]?.bg ?? null;
+      buf.cells[row][c] = makeCell(ch, fg, effectiveBg, bold, dim, italic);
       if (cw === 2 && c + 1 < buf.cols) {
-        buf.cells[row][c + 1] = makeCell("", fg, null, bold, dim, italic);
+        buf.cells[row][c + 1] = makeCell("", fg, effectiveBg, bold, dim, italic);
       }
     }
     c += cw;
@@ -383,7 +386,7 @@ function drawBoxBuf(
   width: number,
   height: number,
   style: BoxStyle,
-  fgc: [number, number, number],
+  fgc: [number, number, number] | null,
   bgc: [number, number, number] | null,
 ): void {
   const b = boxChars(style);
@@ -419,7 +422,7 @@ function hSepBuf(
   col: number,
   width: number,
   style: BoxStyle,
-  fgc: [number, number, number],
+  fgc: [number, number, number] | null,
   bgc: [number, number, number] | null,
 ): void {
   if (row < 0 || row >= buf.rows) return;
@@ -669,8 +672,8 @@ function renderNodeToBuffer(
           const cell = ptyRow[c];
           buf.cells[absY][absX] = makeCell(
             cell.char || " ",
-            cell.fg ?? [...theme.fg1],
-            cell.bg ?? [...theme.bg1],
+            cell.fg ?? (theme.fg1 ? [...theme.fg1] : null),
+            cell.bg ?? (theme.bg1 ? [...theme.bg1] : null),
             cell.bold, cell.dim, cell.italic,
           );
         }

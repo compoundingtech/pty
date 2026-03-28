@@ -27,31 +27,35 @@ function brighten(c: [number, number, number], amt = 40): [number, number, numbe
  * This makes CLI tools (ls, git, etc.) inside embedded PTYs use colors that
  * are coherent with the surrounding UI.
  */
+function hexOrDefault(c: [number, number, number] | null, fallback: string): string {
+  return c ? rgbToHex(c) : fallback;
+}
+
 export function themeToXterm(theme: Theme): Record<string, string> {
   return {
-    foreground: rgbToHex(theme.fg1),
-    background: rgbToHex(theme.bg1),
-    cursor: rgbToHex(theme.fgAc),
-    cursorAccent: rgbToHex(theme.bg1),
-    selection: rgbToHex(theme.bgHi),
+    foreground: hexOrDefault(theme.fg1, "#d2dae8"),
+    background: hexOrDefault(theme.bg1, "#0f111a"),
+    cursor: hexOrDefault(theme.fgAc, "#64a0ff"),
+    cursorAccent: hexOrDefault(theme.bg1, "#0f111a"),
+    selection: hexOrDefault(theme.bgHi, "#1e2841"),
     // Standard 8 colors
-    black: rgbToHex(theme.bg1),
-    red: rgbToHex(theme.err),
-    green: rgbToHex(theme.ok),
-    yellow: rgbToHex(theme.warn),
-    blue: rgbToHex(theme.info),
-    magenta: rgbToHex(theme.fgAc),
-    cyan: rgbToHex(theme.fg2),
-    white: rgbToHex(theme.fg1),
+    black: hexOrDefault(theme.bg1, "#0f111a"),
+    red: hexOrDefault(theme.err, "#f05050"),
+    green: hexOrDefault(theme.ok, "#50c878"),
+    yellow: hexOrDefault(theme.warn, "#f0b432"),
+    blue: hexOrDefault(theme.info, "#50aaf0"),
+    magenta: hexOrDefault(theme.fgAc, "#64a0ff"),
+    cyan: hexOrDefault(theme.fg2, "#8c9bb9"),
+    white: hexOrDefault(theme.fg1, "#d2dae8"),
     // Bright variants
-    brightBlack: rgbToHex(theme.fgMu),
-    brightRed: rgbToHex(brighten(theme.err)),
-    brightGreen: rgbToHex(brighten(theme.ok)),
-    brightYellow: rgbToHex(brighten(theme.warn)),
-    brightBlue: rgbToHex(brighten(theme.info)),
-    brightMagenta: rgbToHex(brighten(theme.fgAc)),
-    brightCyan: rgbToHex(brighten(theme.fg2)),
-    brightWhite: rgbToHex(brighten(theme.fg1)),
+    brightBlack: hexOrDefault(theme.fgMu, "#465069"),
+    brightRed: hexOrDefault(theme.err ? brighten(theme.err) : null, "#ff6666"),
+    brightGreen: hexOrDefault(theme.ok ? brighten(theme.ok) : null, "#78e0a0"),
+    brightYellow: hexOrDefault(theme.warn ? brighten(theme.warn) : null, "#ffcc5a"),
+    brightBlue: hexOrDefault(theme.info ? brighten(theme.info) : null, "#78c8ff"),
+    brightMagenta: hexOrDefault(theme.fgAc ? brighten(theme.fgAc) : null, "#8cc0ff"),
+    brightCyan: hexOrDefault(theme.fg2 ? brighten(theme.fg2) : null, "#b4c3e1"),
+    brightWhite: hexOrDefault(theme.fg1 ? brighten(theme.fg1) : null, "#ffffff"),
   };
 }
 

@@ -270,7 +270,29 @@ describe("screen() wrapper", () => {
     const s = screen({ id: "test", render: () => [text("x")] });
     const ctx = { rows: 24, cols: 80, theme, boxStyle: "rounded" as const } as any;
     const buf = s.renderToBuffer(ctx);
-    expect(buf.cells[20][60].bg).toEqual([...theme.bg1]);
+    expect(buf.cells[20][60].bg).toEqual(theme.bg1 ? [...theme.bg1] : null);
+  });
+
+  it("text inside a panel preserves the panel background color", () => {
+    const s = screen({
+      id: "panel-bg-test",
+      render() {
+        return [panel("Test", [text("hello", "primary")])];
+      },
+    });
+    const ctx = { rows: 10, cols: 40, theme, boxStyle: "rounded" as const } as any;
+    const buf = s.renderToBuffer(ctx);
+    // Find the row with "hello" text
+    let helloRow = -1;
+    for (let r = 0; r < buf.rows; r++) {
+      const rowText = buf.cells[r].map(c => c.char).join("");
+      if (rowText.includes("hello")) { helloRow = r; break; }
+    }
+    expect(helloRow).toBeGreaterThan(0);
+    // The cell with "h" should have the panel's bg2 background, not null
+    const hCol = buf.cells[helloRow].findIndex(c => c.char === "h");
+    expect(hCol).toBeGreaterThan(0);
+    expect(buf.cells[helloRow][hCol].bg).toEqual(theme.bg2 ? [...theme.bg2] : null);
   });
 });
 
@@ -593,5 +615,99 @@ describe("app()", () => {
     });
     const a = app({ screen: () => dummyScreen });
     expect(typeof a.start).toBe("function");
+  });
+});
+
+// ── Fuzzy match ──
+describe("fuzzyMatch", () => {
+  const { fuzzyMatch } = require("../src/tui/fuzzy.ts");
+
+  // Basic matching
+  it("empty query matches everything", () => {
+    expect(fuzzyMatch("", "anything").match).toBe(true);
+  });
+
+  it("exact match", () => {
+    expect(fuzzyMatch("node", "node").match).toBe(true);
+  });
+
+  it("substring match", () => {
+    expect(fuzzyMatch("server", "node-server").match).toBe(true);
+  });
+
+  it("fuzzy match — characters in order but not adjacent", () => {
+    expect(fuzzyMatch("nsr", "node-server").match).toBe(true);
+  });
+
+  it("fuzzy match — skipping characters", () => {
+    expect(fuzzyMatch("ns", "node-server").match).toBe(true);
+  });
+
+  it("no match when characters are out of order", () => {
+    expect(fuzzyMatch("sn", "node-server").match).toBe(false);
+  });
+
+  it("no match when query has characters not in target", () => {
+    expect(fuzzyMatch("xyz", "node-server").match).toBe(false);
+  });
+
+  it("case insensitive", () => {
+    expect(fuzzyMatch("NODE", "node-server").match).toBe(true);
+    expect(fuzzyMatch("node", "Node-Server").match).toBe(true);
+  });
+
+  it("query longer than target never matches", () => {
+    expect(fuzzyMatch("longquery", "short").match).toBe(false);
+  });
+
+  // Scoring — better matches should score higher
+  it("exact match scores higher than fuzzy match", () => {
+    const exact = fuzzyMatch("node", "node");
+    const fuzzy = fuzzyMatch("node", "n-o-d-e");
+    expect(exact.score).toBeGreaterThan(fuzzy.score);
+  });
+
+  it("prefix match scores higher than middle match", () => {
+    const prefix = fuzzyMatch("node", "node-server");
+    const middle = fuzzyMatch("node", "my-node-server");
+    expect(prefix.score).toBeGreaterThan(middle.score);
+  });
+
+  it("consecutive match scores higher than scattered match", () => {
+    const consecutive = fuzzyMatch("serve", "server");
+    const scattered = fuzzyMatch("serve", "s_e_r_v_e");
+    expect(consecutive.score).toBeGreaterThan(scattered.score);
+  });
+
+  it("word boundary match scores higher than mid-word match", () => {
+    const boundary = fuzzyMatch("server", "node-server");
+    const midword = fuzzyMatch("server", "nodeserver");
+    expect(boundary.score).toBeGreaterThanOrEqual(midword.score);
+  });
+
+  it("shorter target scores higher for same query", () => {
+    const short = fuzzyMatch("node", "node");
+    const long = fuzzyMatch("node", "node-server-application");
+    expect(short.score).toBeGreaterThan(long.score);
+  });
+
+  // Edge cases
+  it("single character query", () => {
+    expect(fuzzyMatch("n", "node").match).toBe(true);
+    expect(fuzzyMatch("z", "node").match).toBe(false);
+  });
+
+  it("single character target", () => {
+    expect(fuzzyMatch("n", "n").match).toBe(true);
+    expect(fuzzyMatch("no", "n").match).toBe(false);
+  });
+
+  it("special characters in query", () => {
+    expect(fuzzyMatch(".", "file.ts").match).toBe(true);
+    expect(fuzzyMatch("-", "node-server").match).toBe(true);
+  });
+
+  it("spaces in query match naturally", () => {
+    expect(fuzzyMatch("no se", "node server").match).toBe(true);
   });
 });

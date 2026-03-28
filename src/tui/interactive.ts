@@ -1,19 +1,22 @@
 // Interactive session list — built with the declarative TUI framework + app()
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { attach } from "../client.ts";
 import {
   listSessions, validateName, acquireLock, releaseLock,
-  cleanupAll, getSession, type SessionInfo,
+  cleanupAll, getSession, getSessionDir, type SessionInfo,
 } from "../sessions.ts";
 import { spawnDaemon, resolveCommand } from "../spawn.ts";
 import {
   app, screen, signal, computed, batch,
   text, row, spacer, panel, selectable, footer, canvas,
-  updateScrollRegion, type KeyEvent, type ScreenContext, type UINode,
+  updateScrollRegion, themes,
+  type KeyEvent, type ScreenContext, type UINode,
 } from "./index.ts";
 // Reuse utility functions from the existing screen modules
 import { sortSessions, shortPath, timeAgo } from "./screen-list.ts";
 import { dedupName, listDirs } from "./screen-create.ts";
+import { fuzzyMatch } from "./fuzzy.ts";
 
 /** Generate a session name from dir and command. */
 function autoName(dir: string, cmd: string, cmdArgs: string[]): string {
@@ -40,6 +43,35 @@ const filterText = signal("");
 const selectedIndex = signal(0);
 const currentScreen = signal<"list" | "create">("list");
 
+// Theme — persisted to ~/.local/state/pty/theme
+const themeNames = Object.keys(themes);
+const terminalIdx = themeNames.indexOf("terminal");
+
+function loadSavedThemeIndex(): number {
+  try {
+    const name = fs.readFileSync(path.join(getSessionDir(), "theme"), "utf-8").trim();
+    const idx = themeNames.indexOf(name);
+    if (idx >= 0) return idx;
+  } catch {}
+  return terminalIdx >= 0 ? terminalIdx : 0;
+}
+
+function saveTheme(name: string): void {
+  try {
+    fs.writeFileSync(path.join(getSessionDir(), "theme"), name + "\n");
+  } catch {}
+}
+
+const themeIndex = signal(loadSavedThemeIndex());
+function cycleTheme(): void {
+  const next = (themeIndex.peek() + 1) % themeNames.length;
+  themeIndex.set(next);
+  saveTheme(themeNames[next]);
+}
+function currentTheme() {
+  return themes[themeNames[themeIndex.get()]];
+}
+
 // Create wizard state
 const createStep = signal<"dir-initial" | "dir-browse" | "name-command">("dir-initial");
 const cwdPath = signal(process.cwd());
@@ -64,27 +96,32 @@ interface ListItem {
 const sortedSessions = computed<SessionInfo[]>(() => sortSessions(sessions.get()));
 
 const filteredItems = computed<ListItem[]>(() => {
-  const filter = filterText.get().toLowerCase();
-  const matches: { item: ListItem; rank: number }[] = [];
+  const filter = filterText.get();
+  const matches: { item: ListItem; score: number }[] = [];
   for (const s of sortedSessions.get()) {
     if (!filter) {
-      matches.push({ item: { type: "session", session: s }, rank: 0 });
+      matches.push({ item: { type: "session", session: s }, score: 0 });
       continue;
     }
     const cmd = s.metadata
       ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
       : "";
     const cwd = s.metadata?.cwd ?? "";
-    const nameMatch = s.name.toLowerCase().includes(filter);
-    const cwdMatch = cwd.toLowerCase().includes(filter);
-    const cmdMatch = cmd.toLowerCase().includes(filter);
-    if (!nameMatch && !cwdMatch && !cmdMatch) continue;
-    // Name matches rank highest (0), then cwd (1), then command (2)
-    const rank = nameMatch ? 0 : cwdMatch ? 1 : 2;
-    matches.push({ item: { type: "session", session: s }, rank });
+    // Fuzzy match against name (weighted highest), cwd, and command
+    const nameResult = fuzzyMatch(filter, s.name);
+    const cwdResult = fuzzyMatch(filter, cwd);
+    const cmdResult = fuzzyMatch(filter, cmd);
+    if (!nameResult.match && !cwdResult.match && !cmdResult.match) continue;
+    // Name matches get a large bonus so they always rank above cwd/cmd matches
+    const score = Math.max(
+      nameResult.match ? nameResult.score + 10000 : 0,
+      cwdResult.match ? cwdResult.score : 0,
+      cmdResult.match ? cmdResult.score : 0,
+    );
+    matches.push({ item: { type: "session", session: s }, score });
   }
-  // Stable sort: within same rank, preserve the existing order (running first, alpha)
-  matches.sort((a, b) => a.rank - b.rank);
+  // Higher score = better match = first in list
+  matches.sort((a, b) => b.score - a.score);
   const items = matches.map(m => m.item);
   items.push({ type: "create" });
   return items;
@@ -95,13 +132,12 @@ const filteredItems = computed<ListItem[]>(() => {
 // ============================================================
 
 function renderListItem(item: ListItem, _index: number, selected: boolean): UINode[] {
+  const sel = selected ? "\u25b8 " : "  ";
   if (item.type === "create") {
-    const label = selected ? "  + Create new session..." : "  + Create new session...";
-    return [text(label, selected ? "accent" : "muted", { bold: selected, truncate: true })];
+    return [text(sel + "+ Create new session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
   }
   const s = item.session!;
   const icon = s.status === "running" ? "\u25cf" : "\u25cb";
-  const iconColor: "ok" | "error" = s.status === "running" ? "ok" : "error";
   const cmd = s.metadata
     ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
     : "";
@@ -109,9 +145,7 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
     ? (s.metadata?.cwd ? shortPath(s.metadata.cwd) : "")
     : (s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "");
 
-  // Single text node per row — keeps column layout simple and avoids
-  // the framework's flex distribution splitting the line oddly.
-  const line = `  ${icon} ${s.name}  ${pathStr}  ${cmd}`;
+  const line = `${sel}${icon} ${s.name}  ${pathStr}  ${cmd}`;
   return [text(line, selected ? "accent" : "primary", { bold: selected, truncate: true })];
 }
 
@@ -138,7 +172,7 @@ const listScreen = screen({
         text("", "muted"), // blank line
         selectable(region, items, renderListItem),
       ]),
-      footer("\u2191\u2193 select  \u23ce attach  q quit"),
+      footer(`\u2191\u2193 select  \u23ce attach  ctrl+g theme (${themeNames[themeIndex.get()]})  q quit`),
     ];
   },
 
@@ -568,6 +602,11 @@ export async function runInteractive(): Promise<void> {
 
   myApp = app({
     screen: () => currentScreen.get() === "list" ? listScreen : createScreen,
+    theme: () => currentTheme(),
+    onKey: (key) => {
+      if (key.name === "g" && key.ctrl) { cycleTheme(); return true; }
+      return false;
+    },
   });
 
   myApp.start();

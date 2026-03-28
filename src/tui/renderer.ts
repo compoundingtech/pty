@@ -268,7 +268,7 @@ function renderIcon(node: IconNode, rect: Rect, theme: Theme): string {
 }
 
 function renderSeparator(rect: Rect, theme: Theme, boxStyle: BoxStyle): string {
-  return fg(theme.border[0], theme.border[1], theme.border[2])
+  return (theme.border ? fg(theme.border[0], theme.border[1], theme.border[2]) : "")
     + hSep(rect.y + 1, rect.x + 1, rect.width, boxStyle)
     + RESET;
 }
@@ -318,14 +318,14 @@ function renderPanel(
   out += bgColor(theme.bg2) + fillRect(rect.y + 1, rect.x + 1, rect.width, rect.height);
 
   // Draw border
-  out += fg(theme.border[0], theme.border[1], theme.border[2])
+  out += (theme.border ? fg(theme.border[0], theme.border[1], theme.border[2]) : "")
     + drawBox(rect.y + 1, rect.x + 1, rect.width, rect.height, { style });
 
   // Title
   if (node.title) {
     out += writeAt(rect.y + 1, rect.x + 3,
       " " + fgColor(theme.fgAc) + BOLD + node.title + RESET
-      + bgColor(theme.bg2) + fg(theme.border[0], theme.border[1], theme.border[2]) + " ");
+      + bgColor(theme.bg2) + (theme.border ? fg(theme.border[0], theme.border[1], theme.border[2]) : "") + " ");
   }
 
   // Render children
@@ -394,7 +394,7 @@ function renderAskBar(
   out += bgColor(theme.bg2) + fillRect(rect.y + 1, rect.x + 1, rect.width, rect.height);
 
   // Border
-  out += fg(theme.border[0], theme.border[1], theme.border[2])
+  out += (theme.border ? fg(theme.border[0], theme.border[1], theme.border[2]) : "")
     + drawBox(rect.y + 1, rect.x + 1, rect.width, rect.height, { style });
 
   if (node.active) {
@@ -533,8 +533,8 @@ function renderPtyView(node: PtyViewNode, rect: Rect, theme: Theme): string {
       if (cell.underline) out += "\x1b[4m";
       const fgC = cell.fg ?? theme.fg1;
       const bgC = cell.bg ?? theme.bg1;
-      out += fg(fgC[0], fgC[1], fgC[2]);
-      out += bg(bgC[0], bgC[1], bgC[2]);
+      if (fgC) out += fg(fgC[0], fgC[1], fgC[2]);
+      if (bgC) out += bg(bgC[0], bgC[1], bgC[2]);
       out += cell.char;
       out += RESET;
     }

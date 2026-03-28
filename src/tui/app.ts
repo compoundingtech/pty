@@ -128,7 +128,7 @@ export function app(config: AppConfig): App {
       for (let i = 0; i < label.length; i++) {
         if (col + i >= 0 && col + i < buf.cols) {
           buf.cells[0][col + i] = {
-            char: label[i], fg: [...theme.bg1], bg: [...theme.fgAc],
+            char: label[i], fg: theme.bg1 ? [...theme.bg1] : null, bg: theme.fgAc ? [...theme.fgAc] : null,
             bold: false, dim: false, italic: false, underline: false,
           };
         }

@@ -268,20 +268,22 @@ export function progressBar(width: number, pct: number): string {
 }
 
 // --- Theme ---
+type ThemeColor = [number, number, number] | null;
+
 export interface Theme {
-  bg1: [number, number, number];
-  bg2: [number, number, number];
-  bgHi: [number, number, number];
-  bgAc: [number, number, number];
-  fg1: [number, number, number];
-  fg2: [number, number, number];
-  fgAc: [number, number, number];
-  fgMu: [number, number, number];
-  ok: [number, number, number];
-  warn: [number, number, number];
-  err: [number, number, number];
-  info: [number, number, number];
-  border: [number, number, number];
+  bg1: ThemeColor;
+  bg2: ThemeColor;
+  bgHi: ThemeColor;
+  bgAc: ThemeColor;
+  fg1: ThemeColor;
+  fg2: ThemeColor;
+  fgAc: ThemeColor;
+  fgMu: ThemeColor;
+  ok: ThemeColor;
+  warn: ThemeColor;
+  err: ThemeColor;
+  info: ThemeColor;
+  border: ThemeColor;
 }
 
 export const themes: Record<string, Theme> = {
@@ -315,16 +317,56 @@ export const themes: Record<string, Theme> = {
     ok: [80, 230, 120], warn: [230, 200, 80], err: [230, 90, 80], info: [80, 190, 220],
     border: [45, 65, 48],
   },
+  // --- Light variants ---
+  coolBlueLight: {
+    bg1: [240, 244, 250], bg2: [230, 236, 245], bgHi: [210, 220, 238], bgAc: [70, 120, 200],
+    fg1: [30, 35, 50], fg2: [80, 90, 115], fgAc: [40, 100, 220], fgMu: [140, 150, 175],
+    ok: [30, 140, 70], warn: [180, 120, 0], err: [200, 40, 40], info: [30, 120, 200],
+    border: [180, 190, 210],
+  },
+  warmAmberLight: {
+    bg1: [252, 245, 235], bg2: [242, 232, 218], bgHi: [230, 215, 195], bgAc: [180, 130, 50],
+    fg1: [50, 40, 30], fg2: [100, 80, 55], fgAc: [190, 120, 10], fgMu: [150, 135, 110],
+    ok: [40, 150, 40], warn: [200, 140, 0], err: [190, 50, 30], info: [50, 130, 180],
+    border: [200, 185, 160],
+  },
+  monoLight: {
+    bg1: [245, 245, 245], bg2: [235, 235, 235], bgHi: [215, 215, 215], bgAc: [180, 180, 180],
+    fg1: [30, 30, 30], fg2: [80, 80, 80], fgAc: [0, 0, 0], fgMu: [150, 150, 150],
+    ok: [40, 140, 40], warn: [170, 140, 20], err: [180, 50, 50], info: [40, 120, 180],
+    border: [190, 190, 190],
+  },
+  draculaLight: {
+    bg1: [248, 248, 242], bg2: [238, 236, 230], bgHi: [220, 218, 210], bgAc: [150, 140, 200],
+    fg1: [40, 42, 54], fg2: [100, 70, 180], fgAc: [50, 160, 180], fgMu: [140, 150, 170],
+    ok: [30, 170, 70], warn: [180, 170, 40], err: [210, 50, 50], info: [50, 160, 180],
+    border: [200, 198, 190],
+  },
+  forestLight: {
+    bg1: [242, 250, 244], bg2: [230, 242, 232], bgHi: [210, 230, 215], bgAc: [70, 140, 85],
+    fg1: [25, 45, 30], fg2: [60, 100, 70], fgAc: [40, 160, 70], fgMu: [130, 155, 135],
+    ok: [30, 160, 60], warn: [170, 140, 20], err: [190, 50, 40], info: [40, 130, 170],
+    border: [175, 200, 180],
+  },
+  terminal: {
+    bg1: null, bg2: null, bgHi: null, bgAc: null,
+    fg1: null, fg2: null, fgAc: null, fgMu: null,
+    ok: null, warn: null, err: null, info: null,
+    border: null,
+  },
 };
 
 // Quick access to theme color codes
+function fgOr(c: ThemeColor): string { return c ? fg(c[0], c[1], c[2]) : ""; }
+function bgOr(c: ThemeColor): string { return c ? bg(c[0], c[1], c[2]) : ""; }
+
 export function c(theme: Theme) {
   return {
-    bg1: bg(...theme.bg1), bg2: bg(...theme.bg2), bgHi: bg(...theme.bgHi), bgAc: bg(...theme.bgAc),
-    fg1: fg(...theme.fg1), fg2: fg(...theme.fg2), fgAc: fg(...theme.fgAc), fgMu: fg(...theme.fgMu),
-    ok: fg(...theme.ok), warn: fg(...theme.warn), err: fg(...theme.err), info: fg(...theme.info),
-    border: fg(...theme.border),
-    bgOk: bg(...theme.ok), bgWarn: bg(...theme.warn), bgErr: bg(...theme.err), bgInfo: bg(...theme.info),
+    bg1: bgOr(theme.bg1), bg2: bgOr(theme.bg2), bgHi: bgOr(theme.bgHi), bgAc: bgOr(theme.bgAc),
+    fg1: fgOr(theme.fg1), fg2: fgOr(theme.fg2), fgAc: fgOr(theme.fgAc), fgMu: fgOr(theme.fgMu),
+    ok: fgOr(theme.ok), warn: fgOr(theme.warn), err: fgOr(theme.err), info: fgOr(theme.info),
+    border: fgOr(theme.border),
+    bgOk: bgOr(theme.ok), bgWarn: bgOr(theme.warn), bgErr: bgOr(theme.err), bgInfo: bgOr(theme.info),
   };
 }
 
