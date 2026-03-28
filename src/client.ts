@@ -11,6 +11,7 @@ import {
   decodeExit,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
+import { stripAnsi } from "./tui/colors.ts";
 
 const DETACH_KEY = 0x1c; // Ctrl+\ (legacy encoding)
 const DETACH_KEY_KITTY = "\x1b[92;5u"; // Ctrl+\ (Kitty keyboard protocol)
@@ -112,14 +113,16 @@ export function peek(options: PeekOptions): void {
 
         case MessageType.DATA:
           if (follow) {
-            stdout.write(packet.payload);
+            stdout.write(options.plain ? stripAnsi(packet.payload.toString()) : packet.payload);
           }
           break;
 
         case MessageType.EXIT: {
           const code = decodeExit(packet.payload);
           socket.destroy();
-          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM);
+          if (!options.plain) {
+            stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM);
+          }
           if (follow) {
             stdout.write(`\r\n[session exited with code ${code}]\r\n`);
           }
