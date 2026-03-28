@@ -195,6 +195,10 @@ async function main(): Promise<void> {
         else break;
         pi++;
       }
+      if (follow && plain) {
+        console.error("Cannot use --plain with -f (follow mode streams raw terminal output).");
+        process.exit(1);
+      }
       const peekName = args[pi];
       if (!peekName) {
         console.error("Usage: pty peek [-f] [--plain] <name>");

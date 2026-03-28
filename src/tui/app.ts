@@ -51,6 +51,8 @@ export function app(config: AppConfig): App {
   let sigintHandler: (() => void) | null = null;
   let sigtermHandler: (() => void) | null = null;
   let exitHandler: (() => void) | null = null;
+  let activeScreen: Screen | null = null;
+  let activeOverlay: Screen | null = null;
 
   function getSize(): [number, number] {
     return [(stdout as any).rows ?? 35, (stdout as any).columns ?? 120];
@@ -90,11 +92,25 @@ export function app(config: AppConfig): App {
     const [rows, cols] = getSize();
     const ctx = createContext(rows, cols);
     const scr = resolveScreen();
+
+    // Detect screen transition
+    if (scr !== activeScreen) {
+      activeScreen?.onLeave?.(ctx);
+      activeScreen = scr;
+      scr.onEnter?.(ctx);
+    }
+
     const buf = scr.renderToBuffer(ctx);
 
     // Composite overlay if present
     if (config.overlay) {
-      const ov = config.overlay();
+      const ov = config.overlay() ?? null;
+      // Detect overlay transition
+      if (ov !== activeOverlay) {
+        activeOverlay?.onLeave?.(ctx);
+        activeOverlay = ov;
+        ov?.onEnter?.(ctx);
+      }
       if (ov) {
         const overlayBuf = ov.renderToBuffer(ctx);
         // Bounding-box composite: find non-empty region, copy all cells within
@@ -219,6 +235,12 @@ export function app(config: AppConfig): App {
       running = false;
       if (effectDispose) { effectDispose(); effectDispose = null; }
       removeListeners();
+      // Call onLeave for active overlay and screen
+      const ctx = createContext(...getSize());
+      activeOverlay?.onLeave?.(ctx);
+      activeScreen?.onLeave?.(ctx);
+      activeOverlay = null;
+      activeScreen = null;
       leaveTerminal(true);
     },
 

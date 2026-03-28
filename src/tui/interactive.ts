@@ -558,25 +558,12 @@ async function doCreate(dir: string, name: string, command: string): Promise<voi
     cleanupAll(name);
   }
 
-  const parts = command.split(/\s+/);
-  const cmd = parts[0];
-  const args = parts.slice(1);
-
-  let resolvedCmd: string;
-  try {
-    resolvedCmd = resolveCommand(cmd);
-  } catch (e: any) {
-    releaseLock(name);
-    console.error(e.message);
-    const updated = await listSessions();
-    sessions.set(updated);
-    currentScreen.set("list");
-    myApp?.resume();
-    return;
-  }
+  // Spawn via sh -c so the command field supports quotes, pipes, env vars, etc.
+  const shellCmd = "/bin/sh";
+  const shellArgs = ["-c", command];
 
   try {
-    await spawnDaemon(name, resolvedCmd, args, cmd, dir);
+    await spawnDaemon(name, shellCmd, shellArgs, command, dir);
   } catch (e: any) {
     releaseLock(name);
     console.error(e.message);
