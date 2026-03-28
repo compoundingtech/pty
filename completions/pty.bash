@@ -49,7 +49,7 @@ _pty() {
       done
       # Before --, complete flags
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--detach -d --attach -a" -- "${cur}"))
+        COMPREPLY=($(compgen -W "--detach -d --attach -a --name" -- "${cur}"))
       fi
       ;;
   esac

@@ -432,6 +432,72 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "create wizard: name updates as command is typed",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const tui = createTuiSession(sessionDir);
+
+      await tui.waitForText("Create new session...", 10000);
+      tui.press("return");
+      await tui.waitForText("Choose Directory", 5000);
+      tui.press("return");
+      await tui.waitForText("Name:", 5000);
+
+      // Name should start as the directory basename
+      let ss = tui.screenshot();
+      const nameLine = ss.lines.find(l => l.includes("Name:"));
+      expect(nameLine).toBeDefined();
+
+      // Type a command — the name should auto-update to include it
+      tui.type("node server.js");
+      await new Promise(r => setTimeout(r, 300));
+
+      ss = tui.screenshot();
+      const updatedName = ss.lines.find(l => l.includes("Name:"));
+      expect(updatedName).toBeDefined();
+      // Should contain "node-server" somewhere in the name field
+      expect(updatedName).toMatch(/node-server/i);
+    },
+    15000
+  );
+
+  it(
+    "create wizard: manually edited name is not overwritten by command typing",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const tui = createTuiSession(sessionDir);
+
+      await tui.waitForText("Create new session...", 10000);
+      tui.press("return");
+      await tui.waitForText("Choose Directory", 5000);
+      tui.press("return");
+      await tui.waitForText("Name:", 5000);
+
+      // Tab to name field, type a custom name
+      tui.press("tab");
+      await new Promise(r => setTimeout(r, 200));
+      // Clear auto-filled name and type custom
+      for (let i = 0; i < 30; i++) tui.press("backspace");
+      await new Promise(r => setTimeout(r, 200));
+      tui.type("custom");
+      await new Promise(r => setTimeout(r, 200));
+
+      // Tab back to command and type something
+      tui.press("tab");
+      await new Promise(r => setTimeout(r, 200));
+      tui.type("echo hi");
+      await new Promise(r => setTimeout(r, 300));
+
+      // Name should still be "custom", not auto-generated
+      const ss = tui.screenshot();
+      const nameLine = ss.lines.find(l => l.includes("Name:"));
+      expect(nameLine).toContain("custom");
+      expect(nameLine).not.toContain("echo");
+    },
+    15000
+  );
+
+  it(
     "empty state shows only 'Create new session...'",
     async () => {
       const sessionDir = makeSessionDir();

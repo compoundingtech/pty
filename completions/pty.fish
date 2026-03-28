@@ -42,6 +42,7 @@ complete -c pty -n __pty_needs_command -a help -d 'Show usage information'
 # run: flags and file completion for the command argument
 complete -c pty -n '__pty_using_command run' -s d -l detach -d 'Create in background'
 complete -c pty -n '__pty_using_command run' -s a -l attach -d 'Attach if already running'
+complete -c pty -n '__pty_using_command run' -l name -x -d 'Session name (auto-generated if omitted)'
 complete -c pty -n '__pty_using_command run' -F
 
 # attach: session names and flags

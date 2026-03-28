@@ -20,9 +20,10 @@ import { runInteractive } from "./tui/interactive.ts";
 function usage(): void {
   console.log(`Usage:
   pty                                       Interactive session manager
-  pty run <name> <command> [args...]        Create a session and attach
-  pty run -d <name> <command> [args...]    Create a session in the background
-  pty run -a <name> <command> [args...]    Create or attach if already running
+  pty run -- <command> [args...]            Create a session and attach (auto-named)
+  pty run --name <n> -- <command> [args...] Create a named session and attach
+  pty run -d -- <command> [args...]        Create in the background
+  pty run -a -- <command> [args...]        Create or attach if already running
   pty attach <name>                        Attach to an existing session
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
@@ -43,6 +44,26 @@ function usage(): void {
 Detach from a session with Ctrl+\\ (press twice to send Ctrl+\\ to the process)`);
 }
 
+/** Generate a session name from the cwd and command. */
+function autoName(cmd: string, cmdArgs: string[]): string {
+  // Directory component: last part of cwd
+  const dirPart = path.basename(process.cwd());
+
+  // Command component: base name of the command + first meaningful arg
+  const cmdBase = path.basename(cmd);
+  const firstArg = cmdArgs.find(a => !a.startsWith("-") && a.length < 30);
+  let cmdPart = cmdBase;
+  if (firstArg) {
+    // Strip extension and path, keep only alphanumeric/dash/dot
+    const argBase = path.basename(firstArg).replace(/\.[^.]+$/, "");
+    if (argBase && /^[a-zA-Z0-9._-]+$/.test(argBase)) {
+      cmdPart = `${cmdBase}-${argBase}`;
+    }
+  }
+
+  return `${dirPart}-${cmdPart}`;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -61,47 +82,54 @@ async function main(): Promise<void> {
     }
 
     case "run": {
-      // Parse flags before positional args
+      // Parse flags before the -- separator
       let detach = false;
       let attachExisting = false;
+      let name: string | null = null;
       let i = 1;
-      while (i < args.length && args[i].startsWith("-") && args[i] !== "--") {
-        if (args[i] === "-d" || args[i] === "--detach") detach = true;
-        else if (args[i] === "-a" || args[i] === "--attach") attachExisting = true;
+      while (i < args.length && args[i] !== "--") {
+        if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
+        else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
+        else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
         else break;
-        i++;
+        // Note: unknown flags or positional args before -- break the loop
       }
-      const runArgs = args.slice(i);
 
-      const dashDash = runArgs.indexOf("--");
-      let name: string;
+      // Everything after -- is the command
+      const dashDash = args.indexOf("--", i);
       let cmd: string;
       let cmdArgs: string[];
 
       if (dashDash !== -1) {
-        if (dashDash !== 1) {
-          console.error("Usage: pty run [-d] [-a] <name> -- <command> [args...]");
-          process.exit(1);
+        // Anything between flags and -- that isn't a flag is a legacy positional name
+        const between = args.slice(i, dashDash);
+        if (between.length > 0 && !name) {
+          // Backward compat: pty run myserver -- node server.js
+          name = between[0];
+          console.error(`Hint: use --name instead: pty run --name ${name} -- ...`);
         }
-        name = runArgs[0];
-        cmd = runArgs[dashDash + 1];
-        cmdArgs = runArgs.slice(dashDash + 2);
+        cmd = args[dashDash + 1];
+        cmdArgs = args.slice(dashDash + 2);
       } else {
-        name = runArgs[0];
-        cmd = runArgs[1];
-        cmdArgs = runArgs.slice(2);
+        // No -- separator: legacy positional format
+        // pty run myserver node server.js
+        const rest = args.slice(i);
+        if (!name && rest.length >= 2) {
+          name = rest[0];
+          cmd = rest[1];
+          cmdArgs = rest.slice(2);
+          console.error(`Hint: use --name instead: pty run --name ${name} -- ${cmd} ${cmdArgs.join(" ")}`.trimEnd());
+        } else {
+          cmd = rest[0];
+          cmdArgs = rest.slice(1);
+        }
       }
 
-      if (!name || !cmd) {
-        console.error("Usage: pty run [-d] [-a] <name> -- <command> [args...]");
+      if (!cmd) {
+        console.error("Usage: pty run [--name <name>] [-d] [-a] -- <command> [args...]");
         process.exit(1);
       }
-      try {
-        validateName(name);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
+
       const displayCmd = cmd;
       try {
         cmd = resolveCommand(cmd);
@@ -109,6 +137,31 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
+
+      // Auto-generate name if not provided
+      if (!name) {
+        const sessions = await listSessions();
+        const existing = new Set(sessions.map(s => s.name));
+        let candidate = autoName(displayCmd, cmdArgs);
+        // Sanitize: validateName allows [a-zA-Z0-9._-]
+        candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+        // Dedup
+        if (existing.has(candidate)) {
+          for (let n = 2; ; n++) {
+            const c = `${candidate}-${n}`;
+            if (!existing.has(c)) { candidate = c; break; }
+          }
+        }
+        name = candidate;
+      }
+
+      try {
+        validateName(name);
+      } catch (e: any) {
+        console.error(e.message);
+        process.exit(1);
+      }
+
       await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd);
       break;
     }

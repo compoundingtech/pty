@@ -15,6 +15,22 @@ import {
 import { sortSessions, shortPath, timeAgo } from "./screen-list.ts";
 import { dedupName, listDirs } from "./screen-create.ts";
 
+/** Generate a session name from dir and command. */
+function autoName(dir: string, cmd: string, cmdArgs: string[]): string {
+  const dirPart = path.basename(dir);
+  const cmdBase = path.basename(cmd);
+  const firstArg = cmdArgs.find(a => !a.startsWith("-") && a.length < 30);
+  let cmdPart = cmdBase;
+  if (firstArg) {
+    const argBase = path.basename(firstArg).replace(/\.[^.]+$/, "");
+    if (argBase && /^[a-zA-Z0-9._-]+$/.test(argBase)) {
+      cmdPart = `${cmdBase}-${argBase}`;
+    }
+  }
+  const raw = `${dirPart}-${cmdPart}`;
+  return raw.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+}
+
 // ============================================================
 // State (signals)
 // ============================================================
@@ -32,6 +48,7 @@ const browseFilter = signal("");
 const createSelectedIndex = signal(0);
 const sessionName = signal("");
 const sessionCommand = signal("");
+const nameManuallyEdited = signal(false);
 const focusedField = signal<"name" | "command">("command");
 const existingNames = signal<Set<string>>(new Set());
 
@@ -293,6 +310,8 @@ function handleDirInitialKey(key: KeyEvent): boolean {
       batch(() => {
         createStep.set("name-command");
         sessionName.set(dedupName(path.basename(cwdPath.peek()), existingNames.peek()));
+        nameManuallyEdited.set(false);
+        sessionCommand.set("");
       });
     } else {
       batch(() => {
@@ -323,6 +342,8 @@ function handleDirBrowseKey(key: KeyEvent): boolean {
       batch(() => {
         createStep.set("name-command");
         sessionName.set(dedupName(path.basename(browsePath.peek()), existingNames.peek()));
+        nameManuallyEdited.set(false);
+        sessionCommand.set("");
       });
     } else if (idx === 1) {
       const parent = path.dirname(browsePath.peek());
@@ -395,21 +416,38 @@ function handleNameCommandKey(key: KeyEvent): boolean {
   }
   if (key.name === "backspace") {
     if (focusedField.peek() === "name") {
+      nameManuallyEdited.set(true);
       sessionName.set(sessionName.peek().slice(0, -1));
     } else {
       sessionCommand.set(sessionCommand.peek().slice(0, -1));
+      regenerateNameIfAuto();
     }
     return true;
   }
   if (key.char && !key.ctrl && !key.alt) {
     if (focusedField.peek() === "name") {
+      nameManuallyEdited.set(true);
       sessionName.set(sessionName.peek() + key.char);
     } else {
       sessionCommand.set(sessionCommand.peek() + key.char);
+      regenerateNameIfAuto();
     }
     return true;
   }
   return true;
+}
+
+function regenerateNameIfAuto(): void {
+  if (nameManuallyEdited.peek()) return;
+  const dir = browsePath.peek() !== cwdPath.peek() ? browsePath.peek() : cwdPath.peek();
+  const cmd = sessionCommand.peek().trim();
+  if (!cmd) {
+    sessionName.set(dedupName(path.basename(dir), existingNames.peek()));
+    return;
+  }
+  const parts = cmd.split(/\s+/);
+  const name = autoName(dir, parts[0], parts.slice(1));
+  sessionName.set(dedupName(name, existingNames.peek()));
 }
 
 // ============================================================

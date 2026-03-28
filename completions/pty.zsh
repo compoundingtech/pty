@@ -79,7 +79,7 @@ _pty() {
           _arguments \
             '(-d --detach)'{-d,--detach}'[Create in background]' \
             '(-a --attach)'{-a,--attach}'[Attach if already running]' \
-            '1:name:'
+            '--name[Session name]:name:'
           ;;
       esac
       ;;

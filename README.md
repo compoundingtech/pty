@@ -48,9 +48,10 @@ When you detach from a session entered via the interactive list (`Ctrl+\`), you 
 
 ```sh
 pty                                       # interactive session manager
-pty run myserver -- node server.js        # start a session and attach
-pty run -d myserver -- node server.js     # start in the background
-pty run -a myserver -- node server.js     # create or attach if already running
+pty run -- node server.js                 # start a session (auto-named)
+pty run --name myserver -- node server.js # start with an explicit name
+pty run -d -- node server.js              # start in the background
+pty run -a -- node server.js              # create or attach if already running
 
 pty list                                  # show active sessions
 pty list --json                           # show as JSON
