@@ -28,7 +28,7 @@ export function getSessionDir(): string {
 }
 
 export function ensureSessionDir(): void {
-  fs.mkdirSync(getSessionDir(), { recursive: true });
+  fs.mkdirSync(getSessionDir(), { recursive: true, mode: 0o700 });
 }
 
 export function getSocketPath(name: string): string {

@@ -171,6 +171,7 @@ export class PtyServer {
     );
     this.ready = new Promise((resolve) => {
       this.socketServer.listen(socketPath, () => {
+        try { fs.chmodSync(socketPath, 0o600); } catch {}
         fs.writeFileSync(getPidPath(this.name), process.pid.toString());
         writeMetadata(this.name, {
           command: options.command,
