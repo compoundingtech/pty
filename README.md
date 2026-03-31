@@ -69,6 +69,27 @@ pty send myserver --seq key:ctrl+c        # send control keys
 
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a session
+
+pty wrap claude                           # auto-wrap claude in pty sessions
+pty unwrap claude                         # remove the wrapper
+pty wrap --list                           # show wrapped commands
+```
+
+### Wrapping Commands
+
+`pty wrap` creates a small shell script that shadows a command so it always runs in a pty session:
+
+```sh
+pty wrap claude
+# Now running "claude" anywhere automatically gets a persistent session
+```
+
+The wrapper uses `pty run -a` (create or attach if already running), so running the command twice in the same directory reattaches instead of creating a duplicate.
+
+Wrappers live in `~/.local/pty/bin/`. Add it to the front of your PATH:
+
+```sh
+export PATH="$HOME/.local/pty/bin:$PATH"
 ```
 
 Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
