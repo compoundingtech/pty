@@ -61,6 +61,7 @@ export class PtyServer {
   private sgrMouseMode = false;
   private cursorHidden = false;
   private kittyKeyboardStack: number[] = [];
+  private lastResizeTime = 0;
   readonly ready: Promise<void>;
 
   constructor(options: ServerOptions) {
@@ -218,15 +219,29 @@ export class PtyServer {
               socket.write(encodeScreen(screen));
               if (this.exited) {
                 socket.write(encodeExit(this.exitCode));
+              } else {
+                // The serialize addon's output is an approximation — ECH/CUF
+                // sequences may not perfectly reproduce what the app originally
+                // drew (e.g., background fills in ratatui). Nudge the child
+                // with a SIGWINCH so it does a fresh full redraw, whose DATA
+                // overwrites any serialize artifacts on the client.
+                this.nudgeRedraw();
               }
             };
 
-            if (resized && !this.exited) {
-              // The PTY was resized, which sends SIGWINCH to the process.
-              // Wait briefly so the process can redraw before we serialize,
-              // otherwise the client sees a transient state (e.g., cursor
-              // clamped to the new width instead of where the TUI places it).
-              setTimeout(sendScreen, 50);
+            if (!this.exited) {
+              // If the PTY was just resized (either by this attach or
+              // recently by another client), wait for the process to
+              // redraw before serializing. Without this delay, the client
+              // sees a transient mid-redraw state.
+              const sinceLast = Date.now() - this.lastResizeTime;
+              const REDRAW_SETTLE_MS = 80;
+              if (resized || sinceLast < REDRAW_SETTLE_MS) {
+                const delay = resized ? REDRAW_SETTLE_MS : REDRAW_SETTLE_MS - sinceLast;
+                setTimeout(sendScreen, delay);
+              } else {
+                sendScreen();
+              }
             } else {
               sendScreen();
             }
@@ -315,10 +330,23 @@ export class PtyServer {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
         this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
+        this.lastResizeTime = Date.now();
         return true;
       }
     }
     return false;
+  }
+
+  /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
+   *  forcing the child to do a complete redraw. The xterm-headless terminal
+   *  is resized in sync so its buffer stays correct. */
+  private nudgeRedraw(): void {
+    const cols = this.terminal.cols;
+    const rows = this.terminal.rows;
+    this.ptyProcess.resize(cols - 1, rows);
+    this.terminal.resize(cols - 1, rows);
+    this.ptyProcess.resize(cols, rows);
+    this.terminal.resize(cols, rows);
   }
 
   private broadcast(data: Buffer): void {
