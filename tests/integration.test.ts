@@ -14,6 +14,7 @@ import {
   encodeDetach,
   encodePeek,
   encodeResize,
+  encodeStatus,
   decodeExit,
 } from "../src/protocol.ts";
 import {
@@ -1246,4 +1247,103 @@ describe("integration", () => {
       client2.destroy();
     });
   }
+});
+
+describe("STATUS message", () => {
+  it("responds with valid JSON containing all expected fields", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", ["-c", "echo hello; sleep 30"]);
+    await new Promise((r) => setTimeout(r, 300));
+
+    const client = await connect(name);
+    const reader = new PacketReader();
+    client.write(encodeStatus());
+
+    const packet = await waitForType(client, reader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.name).toBe(name);
+    expect(stats.terminal.cols).toBe(80);
+    expect(stats.terminal.rows).toBe(24);
+    expect(stats.terminal.cursorX).toBeGreaterThanOrEqual(0);
+    expect(stats.terminal.cursorY).toBeGreaterThanOrEqual(0);
+    expect(stats.terminal.scrollbackUsed).toBeGreaterThan(0);
+    expect(stats.terminal.scrollbackCapacity).toBe(24 + 10000);
+    expect(stats.process.alive).toBe(true);
+    expect(stats.process.exitCode).toBeNull();
+    expect(stats.clients.total).toBeGreaterThanOrEqual(1);
+    expect(stats.modes).toBeDefined();
+    expect(stats.uptimeSeconds).toBeGreaterThanOrEqual(0);
+
+    client.destroy();
+  });
+
+  it("reports correct client counts", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const c1 = await connect(name);
+    const r1 = new PacketReader();
+    c1.write(encodeAttach(24, 80));
+    await waitForType(c1, r1, MessageType.SCREEN);
+
+    const peeker = await connect(name);
+    const peekReader = new PacketReader();
+    peeker.write(encodePeek());
+    await waitForType(peeker, peekReader, MessageType.SCREEN);
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+
+    const packet = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.clients.total).toBe(3);
+    expect(stats.clients.attached).toBe(1);
+    expect(stats.clients.readOnly).toBe(1);
+
+    c1.destroy();
+    peeker.destroy();
+    statsClient.destroy();
+  });
+
+  it("reports exited process", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", ["-c", "exit 7"]);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const client = await connect(name);
+    const reader = new PacketReader();
+    client.write(encodeStatus());
+
+    const packet = await waitForType(client, reader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.process.alive).toBe(false);
+    expect(stats.process.exitCode).toBe(7);
+
+    client.destroy();
+  });
+
+  it("reports terminal modes", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [
+      "-c",
+      "printf '\\033[?1006h'; printf '\\033[?25l'; sleep 30",
+    ]);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const client = await connect(name);
+    const reader = new PacketReader();
+    client.write(encodeStatus());
+
+    const packet = await waitForType(client, reader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.modes.sgrMouse).toBe(true);
+    expect(stats.modes.cursorHidden).toBe(true);
+
+    client.destroy();
+  });
 });

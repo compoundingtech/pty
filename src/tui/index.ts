@@ -89,5 +89,11 @@ export {
 // App lifecycle
 export { app, type AppConfig, type App } from "./app.ts";
 
-// Daemon spawn
+// Session management
+export {
+  listSessions, getSession,
+  type SessionInfo, type SessionMetadata,
+} from "../sessions.ts";
+
+// Daemon spawning
 export { spawnDaemon } from "../spawn.ts";

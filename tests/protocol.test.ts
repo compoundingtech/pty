@@ -9,6 +9,8 @@ import {
   encodeResize,
   encodeExit,
   encodeScreen,
+  encodeStatus,
+  encodeStatusResponse,
   decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
@@ -183,6 +185,30 @@ describe("protocol", () => {
 
     it("decodeExit returns -1 for empty payload", () => {
       expect(decodeExit(Buffer.alloc(0))).toBe(-1);
+    });
+  });
+
+  describe("STATUS", () => {
+    it("round-trips a STATUS request (empty payload)", () => {
+      const reader = new PacketReader();
+      const encoded = encodeStatus();
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.STATUS);
+      expect(packets[0].payload.length).toBe(0);
+    });
+
+    it("round-trips a STATUS response (JSON payload)", () => {
+      const reader = new PacketReader();
+      const json = JSON.stringify({ name: "test", terminal: { cols: 80, rows: 24 } });
+      const encoded = encodeStatusResponse(json);
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.STATUS);
+      expect(JSON.parse(packets[0].payload.toString())).toEqual({
+        name: "test",
+        terminal: { cols: 80, rows: 24 },
+      });
     });
   });
 });

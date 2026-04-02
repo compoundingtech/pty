@@ -500,10 +500,10 @@ export async function attachPty(
   const net = require("node:net") as typeof import("node:net");
   const xtermMod = require("@xterm/headless") as any;
   const TerminalClass = xtermMod.default?.Terminal ?? xtermMod.Terminal;
-  const { getSocketPath } = require("../sessions.ts") as typeof import("../sessions.ts");
+  const { getSocketPath } = require("../sessions.js") as typeof import("../sessions.ts");
   const {
     MessageType, PacketReader, encodeAttach, encodeData, encodeResize, encodeDetach,
-  } = require("../protocol.ts") as typeof import("../protocol.ts");
+  } = require("../protocol.js") as typeof import("../protocol.ts");
 
   const cols = opts?.cols ?? 80;
   const rows = opts?.rows ?? 24;

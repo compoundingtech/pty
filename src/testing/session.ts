@@ -71,7 +71,7 @@ export class Session {
     const terminal = new xterm.Terminal({
       rows,
       cols,
-      scrollback: 1000,
+      scrollback: 10000,
       allowProposedApi: true,
     });
     const serialize = new xtermSerialize.SerializeAddon();
@@ -127,7 +127,7 @@ export class Session {
     const terminal = new xterm.Terminal({
       rows,
       cols,
-      scrollback: 1000,
+      scrollback: 10000,
       allowProposedApi: true,
     });
     const serialize = new xtermSerialize.SerializeAddon();
@@ -168,7 +168,7 @@ export class Session {
     const terminal = new xterm.Terminal({
       rows,
       cols,
-      scrollback: 1000,
+      scrollback: 10000,
       allowProposedApi: true,
     });
     const serialize = new xtermSerialize.SerializeAddon();

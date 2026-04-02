@@ -8,6 +8,7 @@ export const MessageType = {
   EXIT: 4, // Server → Client: process exited
   SCREEN: 5, // Server → Client: screen buffer replay on attach
   PEEK: 6, // Client → Server: read-only attach (no input, no resize)
+  STATUS: 7, // Client → Server: request stats; Server → Client: JSON stats response
 } as const;
 
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
@@ -63,6 +64,14 @@ export function encodePeek(plain = false): Buffer {
 
 export function encodeScreen(data: string): Buffer {
   return encodePacket(MessageType.SCREEN, Buffer.from(data));
+}
+
+export function encodeStatus(): Buffer {
+  return encodePacket(MessageType.STATUS, Buffer.alloc(0));
+}
+
+export function encodeStatusResponse(json: string): Buffer {
+  return encodePacket(MessageType.STATUS, Buffer.from(json));
 }
 
 export function decodeSize(payload: Buffer): { rows: number; cols: number } {

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
-import { attach, peek, send } from "./client.ts";
+import { attach, peek, send, queryStats, type StatsResult } from "./client.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
@@ -282,6 +282,19 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "stats": {
+      let statsJson = false;
+      let statsAll = false;
+      let statsName: string | undefined;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--json") statsJson = true;
+        else if (args[i] === "--all") statsAll = true;
+        else if (!statsName) statsName = args[i];
+      }
+      await cmdStats(statsName, statsJson, statsAll);
+      break;
+    }
+
     case "restart": {
       const forceRestart = args[1] === "-y" || args[1] === "--yes";
       const restartName = forceRestart ? args[2] : args[1];
@@ -531,6 +544,142 @@ async function cmdList(json = false): Promise<void> {
       console.log(`  ${session.name} (exited with code ${code}, ${ago}) — ${cwd}`);
     }
   }
+}
+
+async function cmdStats(
+  name?: string,
+  json = false,
+  all = false,
+): Promise<void> {
+  if (name) {
+    const session = await getSession(name);
+    if (!session) {
+      console.error(`Session "${name}" not found.`);
+      process.exit(1);
+    }
+    if (session.status === "exited") {
+      if (json) {
+        console.log(JSON.stringify({
+          name: session.name,
+          status: "exited",
+          exitCode: session.metadata?.exitCode ?? null,
+          exitedAt: session.metadata?.exitedAt ?? null,
+        }));
+      } else {
+        const code = session.metadata?.exitCode ?? "?";
+        console.log(`Session "${name}" has exited (code ${code}).`);
+      }
+      return;
+    }
+
+    try {
+      const stats = await queryStats(name);
+      if (json) {
+        console.log(JSON.stringify(stats));
+      } else {
+        printStats(stats, session.metadata);
+      }
+    } catch (e: any) {
+      console.error(e.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // All sessions
+  const sessions = await listSessions();
+  const running = sessions.filter((s) => s.status === "running");
+  const exited = sessions.filter((s) => s.status === "exited");
+
+  if (running.length === 0 && (!all || exited.length === 0)) {
+    console.log("No running sessions.");
+    return;
+  }
+
+  // Query all running sessions in parallel
+  const results = await Promise.all(
+    running.map(async (s) => {
+      try {
+        const stats = await queryStats(s.name);
+        return { session: s, stats, error: null as string | null };
+      } catch (e: any) {
+        return { session: s, stats: null as StatsResult | null, error: e.message as string };
+      }
+    }),
+  );
+
+  if (json) {
+    const output = [
+      ...results.map((r) => r.stats ?? { name: r.session.name, error: r.error }),
+      ...(all
+        ? exited.map((s) => ({
+            name: s.name,
+            status: "exited" as const,
+            exitCode: s.metadata?.exitCode ?? null,
+            exitedAt: s.metadata?.exitedAt ?? null,
+          }))
+        : []),
+    ];
+    console.log(JSON.stringify(output));
+    return;
+  }
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.stats) {
+      printStats(r.stats, r.session.metadata);
+    } else {
+      console.log(`Session: ${r.session.name}`);
+      console.log(`  Error: ${r.error}`);
+    }
+    if (i < results.length - 1) console.log("");
+  }
+
+  if (all && exited.length > 0) {
+    if (results.length > 0) console.log("");
+    console.log("Exited sessions:");
+    for (const s of exited) {
+      const code = s.metadata?.exitCode ?? "?";
+      const ago = s.metadata?.exitedAt ? timeAgo(new Date(s.metadata.exitedAt)) : "unknown";
+      console.log(`  ${s.name} (exited with code ${code}, ${ago})`);
+    }
+  }
+}
+
+function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
+  const cmd = meta
+    ? [meta.displayCommand, ...meta.args].join(" ")
+    : "unknown";
+  const cwd = meta?.cwd ? shortPath(meta.cwd) : "unknown";
+
+  console.log(`Session: ${stats.name}`);
+  console.log(`  Command:    ${cmd}`);
+  console.log(`  CWD:        ${cwd}`);
+  console.log(`  Uptime:     ${formatUptime(stats.uptimeSeconds)}`);
+  console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}`);
+  console.log(`  Terminal:   ${stats.terminal.cols}x${stats.terminal.rows}`);
+  console.log(`  Cursor:     row ${stats.terminal.cursorY}, col ${stats.terminal.cursorX}`);
+  console.log(`  Scrollback: ${stats.terminal.scrollbackUsed} / ${stats.terminal.scrollbackCapacity} lines`);
+  console.log(`  Clients:    ${stats.clients.total} (${stats.clients.attached} attached, ${stats.clients.readOnly} readonly)`);
+
+  const modes: string[] = [];
+  if (stats.modes.sgrMouse) modes.push("SGR mouse");
+  if (stats.modes.cursorHidden) modes.push("cursor hidden");
+  if (stats.modes.kittyKeyboard) modes.push(`kitty keyboard (flags: ${stats.modes.kittyKeyboardFlags.join(",")})`);
+  console.log(`  Modes:      ${modes.length > 0 ? modes.join(", ") : "none"}`);
+}
+
+function formatUptime(seconds: number | null): string {
+  if (seconds == null) return "unknown";
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  if (h < 24) return `${h}h ${rm}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
 }
 
 async function cmdKill(name: string): Promise<void> {

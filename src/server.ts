@@ -13,6 +13,7 @@ import {
   encodeData,
   encodeExit,
   encodeScreen,
+  encodeStatusResponse,
   decodeSize,
 } from "./protocol.ts";
 import {
@@ -72,7 +73,7 @@ export class PtyServer {
     this.terminal = new xterm.Terminal({
       rows: options.rows,
       cols: options.cols,
-      scrollback: 1000,
+      scrollback: 10000,
       allowProposedApi: true,
     });
     this.serialize = new xtermSerialize.SerializeAddon();
@@ -288,6 +289,12 @@ export class PtyServer {
             socket.end();
             break;
           }
+
+          case MessageType.STATUS: {
+            const stats = this.collectStats();
+            socket.write(encodeStatusResponse(JSON.stringify(stats)));
+            break;
+          }
         }
       }
     });
@@ -311,6 +318,52 @@ export class PtyServer {
       prefix += `\x1b[>${flags}u`;
     }
     return prefix;
+  }
+
+  private collectStats(): object {
+    const buf = this.terminal.buffer.active;
+    const meta = readMetadata(this.name);
+
+    let attached = 0;
+    let readOnly = 0;
+    for (const c of this.clients.values()) {
+      if (c.readonly) readOnly++;
+      else if (c.attachSeq > 0) attached++;
+    }
+
+    const createdAt = meta?.createdAt ?? null;
+    const uptimeSeconds = createdAt
+      ? Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000)
+      : null;
+
+    return {
+      name: this.name,
+      terminal: {
+        cols: this.terminal.cols,
+        rows: this.terminal.rows,
+        cursorX: buf.cursorX,
+        cursorY: buf.cursorY,
+        scrollbackUsed: buf.length,
+        scrollbackCapacity: this.terminal.rows + (this.terminal.options.scrollback ?? 10000),
+      },
+      process: {
+        alive: !this.exited,
+        exitCode: this.exited ? this.exitCode : null,
+      },
+      clients: {
+        total: this.clients.size,
+        attached,
+        readOnly,
+      },
+      modes: {
+        sgrMouse: this.sgrMouseMode,
+        cursorHidden: this.cursorHidden,
+        kittyKeyboard: this.kittyKeyboardStack.length > 0,
+        kittyKeyboardFlags: [...this.kittyKeyboardStack],
+      },
+      uptimeSeconds,
+      createdAt,
+    };
   }
 
   /** Resize the PTY to the smallest dimensions across all connected writable clients.

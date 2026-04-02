@@ -8,6 +8,7 @@ import {
   encodeDetach,
   encodePeek,
   encodeResize,
+  encodeStatus,
   decodeExit,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
@@ -181,6 +182,71 @@ export function send(options: SendOptions): void {
 
   socket.on("close", () => {
     process.exit(0);
+  });
+}
+
+export interface StatsResult {
+  name: string;
+  terminal: {
+    cols: number;
+    rows: number;
+    cursorX: number;
+    cursorY: number;
+    scrollbackUsed: number;
+    scrollbackCapacity: number;
+  };
+  process: { alive: boolean; exitCode: number | null };
+  clients: { total: number; attached: number; readOnly: number };
+  modes: {
+    sgrMouse: boolean;
+    cursorHidden: boolean;
+    kittyKeyboard: boolean;
+    kittyKeyboardFlags: number[];
+  };
+  uptimeSeconds: number | null;
+  createdAt: string | null;
+}
+
+/** Query live stats from a running session. */
+export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult> {
+  return new Promise((resolve, reject) => {
+    const socketPath = getSocketPath(name);
+    const reader = new PacketReader();
+    const socket = net.createConnection(socketPath);
+
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timeout querying stats for "${name}"`));
+    }, timeoutMs);
+
+    socket.on("connect", () => {
+      socket.write(encodeStatus());
+    });
+
+    socket.on("data", (data: Buffer) => {
+      const packets = reader.feed(data);
+      for (const packet of packets) {
+        if (packet.type === MessageType.STATUS) {
+          clearTimeout(timer);
+          socket.destroy();
+          try {
+            resolve(JSON.parse(packet.payload.toString()));
+          } catch {
+            reject(new Error(`Invalid stats response from "${name}"`));
+          }
+          return;
+        }
+      }
+    });
+
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
+        reject(new Error(`Session "${name}" not found or not running.`));
+      } else {
+        reject(new Error(`Connection error: ${err.message}`));
+      }
+    });
   });
 }
 
