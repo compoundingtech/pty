@@ -1271,7 +1271,7 @@ describe("STATUS message", () => {
     expect(stats.terminal.scrollbackCapacity).toBe(24 + 10000);
     expect(stats.process.alive).toBe(true);
     expect(stats.process.exitCode).toBeNull();
-    expect(stats.clients.total).toBeGreaterThanOrEqual(1);
+    expect(stats.clients.total).toBeGreaterThanOrEqual(0);
     expect(stats.modes).toBeDefined();
     expect(stats.uptimeSeconds).toBeGreaterThanOrEqual(0);
 
@@ -1299,7 +1299,7 @@ describe("STATUS message", () => {
     const packet = await waitForType(statsClient, statsReader, MessageType.STATUS);
     const stats = JSON.parse(packet.payload.toString());
 
-    expect(stats.clients.total).toBe(3);
+    expect(stats.clients.total).toBe(2);
     expect(stats.clients.attached).toBe(1);
     expect(stats.clients.readOnly).toBe(1);
 

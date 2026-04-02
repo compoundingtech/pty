@@ -351,7 +351,7 @@ export class PtyServer {
         exitCode: this.exited ? this.exitCode : null,
       },
       clients: {
-        total: this.clients.size,
+        total: attached + readOnly,
         attached,
         readOnly,
       },
