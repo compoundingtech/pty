@@ -236,8 +236,9 @@ export interface PtyHandle {
   /**
    * Read the terminal's cell grid directly. Full fidelity — every attribute
    * xterm parsed is preserved. No serialize round-trip.
+   * @param scrollOffset Lines to scroll back into history (0 = live viewport).
    */
-  readCells(): { char: string; fg: [number, number, number] | null; bg: [number, number, number] | null; bold: boolean; dim: boolean; italic: boolean; underline: boolean }[][];
+  readCells(scrollOffset?: number): { char: string; fg: [number, number, number] | null; bg: [number, number, number] | null; bold: boolean; dim: boolean; italic: boolean; underline: boolean }[][];
   /** Current PTY dimensions. */
   cols: number;
   rows: number;
@@ -251,6 +252,18 @@ export interface PtyHandle {
   onActivity: (() => void) | null;
   /** Update the xterm terminal's color theme. Call when the app theme changes. */
   setTheme(theme: import("./colors.ts").Theme): void;
+  /** Cursor row position (0-indexed, relative to viewport). */
+  readonly cursorRow: number;
+  /** Cursor column position (0-indexed). */
+  readonly cursorCol: number;
+  /** Whether the child process has enabled mouse tracking (modes 1000/1002/1003). */
+  readonly mouseMode: boolean;
+  /** Configured scrollback line count. */
+  readonly scrollback: number;
+  /** Total lines in the buffer (viewport + scrollback history). */
+  readonly bufferLength: number;
+  /** Line index at the top of the live viewport. */
+  readonly baseY: number;
 }
 
 export interface PtyViewNode {

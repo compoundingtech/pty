@@ -88,3 +88,6 @@ export {
 
 // App lifecycle
 export { app, type AppConfig, type App } from "./app.ts";
+
+// Daemon spawn
+export { spawnDaemon } from "../spawn.ts";

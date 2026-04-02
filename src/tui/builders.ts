@@ -305,12 +305,16 @@ function readXtermCells(
   terminal: any,
   rows: number,
   cols: number,
+  scrollOffset: number = 0,
 ): ReturnType<PtyHandle["readCells"]> {
   const buf = terminal.buffer.active;
+  const baseY = buf.baseY as number;
+  const startLine = Math.max(0, baseY - scrollOffset);
   const grid: ReturnType<PtyHandle["readCells"]> = [];
 
   for (let r = 0; r < rows; r++) {
-    const line = buf.getLine(r);
+    const lineIdx = startLine + r;
+    const line = lineIdx < buf.length ? buf.getLine(lineIdx) : null;
     const row: typeof grid[0] = [];
     for (let c = 0; c < cols; c++) {
       if (!line) {
@@ -361,7 +365,7 @@ function readXtermCells(
 export function createPty(
   command: string,
   args: string[] = [],
-  opts?: { cols?: number; rows?: number; cwd?: string; env?: Record<string, string>; theme?: Theme },
+  opts?: { cols?: number; rows?: number; scrollback?: number; cwd?: string; env?: Record<string, string>; theme?: Theme },
 ): PtyHandle {
   // Lazy-import node-pty and @xterm/headless to avoid top-level side effects
   // and keep the module loadable in test environments that don't need PTY.
@@ -372,10 +376,34 @@ export function createPty(
 
   const cols = opts?.cols ?? 80;
   const rows = opts?.rows ?? 24;
+  const scrollbackSize = opts?.scrollback ?? 0;
 
-  const xtermOpts: any = { rows, cols, scrollback: 0, allowProposedApi: true };
+  const xtermOpts: any = { rows, cols, scrollback: scrollbackSize, allowProposedApi: true };
   if (opts?.theme) xtermOpts.theme = themeToXterm(opts.theme);
   const terminal = new TerminalClass(xtermOpts);
+
+  // Track mouse mode via CSI parser (same approach as server.ts)
+  let mouseMode = false;
+  terminal.parser.registerCsiHandler(
+    { prefix: "?", final: "h" },
+    (params: any) => {
+      for (const p of params) {
+        const v = typeof p === "number" ? p : p[0];
+        if (v === 1000 || v === 1002 || v === 1003) mouseMode = true;
+      }
+      return false;
+    },
+  );
+  terminal.parser.registerCsiHandler(
+    { prefix: "?", final: "l" },
+    (params: any) => {
+      for (const p of params) {
+        const v = typeof p === "number" ? p : p[0];
+        if (v === 1000 || v === 1002 || v === 1003) mouseMode = false;
+      }
+      return false;
+    },
+  );
 
   const childEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
@@ -419,7 +447,9 @@ export function createPty(
       }
     },
 
-    readCells() { return readXtermCells(terminal, handle.rows, handle.cols); },
+    readCells(scrollOffset?: number) {
+      return readXtermCells(terminal, handle.rows, handle.cols, scrollOffset ?? 0);
+    },
 
     kill() {
       if (!exited) {
@@ -440,6 +470,12 @@ export function createPty(
     get dirty() { return dirty; },
     set dirty(v: boolean) { dirty = v; },
     onActivity: null,
+    get cursorRow() { return terminal.buffer.active.cursorY; },
+    get cursorCol() { return terminal.buffer.active.cursorX; },
+    get mouseMode() { return mouseMode; },
+    get scrollback() { return scrollbackSize; },
+    get bufferLength() { return terminal.buffer.active.length; },
+    get baseY() { return terminal.buffer.active.baseY; },
   };
 
   return handle;
@@ -459,7 +495,7 @@ export function createPty(
  */
 export async function attachPty(
   name: string,
-  opts?: { cols?: number; rows?: number; theme?: Theme },
+  opts?: { cols?: number; rows?: number; scrollback?: number; theme?: Theme },
 ): Promise<PtyHandle> {
   const net = require("node:net") as typeof import("node:net");
   const xtermMod = require("@xterm/headless") as any;
@@ -471,10 +507,34 @@ export async function attachPty(
 
   const cols = opts?.cols ?? 80;
   const rows = opts?.rows ?? 24;
+  const scrollbackSize = opts?.scrollback ?? 0;
 
-  const xtermOpts: any = { rows, cols, scrollback: 0, allowProposedApi: true };
+  const xtermOpts: any = { rows, cols, scrollback: scrollbackSize, allowProposedApi: true };
   if (opts?.theme) xtermOpts.theme = themeToXterm(opts.theme);
   const terminal = new TerminalClass(xtermOpts);
+
+  // Track mouse mode via CSI parser
+  let mouseMode = false;
+  terminal.parser.registerCsiHandler(
+    { prefix: "?", final: "h" },
+    (params: any) => {
+      for (const p of params) {
+        const v = typeof p === "number" ? p : p[0];
+        if (v === 1000 || v === 1002 || v === 1003) mouseMode = true;
+      }
+      return false;
+    },
+  );
+  terminal.parser.registerCsiHandler(
+    { prefix: "?", final: "l" },
+    (params: any) => {
+      for (const p of params) {
+        const v = typeof p === "number" ? p : p[0];
+        if (v === 1000 || v === 1002 || v === 1003) mouseMode = false;
+      }
+      return false;
+    },
+  );
   const socketPath = getSocketPath(name);
 
   // Connect to the daemon socket
@@ -502,7 +562,9 @@ export async function attachPty(
       }
     },
 
-    readCells() { return readXtermCells(terminal, handle.rows, handle.cols); },
+    readCells(scrollOffset?: number) {
+      return readXtermCells(terminal, handle.rows, handle.cols, scrollOffset ?? 0);
+    },
 
     kill() {
       // Detach only — the daemon keeps the process running
@@ -523,6 +585,12 @@ export async function attachPty(
     get dirty() { return dirty; },
     set dirty(v: boolean) { dirty = v; },
     onActivity: null,
+    get cursorRow() { return terminal.buffer.active.cursorY; },
+    get cursorCol() { return terminal.buffer.active.cursorX; },
+    get mouseMode() { return mouseMode; },
+    get scrollback() { return scrollbackSize; },
+    get bufferLength() { return terminal.buffer.active.length; },
+    get baseY() { return terminal.buffer.active.baseY; },
   };
 
   socket.on("data", (data: Buffer) => {
