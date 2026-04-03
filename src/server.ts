@@ -21,6 +21,7 @@ import {
   getPidPath,
   ensureSessionDir,
   cleanup,
+  cleanupAll,
   writeMetadata,
   readMetadata,
   type SessionMetadata,
@@ -479,6 +480,15 @@ if (process.argv[1]?.endsWith("/server.js")) {
     process.exit(1);
   }
 
+  const isEphemeral = config.ephemeral === true;
+
+  function cleanShutdown(code: number): Promise<never> {
+    return server.close().then(() => {
+      if (isEphemeral) cleanupAll(config.name);
+      process.exit(code);
+    });
+  }
+
   const server = new PtyServer({
     name: config.name,
     command: config.command,
@@ -489,10 +499,10 @@ if (process.argv[1]?.endsWith("/server.js")) {
     cols: config.cols ?? 80,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
-      setTimeout(() => server.close().then(() => process.exit(code)), 500);
+      setTimeout(() => cleanShutdown(code), 500);
     },
   });
 
-  process.on("SIGTERM", () => server.close().then(() => process.exit(0)));
-  process.on("SIGINT", () => server.close().then(() => process.exit(0)));
+  process.on("SIGTERM", () => cleanShutdown(0));
+  process.on("SIGINT", () => cleanShutdown(0));
 }

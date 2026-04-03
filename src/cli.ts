@@ -89,11 +89,13 @@ async function main(): Promise<void> {
       // Parse flags before the -- separator
       let detach = false;
       let attachExisting = false;
+      let ephemeral = false;
       let name: string | null = null;
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
         else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
+        else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
         else break;
         // Note: unknown flags or positional args before -- break the loop
@@ -166,7 +168,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral);
       break;
     }
 
@@ -321,6 +323,22 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "rm":
+    case "remove": {
+      if (args.length < 2) {
+        console.error("Usage: pty rm <name>");
+        process.exit(1);
+      }
+      try {
+        validateName(args[1]);
+      } catch (e: any) {
+        console.error(e.message);
+        process.exit(1);
+      }
+      await cmdRm(args[1]);
+      break;
+    }
+
     case "wrap": {
       if (args[1] === "--list" || args[1] === "-l") {
         cmdWrapList();
@@ -368,7 +386,8 @@ async function cmdRun(
   args: string[],
   detach = false,
   attachExisting = false,
-  displayCommand: string
+  displayCommand: string,
+  ephemeral = false,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -398,7 +417,7 @@ async function cmdRun(
   }
 
   try {
-    await spawnDaemon(name, command, args, displayCommand, previousCwd);
+    await spawnDaemon(name, command, args, displayCommand, previousCwd, ephemeral);
   } finally {
     releaseLock(name);
   }
@@ -693,20 +712,35 @@ async function cmdKill(name: string): Promise<void> {
     process.exit(1);
   }
 
-  if (session.status === "running" && session.pid) {
-    try {
-      process.kill(session.pid, "SIGTERM");
-      console.log(`Session "${name}" killed.`);
-    } catch {
-      console.error(`Failed to kill session "${name}".`);
-    }
-    cleanupSocket(name);
+  if (session.status !== "running" || !session.pid) {
+    console.error(`Session "${name}" is not running. Use "pty rm ${name}" to remove it.`);
+    process.exit(1);
+  }
+
+  try {
+    process.kill(session.pid, "SIGTERM");
+    console.log(`Session "${name}" killed.`);
+  } catch {
+    console.error(`Failed to kill session "${name}".`);
+  }
+  cleanupSocket(name);
+}
+
+async function cmdRm(name: string): Promise<void> {
+  const session = await getSession(name);
+
+  if (!session) {
+    console.error(`Session "${name}" not found.`);
+    process.exit(1);
+  }
+
+  if (session.status === "running") {
+    console.error(`Session "${name}" is still running. Use "pty kill ${name}" first.`);
+    process.exit(1);
   }
 
   cleanupAll(name);
-  if (session.status === "exited") {
-    console.log(`Session "${name}" removed.`);
-  }
+  console.log(`Session "${name}" removed.`);
 }
 
 async function cmdRestart(name: string, force = false): Promise<void> {

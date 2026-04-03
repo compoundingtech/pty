@@ -12,7 +12,8 @@ export async function spawnDaemon(
   command: string,
   args: string[],
   displayCommand: string,
-  cwd?: string
+  cwd?: string,
+  ephemeral = false,
 ): Promise<void> {
   const stdout = process.stdout as tty.WriteStream;
   const rows = stdout.rows ?? 24;
@@ -27,6 +28,7 @@ export async function spawnDaemon(
     cwd: cwd ?? process.cwd(),
     rows,
     cols,
+    ephemeral,
   });
 
   const child = spawn(process.execPath, [serverModule], {
