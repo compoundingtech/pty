@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import { attach, peek, send, queryStats, type StatsResult } from "./client.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
@@ -373,6 +373,21 @@ async function main(): Promise<void> {
     }
 
     default: {
+      // Look for pty-<command> in PATH (like git does with git-<command>)
+      const ext = `pty-${command}`;
+      let extPath: string | null = null;
+      try {
+        extPath = execFileSync("which", [ext], { encoding: "utf8" }).trim();
+      } catch {}
+
+      if (extPath) {
+        const result = spawnSync(extPath, args.slice(1), {
+          stdio: "inherit",
+          env: process.env,
+        });
+        process.exit(result.status ?? 1);
+      }
+
       console.error(`Unknown command: ${command}`);
       usage();
       process.exit(1);
