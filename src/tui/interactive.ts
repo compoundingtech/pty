@@ -112,8 +112,10 @@ const filteredItems = computed<ListItem[]>(() => {
     const cwdResult = fuzzyMatch(filter, cwd);
     const cmdResult = fuzzyMatch(filter, cmd);
     if (!nameResult.match && !cwdResult.match && !cmdResult.match) continue;
-    // Name matches get a large bonus so they always rank above cwd/cmd matches
-    const score = Math.max(
+    // Name matches get a large bonus so they always rank above cwd/cmd matches.
+    // Running sessions get an extra bonus so they always rank above exited ones.
+    const runningBonus = s.status === "running" ? 100000 : 0;
+    const score = runningBonus + Math.max(
       nameResult.match ? nameResult.score + 10000 : 0,
       cwdResult.match ? cwdResult.score : 0,
       cmdResult.match ? cmdResult.score : 0,
@@ -141,9 +143,11 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const cmd = s.metadata
     ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
     : "";
+  const cwdStr = s.metadata?.cwd ? shortPath(s.metadata.cwd) : "";
+  const exitStr = s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "";
   const pathStr = s.status === "running"
-    ? (s.metadata?.cwd ? shortPath(s.metadata.cwd) : "")
-    : (s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "");
+    ? cwdStr
+    : [cwdStr, exitStr].filter(Boolean).join("  ");
 
   const line = `${sel}${icon} ${s.name}  ${pathStr}  ${cmd}`;
   return [text(line, selected ? "accent" : "primary", { bold: selected, truncate: true })];
@@ -202,7 +206,11 @@ const listScreen = screen({
         return true;
       }
       if (item.session) {
-        doAttach(item.session.name);
+        if (item.session.status === "exited") {
+          doRestart(item.session);
+        } else {
+          doAttach(item.session.name);
+        }
         return true;
       }
     }
@@ -489,6 +497,24 @@ function regenerateNameIfAuto(): void {
 // ============================================================
 
 let myApp: ReturnType<typeof app> | null = null;
+
+async function doRestart(session: SessionInfo): Promise<void> {
+  const meta = session.metadata;
+  if (!meta) {
+    cleanupAll(session.name);
+    return;
+  }
+  cleanupAll(session.name);
+  try {
+    await spawnDaemon(session.name, meta.command, meta.args, meta.displayCommand, meta.cwd);
+  } catch {
+    // Refresh list to show updated state
+    const updated = await listSessions();
+    sessions.set(updated);
+    return;
+  }
+  doAttach(session.name);
+}
 
 function doAttach(name: string): void {
   myApp?.pause();

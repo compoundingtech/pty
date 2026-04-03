@@ -541,7 +541,10 @@ async function cmdList(json = false): Promise<void> {
       const code = meta?.exitCode ?? "?";
       const ago = meta?.exitedAt ? timeAgo(new Date(meta.exitedAt)) : "unknown";
       const cwd = meta?.cwd ? shortPath(meta.cwd) : "";
-      console.log(`  ${session.name} (exited with code ${code}, ${ago}) — ${cwd}`);
+      const cmd = meta
+        ? [meta.displayCommand, ...meta.args].join(" ")
+        : "";
+      console.log(`  ${session.name} (exited with code ${code}, ${ago}) — ${cwd} — ${cmd}`);
     }
   }
 }

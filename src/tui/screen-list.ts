@@ -244,8 +244,10 @@ export function renderList(state: ListState): string {
         pathCol = pad(truncate(cwd, pathWidth), pathWidth);
         cmdCol = truncate(cmd, cmdWidth);
       } else {
-        const ago = s.metadata?.exitedAt ? timeAgo(new Date(s.metadata.exitedAt)) : "";
-        pathCol = pad(truncate(`(exited ${ago})`, pathWidth), pathWidth);
+        const cwd = s.metadata?.cwd ? shortPath(s.metadata.cwd) : "";
+        const ago = s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "(exited)";
+        const exitPath = cwd ? `${cwd}  ${ago}` : ago;
+        pathCol = pad(truncate(exitPath, pathWidth), pathWidth);
         cmdCol = truncate(cmd, cmdWidth);
       }
 
