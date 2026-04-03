@@ -52,6 +52,7 @@ pty run -- node server.js                 # start a session (auto-named)
 pty run --name myserver -- node server.js # start with an explicit name
 pty run -d -- node server.js              # start in the background
 pty run -a -- node server.js              # create or attach if already running
+pty run -e -- npm test                    # ephemeral: auto-remove on exit
 
 pty list                                  # show active sessions
 pty list --json                           # show as JSON
@@ -67,8 +68,13 @@ pty send myserver $'hello\n'              # send text with newline (shell syntax
 pty send myserver --seq "git status" --seq key:return  # ordered sequence
 pty send myserver --seq key:ctrl+c        # send control keys
 
+pty stats                                 # live metrics for all sessions
+pty stats myserver                        # stats for a specific session
+pty stats --json                          # stats as JSON
+
 pty restart myserver                      # restart an exited session
-pty kill myserver                         # terminate a session
+pty kill myserver                         # terminate a running session
+pty rm myserver                           # remove an exited session's metadata
 
 pty wrap claude                           # auto-wrap claude in pty sessions
 pty unwrap claude                         # remove the wrapper
