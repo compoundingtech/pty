@@ -23,6 +23,7 @@ _pty() {
     'list:List active sessions'
     'ls:List active sessions'
     'restart:Restart an exited session'
+    'events:Follow terminal events from sessions'
     'help:Show usage information'
   )
 
@@ -59,6 +60,13 @@ _pty() {
         restart)
           _arguments \
             '(-y --yes)'{-y,--yes}'[Skip confirmation for running sessions]' \
+            '1:session:_pty_sessions'
+          ;;
+        events)
+          _arguments \
+            '--all[Follow events from all sessions]' \
+            '--recent[Show recent events and exit]' \
+            '--json[Output raw JSONL]' \
             '1:session:_pty_sessions'
           ;;
         list|ls)

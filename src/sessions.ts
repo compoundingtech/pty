@@ -43,6 +43,10 @@ export function getMetadataPath(name: string): string {
   return path.join(getSessionDir(), `${name}.json`);
 }
 
+export function getEventsPath(name: string): string {
+  return path.join(getSessionDir(), `${name}.events.jsonl`);
+}
+
 export interface SessionMetadata {
   command: string;
   args: string[];
@@ -204,6 +208,9 @@ export function cleanupAll(name: string): void {
   cleanupSocket(name);
   try {
     fs.unlinkSync(getMetadataPath(name));
+  } catch {}
+  try {
+    fs.unlinkSync(getEventsPath(name));
   } catch {}
   releaseLock(name);
 }
