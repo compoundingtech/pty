@@ -27,6 +27,7 @@ import {
   readMetadata,
   type SessionMetadata,
 } from "./sessions.ts";
+import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
 
 interface Client {
   socket: net.Socket;
@@ -88,11 +89,14 @@ export class PtyServer {
   private cursorHidden = false;
   private kittyKeyboardStack: number[] = [];
   private lastResizeTime = 0;
+  private eventWriter: EventWriter;
+  private lastTitle = "";
   readonly ready: Promise<void>;
 
   constructor(options: ServerOptions) {
     this.name = options.name;
     this.options = options;
+    this.eventWriter = new EventWriter(options.name);
 
     // Set up xterm-headless for screen buffer tracking
     this.terminal = new xterm.Terminal({
@@ -111,7 +115,11 @@ export class PtyServer {
         for (const p of params) {
           const v = typeof p === "number" ? p : p[0];
           if (v === 1006) this.sgrMouseMode = true;
-          if (v === 25) this.cursorHidden = false;
+          if (v === 25) {
+            if (this.cursorHidden) this.emitEvent(EventType.CURSOR_VISIBLE);
+            this.cursorHidden = false;
+          }
+          if (v === 1004) this.emitEvent(EventType.FOCUS_REQUEST);
         }
         return false;
       }
@@ -142,6 +150,55 @@ export class PtyServer {
         return false;
       }
     );
+
+    // ── Event detection ──
+
+    this.terminal.onBell(() => {
+      this.emitEvent(EventType.BELL);
+    });
+
+    this.terminal.onTitleChange((title: string) => {
+      if (title !== this.lastTitle) {
+        this.lastTitle = title;
+        this.emitEvent(EventType.TITLE_CHANGE, { value: title });
+      }
+    });
+
+    // iTerm2 desktop notification (OSC 9)
+    this.terminal.parser.registerOscHandler(9, (data: string) => {
+      this.emitEvent(EventType.NOTIFICATION, { body: data, source: "osc9" });
+      return false;
+    });
+
+    // Kitty notification (OSC 99) — key=value;key=value payload
+    this.terminal.parser.registerOscHandler(99, (data: string) => {
+      const fields: Record<string, string> = {};
+      for (const part of data.split(";")) {
+        const eq = part.indexOf("=");
+        if (eq !== -1) {
+          fields[part.slice(0, eq)] = part.slice(eq + 1);
+        }
+      }
+      this.emitEvent(EventType.NOTIFICATION, {
+        title: fields["title"] ?? fields["t"],
+        body: fields["body"] ?? fields["b"],
+        source: "osc99",
+      });
+      return false;
+    });
+
+    // rxvt notification (OSC 777) — notify;title;body
+    this.terminal.parser.registerOscHandler(777, (data: string) => {
+      const parts = data.split(";");
+      if (parts[0] === "notify" && parts.length >= 2) {
+        this.emitEvent(EventType.NOTIFICATION, {
+          title: parts[1],
+          body: parts.slice(2).join(";"),
+          source: "osc777",
+        });
+      }
+      return false;
+    });
 
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
@@ -187,6 +244,7 @@ export class PtyServer {
 
     // Create Unix socket server
     ensureSessionDir();
+    clearEvents(this.name);
     const socketPath = getSocketPath(this.name);
 
     // Remove stale socket if it exists
@@ -435,6 +493,15 @@ export class PtyServer {
     this.terminal.resize(cols - 1, rows);
     this.ptyProcess.resize(cols, rows);
     this.terminal.resize(cols, rows);
+  }
+
+  private emitEvent(type: EventType, fields?: Record<string, unknown>): void {
+    this.eventWriter.append({
+      session: this.name,
+      type,
+      ts: new Date().toISOString(),
+      ...fields,
+    } as EventRecord);
   }
 
   private broadcast(data: Buffer): void {

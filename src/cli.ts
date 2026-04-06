@@ -17,6 +17,7 @@ import {
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { runInteractive } from "./tui/interactive.ts";
+import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
 
 function usage(): void {
   console.log(`Usage:
@@ -35,6 +36,10 @@ function usage(): void {
   pty send <name> --with-delay 0.5 --seq ...     Delay between each --seq item
   pty restart <name>                       Restart a session (prompts if running)
   pty restart -y <name>                    Restart without confirmation
+  pty events <name>                        Follow events from a session
+  pty events --all                         Follow events from all sessions
+  pty events --recent <name>               Show recent events and exit
+  pty events --json <name>                 Output raw JSONL
   pty list                                 List active sessions
   pty list --json                          List sessions as JSON
   pty kill <name>                          Kill or remove a session
@@ -286,6 +291,37 @@ async function main(): Promise<void> {
       }
 
       send({ name: sendName, data, delayMs: delaySecs != null ? delaySecs * 1000 : undefined });
+      break;
+    }
+
+    case "events": {
+      let all = false;
+      let recent = false;
+      let json = false;
+      let ei = 1;
+      while (ei < args.length && args[ei].startsWith("-")) {
+        if (args[ei] === "--all") { all = true; ei++; }
+        else if (args[ei] === "--recent") { recent = true; ei++; }
+        else if (args[ei] === "--json") { json = true; ei++; }
+        else break;
+      }
+      const eventsName = args[ei];
+
+      if (!all && !eventsName) {
+        console.error("Usage: pty events [--all] [--recent] [--json] [<name>]");
+        process.exit(1);
+      }
+
+      if (eventsName) {
+        try {
+          validateName(eventsName);
+        } catch (e: any) {
+          console.error(e.message);
+          process.exit(1);
+        }
+      }
+
+      await cmdEvents(eventsName ?? null, { all, recent, json });
       break;
     }
 
@@ -824,6 +860,53 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   await spawnDaemon(name, meta.command, meta.args, meta.displayCommand, meta.cwd);
   console.log(`Session "${name}" restarted.`);
   doAttach(name);
+}
+
+async function cmdEvents(
+  name: string | null,
+  opts: { all: boolean; recent: boolean; json: boolean }
+): Promise<void> {
+  if (opts.recent) {
+    if (!name) {
+      console.error("--recent requires a session name.");
+      process.exit(1);
+    }
+    const events = readRecentEvents(name);
+    if (events.length === 0) {
+      console.log(`No recent events for "${name}".`);
+      return;
+    }
+    for (const event of events) {
+      console.log(opts.json ? JSON.stringify(event) : formatEvent(event));
+    }
+    return;
+  }
+
+  // Follow mode: verify session exists if a specific name was given
+  if (name) {
+    const session = await getSession(name);
+    if (!session) {
+      console.error(`Session "${name}" not found.`);
+      process.exit(1);
+    }
+  }
+
+  const follower = new EventFollower({
+    names: opts.all ? undefined : name ? [name] : undefined,
+    onEvent: (event) => {
+      console.log(opts.json ? JSON.stringify(event) : formatEvent(event));
+    },
+  });
+
+  follower.start();
+
+  process.on("SIGINT", () => {
+    follower.stop();
+    process.exit(0);
+  });
+
+  // Keep the process alive while watchers are active
+  setInterval(() => {}, 60_000);
 }
 
 async function cmdTest(args: string[]): Promise<void> {

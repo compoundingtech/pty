@@ -6,7 +6,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach peek send kill list restart help"
+  commands="run attach peek send kill list restart events help"
 
   # Complete subcommand
   if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -16,7 +16,7 @@ _pty() {
 
   # Complete session names for commands that take them
   case "${COMP_WORDS[1]}" in
-    attach|a|peek|send|kill|restart)
+    attach|a|peek|send|kill|restart|events)
       local session_dir="${PTY_SESSION_DIR:-${HOME}/.local/state/pty}"
       if [[ -d "${session_dir}" ]]; then
         local names
@@ -30,6 +30,7 @@ _pty() {
           peek) COMPREPLY=($(compgen -W "--follow -f --plain" -- "${cur}")) ;;
           send) COMPREPLY=($(compgen -W "--seq --with-delay" -- "${cur}")) ;;
           restart) COMPREPLY=($(compgen -W "--yes -y" -- "${cur}")) ;;
+          events) COMPREPLY=($(compgen -W "--all --recent --json" -- "${cur}")) ;;
         esac
       fi
       ;;

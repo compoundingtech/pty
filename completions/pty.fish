@@ -37,6 +37,7 @@ complete -c pty -n __pty_needs_command -a send -d 'Send text or keys to a sessio
 complete -c pty -n __pty_needs_command -a kill -d 'Kill or remove a session'
 complete -c pty -n __pty_needs_command -a list -d 'List active sessions'
 complete -c pty -n __pty_needs_command -a restart -d 'Restart a session'
+complete -c pty -n __pty_needs_command -a events -d 'Follow terminal events from sessions'
 complete -c pty -n __pty_needs_command -a help -d 'Show usage information'
 
 # run: flags and file completion for the command argument
@@ -65,6 +66,12 @@ complete -c pty -n '__pty_using_command kill' -a '(__pty_sessions)' -d 'Session'
 # restart: session names and flags
 complete -c pty -n '__pty_using_command restart' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command restart' -s y -l yes -d 'Skip confirmation'
+
+# events: session names and flags
+complete -c pty -n '__pty_using_command events' -a '(__pty_sessions)' -d 'Session'
+complete -c pty -n '__pty_using_command events' -l all -d 'Follow events from all sessions'
+complete -c pty -n '__pty_using_command events' -l recent -d 'Show recent events and exit'
+complete -c pty -n '__pty_using_command events' -l json -d 'Output raw JSONL'
 
 # list: flags
 complete -c pty -n '__pty_using_command list' -l json -d 'Output as JSON'

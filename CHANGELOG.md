@@ -6,6 +6,15 @@
 - Set `PTY_SESSION` env var in child processes so they can detect they're inside a pty session
 - Add CPU and memory usage to `pty stats` (child process and daemon, via `ps`)
 - Add process PIDs to `pty stats` output
+- Add terminal event logging — sessions capture bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions to a per-session JSONL file
+- Add `pty events <name>` command to follow events in real-time (like `tail -f`)
+- Add `pty events --all` to follow events from all sessions, interleaved
+- Add `pty events --recent <name>` to show recent events and exit
+- Add `pty events --json` for machine-readable JSONL output
+- Deduplicate consecutive identical title change events
+- Event files auto-truncate at 1,000 lines (keeping most recent 500)
+- Event file I/O is fully async (non-blocking write queue)
+- Event files are cleaned up with the existing 24-hour dead session TTL
 
 ## 0.4.1
 
