@@ -125,7 +125,7 @@ export function peek(options: PeekOptions): void {
             stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM);
           }
           if (follow) {
-            stdout.write(`\r\n[session exited with code ${code}]\r\n`);
+            stdout.write(`\r\n[${options.name} exited with code ${code}]\r\n`);
           }
           options.onExit?.(code);
           return;
@@ -402,7 +402,7 @@ export function attach(options: AttachOptions): void {
           exitCode = decodeExit(packet.payload);
           exitHandled = true;
           cleanExit();
-          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[session exited with code ${exitCode}]\r\n`);
+          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} exited with code ${exitCode}]\r\n`);
           options.onExit?.(exitCode);
           return;
       }
