@@ -96,4 +96,4 @@ export {
 } from "../sessions.ts";
 
 // Daemon spawning
-export { spawnDaemon } from "../spawn.ts";
+export { spawnDaemon, type SpawnDaemonOptions } from "../spawn.ts";

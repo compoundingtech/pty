@@ -480,7 +480,7 @@ async function cmdRun(
   }
 
   try {
-    await spawnDaemon(name, command, args, displayCommand, previousCwd, ephemeral);
+    await spawnDaemon({ name, command, args, displayCommand, cwd: previousCwd, ephemeral });
   } finally {
     releaseLock(name);
   }
@@ -551,7 +551,7 @@ async function handleDeadSession(
 
   // Restart
   cleanupAll(session.name);
-  await spawnDaemon(session.name, meta.command, meta.args, meta.displayCommand, meta.cwd);
+  await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
   console.log(`Session "${session.name}" restarted.`);
   doAttach(session.name);
 }
@@ -860,7 +860,7 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   }
 
   cleanupAll(name);
-  await spawnDaemon(name, meta.command, meta.args, meta.displayCommand, meta.cwd);
+  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
   console.log(`Session "${name}" restarted.`);
   doAttach(name);
 }

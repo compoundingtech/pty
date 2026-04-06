@@ -124,6 +124,74 @@ pty events --json myserver       # raw JSONL output
 
 Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
 
+## Client API
+
+@myobie/pty exposes a programmatic TypeScript API for building apps on top of pty sessions. Import from `@myobie/pty/client`.
+
+```typescript
+import {
+  spawnDaemon, listSessions, getSession,
+  SessionConnection, sendData, peekScreen, queryStats,
+  EventFollower, readRecentEvents,
+  resolveKey,
+} from "@myobie/pty/client";
+```
+
+### Managing sessions
+
+```typescript
+// Create a session
+await spawnDaemon({
+  name: "myserver",
+  command: "node",
+  args: ["server.js"],
+  displayCommand: "node server.js",
+  cwd: "/path/to/project",
+  rows: 24,
+  cols: 80,
+});
+
+// List and query
+const sessions = await listSessions();
+const stats = await queryStats("myserver");
+```
+
+### Connecting to a session
+
+`SessionConnection` provides a bidirectional, event-driven connection without taking over stdin/stdout — ideal for GUI apps, multiplexers, or web interfaces:
+
+```typescript
+const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
+const initialScreen = await conn.connect();
+
+conn.on("data", (data) => myTerminalView.write(data));
+conn.on("exit", (code) => console.log(`Exited: ${code}`));
+
+conn.write("hello\r");
+conn.press("ctrl+c");
+conn.resize(30, 100);
+conn.disconnect();
+```
+
+For simpler operations:
+
+```typescript
+await sendData({ name: "myserver", data: ["hello\r"] });
+const screen = await peekScreen({ name: "myserver", plain: true });
+```
+
+### Following events
+
+```typescript
+const follower = new EventFollower({
+  names: ["myserver"],
+  onEvent: (event) => console.log(event.type, event.ts),
+});
+follower.start();
+```
+
+See **[docs/client.md](docs/client.md)** for the full API reference.
+
 ## Testing Library
 
 @myobie/pty includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.

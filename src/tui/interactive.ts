@@ -506,7 +506,7 @@ async function doRestart(session: SessionInfo): Promise<void> {
   }
   cleanupAll(session.name);
   try {
-    await spawnDaemon(session.name, meta.command, meta.args, meta.displayCommand, meta.cwd);
+    await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
   } catch {
     // Refresh list to show updated state
     const updated = await listSessions();
@@ -589,7 +589,7 @@ async function doCreate(dir: string, name: string, command: string): Promise<voi
   const shellArgs = ["-c", command];
 
   try {
-    await spawnDaemon(name, shellCmd, shellArgs, command, dir);
+    await spawnDaemon({ name, command: shellCmd, args: shellArgs, displayCommand: command, cwd: dir });
   } catch (e: any) {
     releaseLock(name);
     console.error(e.message);

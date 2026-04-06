@@ -12,33 +12,33 @@ export const EventType = {
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
 
-interface EventBase {
+export interface EventBase {
   session: string;
   type: EventType;
   ts: string;
 }
 
-interface BellEvent extends EventBase {
+export interface BellEvent extends EventBase {
   type: "bell";
 }
 
-interface TitleChangeEvent extends EventBase {
+export interface TitleChangeEvent extends EventBase {
   type: "title_change";
   value: string;
 }
 
-interface NotificationEvent extends EventBase {
+export interface NotificationEvent extends EventBase {
   type: "notification";
   title?: string;
   body?: string;
   source?: "osc9" | "osc99" | "osc777";
 }
 
-interface FocusRequestEvent extends EventBase {
+export interface FocusRequestEvent extends EventBase {
   type: "focus_request";
 }
 
-interface CursorVisibleEvent extends EventBase {
+export interface CursorVisibleEvent extends EventBase {
   type: "cursor_visible";
 }
 

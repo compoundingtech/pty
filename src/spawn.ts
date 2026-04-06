@@ -7,28 +7,32 @@ import { getSocketPath } from "./sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export async function spawnDaemon(
-  name: string,
-  command: string,
-  args: string[],
-  displayCommand: string,
-  cwd?: string,
-  ephemeral = false,
-): Promise<void> {
+export interface SpawnDaemonOptions {
+  name: string;
+  command: string;
+  args: string[];
+  displayCommand: string;
+  cwd?: string;
+  ephemeral?: boolean;
+  rows?: number;
+  cols?: number;
+}
+
+export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   const stdout = process.stdout as tty.WriteStream;
-  const rows = stdout.rows ?? 24;
-  const cols = stdout.columns ?? 80;
+  const rows = options.rows ?? stdout.rows ?? 24;
+  const cols = options.cols ?? stdout.columns ?? 80;
 
   const serverModule = path.join(__dirname, "server.js");
   const config = JSON.stringify({
-    name,
-    command,
-    args,
-    displayCommand,
-    cwd: cwd ?? process.cwd(),
+    name: options.name,
+    command: options.command,
+    args: options.args,
+    displayCommand: options.displayCommand,
+    cwd: options.cwd ?? process.cwd(),
     rows,
     cols,
-    ephemeral,
+    ephemeral: options.ephemeral ?? false,
   });
 
   const child = spawn(process.execPath, [serverModule], {
@@ -54,7 +58,7 @@ export async function spawnDaemon(
   (child.stderr as any)?.unref?.();
   child.unref();
 
-  await waitForSocket(name, 3000, () => {
+  await waitForSocket(options.name, 3000, () => {
     if (earlyExit) {
       const details = stderrOutput.trim();
       const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;

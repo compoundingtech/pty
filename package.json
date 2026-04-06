@@ -36,6 +36,10 @@
     "./tui": {
       "types": "./dist/tui/index.d.ts",
       "default": "./dist/tui/index.js"
+    },
+    "./client": {
+      "types": "./dist/client-api.d.ts",
+      "default": "./dist/client-api.js"
     }
   },
   "scripts": {

@@ -2,10 +2,27 @@
 
 ## Unreleased
 
+### Client API (`@myobie/pty/client`)
+- New `@myobie/pty/client` entry point for programmatic session management — no TUI framework dependency required
+- `SessionConnection` class for bidirectional session connections without taking over stdin/stdout
+- `sendData()` — Promise-based alternative to CLI send (no `process.exit()`)
+- `peekScreen()` — Promise-based screen capture (no stdout writes)
+- Export `queryStats`, `attach`, `peek`, `send` from client API
+- Export `PtyServer` and `ServerOptions` for embedding
+- Export events system: `EventType`, `EventRecord`, `EventFollower`, `readRecentEvents`, `formatEvent`, and all event subtypes
+- Export key resolution: `resolveKey`, `parseSeqValue`
+- Export session helpers: `validateName`, `cleanupAll`, `cleanupSocket`, `getSocketPath`
+- Export protocol types: `PacketReader`, `MessageType`, `Packet`
+- `spawnDaemon` now takes an options object with optional `rows`/`cols` (breaking change from positional args)
+
+### CLI improvements
 - Prevent accidental session nesting: `pty run` inside an existing session execs the command directly instead of creating a nested session (`-d` bypasses the check)
 - Set `PTY_SESSION` env var in child processes so they can detect they're inside a pty session
 - Add CPU and memory usage to `pty stats` (child process and daemon, via `ps`)
 - Add process PIDs to `pty stats` output
+- Gracefully handle older daemons that don't report resource usage
+
+### Events
 - Add terminal event logging — sessions capture bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions to a per-session JSONL file
 - Add `pty events <name>` command to follow events in real-time (like `tail -f`)
 - Add `pty events --all` to follow events from all sessions, interleaved
