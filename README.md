@@ -70,7 +70,12 @@ pty send myserver --seq key:ctrl+c        # send control keys
 
 pty stats                                 # live metrics for all sessions
 pty stats myserver                        # stats for a specific session
-pty stats --json                          # stats as JSON
+pty stats --json                          # stats as JSON (includes CPU, memory, PIDs)
+
+pty events myserver                       # follow events in real-time
+pty events --all                          # follow events from all sessions
+pty events --recent myserver              # show recent events and exit
+pty events --json myserver                # output raw JSONL
 
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
@@ -99,6 +104,25 @@ export PATH="$HOME/.local/pty/bin:$PATH"
 ```
 
 Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
+
+### Nesting Prevention
+
+If you run `pty run` (or a wrapped command) inside an existing pty session, pty detects the nesting via the `PTY_SESSION` environment variable and runs the command directly instead of creating a session-inside-a-session. This means wrapped commands "just work" inside pty sessions without double-wrapping.
+
+Use `pty run -d` to explicitly create a background session from inside another session.
+
+### Events
+
+Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — to per-session JSONL files.
+
+```sh
+pty events myserver              # follow events live (like tail -f)
+pty events --all                 # follow all sessions, interleaved
+pty events --recent myserver     # dump recent events and exit
+pty events --json myserver       # raw JSONL output
+```
+
+Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
 
 ## Testing Library
 

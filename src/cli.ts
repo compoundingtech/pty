@@ -741,12 +741,15 @@ function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   console.log(`  Command:    ${cmd}`);
   console.log(`  CWD:        ${cwd}`);
   console.log(`  Uptime:     ${formatUptime(stats.uptimeSeconds)}`);
-  console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}${stats.process.pid ? ` (pid ${stats.process.pid})` : ""}`);
-  if (stats.process.resources) {
+  const pidSuffix = stats.process?.pid ? ` (pid ${stats.process.pid})` : "";
+  console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}${pidSuffix}`);
+  if (stats.process?.resources) {
     console.log(`  CPU:        ${stats.process.resources.cpuPercent.toFixed(1)}%`);
     console.log(`  Memory:     ${formatMemory(stats.process.resources.rssKb)}`);
   }
-  console.log(`  Daemon:     pid ${stats.daemon.pid}${stats.daemon.resources ? `, ${formatMemory(stats.daemon.resources.rssKb)}` : ""}`);
+  if (stats.daemon) {
+    console.log(`  Daemon:     pid ${stats.daemon.pid}${stats.daemon.resources ? `, ${formatMemory(stats.daemon.resources.rssKb)}` : ""}`);
+  }
   console.log(`  Terminal:   ${stats.terminal.cols}x${stats.terminal.rows}`);
   console.log(`  Cursor:     row ${stats.terminal.cursorY}, col ${stats.terminal.cursorX}`);
   console.log(`  Scrollback: ${stats.terminal.scrollbackUsed} / ${stats.terminal.scrollbackCapacity} lines`);
