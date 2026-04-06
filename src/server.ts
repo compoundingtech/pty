@@ -116,6 +116,20 @@ export class PtyServer {
       }
     );
 
+    // Respond to DA1 (Primary Device Attribute) queries from the child process.
+    // Shells like fish 4.x send ESC[c at startup and block for up to 10s waiting
+    // for a response. Since xterm-headless doesn't reply, we intercept the query
+    // in the output stream and write a VT220 response back to the pty process.
+    this.terminal.parser.registerCsiHandler(
+      { final: "c" },
+      (params) => {
+        if (params.length === 0 || params[0] === 0) {
+          this.ptyProcess.write("\x1b[?62;22c");
+        }
+        return false;
+      }
+    );
+
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
