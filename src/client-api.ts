@@ -3,7 +3,7 @@
 
 // Session management
 export {
-  listSessions, getSession, validateName,
+  listSessions, getSession, gc, validateName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
   type SessionInfo, type SessionMetadata,

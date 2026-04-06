@@ -11,11 +11,12 @@
 - Export `PtyServer` and `ServerOptions` for embedding
 - Export events system: `EventType`, `EventRecord`, `EventFollower`, `readRecentEvents`, `formatEvent`, and all event subtypes
 - Export key resolution: `resolveKey`, `parseSeqValue`
-- Export session helpers: `validateName`, `cleanupAll`, `cleanupSocket`, `getSocketPath`
+- Export session helpers: `gc`, `validateName`, `cleanupAll`, `cleanupSocket`, `getSocketPath`
 - Export protocol types: `PacketReader`, `MessageType`, `Packet`
 - `spawnDaemon` now takes an options object with optional `rows`/`cols` (breaking change from positional args)
 
 ### CLI improvements
+- Add `pty gc` command to remove all exited sessions at once
 - Prevent accidental session nesting: `pty run` inside an existing session execs the command directly instead of creating a nested session (`-d` bypasses the check)
 - Set `PTY_SESSION` env var in child processes so they can detect they're inside a pty session
 - Add CPU and memory usage to `pty stats` (child process and daemon, via `ps`)

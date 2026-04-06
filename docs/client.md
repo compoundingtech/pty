@@ -28,6 +28,15 @@ Returns the session directory path (`PTY_SESSION_DIR` env var or `~/.local/state
 
 Returns the Unix socket path for a session.
 
+### `gc(): Promise<string[]>`
+
+Remove all exited sessions. Returns the names of removed sessions.
+
+```typescript
+const removed = await gc();
+console.log(`Cleaned up ${removed.length} sessions`);
+```
+
 ### `cleanupSocket(name: string): void`
 
 Remove a session's `.sock` and `.pid` files.

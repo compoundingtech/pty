@@ -8,6 +8,7 @@ import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
   getSession,
+  gc,
   cleanupAll,
   cleanupSocket,
   validateName,
@@ -43,6 +44,7 @@ function usage(): void {
   pty list                                 List active sessions
   pty list --json                          List sessions as JSON
   pty kill <name>                          Kill or remove a session
+  pty gc                                   Remove all exited sessions
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -368,6 +370,11 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       await cmdKill(args[1]);
+      break;
+    }
+
+    case "gc": {
+      await cmdGc();
       break;
     }
 
@@ -820,6 +827,20 @@ async function cmdRm(name: string): Promise<void> {
 
   cleanupAll(name);
   console.log(`Session "${name}" removed.`);
+}
+
+async function cmdGc(): Promise<void> {
+  const removed = await gc();
+
+  if (removed.length === 0) {
+    console.log("No exited sessions to clean up.");
+    return;
+  }
+
+  for (const name of removed) {
+    console.log(`Removed: ${name}`);
+  }
+  console.log(`Cleaned up ${removed.length} exited session${removed.length === 1 ? "" : "s"}.`);
 }
 
 async function cmdRestart(name: string, force = false): Promise<void> {

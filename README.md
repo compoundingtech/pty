@@ -80,6 +80,7 @@ pty events --json myserver                # output raw JSONL
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
+pty gc                                    # remove all exited sessions
 
 pty wrap claude                           # auto-wrap claude in pty sessions
 pty unwrap claude                         # remove the wrapper

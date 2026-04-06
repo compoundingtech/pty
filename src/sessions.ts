@@ -155,6 +155,16 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
   return sessions.find((s) => s.name === name) ?? null;
 }
 
+/** Remove all exited sessions. Returns the names of removed sessions. */
+export async function gc(): Promise<string[]> {
+  const sessions = await listSessions();
+  const exited = sessions.filter((s) => s.status === "exited");
+  for (const s of exited) {
+    cleanupAll(s.name);
+  }
+  return exited.map((s) => s.name);
+}
+
 function readPid(name: string): number | null {
   try {
     const content = fs.readFileSync(getPidPath(name), "utf-8").trim();
