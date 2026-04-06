@@ -185,6 +185,11 @@ export function send(options: SendOptions): void {
   });
 }
 
+export interface ProcessResources {
+  rssKb: number;
+  cpuPercent: number;
+}
+
 export interface StatsResult {
   name: string;
   terminal: {
@@ -195,7 +200,16 @@ export interface StatsResult {
     scrollbackUsed: number;
     scrollbackCapacity: number;
   };
-  process: { alive: boolean; exitCode: number | null };
+  process: {
+    alive: boolean;
+    exitCode: number | null;
+    pid: number | null;
+    resources: ProcessResources | null;
+  };
+  daemon: {
+    pid: number;
+    resources: ProcessResources | null;
+  };
   clients: { total: number; attached: number; readOnly: number };
   modes: {
     sgrMouse: boolean;

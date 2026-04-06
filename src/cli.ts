@@ -144,6 +144,18 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
+      // Nesting prevention: if inside a pty session and not detaching, exec directly
+      if (process.env.PTY_SESSION && !detach) {
+        console.error(
+          `Already inside pty session "${process.env.PTY_SESSION}", running directly.`
+        );
+        const result = spawnSync(cmd, cmdArgs, {
+          stdio: "inherit",
+          env: process.env,
+        });
+        process.exit(result.status ?? 1);
+      }
+
       // Auto-generate name if not provided
       if (!name) {
         const sessions = await listSessions();
@@ -693,7 +705,12 @@ function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   console.log(`  Command:    ${cmd}`);
   console.log(`  CWD:        ${cwd}`);
   console.log(`  Uptime:     ${formatUptime(stats.uptimeSeconds)}`);
-  console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}`);
+  console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}${stats.process.pid ? ` (pid ${stats.process.pid})` : ""}`);
+  if (stats.process.resources) {
+    console.log(`  CPU:        ${stats.process.resources.cpuPercent.toFixed(1)}%`);
+    console.log(`  Memory:     ${formatMemory(stats.process.resources.rssKb)}`);
+  }
+  console.log(`  Daemon:     pid ${stats.daemon.pid}${stats.daemon.resources ? `, ${formatMemory(stats.daemon.resources.rssKb)}` : ""}`);
   console.log(`  Terminal:   ${stats.terminal.cols}x${stats.terminal.rows}`);
   console.log(`  Cursor:     row ${stats.terminal.cursorY}, col ${stats.terminal.cursorX}`);
   console.log(`  Scrollback: ${stats.terminal.scrollbackUsed} / ${stats.terminal.scrollbackCapacity} lines`);
@@ -704,6 +721,14 @@ function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   if (stats.modes.cursorHidden) modes.push("cursor hidden");
   if (stats.modes.kittyKeyboard) modes.push(`kitty keyboard (flags: ${stats.modes.kittyKeyboardFlags.join(",")})`);
   console.log(`  Modes:      ${modes.length > 0 ? modes.join(", ") : "none"}`);
+}
+
+function formatMemory(rssKb: number): string {
+  if (rssKb < 1024) return `${rssKb} KB`;
+  const mb = rssKb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(2)} GB`;
 }
 
 function formatUptime(seconds: number | null): string {

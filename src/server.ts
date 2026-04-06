@@ -1,5 +1,6 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import * as pty from "node-pty";
 // @xterm packages are CJS-only. Named imports fail under Node's native ESM
 // loader (Node v24+), so we use default imports + separate type imports.
@@ -48,6 +49,29 @@ export interface ServerOptions {
 }
 
 const LAST_LINES_COUNT = 20;
+
+export interface ProcessResources {
+  rssKb: number;       // Resident set size in KB
+  cpuPercent: number;  // CPU usage percentage
+}
+
+/** Query CPU and memory usage for a process via ps. Returns null on failure. */
+function queryProcessResources(pid: number): ProcessResources | null {
+  try {
+    const output = execFileSync("ps", ["-o", "rss=,pcpu=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 1000,
+    }).trim();
+    const parts = output.split(/\s+/);
+    if (parts.length < 2) return null;
+    return {
+      rssKb: parseInt(parts[0], 10),
+      cpuPercent: parseFloat(parts[1]),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export class PtyServer {
   private terminal: Terminal;
@@ -124,6 +148,7 @@ export class PtyServer {
     // `exec "$@"` replaces the shell with the actual process.
     const childEnv = { ...process.env };
     delete childEnv.PTY_SERVER_CONFIG;
+    childEnv.PTY_SESSION = options.name;
     try {
       this.ptyProcess = pty.spawn(
         "/bin/sh",
@@ -337,6 +362,9 @@ export class PtyServer {
       ? Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000)
       : null;
 
+    const childPid = this.exited ? null : this.ptyProcess.pid;
+    const daemonPid = process.pid;
+
     return {
       name: this.name,
       terminal: {
@@ -350,6 +378,12 @@ export class PtyServer {
       process: {
         alive: !this.exited,
         exitCode: this.exited ? this.exitCode : null,
+        pid: childPid,
+        resources: childPid ? queryProcessResources(childPid) : null,
+      },
+      daemon: {
+        pid: daemonPid,
+        resources: queryProcessResources(daemonPid),
       },
       clients: {
         total: attached + readOnly,

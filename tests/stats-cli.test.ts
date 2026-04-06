@@ -118,6 +118,9 @@ describe("pty stats CLI", () => {
     expect(output).toContain("Process:");
     expect(output).toContain("Modes:");
     expect(output).toContain("running");
+    expect(output).toContain("CPU:");
+    expect(output).toContain("Memory:");
+    expect(output).toContain("Daemon:");
   }, 15000);
 
   it("returns valid JSON with --json flag", async () => {
@@ -134,6 +137,14 @@ describe("pty stats CLI", () => {
     expect(stats.terminal.rows).toBe(24);
     expect(stats.terminal.scrollbackCapacity).toBe(24 + 10000);
     expect(stats.process.alive).toBe(true);
+    expect(stats.process.pid).toBeTypeOf("number");
+    expect(stats.process.resources).toBeDefined();
+    expect(stats.process.resources.rssKb).toBeTypeOf("number");
+    expect(stats.process.resources.cpuPercent).toBeTypeOf("number");
+    expect(stats.daemon).toBeDefined();
+    expect(stats.daemon.pid).toBeTypeOf("number");
+    expect(stats.daemon.resources).toBeDefined();
+    expect(stats.daemon.resources.rssKb).toBeTypeOf("number");
     expect(stats.clients).toBeDefined();
     expect(stats.modes).toBeDefined();
   }, 15000);
@@ -170,5 +181,39 @@ describe("pty stats CLI", () => {
 
     const output = runStats(dir, name);
     expect(output).toContain("exited");
+  }, 15000);
+
+  it("reports resource usage with reasonable values", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat");
+
+    const output = runStats(dir, "--json", name);
+    const stats = JSON.parse(output);
+
+    // Child process resources
+    expect(stats.process.resources.rssKb).toBeGreaterThan(0);
+    expect(stats.process.resources.cpuPercent).toBeGreaterThanOrEqual(0);
+
+    // Daemon resources
+    expect(stats.daemon.resources.rssKb).toBeGreaterThan(0);
+    expect(stats.daemon.resources.cpuPercent).toBeGreaterThanOrEqual(0);
+
+    // PIDs should be positive integers
+    expect(stats.process.pid).toBeGreaterThan(0);
+    expect(stats.daemon.pid).toBeGreaterThan(0);
+    expect(stats.process.pid).not.toBe(stats.daemon.pid);
+  }, 15000);
+
+  it("does not show CPU/Memory for exited sessions", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "true"); // exits immediately
+    await new Promise((r) => setTimeout(r, 1000)); // wait for exit
+
+    const output = runStats(dir, name);
+    expect(output).toContain("exited");
+    expect(output).not.toContain("CPU:");
+    expect(output).not.toContain("Memory:");
   }, 15000);
 });

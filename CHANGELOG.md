@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Prevent accidental session nesting: `pty run` inside an existing session execs the command directly instead of creating a nested session (`-d` bypasses the check)
+- Set `PTY_SESSION` env var in child processes so they can detect they're inside a pty session
+- Add CPU and memory usage to `pty stats` (child process and daemon, via `ps`)
+- Add process PIDs to `pty stats` output
+
 ## 0.4.1
 
 - Add `pty stats` command for live session metrics (terminal size, scrollback, clients, modes, uptime)
