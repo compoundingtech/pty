@@ -125,6 +125,10 @@ pty events --json myserver       # raw JSONL output
 
 Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
 
+### Plugins
+
+Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-foo` executable in your `$PATH`, pty will run it with the remaining arguments. This lets you build your own subcommands without modifying pty.
+
 ## Client API
 
 @myobie/pty exposes a programmatic TypeScript API for building apps on top of pty sessions. Import from `@myobie/pty/client`.

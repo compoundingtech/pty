@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 ### Client API (`@myobie/pty/client`)
 - New `@myobie/pty/client` entry point for programmatic session management — no TUI framework dependency required
@@ -17,11 +17,13 @@
 
 ### CLI improvements
 - Add `pty gc` command to remove all exited sessions at once
+- Git-style plugin support: `pty <anything>` looks for `pty-<anything>` in PATH and runs it, forwarding remaining args
 - Prevent accidental session nesting: `pty run` inside an existing session execs the command directly instead of creating a nested session (`-d` bypasses the check)
 - Set `PTY_SESSION` env var in child processes so they can detect they're inside a pty session
 - Add CPU and memory usage to `pty stats` (child process and daemon, via `ps`)
 - Add process PIDs to `pty stats` output
 - Gracefully handle older daemons that don't report resource usage
+- Exit messages now include the session name (`[myserver exited with code 0]`)
 
 ### Events
 - Add terminal event logging — sessions capture bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions to a per-session JSONL file
@@ -33,6 +35,13 @@
 - Event files auto-truncate at 1,000 lines (keeping most recent 500)
 - Event file I/O is fully async (non-blocking write queue)
 - Event files are cleaned up with the existing 24-hour dead session TTL
+
+### Fixes
+- Respond to DA1 (Primary Device Attribute) queries so fish shell 4.x starts in under 50ms instead of blocking 10s at startup (#5)
+- Fix postinstall `spawn-helper` chmod to work under pnpm's global virtual store layout, replacing the broken relative-path `chmod` with a proper Node.js script that uses `createRequire` to find node-pty regardless of layout (#8, thanks @schickling)
+
+### Tests
+- Add shell integration tests covering bash, zsh, and fish startup
 
 ## 0.4.1
 
