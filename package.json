@@ -22,6 +22,7 @@
     "dist/",
     "completions/",
     "docs/",
+    "scripts/postinstall.js",
     "README.md",
     "LICENSE"
   ],
@@ -45,7 +46,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build",
-    "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
+    "postinstall": "node scripts/postinstall.js",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",
