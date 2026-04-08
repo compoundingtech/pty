@@ -74,6 +74,32 @@ function queryProcessResources(pid: number): ProcessResources | null {
   }
 }
 
+function describeInvalidCwd(cwd: string): string | undefined {
+  if (cwd.length === 0) return "Working directory is empty.";
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(cwd);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      return `Working directory does not exist: ${cwd}`;
+    }
+    return `Working directory is not accessible: ${cwd} (${err?.message ?? String(err)})`;
+  }
+
+  if (!stats.isDirectory()) {
+    return `Working directory is not a directory: ${cwd}`;
+  }
+
+  try {
+    fs.accessSync(cwd, fs.constants.X_OK);
+  } catch {
+    return `Working directory is not searchable: ${cwd}`;
+  }
+
+  return undefined;
+}
+
 export class PtyServer {
   private terminal: Terminal;
   private serialize: SerializeAddon;
@@ -220,6 +246,14 @@ export class PtyServer {
     const childEnv = { ...process.env };
     delete childEnv.PTY_SERVER_CONFIG;
     childEnv.PTY_SESSION = options.name;
+
+    const invalidCwd = describeInvalidCwd(options.cwd);
+    if (invalidCwd !== undefined) {
+      throw new Error(
+        `${invalidCwd}\nCannot start session "${options.name}" for command "${options.command}".`
+      );
+    }
+
     try {
       this.ptyProcess = pty.spawn(
         "/bin/sh",
@@ -236,7 +270,7 @@ export class PtyServer {
       const msg = err?.message ?? String(err);
       if (msg.includes("posix_spawnp") || msg.includes("spawn")) {
         throw new Error(
-          `Failed to spawn "${options.command}": ${msg}\nIs the command installed and executable?`
+          `Failed to spawn PTY shell "/bin/sh" for command "${options.command}" in cwd "${options.cwd}": ${msg}`
         );
       }
       throw err;

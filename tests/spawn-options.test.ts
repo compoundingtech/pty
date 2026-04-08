@@ -82,6 +82,46 @@ async function startDaemonWithSize(
   throw new Error(`Timeout waiting for daemon socket: ${socketPath}`);
 }
 
+async function startDaemonExpectFailure(
+  sessionDir: string,
+  name: string,
+  cwd: string,
+  command = "cat",
+  args: string[] = [],
+): Promise<{ exitCode: number | null; stderr: string }> {
+  const config = JSON.stringify({
+    name,
+    command,
+    args,
+    displayCommand: command,
+    cwd,
+    rows: 24,
+    cols: 80,
+  });
+
+  const child = spawn(nodeBin, [serverModule], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PTY_SERVER_CONFIG: config,
+      PTY_SESSION_DIR: sessionDir,
+    },
+  });
+
+  let stderr = "";
+  child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out waiting for daemon failure")), 5000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+
+  return { exitCode, stderr };
+}
+
 afterEach(() => {
   for (const pid of bgPids) {
     try { process.kill(pid, "SIGTERM"); } catch {}
@@ -148,5 +188,45 @@ describe("spawnDaemon options", () => {
     const stats = await queryStats(name);
     expect(stats.terminal.rows).toBe(24);
     expect(stats.terminal.cols).toBe(80);
+  }, 15000);
+
+  it("surfaces a missing cwd explicitly instead of failing silently", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const missingDir = path.join(testRoot, `missing-${name}`);
+
+    const result = await startDaemonExpectFailure(dir, name, missingDir);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`Working directory does not exist: ${missingDir}`);
+    expect(result.stderr).toContain(`Cannot start session "${name}"`);
+  }, 15000);
+
+  it("surfaces a non-directory cwd explicitly instead of reporting posix_spawnp", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const filePath = path.join(testRoot, `file-${name}`);
+    fs.writeFileSync(filePath, "not a directory");
+
+    const result = await startDaemonExpectFailure(dir, name, filePath);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`Working directory is not a directory: ${filePath}`);
+    expect(result.stderr).not.toContain("posix_spawnp failed");
+  }, 15000);
+
+  it("non-interactive CLI commands still work when the caller cwd was deleted", () => {
+    const dir = makeSessionDir();
+    const deletedCwd = fs.mkdtempSync(path.join(testRoot, "deleted-cwd-"));
+    const script = `cd ${JSON.stringify(deletedCwd)} && rmdir ${JSON.stringify(deletedCwd)} && exec ${JSON.stringify(nodeBin)} ${JSON.stringify(cliPath)} list`;
+
+    const result = spawnSync("sh", ["-lc", script], {
+      env: { ...process.env, PTY_SESSION_DIR: dir },
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("uv_cwd");
   }, 15000);
 });
