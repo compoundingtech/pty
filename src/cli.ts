@@ -17,8 +17,12 @@ import {
   type SessionInfo,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
-import { runInteractive } from "./tui/interactive.ts";
 import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
+
+const runInteractive = async (): Promise<void> => {
+  const { runInteractive } = await import("./tui/interactive.ts");
+  await runInteractive();
+};
 
 function usage(): void {
   console.log(`Usage:
