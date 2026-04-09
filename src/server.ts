@@ -74,6 +74,8 @@ function queryProcessResources(pid: number): ProcessResources | null {
   }
 }
 
+/** Validate that cwd is usable for spawning a process. Returns undefined if
+ *  valid, or a descriptive error string explaining what's wrong. */
 function describeInvalidCwd(cwd: string): string | undefined {
   if (cwd.length === 0) return "Working directory is empty.";
 

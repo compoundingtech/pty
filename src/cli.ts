@@ -19,10 +19,12 @@ import {
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
 
-const runInteractive = async (): Promise<void> => {
-  const { runInteractive } = await import("./tui/interactive.ts");
-  await runInteractive();
-};
+// Lazy-load the interactive TUI so non-interactive commands don't crash when
+// the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
+async function runInteractive(): Promise<void> {
+  const mod = await import("./tui/interactive.ts");
+  await mod.runInteractive();
+}
 
 function usage(): void {
   console.log(`Usage:

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- Validate session `cwd` before spawning and surface explicit errors (`Working directory does not exist`, `Working directory is not a directory`, `Working directory is not searchable`) instead of failing silently with exit code 1 or misleading `posix_spawnp failed` messages (#9, #10, thanks @schickling)
+- Lazy-load the interactive TUI module so non-interactive CLI commands like `pty list` don't crash with `uv_cwd` when launched from a deleted directory (#9, #10)
+- Clarify the `posix_spawnp` error message to mention the actual PTY shell and cwd context instead of blaming the wrapped command
+
 ## 0.5.0
 
 ### Client API (`@myobie/pty/client`)
