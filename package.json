@@ -41,6 +41,10 @@
     "./client": {
       "types": "./dist/client-api.d.ts",
       "default": "./dist/client-api.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "default": "./dist/protocol.js"
     }
   },
   "scripts": {
