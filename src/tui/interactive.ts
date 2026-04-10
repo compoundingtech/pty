@@ -506,7 +506,7 @@ async function doRestart(session: SessionInfo): Promise<void> {
   }
   cleanupAll(session.name);
   try {
-    await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
+    await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
   } catch {
     // Refresh list to show updated state
     const updated = await listSessions();

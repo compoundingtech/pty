@@ -33,6 +33,7 @@ function usage(): void {
   pty run --name <n> -- <command> [args...] Create a named session and attach
   pty run -d -- <command> [args...]        Create in the background
   pty run -a -- <command> [args...]        Create or attach if already running
+  pty run --tag key=value -- <command>    Tag a session with metadata
   pty attach <name>                        Attach to an existing session
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
@@ -104,12 +105,22 @@ async function main(): Promise<void> {
       let attachExisting = false;
       let ephemeral = false;
       let name: string | null = null;
+      const tags: Record<string, string> = {};
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
         else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
         else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
+        else if (args[i] === "--tag" && i + 1 < args.length) {
+          const eq = args[i + 1].indexOf("=");
+          if (eq === -1) {
+            console.error(`Invalid tag format: "${args[i + 1]}". Use --tag key=value`);
+            process.exit(1);
+          }
+          tags[args[i + 1].slice(0, eq)] = args[i + 1].slice(eq + 1);
+          i += 2;
+        }
         else break;
         // Note: unknown flags or positional args before -- break the loop
       }
@@ -193,7 +204,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags);
       break;
     }
 
@@ -464,6 +475,7 @@ async function cmdRun(
   attachExisting = false,
   displayCommand: string,
   ephemeral = false,
+  tags: Record<string, string> = {},
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -485,15 +497,17 @@ async function cmdRun(
     process.exit(1);
   }
 
-  // Clean up any dead session with the same name, but preserve cwd
-  // so that `run -a` re-creates the session in the original directory.
+  // Clean up any dead session with the same name, but preserve cwd and tags
+  // so that `run -a` re-creates the session in the original directory with original tags.
   const previousCwd = session?.status === "exited" ? session.metadata?.cwd : undefined;
+  const previousTags = session?.status === "exited" ? session.metadata?.tags : undefined;
   if (session?.status === "exited") {
     cleanupAll(name);
   }
 
   try {
-    await spawnDaemon({ name, command, args, displayCommand, cwd: previousCwd, ephemeral });
+    const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
+    await spawnDaemon({ name, command, args, displayCommand, cwd: previousCwd, ephemeral, tags: tagOpt });
   } finally {
     releaseLock(name);
   }
@@ -564,7 +578,7 @@ async function handleDeadSession(
 
   // Restart
   cleanupAll(session.name);
-  await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
+  await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
   console.log(`Session "${session.name}" restarted.`);
   doAttach(session.name);
 }
@@ -602,6 +616,7 @@ async function cmdList(json = false): Promise<void> {
       createdAt: s.metadata?.createdAt ?? null,
       exitCode: s.metadata?.exitCode ?? null,
       exitedAt: s.metadata?.exitedAt ?? null,
+      ...(s.metadata?.tags ? { tags: s.metadata.tags } : {}),
     }));
     console.log(JSON.stringify(output));
     return;
@@ -662,6 +677,7 @@ async function cmdStats(
           status: "exited",
           exitCode: session.metadata?.exitCode ?? null,
           exitedAt: session.metadata?.exitedAt ?? null,
+          ...(session.metadata?.tags ? { tags: session.metadata.tags } : {}),
         }));
       } else {
         const code = session.metadata?.exitCode ?? "?";
@@ -715,6 +731,7 @@ async function cmdStats(
             status: "exited" as const,
             exitCode: s.metadata?.exitCode ?? null,
             exitedAt: s.metadata?.exitedAt ?? null,
+            ...(s.metadata?.tags ? { tags: s.metadata.tags } : {}),
           }))
         : []),
     ];
@@ -887,7 +904,7 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   }
 
   cleanupAll(name);
-  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd });
+  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
   console.log(`Session "${name}" restarted.`);
   doAttach(name);
 }

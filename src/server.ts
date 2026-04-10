@@ -46,6 +46,7 @@ export interface ServerOptions {
   cwd: string;
   rows: number;
   cols: number;
+  tags?: Record<string, string>;
   onExit?: (code: number) => void;
 }
 
@@ -315,6 +316,7 @@ export class PtyServer {
           displayCommand: options.displayCommand,
           cwd: options.cwd,
           createdAt: new Date().toISOString(),
+          ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
         });
         resolve();
       });
@@ -603,6 +605,7 @@ export class PtyServer {
       exitCode,
       exitedAt: new Date().toISOString(),
       lastLines: this.getLastLines(),
+      ...(existing?.tags ? { tags: existing.tags } : {}),
     });
   }
 
@@ -648,6 +651,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     cwd: config.cwd ?? process.cwd(),
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
+    tags: config.tags,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
       setTimeout(() => cleanShutdown(code), 500);

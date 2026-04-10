@@ -16,6 +16,7 @@ export interface SpawnDaemonOptions {
   ephemeral?: boolean;
   rows?: number;
   cols?: number;
+  tags?: Record<string, string>;
 }
 
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
@@ -33,6 +34,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     rows,
     cols,
     ephemeral: options.ephemeral ?? false,
+    ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
   });
 
   const child = spawn(process.execPath, [serverModule], {

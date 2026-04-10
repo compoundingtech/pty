@@ -56,6 +56,7 @@ export interface SessionMetadata {
   exitCode?: number;
   exitedAt?: string;
   lastLines?: string[];
+  tags?: Record<string, string>;
 }
 
 export interface SessionInfo {

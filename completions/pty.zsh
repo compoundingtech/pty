@@ -122,7 +122,8 @@ _pty() {
             '(-d --detach)'{-d,--detach}'[Create in background]' \
             '(-a --attach)'{-a,--attach}'[Attach if already running]' \
             '(-e --ephemeral)'{-e,--ephemeral}'[Auto-remove on exit]' \
-            '--name[Session name]:name:'
+            '--name[Session name]:name:' \
+            '*--tag[Tag session with key=value]:tag:'
           ;;
       esac
       ;;

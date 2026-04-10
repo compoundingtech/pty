@@ -65,6 +65,7 @@ interface SessionMetadata {
   exitCode?: number;
   exitedAt?: string;
   lastLines?: string[];
+  tags?: Record<string, string>;
 }
 ```
 
@@ -80,10 +81,11 @@ interface SpawnDaemonOptions {
   command: string;
   args: string[];
   displayCommand: string;
-  cwd?: string;         // defaults to process.cwd()
-  ephemeral?: boolean;  // auto-remove on exit
-  rows?: number;        // defaults to process.stdout.rows ?? 24
-  cols?: number;        // defaults to process.stdout.columns ?? 80
+  cwd?: string;                      // defaults to process.cwd()
+  ephemeral?: boolean;               // auto-remove on exit
+  rows?: number;                     // defaults to process.stdout.rows ?? 24
+  cols?: number;                     // defaults to process.stdout.columns ?? 80
+  tags?: Record<string, string>;     // key-value metadata (e.g. { owner: "forge" })
 }
 ```
 

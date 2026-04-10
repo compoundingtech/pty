@@ -53,6 +53,7 @@ pty run --name myserver -- node server.js # start with an explicit name
 pty run -d -- node server.js              # start in the background
 pty run -a -- node server.js              # create or attach if already running
 pty run -e -- npm test                    # ephemeral: auto-remove on exit
+pty run --tag owner=forge -- node srv.js  # tag a session with metadata
 
 pty list                                  # show active sessions
 pty list --json                           # show as JSON

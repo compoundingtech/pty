@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Features
+- Add session tags: `pty run --tag owner=forge --tag env=dev -- command` sets key-value metadata on sessions, visible in `pty list --json` and persisted across exits. Tags are available in `SpawnDaemonOptions`, `ServerOptions`, and `SessionMetadata` for programmatic use (#12)
+
 ### Fixes
 - Fix `resolveKey` silently dropping shift modifier for non-letter keys: `shift+return` now correctly produces CSI u encoding (`\x1b[13;2u`), `shift+up` produces `\x1b[1;2A`, etc. All modifier combinations (ctrl+shift, alt+shift, ctrl+alt+shift) now work for arrows, navigation keys, and control chars (#13, #14, thanks @schickling)
 - Validate session `cwd` before spawning and surface explicit errors (`Working directory does not exist`, `Working directory is not a directory`, `Working directory is not searchable`) instead of failing silently with exit code 1 or misleading `posix_spawnp failed` messages (#9, #10, thanks @schickling)
