@@ -13,6 +13,7 @@
 
 ### Exports
 - Add `@myobie/pty/protocol` subpath export for browser-safe access to the wire protocol types (`PacketReader`, `MessageType`, encode/decode helpers) without pulling in Node-only dependencies (#11, thanks @schickling)
+- Split `PtyServer` out of `@myobie/pty/client` and expose it from `@myobie/pty/server` so client-only imports stay compile-safe
 
 ## 0.5.0
 

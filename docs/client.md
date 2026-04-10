@@ -4,6 +4,7 @@ Import from `@myobie/pty/client`.
 
 ```typescript
 import { SessionConnection, spawnDaemon, listSessions } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";
 ```
 
 ## Session Management
@@ -97,12 +98,12 @@ Resolve a command name to an absolute path (like `which`). Throws if not found.
 
 Wait for a session's Unix socket to appear on disk.
 
-### `PtyServer`
+### `@myobie/pty/server`
 
-The server class itself, for embedding a pty server directly (without the daemon process):
+Import the server class from `@myobie/pty/server` when you need to embed a pty server directly:
 
 ```typescript
-import { PtyServer } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";
 
 const server = new PtyServer({
   name: "embedded",

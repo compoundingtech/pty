@@ -141,6 +141,7 @@ import {
   EventFollower, readRecentEvents,
   resolveKey,
 } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";
 ```
 
 ### Managing sessions

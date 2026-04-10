@@ -42,6 +42,10 @@
       "types": "./dist/client-api.d.ts",
       "default": "./dist/client-api.js"
     },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
     "./protocol": {
       "types": "./dist/protocol.d.ts",
       "default": "./dist/protocol.js"
