@@ -19,6 +19,27 @@ const KEY_MAP: Record<string, string> = {
 
 const MODIFIERS = new Set(["ctrl", "alt", "shift"]);
 
+/** Keycodes for CSI u encoding (Kitty keyboard protocol). */
+const CSI_U_KEYCODES: Record<string, number> = {
+  return: 13,
+  enter: 13,
+  tab: 9,
+  escape: 27,
+  esc: 27,
+  space: 32,
+  backspace: 127,
+};
+
+/** Compute xterm modifier parameter: 1 + bitmask(shift=1, alt=2, ctrl=4). */
+function modifierParam(mods: Set<string>): number {
+  return (
+    1 +
+    (mods.has("shift") ? 1 : 0) +
+    (mods.has("alt") ? 2 : 0) +
+    (mods.has("ctrl") ? 4 : 0)
+  );
+}
+
 /** Parse a key spec like `ctrl+c`, `return`, `alt+x` into bytes. */
 export function resolveKey(spec: string): string {
   const parts = spec.toLowerCase().split("+");
@@ -32,40 +53,64 @@ export function resolveKey(spec: string): string {
     }
   }
 
-  let result: string;
+  const isLetter = base.length === 1 && base >= "a" && base <= "z";
+  const hasModifiers = mods.size > 0;
+  const mapped = KEY_MAP[base];
 
-  if (KEY_MAP[base] !== undefined) {
-    result = KEY_MAP[base];
-  } else if (base.length === 1 && base >= "a" && base <= "z") {
-    result = base;
-  } else {
+  if (mapped === undefined && !isLetter) {
     throw new Error(`Unknown key: "${base}" in key spec "${spec}"`);
   }
 
-  // Apply shift (only meaningful for single letters)
-  if (mods.has("shift")) {
-    if (result.length === 1 && result >= "a" && result <= "z") {
+  // Single letter keys
+  if (isLetter) {
+    let result = base;
+
+    if (mods.has("shift")) {
       result = result.toUpperCase();
     }
-    // shift on non-letters is silently ignored (e.g. shift+return = return)
-  }
 
-  // Apply ctrl (only meaningful for single letters)
-  if (mods.has("ctrl")) {
-    if (result.length === 1) {
+    if (mods.has("ctrl")) {
       const code = result.toLowerCase().charCodeAt(0);
-      if (code >= 97 && code <= 122) {
-        result = String.fromCharCode(code - 96);
-      }
+      result = String.fromCharCode(code - 96);
     }
+
+    if (mods.has("alt")) {
+      result = "\x1b" + result;
+    }
+
+    return result;
   }
 
-  // Apply alt (prefix with ESC)
-  if (mods.has("alt")) {
-    result = "\x1b" + result;
+  // Named keys without modifiers: return the mapped value directly
+  if (!hasModifiers) {
+    return mapped;
   }
 
-  return result;
+  const mod = modifierParam(mods);
+
+  // Special case: shift+tab produces legacy backtab sequence
+  if (base === "tab" && mod === 2) {
+    return "\x1b[Z";
+  }
+
+  // CSI sequences: \x1b[N~ (e.g. delete, pageup) or \x1b[X (e.g. arrows, home, end)
+  const csiTilde = mapped.match(/^\x1b\[(\d+)~$/);
+  if (csiTilde) {
+    return `\x1b[${csiTilde[1]};${mod}~`;
+  }
+
+  const csiLetter = mapped.match(/^\x1b\[([A-Z])$/);
+  if (csiLetter) {
+    return `\x1b[1;${mod}${csiLetter[1]}`;
+  }
+
+  // Control char keys (return, tab, escape, space, backspace): use CSI u encoding
+  const keycode = CSI_U_KEYCODES[base];
+  if (keycode !== undefined) {
+    return `\x1b[${keycode};${mod}u`;
+  }
+
+  return mapped;
 }
 
 /** If value starts with `key:`, resolve the key name; otherwise return the literal string. */
