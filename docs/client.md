@@ -295,7 +295,7 @@ If value starts with `key:`, resolves the key name. Otherwise returns the litera
 
 ## Protocol (Advanced)
 
-Low-level protocol types for building custom clients.
+Low-level protocol types for building custom clients. Also available as a standalone browser-safe import via `@myobie/pty/protocol` (no Node-only dependencies).
 
 ### `PacketReader`
 

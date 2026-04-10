@@ -3,9 +3,13 @@
 ## Unreleased
 
 ### Fixes
+- Fix `resolveKey` silently dropping shift modifier for non-letter keys: `shift+return` now correctly produces CSI u encoding (`\x1b[13;2u`), `shift+up` produces `\x1b[1;2A`, etc. All modifier combinations (ctrl+shift, alt+shift, ctrl+alt+shift) now work for arrows, navigation keys, and control chars (#13, #14, thanks @schickling)
 - Validate session `cwd` before spawning and surface explicit errors (`Working directory does not exist`, `Working directory is not a directory`, `Working directory is not searchable`) instead of failing silently with exit code 1 or misleading `posix_spawnp failed` messages (#9, #10, thanks @schickling)
 - Lazy-load the interactive TUI module so non-interactive CLI commands like `pty list` don't crash with `uv_cwd` when launched from a deleted directory (#9, #10)
 - Clarify the `posix_spawnp` error message to mention the actual PTY shell and cwd context instead of blaming the wrapped command
+
+### Exports
+- Add `@myobie/pty/protocol` subpath export for browser-safe access to the wire protocol types (`PacketReader`, `MessageType`, encode/decode helpers) without pulling in Node-only dependencies (#11, thanks @schickling)
 
 ## 0.5.0
 
