@@ -139,8 +139,10 @@ import {
   spawnDaemon, listSessions, getSession,
   SessionConnection, sendData, peekScreen, queryStats,
   EventFollower, readRecentEvents,
-  resolveKey,
 } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";         // native addon (node-pty)
+import { resolveKey } from "@myobie/pty/keys";           // browser-safe
+import { PacketReader, MessageType } from "@myobie/pty/protocol"; // browser-safe
 ```
 
 ### Managing sessions

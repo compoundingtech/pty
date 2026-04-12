@@ -1,18 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+### Breaking changes
+- **`PtyServer` moved from `@myobie/pty/client` to `@myobie/pty/server`** — this keeps `./client` free of native addon dependencies (`node-pty`). Update imports: `import { PtyServer } from "@myobie/pty/server"`
+- **`resolveKey` and `parseSeqValue` are still in `@myobie/pty/client`** but also available standalone via the new `@myobie/pty/keys` export (browser-safe, zero dependencies)
 
 ### Features
-- Add session tags: `pty run --tag owner=forge --tag env=dev -- command` sets key-value metadata on sessions, visible in `pty list --json` and persisted across exits. Tags are available in `SpawnDaemonOptions`, `ServerOptions`, and `SessionMetadata` for programmatic use (#12)
+- Add session tags: `pty run --tag owner=forge --tag env=dev -- command` sets key-value metadata on sessions, visible in `pty list --json` and persisted across exits and restarts. Tags are available in `SpawnDaemonOptions`, `ServerOptions`, and `SessionMetadata` for programmatic use (#12)
+
+### Exports
+- Add `@myobie/pty/server` subpath export for `PtyServer` and `ServerOptions` (requires `node-pty` native addon)
+- Add `@myobie/pty/keys` subpath export for browser-safe key resolution (`resolveKey`, `parseSeqValue` — zero dependencies)
+- Add `@myobie/pty/protocol` subpath export for browser-safe wire protocol types (`PacketReader`, `MessageType`, encode/decode helpers) (#11, thanks @schickling)
 
 ### Fixes
 - Fix `resolveKey` silently dropping shift modifier for non-letter keys: `shift+return` now correctly produces CSI u encoding (`\x1b[13;2u`), `shift+up` produces `\x1b[1;2A`, etc. All modifier combinations (ctrl+shift, alt+shift, ctrl+alt+shift) now work for arrows, navigation keys, and control chars (#13, #14, thanks @schickling)
 - Validate session `cwd` before spawning and surface explicit errors (`Working directory does not exist`, `Working directory is not a directory`, `Working directory is not searchable`) instead of failing silently with exit code 1 or misleading `posix_spawnp failed` messages (#9, #10, thanks @schickling)
 - Lazy-load the interactive TUI module so non-interactive CLI commands like `pty list` don't crash with `uv_cwd` when launched from a deleted directory (#9, #10)
 - Clarify the `posix_spawnp` error message to mention the actual PTY shell and cwd context instead of blaming the wrapped command
-
-### Exports
-- Add `@myobie/pty/protocol` subpath export for browser-safe access to the wire protocol types (`PacketReader`, `MessageType`, encode/decode helpers) without pulling in Node-only dependencies (#11, thanks @schickling)
 
 ## 0.5.0
 

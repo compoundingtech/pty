@@ -4,6 +4,9 @@ Import from `@myobie/pty/client`.
 
 ```typescript
 import { SessionConnection, spawnDaemon, listSessions } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";
+import { resolveKey } from "@myobie/pty/keys";
+import { PacketReader, MessageType } from "@myobie/pty/protocol";
 ```
 
 ## Session Management
@@ -97,12 +100,13 @@ Resolve a command name to an absolute path (like `which`). Throws if not found.
 
 Wait for a session's Unix socket to appear on disk.
 
-### `PtyServer`
+### `PtyServer` (from `@myobie/pty/server`)
 
-The server class itself, for embedding a pty server directly (without the daemon process):
+The server class itself, for embedding a pty server directly (without the daemon process).
+This is a separate export because it requires `node-pty` (a native C++ addon):
 
 ```typescript
-import { PtyServer } from "@myobie/pty/client";
+import { PtyServer } from "@myobie/pty/server";
 
 const server = new PtyServer({
   name: "embedded",
@@ -280,7 +284,9 @@ Each extends `EventBase { session: string; type: EventType; ts: string }`.
 `NotificationEvent` adds `title?`, `body?`, `source?: "osc9" | "osc99" | "osc777"`.
 `TitleChangeEvent` adds `value: string`.
 
-## Keys
+## Keys (also available via `@myobie/pty/keys`)
+
+These functions are also available as a standalone browser-safe import via `@myobie/pty/keys` (zero dependencies).
 
 ### `resolveKey(spec: string): string`
 

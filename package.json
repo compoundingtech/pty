@@ -1,6 +1,6 @@
 {
   "name": "@myobie/pty",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Persistent terminal sessions with detach/attach, plus a Playwright-style testing library for TUI apps",
   "type": "module",
   "license": "MIT",
@@ -42,9 +42,17 @@
       "types": "./dist/client-api.d.ts",
       "default": "./dist/client-api.js"
     },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
     "./protocol": {
       "types": "./dist/protocol.d.ts",
       "default": "./dist/protocol.js"
+    },
+    "./keys": {
+      "types": "./dist/keys.d.ts",
+      "default": "./dist/keys.js"
     }
   },
   "scripts": {

@@ -11,7 +11,6 @@ export {
 
 // Session creation
 export { spawnDaemon, resolveCommand, waitForSocket, type SpawnDaemonOptions } from "./spawn.ts";
-export { PtyServer, type ServerOptions } from "./server.ts";
 
 // Session interaction (programmatic — no process.exit, no stdin/stdout)
 export {
