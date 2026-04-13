@@ -18,6 +18,7 @@ import {
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
+import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
@@ -50,7 +51,14 @@ function usage(): void {
   pty events --recent <name>               Show recent events and exit
   pty events --json <name>                 Output raw JSONL
   pty list                                 List active sessions
+  pty list --tags                          List sessions with tags (#key=value)
   pty list --json                          List sessions as JSON
+  pty up                                   Start all sessions from pty.toml
+  pty up <dir>                             Start sessions from <dir>/pty.toml
+  pty up <name> [<name>...]               Start specific sessions from pty.toml
+  pty down                                 Stop all sessions from pty.toml
+  pty down <dir>                           Stop sessions from <dir>/pty.toml
+  pty down <name> [<name>...]             Stop specific sessions from pty.toml
   pty kill <name>                          Kill or remove a session
   pty gc                                   Remove all exited sessions
   pty wrap <command>                       Auto-wrap a command in pty sessions
@@ -350,7 +358,8 @@ async function main(): Promise<void> {
     case "list":
     case "ls": {
       const jsonFlag = args.includes("--json");
-      await cmdList(jsonFlag);
+      const tagsFlag = args.includes("--tags");
+      await cmdList(jsonFlag, tagsFlag);
       break;
     }
 
@@ -395,6 +404,53 @@ async function main(): Promise<void> {
 
     case "gc": {
       await cmdGc();
+      break;
+    }
+
+    case "up": {
+      if (args[1] === "-h" || args[1] === "--help") {
+        console.log("Usage: pty up [dir] [name...]\n\nStart sessions defined in pty.toml.");
+        break;
+      }
+      // pty up [dir] [name...]
+      const upArgs = args.slice(1);
+      let dir: string | undefined;
+      const names: string[] = [];
+
+      for (const arg of upArgs) {
+        if (arg.startsWith("-")) break;
+        // First arg: directory if pty.toml exists there, otherwise session name
+        if (!dir && names.length === 0 && hasPtyFile(arg)) {
+          dir = arg;
+        } else {
+          names.push(arg);
+        }
+      }
+
+      await cmdUp(dir, names);
+      break;
+    }
+
+    case "down": {
+      if (args[1] === "-h" || args[1] === "--help") {
+        console.log("Usage: pty down [dir] [name...]\n\nStop sessions defined in pty.toml.");
+        break;
+      }
+      // pty down [dir] [name...]
+      const downArgs = args.slice(1);
+      let dir: string | undefined;
+      const names: string[] = [];
+
+      for (const arg of downArgs) {
+        if (arg.startsWith("-")) break;
+        if (!dir && names.length === 0 && hasPtyFile(arg)) {
+          dir = arg;
+        } else {
+          names.push(arg);
+        }
+      }
+
+      await cmdDown(dir, names);
       break;
     }
 
@@ -606,7 +662,7 @@ function cmdPeek(name: string, follow: boolean, plain: boolean): void {
   });
 }
 
-async function cmdList(json = false): Promise<void> {
+async function cmdList(json = false, showTags = false): Promise<void> {
   const sessions = await listSessions();
 
   if (json) {
@@ -644,7 +700,10 @@ async function cmdList(json = false): Promise<void> {
       const cwd = session.metadata?.cwd
         ? shortPath(session.metadata.cwd)
         : "";
-      console.log(`  ${session.name} (pid: ${session.pid}) — ${cwd} — ${cmd}`);
+      const tagStr = showTags && session.metadata?.tags
+        ? " " + Object.entries(session.metadata.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
+        : "";
+      console.log(`  \x1b[1;36m${session.name}\x1b[0m${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 
@@ -659,7 +718,10 @@ async function cmdList(json = false): Promise<void> {
       const cmd = meta
         ? [meta.displayCommand, ...meta.args].join(" ")
         : "";
-      console.log(`  ${session.name} (exited with code ${code}, ${ago}) — ${cwd} — ${cmd}`);
+      const tagStr = showTags && meta?.tags
+        ? " " + Object.entries(meta.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
+        : "";
+      console.log(`  \x1b[1m${session.name}\x1b[0m${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 }
@@ -869,6 +931,123 @@ async function cmdGc(): Promise<void> {
     console.log(`Removed: ${name}`);
   }
   console.log(`Cleaned up ${removed.length} exited session${removed.length === 1 ? "" : "s"}.`);
+}
+
+function hasPtyFile(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(path.resolve(dir), "pty.toml")).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
+  let ptyFile;
+  try {
+    ptyFile = readPtyFile(dir);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  let sessions = ptyFile.sessions;
+  if (names.length > 0) {
+    const nameSet = new Set(names);
+    const matchesName = (s: PtySessionDef) => nameSet.has(s.name) || nameSet.has(s.shortName);
+    const unknown = names.filter((n) => !sessions.some((s) => s.name === n || s.shortName === n));
+    if (unknown.length > 0) {
+      console.error(`Unknown session${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`);
+      console.error(`Available: ${sessions.map((s) => s.shortName).join(", ")}`);
+      process.exit(1);
+    }
+    sessions = sessions.filter(matchesName);
+  }
+
+  const existing = await listSessions();
+  const runningNames = new Set(existing.filter((s) => s.status === "running").map((s) => s.name));
+
+  let started = 0;
+  let skipped = 0;
+
+  for (const sess of sessions) {
+    if (runningNames.has(sess.name)) {
+      console.log(`  ● ${sess.name} (already running)`);
+      skipped++;
+      continue;
+    }
+
+    // Clean up exited session with the same name
+    const existingSession = existing.find((s) => s.name === sess.name);
+    if (existingSession?.status === "exited") {
+      cleanupAll(sess.name);
+    }
+
+    try {
+      await spawnDaemon({
+        name: sess.name,
+        command: "/bin/sh",
+        args: ["-c", sess.command],
+        displayCommand: sess.command,
+        cwd: ptyFile.dir,
+        tags: sess.tags,
+      });
+      console.log(`  ● ${sess.name} (started)`);
+      started++;
+    } catch (e: any) {
+      console.error(`  ✗ ${sess.name}: ${e.message}`);
+    }
+  }
+
+  if (started === 0 && skipped === sessions.length) {
+    console.log("All sessions already running.");
+  } else if (started > 0) {
+    console.log(`Started ${started} session${started === 1 ? "" : "s"}.`);
+  }
+}
+
+async function cmdDown(dir: string | undefined, names: string[]): Promise<void> {
+  let ptyFile;
+  try {
+    ptyFile = readPtyFile(dir);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  let sessions = ptyFile.sessions;
+  if (names.length > 0) {
+    const nameSet = new Set(names);
+    sessions = sessions.filter((s) => nameSet.has(s.name) || nameSet.has(s.shortName));
+  }
+
+  const existing = await listSessions();
+  let stopped = 0;
+
+  for (const sess of sessions) {
+    const existingSession = existing.find((s) => s.name === sess.name);
+    if (!existingSession) continue;
+
+    if (existingSession.status === "running" && existingSession.pid) {
+      try {
+        process.kill(existingSession.pid, "SIGTERM");
+        console.log(`  ○ ${sess.name} (stopped)`);
+        stopped++;
+      } catch {
+        console.error(`  ✗ ${sess.name}: failed to stop`);
+      }
+      cleanupSocket(sess.name);
+    } else if (existingSession.status === "exited") {
+      cleanupAll(sess.name);
+      console.log(`  ○ ${sess.name} (cleaned up)`);
+      stopped++;
+    }
+  }
+
+  if (stopped === 0) {
+    console.log("No sessions to stop.");
+  } else {
+    console.log(`Stopped ${stopped} session${stopped === 1 ? "" : "s"}.`);
+  }
 }
 
 async function cmdRestart(name: string, force = false): Promise<void> {

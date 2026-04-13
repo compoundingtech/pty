@@ -36,6 +36,9 @@ export {
   type FollowerOptions,
 } from "./events.ts";
 
+// Project files
+export { readPtyFile, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
+
 // Keys
 export { resolveKey, parseSeqValue } from "./keys.ts";
 

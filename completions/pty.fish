@@ -58,6 +58,8 @@ complete -c pty -n __pty_needs_command -a kill -d 'Kill a running session'
 complete -c pty -n __pty_needs_command -a rm -d 'Remove an exited session'
 complete -c pty -n __pty_needs_command -a remove -d 'Remove an exited session'
 complete -c pty -n __pty_needs_command -a gc -d 'Remove all exited sessions'
+complete -c pty -n __pty_needs_command -a up -d 'Start sessions from pty.toml'
+complete -c pty -n __pty_needs_command -a down -d 'Stop sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a wrap -d 'Auto-wrap a command in pty sessions'
 complete -c pty -n __pty_needs_command -a unwrap -d 'Remove a wrapper'
 complete -c pty -n __pty_needs_command -a test -d 'Run tests (vitest)'
@@ -96,7 +98,9 @@ complete -c pty -n '__pty_using_command events' -l json -d 'Output raw JSONL'
 
 # list: flags
 complete -c pty -n '__pty_using_command list' -l json -d 'Output as JSON'
+complete -c pty -n '__pty_using_command list' -l tags -d 'Show tags as #key=value'
 complete -c pty -n '__pty_using_command ls' -l json -d 'Output as JSON'
+complete -c pty -n '__pty_using_command ls' -l tags -d 'Show tags as #key=value'
 
 # stats: session names and flags
 complete -c pty -n '__pty_using_command stats' -a '(__pty_sessions)' -d 'Session'

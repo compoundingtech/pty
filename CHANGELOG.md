@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `pty up` / `pty down` commands to start and stop sessions defined in a `pty.toml` project file
+- `pty.toml` supports named sessions with commands and optional tags
+- `pty up` accepts a directory argument (`pty up ./backend`) and session name filtering (`pty up dev serve`)
+- Add `--tags` flag to `pty list` to display tags as `#key=value` hashtags
+- Colorize `pty list` output: bold cyan session names, dimmed commands
 - Add `--cwd` flag to `pty run` to start a session in a specific directory without needing to `cd` first
 
 ## 0.6.0

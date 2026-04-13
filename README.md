@@ -56,6 +56,7 @@ pty run -e -- npm test                    # ephemeral: auto-remove on exit
 pty run --tag owner=forge -- node srv.js  # tag a session with metadata
 
 pty list                                  # show active sessions
+pty list --tags                           # show sessions with tags (#key=value)
 pty list --json                           # show as JSON
 
 pty attach myserver                       # reconnect to a session
@@ -82,6 +83,12 @@ pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # remove all exited sessions
+
+pty up                                    # start all sessions from ./pty.toml
+pty up ./backend                          # start sessions from ./backend/pty.toml
+pty up claude dev                         # start specific sessions from ./pty.toml
+pty down                                  # stop all sessions from ./pty.toml
+pty down claude                           # stop specific sessions
 
 pty wrap claude                           # auto-wrap claude in pty sessions
 pty unwrap claude                         # remove the wrapper
@@ -125,6 +132,26 @@ pty events --json myserver       # raw JSONL output
 ```
 
 Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
+
+### Project Files
+
+A project can include a `pty.toml` to declare its sessions:
+
+```toml
+[sessions.claude]
+command = "claude --dangerously-skip-permissions"
+tags = { role = "agent" }
+
+[sessions.dev]
+command = "deno task dev"
+tags = { role = "build" }
+
+[sessions.serve]
+command = "bin/serve"
+tags = { role = "server" }
+```
+
+Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
 
 ### Plugins
 

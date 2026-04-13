@@ -38,6 +38,8 @@ _pty() {
     'rm:Remove an exited session'
     'remove:Remove an exited session'
     'gc:Remove all exited sessions'
+    'up:Start sessions from pty.toml'
+    'down:Stop sessions from pty.toml'
     'wrap:Auto-wrap a command in pty sessions'
     'unwrap:Remove a wrapper'
     'test:Run tests (vitest)'
@@ -94,7 +96,8 @@ _pty() {
           ;;
         list|ls)
           _arguments \
-            '--json[Output as JSON]'
+            '--json[Output as JSON]' \
+            '--tags[Show tags as #key=value]'
           ;;
         gc)
           # No arguments
