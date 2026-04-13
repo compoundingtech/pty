@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `--cwd` flag to `pty run` to start a session in a specific directory without needing to `cd` first
+
 ## 0.6.0
 
 ### Breaking changes

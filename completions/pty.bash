@@ -70,7 +70,7 @@ _pty() {
       done
       # Before --, complete flags
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--detach -d --attach -a --ephemeral -e --name --tag" -- "${cur}"))
+        COMPREPLY=($(compgen -W "--detach -d --attach -a --ephemeral -e --name --cwd --tag" -- "${cur}"))
       fi
       ;;
   esac

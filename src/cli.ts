@@ -34,6 +34,7 @@ function usage(): void {
   pty run -d -- <command> [args...]        Create in the background
   pty run -a -- <command> [args...]        Create or attach if already running
   pty run --tag key=value -- <command>    Tag a session with metadata
+  pty run --cwd /path -- <command>        Run in a specific directory
   pty attach <name>                        Attach to an existing session
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
@@ -105,6 +106,7 @@ async function main(): Promise<void> {
       let attachExisting = false;
       let ephemeral = false;
       let name: string | null = null;
+      let cwd: string | null = null;
       const tags: Record<string, string> = {};
       let i = 1;
       while (i < args.length && args[i] !== "--") {
@@ -112,6 +114,7 @@ async function main(): Promise<void> {
         else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
         else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
+        else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
         else if (args[i] === "--tag" && i + 1 < args.length) {
           const eq = args[i + 1].indexOf("=");
           if (eq === -1) {
@@ -204,7 +207,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd);
       break;
     }
 
@@ -476,6 +479,7 @@ async function cmdRun(
   displayCommand: string,
   ephemeral = false,
   tags: Record<string, string> = {},
+  explicitCwd: string | null = null,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -507,7 +511,8 @@ async function cmdRun(
 
   try {
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
-    await spawnDaemon({ name, command, args, displayCommand, cwd: previousCwd, ephemeral, tags: tagOpt });
+    const cwdOpt = explicitCwd ?? previousCwd;
+    await spawnDaemon({ name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt });
   } finally {
     releaseLock(name);
   }

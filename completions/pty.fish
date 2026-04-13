@@ -68,6 +68,7 @@ complete -c pty -n '__pty_using_command run' -s d -l detach -d 'Create in backgr
 complete -c pty -n '__pty_using_command run' -s a -l attach -d 'Attach if already running'
 complete -c pty -n '__pty_using_command run' -s e -l ephemeral -d 'Auto-remove on exit'
 complete -c pty -n '__pty_using_command run' -l name -x -d 'Session name (auto-generated if omitted)'
+complete -c pty -n '__pty_using_command run' -l cwd -x -a '(__fish_complete_directories)' -d 'Working directory'
 complete -c pty -n '__pty_using_command run' -l tag -x -d 'Tag session (key=value, repeatable)'
 complete -c pty -n '__pty_using_command run' -F
 

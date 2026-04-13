@@ -123,6 +123,7 @@ _pty() {
             '(-a --attach)'{-a,--attach}'[Attach if already running]' \
             '(-e --ephemeral)'{-e,--ephemeral}'[Auto-remove on exit]' \
             '--name[Session name]:name:' \
+            '--cwd[Working directory]:dir:_directories' \
             '*--tag[Tag session with key=value]:tag:'
           ;;
       esac
