@@ -321,10 +321,11 @@ describe("interactive TUI", () => {
       await tui.waitForText(name1, 10000);
       await tui.waitForText(name2, 10000);
 
-      // Type part of name1 to filter
+      // Type part of name1 to filter — wait for name2 to disappear,
+      // which proves the filter rendered (not just that the input updated)
       const filterText = name1.slice(-4);
       tui.type(filterText);
-      await tui.waitForText(filterText, 5000);
+      await tui.waitForAbsent(name2, 5000);
 
       let ss = tui.screenshot();
       expect(ss.text).toContain(name1);
