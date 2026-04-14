@@ -50,7 +50,7 @@ export interface ServerOptions {
   onExit?: (code: number) => void;
 }
 
-const LAST_LINES_COUNT = 20;
+const LAST_LINES_COUNT = 200;
 
 export interface ProcessResources {
   rssKb: number;       // Resident set size in KB
@@ -289,6 +289,10 @@ export class PtyServer {
       this.exited = true;
       this.exitCode = exitCode;
       this.broadcast(encodeExit(exitCode));
+      // Save exit status immediately so the session shows as "exited"
+      // in pty list during the cleanup window. lastLines may be incomplete
+      // here since PTY data could still be in-flight — close() will
+      // update with the final output.
       this.saveExitMetadata(exitCode);
       options.onExit?.(exitCode);
     });
@@ -624,6 +628,13 @@ export class PtyServer {
 
   /** Clean up resources. Does not call process.exit(). */
   close(): Promise<void> {
+    // Update exit metadata with final output — by the time close() runs,
+    // all PTY data has been delivered to the terminal buffer. This overwrites
+    // the initial save from onExit which may have had incomplete lastLines.
+    if (this.exited) {
+      this.saveExitMetadata(this.exitCode);
+    }
+
     return new Promise((resolve) => {
       for (const client of this.clients.values()) {
         client.socket.destroy();

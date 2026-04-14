@@ -702,12 +702,13 @@ describe("interactive TUI", () => {
       // is still alive (500ms cleanup delay) but metadata has exitedAt set
       tui.sendKeys("\x04"); // Ctrl+D
 
-      // Wait for TUI to return to the list
+      // Wait for TUI to return to the list and show the session as exited.
+      // There's a brief window after Ctrl+D where the daemon is still alive
+      // but exitedAt has been written — the TUI needs to refresh to pick it up.
       await tui.waitForText("Create new session...", 10000);
+      await tui.waitForText("exited", 5000);
 
-      // The session must show as exited, not running
       const ss = tui.screenshot();
-      expect(ss.text).toContain("exited");
       expect(ss.text).toContain(name);
     },
     20000

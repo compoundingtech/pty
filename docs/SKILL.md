@@ -136,7 +136,7 @@ pty kill dev-server
 
 ```bash
 pty run -d --name tests --tag owner=agent -- npm test
-pty peek --wait "passed\|failed" --plain tests -t 120
+pty peek --wait "passed" --wait "failed" --plain tests -t 120
 pty peek --full --plain tests
 pty kill tests
 ```
@@ -145,7 +145,7 @@ pty kill tests
 
 ```bash
 pty run -d --name build --tag owner=agent -- npm run build
-pty peek --wait "error\|successfully" --plain build -t 60
+pty peek --wait "error" --wait "successfully" --plain build -t 60
 pty peek --full --plain build
 pty kill build
 ```

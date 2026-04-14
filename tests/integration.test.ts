@@ -531,8 +531,8 @@ describe("integration", () => {
       "echo 'line one'; echo 'line two'; echo 'line three'; sleep 0.2; exit 7",
     ]);
 
-    // Wait for the process to exit and metadata to be written
-    await new Promise((r) => setTimeout(r, 500));
+    // Wait for the process to exit (200ms) + shutdown delay (500ms) + buffer
+    await new Promise((r) => setTimeout(r, 1000));
 
     const meta = readMetadata(name);
     expect(meta).not.toBeNull();

@@ -257,14 +257,14 @@ async function main(): Promise<void> {
       let follow = false;
       let plain = false;
       let full = false;
-      let waitPattern: string | null = null;
+      const waitPatterns: string[] = [];
       let timeoutSec = 0;
       let pi = 1;
       while (pi < args.length && args[pi].startsWith("-")) {
         if (args[pi] === "-f" || args[pi] === "--follow") { follow = true; pi++; }
         else if (args[pi] === "--plain") { plain = true; pi++; }
         else if (args[pi] === "--full") { full = true; pi++; }
-        else if (args[pi] === "--wait" && pi + 1 < args.length) { waitPattern = args[pi + 1]; pi += 2; }
+        else if (args[pi] === "--wait" && pi + 1 < args.length) { waitPatterns.push(args[pi + 1]); pi += 2; }
         else if ((args[pi] === "-t" || args[pi] === "--timeout") && pi + 1 < args.length) { timeoutSec = parseFloat(args[pi + 1]); pi += 2; }
         else break;
       }
@@ -279,8 +279,8 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
-      if (waitPattern) {
-        await cmdPeekWait(peekName, waitPattern, timeoutSec, plain);
+      if (waitPatterns.length > 0) {
+        await cmdPeekWait(peekName, waitPatterns, timeoutSec, plain);
       } else {
         cmdPeek(peekName, follow, plain, full);
       }
@@ -813,20 +813,23 @@ function doAttach(name: string): void {
   });
 }
 
-async function cmdPeekWait(name: string, pattern: string, timeoutSec: number, plain: boolean): Promise<void> {
+async function cmdPeekWait(name: string, patterns: string[], timeoutSec: number, plain: boolean): Promise<void> {
   const { peekScreen } = await import("./connection.ts");
   const start = Date.now();
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
+  const matchesAny = (text: string) => patterns.some((p) => text.includes(p));
+  const patternDesc = patterns.length === 1 ? `"${patterns[0]}"` : patterns.map((p) => `"${p}"`).join(" or ");
 
   while (true) {
     if (timeoutMs > 0 && Date.now() - start > timeoutMs) {
-      console.error(`Timed out after ${timeoutSec}s waiting for "${pattern}".`);
+      console.error(`Timed out after ${timeoutSec}s waiting for ${patternDesc}.`);
       process.exit(1);
     }
 
+    // Try live session first
     try {
       const screen = await peekScreen({ name, plain: true });
-      if (screen.includes(pattern)) {
+      if (matchesAny(screen)) {
         if (plain) {
           process.stdout.write(screen + "\n");
         } else {
@@ -835,16 +838,45 @@ async function cmdPeekWait(name: string, pattern: string, timeoutSec: number, pl
         }
         return;
       }
-    } catch (err: any) {
-      console.error(err.message);
-      process.exit(1);
+    } catch {
+      // Session might have exited — check metadata for lastLines
+      const meta = readMetadata(name);
+      if (meta?.exitedAt && meta.lastLines) {
+        const lastOutput = meta.lastLines.join("\n");
+        if (matchesAny(lastOutput)) {
+          process.stdout.write(lastOutput + "\n");
+          return;
+        }
+        // Session exited but pattern not found in last lines
+        console.error(`Session "${name}" exited (code ${meta.exitCode ?? "?"}) without matching ${patternDesc}.`);
+        if (meta.lastLines.length > 0) {
+          console.error("Last output:");
+          for (const line of meta.lastLines) {
+            console.error(`  ${line}`);
+          }
+        }
+        process.exit(1);
+      }
+      // No exitedAt — might be a transient connection error, retry
     }
 
     await new Promise((r) => setTimeout(r, 200));
   }
 }
 
-function cmdPeek(name: string, follow: boolean, plain: boolean, full = false): void {
+async function cmdPeek(name: string, follow: boolean, plain: boolean, full = false): Promise<void> {
+  // Check if session is exited — fall back to saved lastLines
+  const session = await getSession(name);
+  if (session?.status === "exited") {
+    const meta = session.metadata;
+    if (meta?.lastLines && meta.lastLines.length > 0) {
+      process.stdout.write(meta.lastLines.join("\n") + "\n");
+    } else {
+      console.error(`Session "${name}" has exited with no saved output.`);
+    }
+    return;
+  }
+
   peek({
     name,
     follow,

@@ -552,6 +552,8 @@ function doAttach(name: string): void {
       myApp?.resume();
     },
     onExit: async (_code) => {
+      // Brief delay to let the daemon write exit metadata to disk
+      await new Promise((r) => setTimeout(r, 200));
       const updated = await listSessions();
       batch(() => {
         sessions.set(updated);
