@@ -7,6 +7,10 @@ import { getSocketPath } from "./sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** Allow overriding the server module path (used by the bundled supervisor). */
+let _serverModulePath: string | null = null;
+export function setServerModulePath(p: string): void { _serverModulePath = p; }
+
 export interface SpawnDaemonOptions {
   name: string;
   command: string;
@@ -24,7 +28,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   const rows = options.rows ?? stdout.rows ?? 24;
   const cols = options.cols ?? stdout.columns ?? 80;
 
-  const serverModule = path.join(__dirname, "server.js");
+  const serverModule = _serverModulePath ?? path.join(__dirname, "server.js");
   const config = JSON.stringify({
     name: options.name,
     command: options.command,

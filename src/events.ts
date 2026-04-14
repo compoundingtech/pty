@@ -8,6 +8,10 @@ export const EventType = {
   NOTIFICATION: "notification",
   FOCUS_REQUEST: "focus_request",
   CURSOR_VISIBLE: "cursor_visible",
+  SESSION_RESTART: "session_restart",
+  SESSION_FAILED: "session_failed",
+  SUPERVISOR_START: "supervisor_start",
+  SUPERVISOR_STOP: "supervisor_stop",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -42,12 +46,36 @@ export interface CursorVisibleEvent extends EventBase {
   type: "cursor_visible";
 }
 
+export interface SessionRestartEvent extends EventBase {
+  type: "session_restart";
+  restartCount: number;
+  backoffMs: number;
+}
+
+export interface SessionFailedEvent extends EventBase {
+  type: "session_failed";
+  restartCount: number;
+  reason: string;
+}
+
+export interface SupervisorStartEvent extends EventBase {
+  type: "supervisor_start";
+}
+
+export interface SupervisorStopEvent extends EventBase {
+  type: "supervisor_stop";
+}
+
 export type EventRecord =
   | BellEvent
   | TitleChangeEvent
   | NotificationEvent
   | FocusRequestEvent
-  | CursorVisibleEvent;
+  | CursorVisibleEvent
+  | SessionRestartEvent
+  | SessionFailedEvent
+  | SupervisorStartEvent
+  | SupervisorStopEvent;
 
 const MAX_LINES = 1000;
 const KEEP_LINES = 500;
@@ -249,5 +277,13 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} focus requested`;
     case "cursor_visible":
       return `${prefix} cursor restored`;
+    case "session_restart":
+      return `${prefix} restarted (attempt ${event.restartCount}, backoff ${event.backoffMs}ms)`;
+    case "session_failed":
+      return `${prefix} failed — ${event.reason}`;
+    case "supervisor_start":
+      return `${prefix} supervisor started`;
+    case "supervisor_stop":
+      return `${prefix} supervisor stopped`;
   }
 }

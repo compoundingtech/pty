@@ -6,7 +6,20 @@
 - `pty.toml` supports named sessions with commands and optional tags
 - `pty up` accepts a directory argument (`pty up ./backend`) and session name filtering (`pty up dev serve`)
 - Add `--tags` flag to `pty list` to display tags as `#key=value` hashtags
+- Add session supervisor: `pty supervisor start` runs a process that watches for sessions with `strategy=permanent` tag and restarts them on exit with exponential backoff
+- Add `pty tag <name> key=value` / `pty tag <name> --rm key` to set and remove tags on running or exited sessions
+- Add `pty supervisor start/stop/status/forget` commands
+- Add `pty supervisor launchd install/uninstall` for macOS auto-start
+- Supervision is configured entirely through tags (`strategy=permanent` in pty.toml tags or via `pty tag`)
+- `pty list` shows `[permanent]`, `[temporary]`, and `[failed]` markers for supervised sessions
+- `pty down` refuses to stop supervised sessions (use `pty supervisor forget` first)
+- New event types: `session_restart`, `session_failed`, `supervisor_start`, `supervisor_stop`
+- Atomic metadata writes (write-to-temp + rename) to prevent partial reads
+- Add `pty peek --wait "text"` to block until text appears on screen, with optional `-t` timeout
+- Add `pty peek --full` to show full scrollback (not just viewport)
+- Add `pty events --wait <type>` to block until a specific event type occurs
 - Colorize `pty list` output: bold cyan session names, dimmed commands
+- Interactive TUI list shows `[permanent]`/`[temporary]`/`[failed]` markers with color
 - Add `--cwd` flag to `pty run` to start a session in a specific directory without needing to `cd` first
 
 ## 0.6.0

@@ -69,7 +69,35 @@ export interface SessionInfo {
 
 export function writeMetadata(name: string, metadata: SessionMetadata): void {
   ensureSessionDir();
-  fs.writeFileSync(getMetadataPath(name), JSON.stringify(metadata, null, 2));
+  const target = getMetadataPath(name);
+  const tmp = target + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(metadata, null, 2));
+  fs.renameSync(tmp, target);
+}
+
+/** Update tags on an existing session. Performs an atomic read-modify-write. */
+export function updateTags(
+  name: string,
+  updates: Record<string, string>,
+  removals: string[] = [],
+): void {
+  const metadata = readMetadata(name);
+  if (!metadata) {
+    throw new Error(`Session "${name}" not found.`);
+  }
+  const tags = { ...(metadata.tags ?? {}) };
+  for (const [k, v] of Object.entries(updates)) {
+    tags[k] = v;
+  }
+  for (const k of removals) {
+    delete tags[k];
+  }
+  if (Object.keys(tags).length > 0) {
+    metadata.tags = tags;
+  } else {
+    delete metadata.tags;
+  }
+  writeMetadata(name, metadata);
 }
 
 export function readMetadata(name: string): SessionMetadata | null {

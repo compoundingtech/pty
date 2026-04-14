@@ -153,6 +153,35 @@ tags = { role = "server" }
 
 Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
 
+### Supervisor
+
+The supervisor keeps sessions alive by watching for the `strategy` tag:
+
+```sh
+# Tag a session as permanent
+pty tag myserver strategy=permanent
+
+# Start the supervisor
+pty supervisor start
+
+# If myserver exits, the supervisor restarts it with exponential backoff
+# Max 5 restarts in 60 seconds before marking as [failed]
+
+pty supervisor status            # show supervised sessions
+pty supervisor forget myserver   # stop supervising
+pty supervisor stop              # stop the supervisor
+```
+
+Sessions can be supervised from `pty.toml` by setting the `strategy` tag:
+
+```toml
+[sessions.serve]
+command = "bin/serve"
+tags = { strategy = "permanent" }
+```
+
+For macOS auto-start on login: `pty supervisor launchd install`.
+
 ### Plugins
 
 Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-foo` executable in your `$PATH`, pty will run it with the remaining arguments. This lets you build your own subcommands without modifying pty.

@@ -1,4 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import { Session } from "../src/testing/index.ts";
 
 // Shell integration tests — verify that common shells start up,
@@ -7,6 +9,23 @@ import { Session } from "../src/testing/index.ts";
 // bash and zsh use Session.spawn() (direct PTY, no server).
 // fish uses Session.server() (PtyServer) to exercise the DA1 response
 // handler — fish 4.x sends DA1 at startup and blocks 10s without it.
+//
+// Set PTY_SESSION_DIR to an isolated temp directory so PtyServer
+// doesn't pollute real sessions. Vitest runs each file in its own
+// worker, so this doesn't affect other test files.
+
+const testSessionDir = fs.mkdtempSync(os.tmpdir() + "/pty-shells-");
+process.env.PTY_SESSION_DIR = testSessionDir;
+
+afterAll(() => {
+  // Allow async exit metadata writes to complete before cleanup
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      try { fs.rmSync(testSessionDir, { recursive: true, force: true }); } catch {}
+      resolve(undefined);
+    }, 500);
+  });
+});
 
 describe("shell integration", () => {
   describe("bash", () => {

@@ -38,6 +38,8 @@ _pty() {
     'rm:Remove an exited session'
     'remove:Remove an exited session'
     'gc:Remove all exited sessions'
+    'tag:Show or modify session tags'
+    'supervisor:Manage the session supervisor'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'wrap:Auto-wrap a command in pty sessions'
@@ -65,6 +67,9 @@ _pty() {
           _arguments \
             '(-f --follow)'{-f,--follow}'[Follow output read-only]' \
             '--plain[Output plain text without ANSI codes]' \
+            '--full[Include full scrollback]' \
+            '--wait[Wait until text appears]:pattern:' \
+            '(-t --timeout)'{-t,--timeout}'[Timeout in seconds]:seconds:' \
             '1:session:_pty_sessions'
           ;;
         send)
@@ -86,6 +91,8 @@ _pty() {
             '--all[Follow events from all sessions]' \
             '--recent[Show recent events and exit]' \
             '--json[Output raw JSONL]' \
+            '--wait[Wait for a specific event type]:type:' \
+            '(-t --timeout)'{-t,--timeout}'[Timeout in seconds]:seconds:' \
             '1:session:_pty_sessions'
           ;;
         stats)
@@ -101,6 +108,29 @@ _pty() {
           ;;
         gc)
           # No arguments
+          ;;
+        tag)
+          _arguments '1:session:_pty_sessions'
+          ;;
+        supervisor)
+          local -a subcmds
+          subcmds=(
+            'start:Start the supervisor'
+            'stop:Stop the supervisor'
+            'status:Show supervised sessions'
+            'forget:Stop supervising a session'
+            'reset:Reset a failed session for retry'
+            'launchd:Register/unregister with macOS launchd'
+          )
+          _arguments '1:subcommand:->subcmd' '*::arg:->subargs'
+          case $state in
+            subcmd) _describe 'subcommand' subcmds ;;
+            subargs)
+              case ${words[1]} in
+                forget|reset) _arguments '1:session:_pty_sessions' ;;
+                launchd) _arguments '1:action:(install uninstall)' ;;
+              esac ;;
+          esac
           ;;
         wrap)
           _arguments \

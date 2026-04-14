@@ -58,6 +58,8 @@ complete -c pty -n __pty_needs_command -a kill -d 'Kill a running session'
 complete -c pty -n __pty_needs_command -a rm -d 'Remove an exited session'
 complete -c pty -n __pty_needs_command -a remove -d 'Remove an exited session'
 complete -c pty -n __pty_needs_command -a gc -d 'Remove all exited sessions'
+complete -c pty -n __pty_needs_command -a tag -d 'Show or modify session tags'
+complete -c pty -n __pty_needs_command -a supervisor -d 'Manage the session supervisor'
 complete -c pty -n __pty_needs_command -a up -d 'Start sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a down -d 'Stop sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a wrap -d 'Auto-wrap a command in pty sessions'
@@ -84,6 +86,9 @@ complete -c pty -n '__pty_using_command a' -s r -l auto-restart -d 'Auto-restart
 complete -c pty -n '__pty_using_command peek' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command peek' -s f -l follow -d 'Follow output read-only'
 complete -c pty -n '__pty_using_command peek' -l plain -d 'Output plain text without ANSI'
+complete -c pty -n '__pty_using_command peek' -l full -d 'Include full scrollback'
+complete -c pty -n '__pty_using_command peek' -l wait -x -d 'Wait until text appears'
+complete -c pty -n '__pty_using_command peek' -s t -l timeout -x -d 'Timeout in seconds'
 
 # send: session names and flags
 complete -c pty -n '__pty_using_command send' -a '(__pty_sessions)' -d 'Session'
@@ -95,6 +100,8 @@ complete -c pty -n '__pty_using_command events' -a '(__pty_sessions)' -d 'Sessio
 complete -c pty -n '__pty_using_command events' -l all -d 'Follow events from all sessions'
 complete -c pty -n '__pty_using_command events' -l recent -d 'Show recent events and exit'
 complete -c pty -n '__pty_using_command events' -l json -d 'Output raw JSONL'
+complete -c pty -n '__pty_using_command events' -l wait -x -d 'Wait for a specific event type'
+complete -c pty -n '__pty_using_command events' -s t -l timeout -x -d 'Timeout in seconds'
 
 # list: flags
 complete -c pty -n '__pty_using_command list' -l json -d 'Output as JSON'
@@ -124,3 +131,11 @@ complete -c pty -n '__pty_using_command wrap' -a '(__fish_complete_command)' -d 
 
 # unwrap: previously wrapped commands
 complete -c pty -n '__pty_using_command unwrap' -a '(__pty_wrapped)' -d 'Wrapped command'
+
+# tag: session names
+complete -c pty -n '__pty_using_command tag' -a '(__pty_sessions)' -d 'Session'
+complete -c pty -n '__pty_using_command tag' -l rm -d 'Remove a tag'
+
+# supervisor: subcommands
+complete -c pty -n '__pty_using_command supervisor' -a 'start stop status forget reset launchd' -d 'Subcommand'
+

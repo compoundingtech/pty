@@ -3,7 +3,7 @@
 
 // Session management
 export {
-  listSessions, getSession, gc, validateName,
+  listSessions, getSession, gc, validateName, updateTags,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
   type SessionInfo, type SessionMetadata,
@@ -33,6 +33,8 @@ export {
   type EventRecord, type EventBase,
   type BellEvent, type TitleChangeEvent, type NotificationEvent,
   type FocusRequestEvent, type CursorVisibleEvent,
+  type SessionRestartEvent, type SessionFailedEvent,
+  type SupervisorStartEvent, type SupervisorStopEvent,
   type FollowerOptions,
 } from "./events.ts";
 

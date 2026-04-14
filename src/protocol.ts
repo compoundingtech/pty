@@ -56,9 +56,10 @@ export function encodeExit(code: number): Buffer {
   return encodePacket(MessageType.EXIT, payload);
 }
 
-export function encodePeek(plain = false): Buffer {
+export function encodePeek(plain = false, full = false): Buffer {
   const payload = Buffer.alloc(1);
-  payload.writeUInt8(plain ? 1 : 0, 0);
+  // Bit 0: plain, Bit 1: full scrollback
+  payload.writeUInt8((plain ? 1 : 0) | (full ? 2 : 0), 0);
   return encodePacket(MessageType.PEEK, payload);
 }
 

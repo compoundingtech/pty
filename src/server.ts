@@ -387,13 +387,16 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
-            const plain = packet.payload.length > 0 && packet.payload.readUInt8(0) === 1;
+            const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
+            const plain = (flags & 1) !== 0;
+            const full = (flags & 2) !== 0;
 
             if (plain) {
-              socket.write(encodeScreen(this.getPlainScreen()));
+              socket.write(encodeScreen(full ? this.getFullPlainScreen() : this.getPlainScreen()));
             } else {
-              // Send current screen state (same as ATTACH)
-              const peekScreen = this.getModePrefix() + this.serialize.serialize();
+              // scrollback: 0 for viewport only, omit for full scrollback
+              const serializeOpts = full ? undefined : { scrollback: 0 };
+              const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
               socket.write(encodeScreen(peekScreen));
             }
 
@@ -563,18 +566,28 @@ export class PtyServer {
   }
 
   private getPlainScreen(): string {
+    // Viewport only: last `rows` lines (where the cursor is)
+    const buffer = this.terminal.buffer.active;
+    const lines: string[] = [];
+    const start = Math.max(0, buffer.baseY);
+    const end = buffer.length;
+    for (let i = start; i < end; i++) {
+      const line = buffer.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.join("\n");
+  }
+
+  private getFullPlainScreen(): string {
+    // Full scrollback + viewport
     const buffer = this.terminal.buffer.active;
     const lines: string[] = [];
     for (let i = 0; i < buffer.length; i++) {
       const line = buffer.getLine(i);
-      if (line) {
-        lines.push(line.translateToString(true));
-      }
+      if (line) lines.push(line.translateToString(true));
     }
-    // Trim trailing empty lines
-    while (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines.pop();
-    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     return lines.join("\n");
   }
 

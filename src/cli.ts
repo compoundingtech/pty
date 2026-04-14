@@ -14,11 +14,15 @@ import {
   validateName,
   acquireLock,
   releaseLock,
+  updateTags,
+  readMetadata,
+  getSessionDir,
   type SessionInfo,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
+import { getSupervisorDir } from "./supervisor.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
@@ -40,6 +44,9 @@ function usage(): void {
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
   pty peek --plain <name>                  Print current screen as plain text (no ANSI)
+  pty peek --full <name>                   Print full scrollback (not just viewport)
+  pty peek --wait "text" <name>            Wait until text appears on screen
+  pty peek --wait "text" -t 10 <name>      Wait with timeout (seconds)
   pty peek -f <name>                       Follow output read-only (Ctrl+\\ to stop)
   pty send <name> "text"                   Send text to a session
   pty send <name> --seq "text" --seq key:return  Send an ordered sequence
@@ -61,6 +68,14 @@ function usage(): void {
   pty down <name> [<name>...]             Stop specific sessions from pty.toml
   pty kill <name>                          Kill or remove a session
   pty gc                                   Remove all exited sessions
+  pty tag <name>                           Show tags on a session
+  pty tag <name> key=value [key=value...]  Set tags
+  pty tag <name> --rm key [--rm key...]    Remove tags
+  pty supervisor start                     Start the session supervisor
+  pty supervisor stop                      Stop the supervisor
+  pty supervisor status                    Show supervised sessions
+  pty supervisor forget <name>             Stop supervising a session
+  pty supervisor reset <name>              Reset a failed session for retry
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -241,16 +256,21 @@ async function main(): Promise<void> {
     case "peek": {
       let follow = false;
       let plain = false;
+      let full = false;
+      let waitPattern: string | null = null;
+      let timeoutSec = 0;
       let pi = 1;
       while (pi < args.length && args[pi].startsWith("-")) {
-        if (args[pi] === "-f" || args[pi] === "--follow") follow = true;
-        else if (args[pi] === "--plain") plain = true;
+        if (args[pi] === "-f" || args[pi] === "--follow") { follow = true; pi++; }
+        else if (args[pi] === "--plain") { plain = true; pi++; }
+        else if (args[pi] === "--full") { full = true; pi++; }
+        else if (args[pi] === "--wait" && pi + 1 < args.length) { waitPattern = args[pi + 1]; pi += 2; }
+        else if ((args[pi] === "-t" || args[pi] === "--timeout") && pi + 1 < args.length) { timeoutSec = parseFloat(args[pi + 1]); pi += 2; }
         else break;
-        pi++;
       }
       const peekName = args[pi];
       if (!peekName) {
-        console.error("Usage: pty peek [-f] [--plain] <name>");
+        console.error("Usage: pty peek [-f] [--plain] [--full] [--wait <pattern>] [-t <seconds>] <name>");
         process.exit(1);
       }
       try {
@@ -259,7 +279,11 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
-      cmdPeek(peekName, follow, plain);
+      if (waitPattern) {
+        await cmdPeekWait(peekName, waitPattern, timeoutSec, plain);
+      } else {
+        cmdPeek(peekName, follow, plain, full);
+      }
       break;
     }
 
@@ -328,17 +352,21 @@ async function main(): Promise<void> {
       let all = false;
       let recent = false;
       let json = false;
+      let waitEventType: string | null = null;
+      let eventsTimeout = 0;
       let ei = 1;
       while (ei < args.length && args[ei].startsWith("-")) {
         if (args[ei] === "--all") { all = true; ei++; }
         else if (args[ei] === "--recent") { recent = true; ei++; }
         else if (args[ei] === "--json") { json = true; ei++; }
+        else if (args[ei] === "--wait" && ei + 1 < args.length) { waitEventType = args[ei + 1]; ei += 2; }
+        else if ((args[ei] === "-t" || args[ei] === "--timeout") && ei + 1 < args.length) { eventsTimeout = parseFloat(args[ei + 1]); ei += 2; }
         else break;
       }
       const eventsName = args[ei];
 
       if (!all && !eventsName) {
-        console.error("Usage: pty events [--all] [--recent] [--json] [<name>]");
+        console.error("Usage: pty events [--all] [--recent] [--json] [--wait <type>] [-t <seconds>] [<name>]");
         process.exit(1);
       }
 
@@ -351,7 +379,7 @@ async function main(): Promise<void> {
         }
       }
 
-      await cmdEvents(eventsName ?? null, { all, recent, json });
+      await cmdEvents(eventsName ?? null, { all, recent, json, waitEventType, timeout: eventsTimeout });
       break;
     }
 
@@ -407,6 +435,80 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "tag": {
+      const tagName = args[1];
+      if (!tagName) {
+        console.error("Usage: pty tag <name> [key=value...] [--rm key...]");
+        process.exit(1);
+      }
+      try {
+        validateName(tagName);
+      } catch (e: any) {
+        console.error(e.message);
+        process.exit(1);
+      }
+
+      const updates: Record<string, string> = {};
+      const removals: string[] = [];
+      for (let i = 2; i < args.length; i++) {
+        if (args[i] === "--rm" && i + 1 < args.length) {
+          removals.push(args[i + 1]);
+          i++;
+        } else {
+          const eq = args[i].indexOf("=");
+          if (eq === -1) {
+            console.error(`Invalid tag format: "${args[i]}". Use key=value or --rm key`);
+            process.exit(1);
+          }
+          updates[args[i].slice(0, eq)] = args[i].slice(eq + 1);
+        }
+      }
+
+      // No updates or removals — show current tags
+      if (Object.keys(updates).length === 0 && removals.length === 0) {
+        const meta = readMetadata(tagName);
+        if (!meta) {
+          console.error(`Session "${tagName}" not found.`);
+          process.exit(1);
+        }
+        if (!meta.tags || Object.keys(meta.tags).length === 0) {
+          console.log(`No tags on "${tagName}".`);
+        } else {
+          for (const [k, v] of Object.entries(meta.tags)) {
+            console.log(`  ${k}=${v}`);
+          }
+        }
+        break;
+      }
+
+      try {
+        // Check if session is managed by a pty.toml before modifying
+        const beforeMeta = readMetadata(tagName);
+        const ptyfilePath = beforeMeta?.tags?.ptyfile;
+
+        updateTags(tagName, updates, removals);
+        const meta = readMetadata(tagName);
+        if (!meta?.tags || Object.keys(meta.tags).length === 0) {
+          console.log(`Tags cleared on "${tagName}".`);
+        } else {
+          console.log(`Tags on "${tagName}":`);
+          for (const [k, v] of Object.entries(meta.tags)) {
+            console.log(`  ${k}=${v}`);
+          }
+        }
+
+        if (ptyfilePath) {
+          console.error(`\nWarning: this session is managed by ${ptyfilePath}`);
+          console.error("Running 'pty up' will sync tags from the toml and may overwrite this change.");
+          console.error("To make it permanent, edit the pty.toml file directly.");
+        }
+      } catch (e: any) {
+        console.error(e.message);
+        process.exit(1);
+      }
+      break;
+    }
+
     case "up": {
       if (args[1] === "-h" || args[1] === "--help") {
         console.log("Usage: pty up [dir] [name...]\n\nStart sessions defined in pty.toml.");
@@ -419,7 +521,6 @@ async function main(): Promise<void> {
 
       for (const arg of upArgs) {
         if (arg.startsWith("-")) break;
-        // First arg: directory if pty.toml exists there, otherwise session name
         if (!dir && names.length === 0 && hasPtyFile(arg)) {
           dir = arg;
         } else {
@@ -467,6 +568,66 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       await cmdRm(args[1]);
+      break;
+    }
+
+    case "supervisor": {
+      const subCmd = args[1];
+      if (!subCmd || subCmd === "-h" || subCmd === "--help") {
+        console.log(`Usage:
+  pty supervisor start            Start the supervisor
+  pty supervisor stop             Stop the supervisor
+  pty supervisor status           Show supervised sessions
+  pty supervisor forget <name>    Stop supervising a session
+  pty supervisor reset <name>     Reset a failed session for retry
+  pty supervisor launchd install  Register with macOS launchd
+  pty supervisor launchd uninstall Remove from launchd`);
+        break;
+      }
+      switch (subCmd) {
+        case "start":
+          await cmdSupervisorStart();
+          break;
+        case "stop":
+          await cmdSupervisorStop();
+          break;
+        case "status":
+          await cmdSupervisorStatus();
+          break;
+        case "forget": {
+          const forgetName = args[2];
+          if (!forgetName) {
+            console.error("Usage: pty supervisor forget <name>");
+            process.exit(1);
+          }
+          await cmdSupervisorForget(forgetName);
+          break;
+        }
+        case "reset": {
+          const resetName = args[2];
+          if (!resetName) {
+            console.error("Usage: pty supervisor reset <name>");
+            process.exit(1);
+          }
+          await cmdSupervisorReset(resetName);
+          break;
+        }
+        case "launchd": {
+          const launchdCmd = args[2];
+          if (launchdCmd === "install") {
+            cmdSupervisorLaunchdInstall();
+          } else if (launchdCmd === "uninstall") {
+            cmdSupervisorLaunchdUninstall();
+          } else {
+            console.error("Usage: pty supervisor launchd install|uninstall");
+            process.exit(1);
+          }
+          break;
+        }
+        default:
+          console.error(`Unknown supervisor command: ${subCmd}`);
+          process.exit(1);
+      }
       break;
     }
 
@@ -626,7 +787,7 @@ async function handleDeadSession(
     `Session "${session.name}" exited with code ${meta.exitCode ?? "unknown"}.`
   );
 
-  const cmd = [meta.displayCommand, ...meta.args].join(" ");
+  const cmd = [meta.displayCommand, ...(meta.args ?? [])].join(" ");
   console.log(`Command was: ${cmd}`);
   console.log("");
 
@@ -652,11 +813,43 @@ function doAttach(name: string): void {
   });
 }
 
-function cmdPeek(name: string, follow: boolean, plain: boolean): void {
+async function cmdPeekWait(name: string, pattern: string, timeoutSec: number, plain: boolean): Promise<void> {
+  const { peekScreen } = await import("./connection.ts");
+  const start = Date.now();
+  const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
+
+  while (true) {
+    if (timeoutMs > 0 && Date.now() - start > timeoutMs) {
+      console.error(`Timed out after ${timeoutSec}s waiting for "${pattern}".`);
+      process.exit(1);
+    }
+
+    try {
+      const screen = await peekScreen({ name, plain: true });
+      if (screen.includes(pattern)) {
+        if (plain) {
+          process.stdout.write(screen + "\n");
+        } else {
+          const ansiScreen = await peekScreen({ name, plain: false });
+          process.stdout.write(ansiScreen + "\n");
+        }
+        return;
+      }
+    } catch (err: any) {
+      console.error(err.message);
+      process.exit(1);
+    }
+
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+function cmdPeek(name: string, follow: boolean, plain: boolean, full = false): void {
   peek({
     name,
     follow,
     plain,
+    full,
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });
@@ -671,7 +864,7 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       status: s.status,
       pid: s.pid,
       command: s.metadata
-        ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
+        ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
         : null,
       cwd: s.metadata?.cwd ?? null,
       createdAt: s.metadata?.createdAt ?? null,
@@ -695,7 +888,7 @@ async function cmdList(json = false, showTags = false): Promise<void> {
     console.log("Active sessions:");
     for (const session of running) {
       const cmd = session.metadata
-        ? [session.metadata.displayCommand, ...session.metadata.args].join(" ")
+        ? [session.metadata.displayCommand, ...(session.metadata.args ?? [])].join(" ")
         : "unknown";
       const cwd = session.metadata?.cwd
         ? shortPath(session.metadata.cwd)
@@ -703,7 +896,8 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       const tagStr = showTags && session.metadata?.tags
         ? " " + Object.entries(session.metadata.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
         : "";
-      console.log(`  \x1b[1;36m${session.name}\x1b[0m${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+      const marker = strategyMarker(session.metadata?.tags);
+      console.log(`  \x1b[1;36m${session.name}\x1b[0m${marker}${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 
@@ -716,12 +910,13 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       const ago = meta?.exitedAt ? timeAgo(new Date(meta.exitedAt)) : "unknown";
       const cwd = meta?.cwd ? shortPath(meta.cwd) : "";
       const cmd = meta
-        ? [meta.displayCommand, ...meta.args].join(" ")
+        ? [meta.displayCommand, ...(meta.args ?? [])].join(" ")
         : "";
       const tagStr = showTags && meta?.tags
         ? " " + Object.entries(meta.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
         : "";
-      console.log(`  \x1b[1m${session.name}\x1b[0m${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+      const marker = strategyMarker(meta?.tags);
+      console.log(`  \x1b[1m${session.name}\x1b[0m${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 }
@@ -830,7 +1025,7 @@ async function cmdStats(
 
 function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   const cmd = meta
-    ? [meta.displayCommand, ...meta.args].join(" ")
+    ? [meta.displayCommand, ...(meta.args ?? [])].join(" ")
     : "unknown";
   const cwd = meta?.cwd ? shortPath(meta.cwd) : "unknown";
 
@@ -893,6 +1088,16 @@ async function cmdKill(name: string): Promise<void> {
     process.exit(1);
   }
 
+  // Remove supervision tags so the supervisor doesn't restart it
+  const wasSupervised = session.metadata?.tags?.strategy === "permanent" || session.metadata?.tags?.strategy === "temporary";
+  if (wasSupervised) {
+    try {
+      const removals = ["strategy"];
+      if (session.metadata?.tags?.["supervisor.status"]) removals.push("supervisor.status");
+      updateTags(name, {}, removals);
+    } catch {}
+  }
+
   try {
     process.kill(session.pid, "SIGTERM");
     console.log(`Session "${name}" killed.`);
@@ -900,6 +1105,11 @@ async function cmdKill(name: string): Promise<void> {
     console.error(`Failed to kill session "${name}".`);
   }
   cleanupSocket(name);
+
+  if (wasSupervised && session.metadata?.tags?.ptyfile) {
+    console.error(`Note: this session is managed by ${session.metadata.tags.ptyfile}`);
+    console.error("The strategy tag will be restored on the next 'pty up'.");
+  }
 }
 
 async function cmdRm(name: string): Promise<void> {
@@ -931,6 +1141,278 @@ async function cmdGc(): Promise<void> {
     console.log(`Removed: ${name}`);
   }
   console.log(`Cleaned up ${removed.length} exited session${removed.length === 1 ? "" : "s"}.`);
+}
+
+async function cmdSupervisorStart(): Promise<void> {
+  // Run the supervisor in the foreground (not in a pty session).
+  // This makes it work with launchd KeepAlive since launchd owns the process.
+  // Use `pty events supervisor` to follow activity, `pty supervisor status` for state.
+  const { Supervisor } = await import("./supervisor.ts");
+
+  const sup = new Supervisor("supervisor");
+  sup.start();
+
+  console.log(`[supervisor] started (pid ${process.pid})`);
+  console.log(`[supervisor] watching ${getSessionDir()}`);
+
+  process.on("SIGTERM", () => {
+    console.log("[supervisor] stopping...");
+    sup.stop();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    console.log("[supervisor] stopping...");
+    sup.stop();
+    process.exit(0);
+  });
+
+  // Keep the process alive
+  await new Promise(() => {});
+}
+
+async function cmdSupervisorStop(): Promise<void> {
+  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
+  let pid: number;
+  try {
+    pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
+  } catch {
+    console.error("Supervisor is not running.");
+    process.exit(1);
+  }
+  try {
+    process.kill(pid, 0); // check if alive
+    process.kill(pid, "SIGTERM");
+    console.log("Supervisor stopped.");
+  } catch {
+    console.error("Supervisor is not running (stale pid file).");
+    try { fs.unlinkSync(pidPath); } catch {}
+    process.exit(1);
+  }
+}
+
+async function cmdSupervisorStatus(): Promise<void> {
+  const sessions = await listSessions();
+  const supervised = sessions.filter((s) =>
+    s.metadata?.tags?.strategy === "permanent" || s.metadata?.tags?.strategy === "temporary"
+  );
+
+  if (supervised.length === 0) {
+    console.log("No supervised sessions.");
+    return;
+  }
+
+  // Try to read supervisor state for restart counts
+  let state: Record<string, any> = {};
+  try {
+    const content = fs.readFileSync(path.join(getSupervisorDir(), "state.json"), "utf-8");
+    state = JSON.parse(content).sessions ?? {};
+  } catch {}
+
+  let supervisorRunning = false;
+  try {
+    const pid = parseInt(fs.readFileSync(path.join(getSupervisorDir(), "supervisor.pid"), "utf-8").trim(), 10);
+    process.kill(pid, 0);
+    supervisorRunning = true;
+  } catch {}
+  console.log(`Supervisor: ${supervisorRunning ? "\x1b[32mrunning\x1b[0m" : "\x1b[31mnot running\x1b[0m"}`);
+  console.log("");
+
+  for (const s of supervised) {
+    const strategy = s.metadata!.tags!.strategy;
+    const supStatus = s.metadata?.tags?.["supervisor.status"];
+    const stateInfo = state[s.name];
+    const restarts = stateInfo?.restartCount ?? 0;
+
+    let status = s.status === "running" ? "\x1b[32mrunning\x1b[0m" : "\x1b[33mexited\x1b[0m";
+    if (supStatus === "failed") status = "\x1b[31mfailed\x1b[0m";
+
+    console.log(`  \x1b[1m${s.name}\x1b[0m [${strategy}] — ${status}${restarts > 0 ? ` (${restarts} restarts)` : ""}`);
+  }
+}
+
+async function cmdSupervisorForget(name: string): Promise<void> {
+  try {
+    validateName(name);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  const meta = readMetadata(name);
+  if (!meta) {
+    console.error(`Session "${name}" not found.`);
+    process.exit(1);
+  }
+
+  const removals: string[] = [];
+  if (meta.tags?.strategy) removals.push("strategy");
+  if (meta.tags?.["supervisor.status"]) removals.push("supervisor.status");
+
+  if (removals.length === 0) {
+    console.log(`Session "${name}" is not supervised.`);
+    return;
+  }
+
+  updateTags(name, {}, removals);
+  console.log(`Removed supervision from "${name}".`);
+
+  if (meta.tags?.ptyfile) {
+    console.error(`\nWarning: this session is managed by ${meta.tags.ptyfile}`);
+    console.error("The strategy tag will be restored on the next 'pty up'.");
+    console.error("Edit the pty.toml to make this permanent.");
+  }
+}
+
+async function cmdSupervisorReset(name: string): Promise<void> {
+  try {
+    validateName(name);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  const meta = readMetadata(name);
+  if (!meta) {
+    console.error(`Session "${name}" not found.`);
+    process.exit(1);
+  }
+
+  if (meta.tags?.["supervisor.status"] !== "failed") {
+    console.log(`Session "${name}" is not in failed state.`);
+    return;
+  }
+
+  // Remove the failed tag
+  updateTags(name, {}, ["supervisor.status"]);
+
+  // Reset restart counter in supervisor state
+  const statePath = path.join(getSupervisorDir(), "state.json");
+  try {
+    const content = fs.readFileSync(statePath, "utf-8");
+    const state = JSON.parse(content);
+    if (state.sessions?.[name]) {
+      state.sessions[name].restartCount = 0;
+      state.sessions[name].restartWindowStart = 0;
+      state.sessions[name].nextBackoffMs = 1000;
+      state.sessions[name].failed = false;
+      const tmp = statePath + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+      fs.renameSync(tmp, statePath);
+    }
+  } catch {}
+
+  console.log(`Reset "${name}". The supervisor will try restarting it.`);
+}
+
+function cmdSupervisorLaunchdInstall(): void {
+  const launchdDir = path.join(os.homedir(), ".local", "pty", "launchd");
+  const bundlePath = path.join(launchdDir, "supervisor.bundle.js");
+  const logPath = path.join(os.homedir(), ".local", "state", "pty", "supervisor.log");
+  const plistDir = path.join(os.homedir(), "Library", "LaunchAgents");
+  const plistPath = path.join(plistDir, "com.myobie.pty.supervisor.plist");
+
+  // Stop existing supervisor if running
+  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
+  try {
+    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    try { fs.unlinkSync(pidPath); } catch {}
+    console.log("Stopped existing supervisor.");
+  } catch {}
+
+  // Unload existing plist if present
+  if (fs.existsSync(plistPath)) {
+    spawnSync("launchctl", ["unload", plistPath], { encoding: "utf-8" });
+  }
+
+  // Bundle the supervisor into a single portable JS file
+  const distDir = path.join(
+    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    "..", "dist"
+  );
+  const entryPoint = path.join(distDir, "supervisor-entry.js");
+
+  console.log("Bundling supervisor...");
+  const serverModule = path.join(distDir, "server.js");
+  const esbuildResult = spawnSync("npx", ["esbuild", entryPoint, "--bundle", "--platform=node", "--format=esm", `--outfile=${bundlePath}`, `--define:SERVER_MODULE_PATH="${serverModule.replace(/\\/g, "\\\\")}"`], {
+    encoding: "utf-8",
+    cwd: distDir,
+  });
+  if (esbuildResult.status !== 0) {
+    console.error(`Failed to bundle supervisor: ${esbuildResult.stderr}`);
+    process.exit(1);
+  }
+
+  // Use absolute path to current node binary — no PATH dependency
+  const nodeBin = process.execPath;
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.myobie.pty.supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodeBin}</string>
+    <string>${bundlePath}</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>${logPath}</string>
+  <key>StandardErrorPath</key>
+  <string>${logPath}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
+`;
+
+  fs.mkdirSync(launchdDir, { recursive: true });
+  fs.mkdirSync(plistDir, { recursive: true });
+  fs.writeFileSync(plistPath, plist);
+
+  const result = spawnSync("launchctl", ["load", plistPath], { encoding: "utf-8" });
+  if (result.status !== 0) {
+    console.error(`Failed to load plist: ${result.stderr}`);
+    process.exit(1);
+  }
+
+  console.log(`Bundle:  ${bundlePath}`);
+  console.log(`Plist:   ${plistPath}`);
+  console.log(`Log:     ${logPath}`);
+  console.log(`Node:    ${nodeBin}`);
+  console.log("Supervisor will start on login and restart if it exits.");
+}
+
+function cmdSupervisorLaunchdUninstall(): void {
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", "com.myobie.pty.supervisor.plist");
+  const launchdDir = path.join(os.homedir(), ".local", "pty", "launchd");
+
+  if (!fs.existsSync(plistPath)) {
+    console.error("Supervisor is not registered with launchd.");
+    process.exit(1);
+  }
+
+  spawnSync("launchctl", ["unload", plistPath], { encoding: "utf-8" });
+  try { fs.unlinkSync(plistPath); } catch {}
+
+  // Clean up bundled files
+  try { fs.rmSync(launchdDir, { recursive: true, force: true }); } catch {}
+
+  // Stop supervisor if running
+  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
+  try {
+    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    try { fs.unlinkSync(pidPath); } catch {}
+  } catch {}
+
+  console.log("Supervisor removed from launchd.");
+  console.log(`Cleaned up ${launchdDir}`);
 }
 
 function hasPtyFile(dir: string): boolean {
@@ -971,7 +1453,26 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
 
   for (const sess of sessions) {
     if (runningNames.has(sess.name)) {
-      console.log(`  ● ${sess.name} (already running)`);
+      // Sync tags from toml to the running session (including ptyfile metadata)
+      const currentMeta = readMetadata(sess.name);
+      const tomlPath = path.join(ptyFile.dir, "pty.toml");
+      const tomlTags = { ...sess.tags, ptyfile: tomlPath, "ptyfile.session": sess.shortName };
+      const currentTags = currentMeta?.tags ?? {};
+      const updates: Record<string, string> = {};
+      for (const [k, v] of Object.entries(tomlTags)) {
+        if (currentTags[k] !== v) updates[k] = v;
+      }
+      if (Object.keys(updates).length > 0) {
+        try {
+          updateTags(sess.name, updates);
+          const changed = Object.entries(updates).map(([k, v]) => `${k}=${v}`).join(", ");
+          console.log(`  ● ${sess.name} (already running, updated tags: ${changed})`);
+        } catch {
+          console.log(`  ● ${sess.name} (already running)`);
+        }
+      } else {
+        console.log(`  ● ${sess.name} (already running)`);
+      }
       skipped++;
       continue;
     }
@@ -983,13 +1484,19 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
     }
 
     try {
+      const tomlPath = path.join(ptyFile.dir, "pty.toml");
+      const tags = {
+        ...sess.tags,
+        ptyfile: tomlPath,
+        "ptyfile.session": sess.shortName,
+      };
       await spawnDaemon({
         name: sess.name,
         command: "/bin/sh",
         args: ["-c", sess.command],
         displayCommand: sess.command,
         cwd: ptyFile.dir,
-        tags: sess.tags,
+        tags,
       });
       console.log(`  ● ${sess.name} (started)`);
       started++;
@@ -1027,10 +1534,20 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
     const existingSession = existing.find((s) => s.name === sess.name);
     if (!existingSession) continue;
 
+    // Remove supervision tags so the supervisor doesn't restart it
+    const wasSupervised = existingSession.metadata?.tags?.strategy === "permanent" || existingSession.metadata?.tags?.strategy === "temporary";
+    if (wasSupervised) {
+      try {
+        const removals = ["strategy"];
+        if (existingSession.metadata?.tags?.["supervisor.status"]) removals.push("supervisor.status");
+        updateTags(sess.name, {}, removals);
+      } catch {}
+    }
+
     if (existingSession.status === "running" && existingSession.pid) {
       try {
         process.kill(existingSession.pid, "SIGTERM");
-        console.log(`  ○ ${sess.name} (stopped)`);
+        console.log(`  ○ ${sess.name} (stopped${wasSupervised ? ", removed from supervision" : ""})`);
         stopped++;
       } catch {
         console.error(`  ✗ ${sess.name}: failed to stop`);
@@ -1047,6 +1564,15 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
     console.log("No sessions to stop.");
   } else {
     console.log(`Stopped ${stopped} session${stopped === 1 ? "" : "s"}.`);
+  }
+
+  // Warn if any stopped sessions are toml-managed
+  const anyTomlManaged = sessions.some((sess) => {
+    const existingSession = existing.find((s) => s.name === sess.name);
+    return existingSession?.metadata?.tags?.ptyfile;
+  });
+  if (anyTomlManaged && stopped > 0) {
+    console.error("\nNote: strategy tags will be restored on the next 'pty up'.");
   }
 }
 
@@ -1095,7 +1621,7 @@ async function cmdRestart(name: string, force = false): Promise<void> {
 
 async function cmdEvents(
   name: string | null,
-  opts: { all: boolean; recent: boolean; json: boolean }
+  opts: { all: boolean; recent: boolean; json: boolean; waitEventType: string | null; timeout: number }
 ): Promise<void> {
   if (opts.recent) {
     if (!name) {
@@ -1120,6 +1646,44 @@ async function cmdEvents(
       console.error(`Session "${name}" not found.`);
       process.exit(1);
     }
+  }
+
+  // Wait mode: block until a specific event type appears
+  if (opts.waitEventType) {
+    if (!name) {
+      console.error("--wait requires a session name.");
+      process.exit(1);
+    }
+    const timeoutMs = opts.timeout > 0 ? opts.timeout * 1000 : 0;
+    const start = Date.now();
+
+    return new Promise<void>((resolve) => {
+      const follower = new EventFollower({
+        names: [name!],
+        onEvent: (event) => {
+          if (event.type === opts.waitEventType) {
+            console.log(opts.json ? JSON.stringify(event) : formatEvent(event));
+            follower.stop();
+            resolve();
+          }
+        },
+      });
+
+      follower.start();
+
+      if (timeoutMs > 0) {
+        setTimeout(() => {
+          follower.stop();
+          console.error(`Timed out after ${opts.timeout}s waiting for "${opts.waitEventType}" event.`);
+          process.exit(1);
+        }, timeoutMs);
+      }
+
+      process.on("SIGINT", () => {
+        follower.stop();
+        process.exit(0);
+      });
+    });
   }
 
   const follower = new EventFollower({
@@ -1165,6 +1729,15 @@ function ask(prompt: string): Promise<string> {
     rl.close();
     return answer;
   });
+}
+
+function strategyMarker(tags?: Record<string, string>): string {
+  if (!tags) return "";
+  const supStatus = tags["supervisor.status"];
+  if (supStatus === "failed") return " \x1b[31m[failed]\x1b[0m";
+  if (tags.strategy === "permanent") return " \x1b[33m[permanent]\x1b[0m";
+  if (tags.strategy === "temporary") return " \x1b[2m[temporary]\x1b[0m";
+  return "";
 }
 
 function shortPath(p: string): string {

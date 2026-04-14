@@ -137,6 +137,75 @@ command = "cat"
     expect(result.stdout).toContain("All sessions already running");
   }, 15000);
 
+  it("syncs tags to already-running sessions on pty up", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+
+    // Start with no tags
+    writePtyToml(projDir, `
+[sessions.syncme]
+command = "cat"
+`);
+    runCli(sessDir, "up", projDir);
+
+    // Update toml to add tags
+    writePtyToml(projDir, `
+[sessions.syncme]
+command = "cat"
+tags = { strategy = "permanent", role = "server" }
+`);
+
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.stdout).toContain("updated tags: strategy=permanent, role=server");
+
+    // Verify tags were applied
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "syncme");
+    expect(session.tags.strategy).toBe("permanent");
+    expect(session.tags.role).toBe("server");
+    expect(session.tags.ptyfile).toBeDefined();
+  }, 15000);
+
+  it("does not remove manually-added tags on pty up", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+    writePtyToml(projDir, `
+[sessions.manual]
+command = "cat"
+tags = { role = "server" }
+`);
+
+    runCli(sessDir, "up", projDir);
+
+    // Manually add an extra tag
+    runCli(sessDir, "tag", "manual", "custom=yes");
+
+    // Run pty up again — should NOT remove the custom tag
+    runCli(sessDir, "up", projDir);
+
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "manual");
+    expect(session.tags.role).toBe("server");
+    expect(session.tags.custom).toBe("yes");
+  }, 15000);
+
+  it("no output for already-running sessions with matching tags", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+    writePtyToml(projDir, `
+[sessions.unchanged]
+command = "cat"
+tags = { role = "server" }
+`);
+
+    runCli(sessDir, "up", projDir);
+
+    // Run again — tags match, no update message
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.stdout).toContain("unchanged (already running)");
+    expect(result.stdout).not.toContain("updated tags");
+  }, 15000);
+
   it("propagates tags from pty.toml", () => {
     const projDir = makeProjectDir();
     const sessDir = makeSessionDir();
@@ -151,7 +220,9 @@ tags = { role = "server", env = "dev" }
     const sessions = listJson(sessDir);
     const session = sessions.find((s: any) => s.name === "tagged");
     expect(session).toBeDefined();
-    expect(session.tags).toEqual({ role: "server", env: "dev" });
+    expect(session.tags.role).toBe("server");
+    expect(session.tags.env).toBe("dev");
+    expect(session.tags.ptyfile).toBeDefined();
   }, 15000);
 
   it("sets cwd to the project directory", () => {
@@ -217,6 +288,23 @@ command = "cat"
     const running = sessions.filter((s: any) => s.status === "running");
     expect(running).toHaveLength(1);
     expect(running[0].name).toBe("myapp-web");
+  }, 15000);
+
+  it("sets ptyfile tags on created sessions", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+    writePtyToml(projDir, `
+[sessions.tracked]
+command = "cat"
+`);
+
+    runCli(sessDir, "up", projDir);
+
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "tracked");
+    expect(session).toBeDefined();
+    expect(session.tags.ptyfile).toBe(projDir + "/pty.toml");
+    expect(session.tags["ptyfile.session"]).toBe("tracked");
   }, 15000);
 
   it("errors on unknown session name", () => {

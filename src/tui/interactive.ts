@@ -104,7 +104,7 @@ const filteredItems = computed<ListItem[]>(() => {
       continue;
     }
     const cmd = s.metadata
-      ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
+      ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
       : "";
     const cwd = s.metadata?.cwd ?? "";
     // Fuzzy match against name (weighted highest), cwd, and command
@@ -141,7 +141,7 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const s = item.session!;
   const icon = s.status === "running" ? "\u25cf" : "\u25cb";
   const cmd = s.metadata
-    ? [s.metadata.displayCommand, ...s.metadata.args].join(" ")
+    ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
     : "";
   const cwdStr = s.metadata?.cwd ? shortPath(s.metadata.cwd) : "";
   const exitStr = s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "";
@@ -149,8 +149,28 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
     ? cwdStr
     : [cwdStr, exitStr].filter(Boolean).join("  ");
 
-  const line = `${sel}${icon} ${s.name}  ${pathStr}  ${cmd}`;
-  return [text(line, selected ? "accent" : "primary", { bold: selected, truncate: true })];
+  const supStatus = s.metadata?.tags?.["supervisor.status"];
+  const strategy = s.metadata?.tags?.strategy;
+  const marker = supStatus === "failed" ? " [failed]" : strategy === "permanent" ? " [permanent]" : strategy === "temporary" ? " [temporary]" : "";
+  const markerColor: "error" | "warn" | "muted" = supStatus === "failed" ? "error" : strategy ? "warn" : "muted";
+  const iconColor = selected ? "accent" : s.status === "running" ? "ok" : "muted";
+
+  const parts: string[] = [
+    `${sel}${icon} `,
+  ];
+  // Build as a single string but use dim for path/command
+  const nameStr = `${sel}${icon} ${s.name}${marker}`;
+  const detailStr = `  ${pathStr}  ${cmd}`;
+  const line = nameStr + detailStr;
+
+  if (selected) {
+    return [text(line, "accent", { bold: true, truncate: true })];
+  }
+  // Use two text nodes: bold name + dim details
+  return [
+    text(nameStr, s.status === "running" ? "primary" : "muted", { bold: true }),
+    text(detailStr, "muted", { dim: true, truncate: true }),
+  ];
 }
 
 const listScreen = screen({

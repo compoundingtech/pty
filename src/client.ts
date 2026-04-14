@@ -59,6 +59,7 @@ export interface PeekOptions {
   name: string;
   follow?: boolean; // If true, stay connected and stream (like tail -f). If false, print screen and exit.
   plain?: boolean; // If true, output plain text without ANSI codes.
+  full?: boolean; // If true, include full scrollback, not just the viewport.
   onExit?: (code: number) => void;
   onDetach?: () => void;
 }
@@ -72,7 +73,7 @@ export function peek(options: PeekOptions): void {
   const follow = options.follow ?? false;
 
   socket.on("connect", () => {
-    socket.write(encodePeek(options.plain));
+    socket.write(encodePeek(options.plain, options.full));
 
     if (follow) {
       // In follow mode, Ctrl+\ detaches

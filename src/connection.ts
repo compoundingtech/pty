@@ -28,6 +28,7 @@ export interface SendDataOptions {
 export interface PeekScreenOptions {
   name: string;
   plain?: boolean;
+  full?: boolean;
 }
 
 /**
@@ -183,7 +184,7 @@ export function peekScreen(options: PeekScreenOptions): Promise<string> {
     const socket = net.createConnection(socketPath);
 
     socket.on("connect", () => {
-      socket.write(encodePeek(options.plain));
+      socket.write(encodePeek(options.plain, options.full));
     });
 
     socket.on("data", (raw: Buffer) => {

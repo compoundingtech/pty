@@ -6,7 +6,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a peek send events list ls stats restart kill rm remove gc up down wrap unwrap test help"
+  commands="run attach a peek send events list ls stats restart kill rm remove gc tag supervisor up down wrap unwrap test help"
 
   # Complete subcommand
   if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -21,14 +21,14 @@ _pty() {
   fi
 
   case "${COMP_WORDS[1]}" in
-    attach|a|peek|send|kill|restart|events|rm|remove|stats)
+    attach|a|peek|send|kill|restart|events|rm|remove|stats|tag)
       if [[ "${cur}" == -* ]]; then
         case "${COMP_WORDS[1]}" in
           attach|a) COMPREPLY=($(compgen -W "--auto-restart -r" -- "${cur}")) ;;
-          peek) COMPREPLY=($(compgen -W "--follow -f --plain" -- "${cur}")) ;;
+          peek) COMPREPLY=($(compgen -W "--follow -f --plain --full --wait --timeout -t" -- "${cur}")) ;;
           send) COMPREPLY=($(compgen -W "--seq --with-delay" -- "${cur}")) ;;
           restart) COMPREPLY=($(compgen -W "--yes -y" -- "${cur}")) ;;
-          events) COMPREPLY=($(compgen -W "--all --recent --json" -- "${cur}")) ;;
+          events) COMPREPLY=($(compgen -W "--all --recent --json --wait --timeout -t" -- "${cur}")) ;;
           stats) COMPREPLY=($(compgen -W "--json --all" -- "${cur}")) ;;
         esac
       else
@@ -71,6 +71,15 @@ _pty() {
       # Before --, complete flags
       if [[ "${cur}" == -* ]]; then
         COMPREPLY=($(compgen -W "--detach -d --attach -a --ephemeral -e --name --cwd --tag" -- "${cur}"))
+      fi
+      ;;
+    supervisor)
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "start stop status forget reset launchd" -- "${cur}"))
+      elif [[ "${COMP_WORDS[2]}" == "forget" || "${COMP_WORDS[2]}" == "reset" ]]; then
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      elif [[ "${COMP_WORDS[2]}" == "launchd" ]]; then
+        COMPREPLY=($(compgen -W "install uninstall" -- "${cur}"))
       fi
       ;;
   esac
