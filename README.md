@@ -192,7 +192,7 @@ command = "bin/serve"
 tags = { strategy = "permanent" }
 ```
 
-For macOS auto-start on login: `pty supervisor launchd install`.
+For macOS auto-start on login: `pty supervisor launchd install`. The install will compile a small wrapper binary and prompt you to grant it Full Disk Access (required for sessions on external/removable volumes). Linux (systemd) and other OS integrations are a TODO — contributions welcome.
 
 ### Plugins
 

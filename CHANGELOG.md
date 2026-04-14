@@ -25,6 +25,11 @@
 - Supervisor logs every skip reason in `doRestart` for debugging
 - Supervisor state directory moved to `~/.local/state/pty/supervisor/` (no longer pollutes session dir)
 
+### TUI framework
+- Export `SelectableGroup<T>` interface from `@myobie/pty/tui`
+- `groupedSelectable` `renderHeader` callback now receives the full group object instead of `(title, count)` — allows custom group rendering
+- Empty groups are now rendered (header shown) instead of being silently skipped
+
 ## 0.7.0
 
 ### Supervisor

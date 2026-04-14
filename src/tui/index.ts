@@ -61,7 +61,7 @@ export {
   text, spacer, gap, separator, indent,
   dot, checkbox, progressBar, spinner, icon,
   row, column, hstack, panel,
-  scrollable, selectable, groupedSelectable,
+  scrollable, selectable, groupedSelectable, type SelectableGroup,
   statusBar, footer, askBar, textInput,
   fpsCounter, canvas,
   createPty, attachPty, ptyView, themeToXterm,

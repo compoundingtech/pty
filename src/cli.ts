@@ -581,7 +581,7 @@ async function main(): Promise<void> {
   pty supervisor status           Show supervised sessions
   pty supervisor forget <name>    Stop supervising a session
   pty supervisor reset <name>     Reset a failed session for retry
-  pty supervisor launchd install [--path PATH]  Register with macOS launchd
+  pty supervisor launchd install [--path PATH]  Register with macOS launchd (requires FDA)
   pty supervisor launchd uninstall Remove from launchd`);
         break;
       }

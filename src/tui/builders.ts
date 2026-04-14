@@ -166,12 +166,17 @@ export function selectable<T>(
  * Headers and spacing rows are included in the visual output but the
  * scroll offset is mapped from item-space to visual-row-space automatically.
  */
+export interface SelectableGroup<T> {
+  title: string;
+  items: T[];
+}
+
 export function groupedSelectable<T>(
   region: ScrollRegion,
-  groups: { title: string; items: T[] }[],
+  groups: SelectableGroup<T>[],
   renderItem: (item: T, globalIndex: number, selected: boolean) => UINode[],
-  renderHeader: (title: string, count: number) => UINode[] =
-    (title, count) => [text(title, "accent", { bold: true }), text(` (${count})`, "muted")],
+  renderHeader: (group: SelectableGroup<T>) => UINode[] =
+    (group) => [text(group.title, "accent", { bold: true }), text(` (${group.items.length})`, "muted")],
 ): SelectableNode {
   const allRows: UINode[][] = [];
   let globalIdx = 0;
@@ -179,9 +184,8 @@ export function groupedSelectable<T>(
   let selectedVisualRow = 0;
 
   for (const group of groups) {
-    if (group.items.length === 0) continue;
     if (allRows.length > 0) allRows.push([]); // spacing
-    allRows.push(renderHeader(group.title, group.items.length)); // header
+    allRows.push(renderHeader(group)); // header
     for (const item of group.items) {
       if (globalIdx === region.selectedIndex) {
         selectedVisualRow = allRows.length;
