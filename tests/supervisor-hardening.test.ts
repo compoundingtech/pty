@@ -246,19 +246,21 @@ describe("spawnDaemon process leak", () => {
   it("kills orphaned daemon on waitForSocket timeout", () => {
     const dir = makeSessionDir();
 
-    // Count server.js processes before
-    const before = spawnSync("pgrep", ["-f", "server.js"], { encoding: "utf-8" });
-    const beforeCount = before.stdout.trim().split("\n").filter(Boolean).length;
-
     // Try to spawn with a nonexistent command — daemon will crash
     const result = runCli(dir, "run", "-d", "--name", "leak-test", "--", "/nonexistent/command");
 
-    // Count server.js processes after
-    const after = spawnSync("pgrep", ["-f", "server.js"], { encoding: "utf-8" });
-    const afterCount = after.stdout.trim().split("\n").filter(Boolean).length;
+    // The command should have failed
+    expect(result.status).not.toBe(0);
 
-    // Should not have leaked a process
-    expect(afterCount).toBeLessThanOrEqual(beforeCount);
+    // No PID file should exist (daemon was cleaned up)
+    const pidFile = path.join(dir, "leak-test.pid");
+    let leaked = false;
+    try {
+      const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+      // Check if this process is still alive
+      try { process.kill(pid, 0); leaked = true; } catch {}
+    } catch {}
+    expect(leaked).toBe(false);
   }, 15000);
 });
 

@@ -289,6 +289,7 @@ export class PtyServer {
       this.exited = true;
       this.exitCode = exitCode;
       this.broadcast(encodeExit(exitCode));
+      this.emitEvent(EventType.SESSION_EXIT, { exitCode });
       // Save exit status immediately so the session shows as "exited"
       // in pty list during the cleanup window. lastLines may be incomplete
       // here since PTY data could still be in-flight — close() will
@@ -320,6 +321,9 @@ export class PtyServer {
           displayCommand: options.displayCommand,
           cwd: options.cwd,
           createdAt: new Date().toISOString(),
+          ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+        });
+        this.emitEvent(EventType.SESSION_START, {
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
         });
         resolve();

@@ -9,6 +9,10 @@
 - Add `pty list --remote` to include remote hosts in the text and JSON output
 - Graceful degradation: if pty-relay is not installed, nothing changes
 
+### Events
+- Add `session_start` event — emitted when a session is created, includes tags for filtering
+- Add `session_exit` event — emitted when a session's child process exits, includes exit code
+
 ### TUI framework
 - Export `SelectableGroup<T>` interface from `@myobie/pty/tui`
 - `groupedSelectable` `renderHeader` callback now receives the full group object instead of `(title, count)`

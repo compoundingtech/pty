@@ -361,7 +361,7 @@ describe("PtyServer event detection", () => {
 
     // Send a bell character
     socket.write(encodeData("printf '\\a'\n"));
-    const events = await waitForEvents(name, 1);
+    const events = await waitForEvents(name, 2);
     socket.destroy();
 
     const bells = events.filter((e) => e.type === "bell");
@@ -379,7 +379,7 @@ describe("PtyServer event detection", () => {
 
     // Set the terminal title via OSC 0
     socket.write(encodeData("printf '\\033]0;My Custom Title\\a'\n"));
-    const events = await waitForEvents(name, 1);
+    const events = await waitForEvents(name, 2);
     socket.destroy();
 
     const titles = events.filter((e) => e.type === "title_change");
@@ -428,7 +428,7 @@ describe("PtyServer event detection", () => {
 
     // Send an iTerm2-style notification
     socket.write(encodeData("printf '\\033]9;Build complete\\a'\n"));
-    const events = await waitForEvents(name, 1);
+    const events = await waitForEvents(name, 2);
     socket.destroy();
 
     const notifs = events.filter((e) => e.type === "notification");
@@ -449,7 +449,7 @@ describe("PtyServer event detection", () => {
     socket.write(
       encodeData("printf '\\033]777;notify;Build;All tests passed\\a'\n")
     );
-    const events = await waitForEvents(name, 1);
+    const events = await waitForEvents(name, 2);
     socket.destroy();
 
     const notifs = events.filter((e) => e.type === "notification");

@@ -8,6 +8,8 @@ export const EventType = {
   NOTIFICATION: "notification",
   FOCUS_REQUEST: "focus_request",
   CURSOR_VISIBLE: "cursor_visible",
+  SESSION_START: "session_start",
+  SESSION_EXIT: "session_exit",
   SESSION_RESTART: "session_restart",
   SESSION_FAILED: "session_failed",
   SUPERVISOR_START: "supervisor_start",
@@ -46,6 +48,16 @@ export interface CursorVisibleEvent extends EventBase {
   type: "cursor_visible";
 }
 
+export interface SessionStartEvent extends EventBase {
+  type: "session_start";
+  tags?: Record<string, string>;
+}
+
+export interface SessionExitEvent extends EventBase {
+  type: "session_exit";
+  exitCode: number;
+}
+
 export interface SessionRestartEvent extends EventBase {
   type: "session_restart";
   restartCount: number;
@@ -72,6 +84,8 @@ export type EventRecord =
   | NotificationEvent
   | FocusRequestEvent
   | CursorVisibleEvent
+  | SessionStartEvent
+  | SessionExitEvent
   | SessionRestartEvent
   | SessionFailedEvent
   | SupervisorStartEvent
@@ -277,6 +291,12 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} focus requested`;
     case "cursor_visible":
       return `${prefix} cursor restored`;
+    case "session_start": {
+      const tagStr = event.tags ? " " + Object.entries(event.tags).map(([k, v]) => `${k}=${v}`).join(" ") : "";
+      return `${prefix} started${tagStr}`;
+    }
+    case "session_exit":
+      return `${prefix} exited (code ${event.exitCode})`;
     case "session_restart":
       return `${prefix} restarted (attempt ${event.restartCount}, backoff ${event.backoffMs}ms)`;
     case "session_failed":
