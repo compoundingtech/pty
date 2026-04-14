@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 ### Relay integration
 - Interactive TUI (`pty` with no args) discovers [pty-relay](https://github.com/myobie/pty-relay) on PATH and shows remote sessions alongside local ones, grouped by host
