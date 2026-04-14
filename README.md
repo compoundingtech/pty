@@ -54,6 +54,7 @@ pty run -d -- node server.js              # start in the background
 pty run -a -- node server.js              # create or attach if already running
 pty run -e -- npm test                    # ephemeral: auto-remove on exit
 pty run --tag owner=forge -- node srv.js  # tag a session with metadata
+pty run --cwd /path -- node server.js    # run in a specific directory
 
 pty list                                  # show active sessions
 pty list --tags                           # show sessions with tags (#key=value)
@@ -63,6 +64,9 @@ pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)
+pty peek --full myserver                  # print full scrollback
+pty peek --wait "Listening" myserver      # wait until text appears on screen
+pty peek --wait "Ready" -t 10 myserver    # wait with timeout (seconds)
 pty peek -f myserver                      # follow output read-only
 
 pty send myserver "hello"                 # send text (no implicit newline)
@@ -83,6 +87,14 @@ pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # remove all exited sessions
+pty tag myserver role=web                 # set tags on a session
+pty tag myserver --rm role                # remove a tag
+
+pty supervisor start                      # start the session supervisor
+pty supervisor stop                       # stop the supervisor
+pty supervisor status                     # show supervised sessions
+pty supervisor forget myserver            # stop supervising a session
+pty supervisor reset myserver             # reset a failed session for retry
 
 pty up                                    # start all sessions from ./pty.toml
 pty up ./backend                          # start sessions from ./backend/pty.toml
@@ -296,6 +308,10 @@ The `demos/` directory has three working apps built with the framework:
 - **agent-teams** — live dashboard of a simulated AI agent hierarchy with real-time updates
 
 Run them with `node --experimental-strip-types demos/{name}/main.ts`. Each demo includes unit tests and PTY integration tests that exercise the testing library.
+
+## Skill Reference
+
+For AI coding agents and automation, see **[docs/SKILL.md](docs/SKILL.md)** — a concise guide to running and managing background processes with pty, including session lifecycle, common patterns, and rules for well-behaved agents.
 
 ## Tab Completion
 

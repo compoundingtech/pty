@@ -1,26 +1,50 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
-- Add `pty up` / `pty down` commands to start and stop sessions defined in a `pty.toml` project file
-- `pty.toml` supports named sessions with commands and optional tags
-- `pty up` accepts a directory argument (`pty up ./backend`) and session name filtering (`pty up dev serve`)
-- Add `--tags` flag to `pty list` to display tags as `#key=value` hashtags
-- Add session supervisor: `pty supervisor start` runs a process that watches for sessions with `strategy=permanent` tag and restarts them on exit with exponential backoff
-- Add `pty tag <name> key=value` / `pty tag <name> --rm key` to set and remove tags on running or exited sessions
-- Add `pty supervisor start/stop/status/forget` commands
-- Add `pty supervisor launchd install/uninstall` for macOS auto-start
-- Supervision is configured entirely through tags (`strategy=permanent` in pty.toml tags or via `pty tag`)
-- `pty list` shows `[permanent]`, `[temporary]`, and `[failed]` markers for supervised sessions
-- `pty down` refuses to stop supervised sessions (use `pty supervisor forget` first)
+### Supervisor
+- Add session supervisor: `pty supervisor start` runs a foreground process that watches for sessions with `strategy=permanent` tag and restarts them on exit with exponential backoff (1s→16s, max 5 restarts per 60s)
+- `pty supervisor start/stop/status/forget/reset` commands
+- `pty supervisor launchd install/uninstall` for macOS auto-start — bundles the supervisor into a portable JS file via esbuild, uses absolute paths to node (no PATH dependency), `KeepAlive=true`
+- Supervision is configured entirely through tags (`strategy=permanent` or `strategy=temporary`)
+- `strategy=permanent`: restart on exit with backoff. `strategy=temporary`: clean up on exit
+- Supervisor detects dead processes via PID liveness check (handles external kills where `exitedAt` is never set)
+- Supervisor state persisted in `~/.local/state/pty/supervisor/` (restart counts survive supervisor restarts)
+- `pty supervisor reset <name>` clears failed status for retry
 - New event types: `session_restart`, `session_failed`, `supervisor_start`, `supervisor_stop`
+- 10s periodic scan as safety net for missed `fs.watch` events
+
+### Project files
+- Add `pty up` / `pty down` commands to start and stop sessions defined in a `pty.toml` project file
+- `pty.toml` supports named sessions with commands, tags, and an optional `prefix` for session naming
+- `pty up` accepts a directory argument (`pty up ./backend`) and session name filtering (`pty up dev serve`)
+- `pty up` syncs tags from the toml to already-running sessions (without removing manually-added tags)
+- `pty up` stores `ptyfile` and `ptyfile.session` tags so the supervisor re-reads the toml on restart
+- `pty down` removes strategy tags and stops sessions (including supervised ones), warns about toml-managed sessions
+
+### Mutable tags
+- Add `pty tag <name> key=value` / `pty tag <name> --rm key` to set and remove tags on running or exited sessions
+- `pty tag <name>` with no args shows current tags
+- Warns when modifying tags on toml-managed sessions (changes will be overwritten by `pty up`)
 - Atomic metadata writes (write-to-temp + rename) to prevent partial reads
-- Add `pty peek --wait "text"` to block until text appears on screen, with optional `-t` timeout
+
+### Peek and wait
+- Add `pty peek --wait "text"` to block until text appears on screen, with optional `-t` timeout (seconds)
 - Add `pty peek --full` to show full scrollback (not just viewport)
-- Add `pty events --wait <type>` to block until a specific event type occurs
+- Add `pty events --wait <type>` to block until a specific event type occurs, with optional `-t` timeout
+
+### CLI improvements
+- Add `--cwd` flag to `pty run` to start a session in a specific directory
+- Add `--tags` flag to `pty list` to display tags as `#key=value` hashtags
 - Colorize `pty list` output: bold cyan session names, dimmed commands
 - Interactive TUI list shows `[permanent]`/`[temporary]`/`[failed]` markers with color
-- Add `--cwd` flag to `pty run` to start a session in a specific directory without needing to `cd` first
+- `pty kill` on supervised sessions removes the strategy tag (supervisor won't restart it)
+- `pty kill` and `pty down` warn when stopping toml-managed sessions
+
+### Fixes
+- Defensive `meta.args` fallback to `[]` in all display code (prevents crashes on old metadata)
+- Shell integration tests isolated from real session directory
+- Fix flaky TUI filter test (wait for list to re-render, not just input to appear)
 
 ## 0.6.0
 
