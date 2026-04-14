@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.7.1
+## Unreleased
+
+### Relay integration
+- Interactive TUI (`pty` with no args) discovers [pty-relay](https://github.com/myobie/pty-relay) on PATH and shows remote sessions alongside local ones, grouped by host
+- Remote sessions are fetched asynchronously — local sessions render immediately, remote groups appear when the relay responds
+- Enter on a remote session spawns `pty-relay connect` with pause/resume
+- Add `pty list --remote` to include remote hosts in the text and JSON output
+- Graceful degradation: if pty-relay is not installed, nothing changes
+
+### TUI framework
+- Export `SelectableGroup<T>` interface from `@myobie/pty/tui`
+- `groupedSelectable` `renderHeader` callback now receives the full group object instead of `(title, count)`
+- Empty groups are now rendered (header shown) instead of being silently skipped
 
 ### launchd
 - `pty supervisor launchd install` now compiles a small C wrapper binary (`pty-supervisor`) that validates Full Disk Access before exec'ing node — grant FDA to this binary, not to node itself

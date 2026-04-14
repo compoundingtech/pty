@@ -59,6 +59,7 @@ pty run --cwd /path -- node server.js    # run in a specific directory
 pty list                                  # show active sessions
 pty list --tags                           # show sessions with tags (#key=value)
 pty list --json                           # show as JSON
+pty list --remote                         # include remote sessions via pty-relay
 
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
