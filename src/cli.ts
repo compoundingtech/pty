@@ -388,7 +388,8 @@ async function main(): Promise<void> {
     case "ls": {
       const jsonFlag = args.includes("--json");
       const tagsFlag = args.includes("--tags");
-      await cmdList(jsonFlag, tagsFlag);
+      const remoteFlag = args.includes("--remote");
+      await cmdList(jsonFlag, tagsFlag, remoteFlag);
       break;
     }
 
@@ -896,11 +897,23 @@ async function cmdPeek(name: string, follow: boolean, plain: boolean, full = fal
   });
 }
 
-async function cmdList(json = false, showTags = false): Promise<void> {
+async function cmdList(json = false, showTags = false, remote = false): Promise<void> {
   const sessions = await listSessions();
 
+  // Fetch relay hosts if --remote
+  let remoteHosts: { label: string; sessions: { name: string; status: string; command?: string; cwd?: string }[]; error: string | null }[] = [];
+  if (remote) {
+    try {
+      const relayBin = execFileSync("which", ["pty-relay"], { encoding: "utf-8" }).trim();
+      const result = spawnSync(relayBin, ["ls", "--json"], { encoding: "utf-8", timeout: 5000 });
+      if (result.status === 0 && result.stdout.trim()) {
+        remoteHosts = JSON.parse(result.stdout);
+      }
+    } catch {}
+  }
+
   if (json) {
-    const output = sessions.map((s) => ({
+    const localOutput = sessions.map((s) => ({
       name: s.name,
       status: s.status,
       pid: s.pid,
@@ -913,11 +926,15 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       exitedAt: s.metadata?.exitedAt ?? null,
       ...(s.metadata?.tags ? { tags: s.metadata.tags } : {}),
     }));
-    console.log(JSON.stringify(output));
+    if (remote && remoteHosts.length > 0) {
+      console.log(JSON.stringify({ local: localOutput, remote: remoteHosts }));
+    } else {
+      console.log(JSON.stringify(localOutput));
+    }
     return;
   }
 
-  if (sessions.length === 0) {
+  if (sessions.length === 0 && remoteHosts.length === 0) {
     console.log("No active sessions.");
     return;
   }
@@ -958,6 +975,22 @@ async function cmdList(json = false, showTags = false): Promise<void> {
         : "";
       const marker = strategyMarker(meta?.tags);
       console.log(`  \x1b[1m${session.name}\x1b[0m${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+    }
+  }
+
+  // Remote hosts
+  for (const host of remoteHosts) {
+    console.log("");
+    if (host.error) {
+      console.log(`\x1b[1m${host.label}\x1b[0m \x1b[31m(error: ${host.error})\x1b[0m`);
+      continue;
+    }
+    console.log(`\x1b[1m${host.label}\x1b[0m (${host.sessions.length} sessions):`);
+    for (const s of host.sessions) {
+      const icon = s.status === "running" ? "\u25cf" : "\u25cb";
+      const cwd = s.cwd ? shortPath(s.cwd) : "";
+      const cmd = s.command ?? "";
+      console.log(`  \x1b[1;36m${icon} ${s.name}\x1b[0m — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 }

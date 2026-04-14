@@ -1,6 +1,7 @@
 // Interactive session list — built with the declarative TUI framework + app()
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync, spawn as spawnChild, spawnSync } from "node:child_process";
 import { attach } from "../client.ts";
 import {
   listSessions, validateName, acquireLock, releaseLock,
@@ -10,6 +11,7 @@ import { spawnDaemon, resolveCommand } from "../spawn.ts";
 import {
   app, screen, signal, computed, batch,
   text, row, spacer, panel, selectable, footer, canvas,
+  groupedSelectable, type SelectableGroup,
   updateScrollRegion, themes,
   type KeyEvent, type ScreenContext, type UINode,
 } from "./index.ts";
@@ -85,48 +87,128 @@ const focusedField = signal<"name" | "command">("command");
 const existingNames = signal<Set<string>>(new Set());
 
 // ============================================================
+// Relay integration
+// ============================================================
+
+interface RemoteSession {
+  name: string;
+  status: string;
+  command?: string;
+  cwd?: string;
+}
+
+interface RelayHost {
+  label: string;
+  url: string;
+  sessions: RemoteSession[];
+  spawn_enabled: boolean;
+  error: string | null;
+}
+
+let relayBin: string | null = null;
+try {
+  relayBin = execFileSync("which", ["pty-relay"], { encoding: "utf-8" }).trim();
+} catch {}
+
+const relayHosts = signal<RelayHost[]>([]);
+
+/** Fetch remote sessions from pty-relay asynchronously.
+ *  Updates the relayHosts signal when data arrives, triggering a re-render. */
+function refreshRelayHosts(): void {
+  if (!relayBin) return;
+  const child = spawnChild(relayBin, ["ls", "--json"], {
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 10000,
+  });
+  let stdout = "";
+  child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+  child.on("close", (code) => {
+    if (code === 0 && stdout.trim()) {
+      try {
+        relayHosts.set(JSON.parse(stdout));
+      } catch {}
+    }
+  });
+}
+
+// ============================================================
 // Computed values
 // ============================================================
 
 interface ListItem {
-  type: "session" | "create";
+  type: "session" | "create" | "remote";
   session?: SessionInfo;
+  remote?: { host: RelayHost; session: RemoteSession };
 }
 
 const sortedSessions = computed<SessionInfo[]>(() => sortSessions(sessions.get()));
 
-const filteredItems = computed<ListItem[]>(() => {
-  const filter = filterText.get();
+function filterAndSort(filter: string, items: ListItem[]): ListItem[] {
+  if (!filter) return items;
   const matches: { item: ListItem; score: number }[] = [];
-  for (const s of sortedSessions.get()) {
-    if (!filter) {
-      matches.push({ item: { type: "session", session: s }, score: 0 });
-      continue;
+  for (const item of items) {
+    let name = "";
+    let cmd = "";
+    let cwd = "";
+    if (item.type === "session" && item.session) {
+      name = item.session.name;
+      cmd = item.session.metadata?.displayCommand ?? "";
+      cwd = item.session.metadata?.cwd ?? "";
+    } else if (item.type === "remote" && item.remote) {
+      name = item.remote.session.name;
+      cmd = item.remote.session.command ?? "";
+      cwd = item.remote.session.cwd ?? "";
+    } else {
+      continue; // skip "create" items during filter
     }
-    const cmd = s.metadata
-      ? s.metadata.displayCommand ?? ""
-      : "";
-    const cwd = s.metadata?.cwd ?? "";
-    // Fuzzy match against name (weighted highest), cwd, and command
-    const nameResult = fuzzyMatch(filter, s.name);
+    const nameResult = fuzzyMatch(filter, name);
     const cwdResult = fuzzyMatch(filter, cwd);
     const cmdResult = fuzzyMatch(filter, cmd);
     if (!nameResult.match && !cwdResult.match && !cmdResult.match) continue;
-    // Name matches get a large bonus so they always rank above cwd/cmd matches.
-    // Running sessions get an extra bonus so they always rank above exited ones.
-    const runningBonus = s.status === "running" ? 100000 : 0;
+    const runningBonus = (item.type === "session" && item.session?.status === "running") || (item.type === "remote" && item.remote?.session.status === "running") ? 100000 : 0;
     const score = runningBonus + Math.max(
       nameResult.match ? nameResult.score + 10000 : 0,
       cwdResult.match ? cwdResult.score : 0,
       cmdResult.match ? cmdResult.score : 0,
     );
-    matches.push({ item: { type: "session", session: s }, score });
+    matches.push({ item, score });
   }
-  // Higher score = better match = first in list
   matches.sort((a, b) => b.score - a.score);
-  const items = matches.map(m => m.item);
-  items.push({ type: "create" });
-  return items;
+  return matches.map(m => m.item);
+}
+
+const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
+  const filter = filterText.get();
+
+  // Local group
+  const localItems: ListItem[] = sortedSessions.get().map(s => ({ type: "session" as const, session: s }));
+  const filteredLocal = filter ? filterAndSort(filter, localItems) : localItems;
+  // Always add "Create new session" at the end of local group
+  const localWithCreate: ListItem[] = [...filteredLocal, { type: "create" }];
+
+  const groups: SelectableGroup<ListItem>[] = [
+    { title: "Local", items: localWithCreate },
+  ];
+
+  // Remote groups from relay
+  for (const host of relayHosts.get()) {
+    if (host.error) continue;
+    const remoteItems: ListItem[] = host.sessions.map(s => ({
+      type: "remote" as const,
+      remote: { host, session: s },
+    }));
+    const filtered = filter ? filterAndSort(filter, remoteItems) : remoteItems;
+    if (filtered.length > 0 || !filter) {
+      groups.push({ title: host.label, items: filtered });
+    }
+  }
+
+  return groups;
+});
+
+// Total item count across all groups (for scroll region)
+const totalItems = computed(() => {
+  return filteredGroups.get().reduce((sum, g) => sum + g.items.length, 0);
 });
 
 // ============================================================
@@ -138,6 +220,25 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   if (item.type === "create") {
     return [text(sel + "+ Create new session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
   }
+
+  if (item.type === "remote" && item.remote) {
+    const rs = item.remote.session;
+    const icon = rs.status === "running" ? "\u25cf" : "\u25cb";
+    const cwdStr = rs.cwd ? shortPath(rs.cwd) : "";
+    const cmd = rs.command ?? "";
+    const nameStr = `${sel}${icon} ${rs.name}`;
+    const detailStr = `  ${cwdStr}  ${cmd}`;
+    const line = nameStr + detailStr;
+
+    if (selected) {
+      return [text(line, "accent", { bold: true, truncate: true })];
+    }
+    return [
+      text(nameStr, rs.status === "running" ? "primary" : "muted", { bold: true }),
+      text(detailStr, "muted", { dim: true, truncate: true }),
+    ];
+  }
+
   const s = item.session!;
   const icon = s.status === "running" ? "\u25cf" : "\u25cb";
   const cmd = s.metadata
@@ -152,13 +253,7 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const supStatus = s.metadata?.tags?.["supervisor.status"];
   const strategy = s.metadata?.tags?.strategy;
   const marker = supStatus === "failed" ? " [failed]" : strategy === "permanent" ? " [permanent]" : strategy === "temporary" ? " [temporary]" : "";
-  const markerColor: "error" | "warn" | "muted" = supStatus === "failed" ? "error" : strategy ? "warn" : "muted";
-  const iconColor = selected ? "accent" : s.status === "running" ? "ok" : "muted";
 
-  const parts: string[] = [
-    `${sel}${icon} `,
-  ];
-  // Build as a single string but use dim for path/command
   const nameStr = `${sel}${icon} ${s.name}${marker}`;
   const detailStr = `  ${pathStr}  ${cmd}`;
   const line = nameStr + detailStr;
@@ -166,7 +261,6 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   if (selected) {
     return [text(line, "accent", { bold: true, truncate: true })];
   }
-  // Use two text nodes: bold name + dim details
   return [
     text(nameStr, s.status === "running" ? "primary" : "muted", { bold: true }),
     text(detailStr, "muted", { dim: true, truncate: true }),
@@ -177,11 +271,12 @@ const listScreen = screen({
   id: "list",
 
   render(ctx: ScreenContext): UINode[] {
-    const items = filteredItems.get();
+    const groups = filteredGroups.get();
+    const total = totalItems.get();
     const viewport = Math.max(1, ctx.rows - 6);
     const region = updateScrollRegion(
-      { offset: 0, selectedIndex: selectedIndex.get(), totalItems: items.length, viewportHeight: viewport },
-      items.length,
+      { offset: 0, selectedIndex: selectedIndex.get(), totalItems: total, viewportHeight: viewport },
+      total,
       viewport,
     );
 
@@ -190,20 +285,36 @@ const listScreen = screen({
       ? text("  Filter: " + filter, "primary")
       : text("  Filter: (type to filter)", "muted", { dim: true });
 
+    const hasRelay = relayHosts.get().length > 0;
+
     return [
       panel("pty", [
         filterLine,
         text("", "muted"), // blank line
-        selectable(region, items, renderListItem),
+        hasRelay
+          ? groupedSelectable(region, groups, renderListItem)
+          : groupedSelectable(region, groups, renderListItem, () => []),
       ]),
       footer(`\u2191\u2193 select  \u23ce attach  ctrl+g theme (${themeNames[themeIndex.get()]})  q quit`),
     ];
   },
 
   handleKey(key: KeyEvent, _ctx: ScreenContext): boolean {
-    const items = filteredItems.get();
+    const total = totalItems.get();
     const idx = selectedIndex.peek();
-    const maxIndex = items.length - 1;
+    const maxIndex = total - 1;
+
+    // Resolve the item at the current global index across all groups
+    function getItemAtIndex(globalIdx: number): ListItem | null {
+      let i = 0;
+      for (const group of filteredGroups.get()) {
+        for (const item of group.items) {
+          if (i === globalIdx) return item;
+          i++;
+        }
+      }
+      return null;
+    }
 
     if (key.name === "up") {
       selectedIndex.set(Math.max(0, idx - 1));
@@ -214,7 +325,7 @@ const listScreen = screen({
       return true;
     }
     if (key.name === "return") {
-      const item = items[idx];
+      const item = getItemAtIndex(idx);
       if (!item) return true;
       if (item.type === "create") {
         batch(() => {
@@ -223,6 +334,10 @@ const listScreen = screen({
           createSelectedIndex.set(0);
           existingNames.set(new Set(sessions.peek().map(s => s.name)));
         });
+        return true;
+      }
+      if (item.type === "remote" && item.remote) {
+        doAttachRemote(item.remote.host, item.remote.session);
         return true;
       }
       if (item.session) {
@@ -536,6 +651,33 @@ async function doRestart(session: SessionInfo): Promise<void> {
   doAttach(session.name);
 }
 
+function doAttachRemote(host: RelayHost, session: RemoteSession): void {
+  if (!relayBin) return;
+  myApp?.pause();
+
+  // Build the connect URL: base URL + /session-name
+  const url = host.url.replace(/#.*$/, "") + "/" + session.name +
+    (host.url.includes("#") ? "#" + host.url.split("#").slice(1).join("#") : "");
+
+  const result = spawnSync(relayBin, ["connect", url], {
+    stdio: "inherit",
+  });
+
+  // Refresh and resume
+  (async () => {
+    const updated = await listSessions();
+    refreshRelayHosts();
+    batch(() => {
+      sessions.set(updated);
+      currentScreen.set("list");
+      filterText.set("");
+      const maxIdx = Math.max(0, totalItems.get() - 1);
+      if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
+    });
+    myApp?.resume();
+  })();
+}
+
 function doAttach(name: string): void {
   myApp?.pause();
   attach({
@@ -546,7 +688,7 @@ function doAttach(name: string): void {
         sessions.set(updated);
         currentScreen.set("list");
         filterText.set("");
-        const maxIdx = Math.max(0, filteredItems.get().length - 1);
+        const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });
       myApp?.resume();
@@ -559,7 +701,7 @@ function doAttach(name: string): void {
         sessions.set(updated);
         currentScreen.set("list");
         filterText.set("");
-        const maxIdx = Math.max(0, filteredItems.get().length - 1);
+        const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });
       myApp?.resume();
@@ -634,6 +776,9 @@ async function doCreate(dir: string, name: string, command: string): Promise<voi
 export async function runInteractive(): Promise<void> {
   const sessionList = await listSessions();
   sessions.set(sessionList);
+
+  // Fetch relay hosts in the background (non-blocking)
+  refreshRelayHosts();
 
   myApp = app({
     screen: () => currentScreen.get() === "list" ? listScreen : createScreen,
