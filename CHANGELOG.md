@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1
+
+### Fixes
+- `pty peek` now works on exited sessions by reading saved output from metadata
+- `pty peek --wait` handles exited sessions: checks saved output, shows last lines and exit code if pattern not found
+- `--wait` accepts multiple patterns (`--wait "passed" --wait "failed"`) — matches on any
+- Increase saved output from 20 to 200 lines (`lastLines` in exit metadata)
+- Exit metadata saved twice: immediately in `onExit` (for status display) and again in `close()` (for complete output after all PTY data has flushed)
+- Fix TUI race where session showed as "running" after exit (delay list refresh 200ms to let metadata flush)
+- Fix SKILL.md examples to use multiple `--wait` flags instead of regex syntax
+
 ## 0.7.0
 
 ### Supervisor
