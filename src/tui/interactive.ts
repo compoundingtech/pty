@@ -104,7 +104,7 @@ const filteredItems = computed<ListItem[]>(() => {
       continue;
     }
     const cmd = s.metadata
-      ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
+      ? s.metadata.displayCommand ?? ""
       : "";
     const cwd = s.metadata?.cwd ?? "";
     // Fuzzy match against name (weighted highest), cwd, and command
@@ -141,7 +141,7 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const s = item.session!;
   const icon = s.status === "running" ? "\u25cf" : "\u25cb";
   const cmd = s.metadata
-    ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
+    ? s.metadata.displayCommand ?? ""
     : "";
   const cwdStr = s.metadata?.cwd ? shortPath(s.metadata.cwd) : "";
   const exitStr = s.metadata?.exitedAt ? `(exited ${timeAgo(new Date(s.metadata.exitedAt))})` : "";

@@ -186,7 +186,8 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      const displayCmd = cmd;
+      const autoNameCmd = cmd;
+      const displayCmd = [cmd, ...cmdArgs].join(" ");
       try {
         cmd = resolveCommand(cmd);
       } catch (e: any) {
@@ -210,7 +211,7 @@ async function main(): Promise<void> {
       if (!name) {
         const sessions = await listSessions();
         const existing = new Set(sessions.map(s => s.name));
-        let candidate = autoName(displayCmd, cmdArgs);
+        let candidate = autoName(autoNameCmd, cmdArgs);
         // Sanitize: validateName allows [a-zA-Z0-9._-]
         candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
         // Dedup
@@ -580,7 +581,7 @@ async function main(): Promise<void> {
   pty supervisor status           Show supervised sessions
   pty supervisor forget <name>    Stop supervising a session
   pty supervisor reset <name>     Reset a failed session for retry
-  pty supervisor launchd install  Register with macOS launchd
+  pty supervisor launchd install [--path PATH]  Register with macOS launchd
   pty supervisor launchd uninstall Remove from launchd`);
         break;
       }
@@ -615,7 +616,15 @@ async function main(): Promise<void> {
         case "launchd": {
           const launchdCmd = args[2];
           if (launchdCmd === "install") {
-            cmdSupervisorLaunchdInstall();
+            // Parse --path flag
+            let userPath: string | undefined;
+            for (let li = 3; li < args.length; li++) {
+              if (args[li] === "--path" && li + 1 < args.length) {
+                userPath = args[li + 1];
+                break;
+              }
+            }
+            await cmdSupervisorLaunchdInstall(userPath);
           } else if (launchdCmd === "uninstall") {
             cmdSupervisorLaunchdUninstall();
           } else {
@@ -896,7 +905,7 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       status: s.status,
       pid: s.pid,
       command: s.metadata
-        ? [s.metadata.displayCommand, ...(s.metadata.args ?? [])].join(" ")
+        ? s.metadata.displayCommand
         : null,
       cwd: s.metadata?.cwd ?? null,
       createdAt: s.metadata?.createdAt ?? null,
@@ -920,7 +929,7 @@ async function cmdList(json = false, showTags = false): Promise<void> {
     console.log("Active sessions:");
     for (const session of running) {
       const cmd = session.metadata
-        ? [session.metadata.displayCommand, ...(session.metadata.args ?? [])].join(" ")
+        ? session.metadata.displayCommand
         : "unknown";
       const cwd = session.metadata?.cwd
         ? shortPath(session.metadata.cwd)
@@ -942,7 +951,7 @@ async function cmdList(json = false, showTags = false): Promise<void> {
       const ago = meta?.exitedAt ? timeAgo(new Date(meta.exitedAt)) : "unknown";
       const cwd = meta?.cwd ? shortPath(meta.cwd) : "";
       const cmd = meta
-        ? [meta.displayCommand, ...(meta.args ?? [])].join(" ")
+        ? meta.displayCommand
         : "";
       const tagStr = showTags && meta?.tags
         ? " " + Object.entries(meta.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
@@ -1057,7 +1066,7 @@ async function cmdStats(
 
 function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   const cmd = meta
-    ? [meta.displayCommand, ...(meta.args ?? [])].join(" ")
+    ? meta.displayCommand
     : "unknown";
   const cwd = meta?.cwd ? shortPath(meta.cwd) : "unknown";
 
@@ -1336,8 +1345,9 @@ async function cmdSupervisorReset(name: string): Promise<void> {
   console.log(`Reset "${name}". The supervisor will try restarting it.`);
 }
 
-function cmdSupervisorLaunchdInstall(): void {
+async function cmdSupervisorLaunchdInstall(userPath?: string): Promise<void> {
   const launchdDir = path.join(os.homedir(), ".local", "pty", "launchd");
+  const wrapperPath = path.join(launchdDir, "pty-supervisor");
   const bundlePath = path.join(launchdDir, "supervisor.bundle.js");
   const logPath = path.join(os.homedir(), ".local", "state", "pty", "supervisor.log");
   const plistDir = path.join(os.homedir(), "Library", "LaunchAgents");
@@ -1357,15 +1367,23 @@ function cmdSupervisorLaunchdInstall(): void {
     spawnSync("launchctl", ["unload", plistPath], { encoding: "utf-8" });
   }
 
-  // Bundle the supervisor into a single portable JS file
-  const distDir = path.join(
+  const srcRoot = path.join(
     import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
-    "..", "dist"
+    ".."
   );
+  const distDir = path.join(srcRoot, "dist");
+  const nodeBin = process.execPath;
+  const wrapperSrc = path.join(srcRoot, "scripts", "supervisor-wrapper.c");
+
+  // Clean and create launchd directory
+  fs.rmSync(launchdDir, { recursive: true, force: true });
+  fs.mkdirSync(launchdDir, { recursive: true });
+
+  // Bundle the supervisor
   const entryPoint = path.join(distDir, "supervisor-entry.js");
+  const serverModule = path.join(distDir, "server.js");
 
   console.log("Bundling supervisor...");
-  const serverModule = path.join(distDir, "server.js");
   const esbuildResult = spawnSync("npx", ["esbuild", entryPoint, "--bundle", "--platform=node", "--format=esm", `--outfile=${bundlePath}`, `--define:SERVER_MODULE_PATH="${serverModule.replace(/\\/g, "\\\\")}"`], {
     encoding: "utf-8",
     cwd: distDir,
@@ -1375,9 +1393,123 @@ function cmdSupervisorLaunchdInstall(): void {
     process.exit(1);
   }
 
-  // Use absolute path to current node binary — no PATH dependency
-  const nodeBin = process.execPath;
+  // Compile the FDA wrapper binary with PATH baked in
+  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  console.log("Compiling FDA wrapper...");
+  const ccResult = spawnSync("cc", [
+    "-O2", "-o", wrapperPath,
+    `-DNODE_PATH="${nodeBin}"`,
+    `-DBUNDLE_PATH="${bundlePath}"`,
+    `-DUSER_PATH="${envPath}"`,
+    wrapperSrc,
+  ], { encoding: "utf-8" });
+  if (ccResult.status !== 0) {
+    console.error(`Failed to compile wrapper: ${ccResult.stderr}`);
+    process.exit(1);
+  }
 
+  // Run --check via a one-shot launchd job to test under launchd's actual
+  // permission scope (not the terminal's). This is the only reliable way to
+  // know if the wrapper binary has FDA.
+  function checkFDAViaLaunchd(): boolean {
+    const checkLabel = "com.myobie.pty.fda-check";
+    const checkOutput = path.join(launchdDir, "fda-check.log");
+    const checkPlist = path.join(launchdDir, "fda-check.plist");
+
+    try { fs.unlinkSync(checkOutput); } catch {}
+
+    fs.writeFileSync(checkPlist, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${checkLabel}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${wrapperPath}</string>
+    <string>--check</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>${checkOutput}</string>
+  <key>StandardErrorPath</key>
+  <string>${checkOutput}</string>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+`);
+
+    // Unload any previous check job
+    spawnSync("launchctl", ["unload", checkPlist], { encoding: "utf-8" });
+
+    // Load — runs immediately due to RunAtLoad
+    spawnSync("launchctl", ["load", checkPlist], { encoding: "utf-8" });
+
+    // Wait for the job to finish (it's a one-shot, exits quickly)
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      const list = spawnSync("launchctl", ["list"], { encoding: "utf-8" });
+      const line = list.stdout.split("\n").find((l: string) => l.includes(checkLabel));
+      // Format: "PID\tExitCode\tLabel" — if PID is "-", the job has exited
+      if (line && line.startsWith("-")) break;
+      spawnSync("sleep", ["0.2"]);
+    }
+
+    // Unload the check job
+    spawnSync("launchctl", ["unload", checkPlist], { encoding: "utf-8" });
+    try { fs.unlinkSync(checkPlist); } catch {}
+
+    // Read the output
+    try {
+      const output = fs.readFileSync(checkOutput, "utf-8");
+      try { fs.unlinkSync(checkOutput); } catch {}
+      return output.includes("All checks passed");
+    } catch {
+      return false;
+    }
+  }
+
+  console.log("Checking Full Disk Access via launchd...");
+  let hasFDA = checkFDAViaLaunchd();
+
+  if (!hasFDA) {
+    console.log("");
+    console.log("The supervisor wrapper needs Full Disk Access to manage");
+    console.log("sessions on external/removable volumes.");
+    console.log("");
+    console.log("1. Open System Settings > Privacy & Security > Full Disk Access");
+    console.log(`2. Click + and add: ${wrapperPath}`);
+    console.log("");
+
+    // Open the folder in Finder so they can find the binary
+    spawnSync("open", [launchdDir]);
+
+    const rl = await import("node:readline/promises");
+    const prompt = rl.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await prompt.question("Have you granted Full Disk Access? [y/N] ");
+    prompt.close();
+
+    if (answer.trim().toLowerCase() !== "y") {
+      console.error("Aborted. Full Disk Access is required for launchd.");
+      process.exit(1);
+    }
+
+    // Re-check via launchd
+    console.log("Verifying...");
+    hasFDA = checkFDAViaLaunchd();
+    if (!hasFDA) {
+      console.error("");
+      console.error("Full Disk Access check failed under launchd.");
+      console.error("The plist was NOT loaded. Grant FDA and try again:");
+      console.error(`  ${wrapperPath}`);
+      process.exit(1);
+    }
+    console.log("Full Disk Access verified.");
+  } else {
+    console.log("Full Disk Access: granted.");
+  }
+
+  // Write and load the plist — FDA is confirmed
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1386,8 +1518,7 @@ function cmdSupervisorLaunchdInstall(): void {
   <string>com.myobie.pty.supervisor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodeBin}</string>
-    <string>${bundlePath}</string>
+    <string>${wrapperPath}</string>
   </array>
   <key>StandardOutPath</key>
   <string>${logPath}</string>
@@ -1403,7 +1534,6 @@ function cmdSupervisorLaunchdInstall(): void {
 </plist>
 `;
 
-  fs.mkdirSync(launchdDir, { recursive: true });
   fs.mkdirSync(plistDir, { recursive: true });
   fs.writeFileSync(plistPath, plist);
 
@@ -1413,10 +1543,11 @@ function cmdSupervisorLaunchdInstall(): void {
     process.exit(1);
   }
 
+  console.log("");
+  console.log(`Wrapper: ${wrapperPath}`);
   console.log(`Bundle:  ${bundlePath}`);
   console.log(`Plist:   ${plistPath}`);
   console.log(`Log:     ${logPath}`);
-  console.log(`Node:    ${nodeBin}`);
   console.log("Supervisor will start on login and restart if it exits.");
 }
 
@@ -1690,10 +1821,13 @@ async function cmdEvents(
     const start = Date.now();
 
     return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
       const follower = new EventFollower({
         names: [name!],
         onEvent: (event) => {
           if (event.type === opts.waitEventType) {
+            if (timer) clearTimeout(timer);
             console.log(opts.json ? JSON.stringify(event) : formatEvent(event));
             follower.stop();
             resolve();
@@ -1704,7 +1838,7 @@ async function cmdEvents(
       follower.start();
 
       if (timeoutMs > 0) {
-        setTimeout(() => {
+        timer = setTimeout(() => {
           follower.stop();
           console.error(`Timed out after ${opts.timeout}s waiting for "${opts.waitEventType}" event.`);
           process.exit(1);

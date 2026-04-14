@@ -144,4 +144,78 @@ describe("pty peek --wait", () => {
     expect(result.stdout).toContain("ALREADY");
     expect(elapsed).toBeLessThan(2000);
   }, 15000);
+
+  it("multiple --wait patterns match on any", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "sh", ["-c", "echo SECOND; exec cat"]);
+    await new Promise((r) => setTimeout(r, 300));
+
+    const result = runCli(dir, "peek", "--wait", "FIRST", "--wait", "SECOND", "-t", "5", "--plain", name);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("SECOND");
+  }, 15000);
+
+  it("peek --wait reads saved output from exited session", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "sh", ["-c", "echo TEST_PASSED; exit 0"]);
+    await new Promise((r) => setTimeout(r, 1500)); // wait for exit + metadata
+
+    const result = runCli(dir, "peek", "--wait", "TEST_PASSED", "-t", "5", "--plain", name);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("TEST_PASSED");
+  }, 15000);
+
+  it("peek --wait on exited session shows error when pattern not found", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "sh", ["-c", "echo nope; exit 0"]);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const result = runCli(dir, "peek", "--wait", "MISSING", "-t", "5", "--plain", name);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("exited");
+    expect(result.stderr).toContain("MISSING");
+  }, 15000);
+
+  it("peek --plain on exited session shows saved output", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "sh", ["-c", "echo SAVED_OUTPUT; exit 0"]);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const result = runCli(dir, "peek", "--plain", name);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("SAVED_OUTPUT");
+  }, 15000);
+});
+
+describe("pty events --wait", () => {
+  it("waits for a specific event type", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    // bell event: \x07 — delay enough for the events follower to start watching
+    await startDaemon(dir, name, "sh", ["-c", "sleep 2; printf '\\007'; exec cat"]);
+
+    const result = runCli(dir, "events", "--wait", "bell", "-t", "10", name);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("bell");
+  }, 20000);
+
+  it("times out when event never occurs", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat");
+
+    const result = runCli(dir, "events", "--wait", "bell", "-t", "1", name);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Timed out");
+  }, 15000);
 });

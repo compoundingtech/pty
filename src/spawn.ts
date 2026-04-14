@@ -64,13 +64,21 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   (child.stderr as any)?.unref?.();
   child.unref();
 
-  await waitForSocket(options.name, 3000, () => {
-    if (earlyExit) {
-      const details = stderrOutput.trim();
-      const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;
-      throw new Error(details ? `${msg}\n${details}` : `${msg} Is the command valid?`);
+  try {
+    await waitForSocket(options.name, 3000, () => {
+      if (earlyExit) {
+        const details = stderrOutput.trim();
+        const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;
+        throw new Error(details ? `${msg}\n${details}` : `${msg} Is the command valid?`);
+      }
+    });
+  } catch (err) {
+    // Kill the orphaned daemon process so it doesn't leak
+    if (!earlyExit && child.pid) {
+      try { process.kill(child.pid, "SIGTERM"); } catch {}
     }
-  });
+    throw err;
+  }
 }
 
 export function waitForSocket(

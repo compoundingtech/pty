@@ -271,8 +271,9 @@ export class Supervisor {
 
     tracked.pendingTimer = setTimeout(() => {
       tracked.pendingTimer = null;
+      console.log(`[supervisor] attempting restart for ${name}...`);
       this.doRestart(name).catch((err) => {
-        console.error(`[supervisor] restart failed for ${name}: ${err.message}`);
+        console.log(`[supervisor] restart failed for ${name}: ${err.message}`);
         tracked.restartCount++;
         tracked.nextBackoffMs = Math.min(tracked.nextBackoffMs * BACKOFF_MULTIPLIER, MAX_BACKOFF_MS);
         this.persistState();
@@ -287,12 +288,20 @@ export class Supervisor {
   }
 
   private async doRestart(name: string): Promise<void> {
-    if (this.stopping) return;
+    if (this.stopping) {
+      console.log(`[supervisor] skipping restart for ${name} (stopping)`);
+      return;
+    }
 
-    // Re-read metadata to verify session is still exited and supervised
     const metadata = readMetadata(name);
-    if (!metadata) return;
-    if (metadata.tags?.strategy !== "permanent") return;
+    if (!metadata) {
+      console.log(`[supervisor] skipping restart for ${name} (no metadata)`);
+      return;
+    }
+    if (metadata.tags?.strategy !== "permanent") {
+      console.log(`[supervisor] skipping restart for ${name} (strategy removed)`);
+      return;
+    }
 
     // Check if actually still dead (exitedAt may be missing if killed externally)
     if (!metadata.exitedAt) {
@@ -300,14 +309,18 @@ export class Supervisor {
       try {
         const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
         process.kill(pid, 0);
-        return; // still alive, skip restart
+        console.log(`[supervisor] skipping restart for ${name} (pid ${pid} still alive)`);
+        return;
       } catch {
         // dead — proceed with restart
       }
     }
 
     const tracked = this.sessions.get(name);
-    if (!tracked) return;
+    if (!tracked) {
+      console.log(`[supervisor] skipping restart for ${name} (not tracked)`);
+      return;
+    }
 
     // If session was started from a pty.toml, re-read it for the latest config
     let command = metadata.command;

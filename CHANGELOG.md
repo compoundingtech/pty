@@ -2,7 +2,19 @@
 
 ## 0.7.1
 
+### launchd
+- `pty supervisor launchd install` now compiles a small C wrapper binary (`pty-supervisor`) that validates Full Disk Access before exec'ing node — grant FDA to this binary, not to node itself
+- Install flow checks FDA via a one-shot launchd job (no false positives from terminal's FDA)
+- Interactive prompt guides user through granting FDA, opens Finder to the binary, verifies after confirmation
+- Wrapper bakes in PATH at compile time so child processes can find deno, claude, etc.
+- `--path` flag to override the baked-in PATH: `pty supervisor launchd install --path "$PATH"`
+- Wrapper runs `--check` for diagnostics: validates node, bundle, and FDA
+
 ### Fixes
+- Fix `spawnDaemon` leaking orphaned daemon processes on failure — child is now killed if `waitForSocket` times out
+- Fix `events --wait` timeout not being cancelled when event is found (caused exit code 1 even on match)
+- Fix `displayCommand` duplication in `pty list` for toml-spawned sessions
+- `displayCommand` now includes full command + args for `pty run` sessions
 - `pty peek` now works on exited sessions by reading saved output from metadata
 - `pty peek --wait` handles exited sessions: checks saved output, shows last lines and exit code if pattern not found
 - `--wait` accepts multiple patterns (`--wait "passed" --wait "failed"`) — matches on any
@@ -10,6 +22,8 @@
 - Exit metadata saved twice: immediately in `onExit` (for status display) and again in `close()` (for complete output after all PTY data has flushed)
 - Fix TUI race where session showed as "running" after exit (delay list refresh 200ms to let metadata flush)
 - Fix SKILL.md examples to use multiple `--wait` flags instead of regex syntax
+- Supervisor logs every skip reason in `doRestart` for debugging
+- Supervisor state directory moved to `~/.local/state/pty/supervisor/` (no longer pollutes session dir)
 
 ## 0.7.0
 
