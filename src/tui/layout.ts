@@ -119,6 +119,12 @@ export function measureWidth(node: UINode): number | "flex" {
     case "fpsCounter": return 8;
     case "canvas": return node.widthHint ?? "flex";
     case "ptyView": return "flex";
+    case "row": return "flex";
+    case "column": return "flex";
+    case "hstack": return "flex";
+    case "panel": return "flex";
+    case "scrollable": return "flex";
+    case "selectable": return "flex";
     default: return 0;
   }
 }
@@ -216,7 +222,11 @@ export function layoutRow(children: UINode[], rect: Rect): void {
       ? flexSize + (flexIndex++ < flexRemainder ? 1 : 0)
       : widths[i] as number;
 
-    children[i]._rect = clipRect({ x, y: rect.y, width: w, height: rect.height }, rect);
+    const childRect = clipRect({ x, y: rect.y, width: w, height: rect.height }, rect);
+    children[i]._rect = childRect;
+    if (childRect.width > 0 && childRect.height > 0) {
+      layoutChildren(children[i], childRect);
+    }
     x += w;
   }
 }
