@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { queryStats } from "../src/client.ts";
+import { spawnDaemon } from "../src/spawn.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -188,6 +189,32 @@ describe("spawnDaemon options", () => {
     const stats = await queryStats(name);
     expect(stats.terminal.rows).toBe(24);
     expect(stats.terminal.cols).toBe(80);
+  }, 15000);
+
+  it("launcher override routes the daemon through the given command", async () => {
+    const dir = makeSessionDir();
+    const argFile = path.join(dir, "launcher-args.txt");
+    const launcherScript = path.join(dir, "launcher.sh");
+    fs.writeFileSync(launcherScript, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argFile}"\nexit 0\n`);
+    fs.chmodSync(launcherScript, 0o755);
+
+    process.env.PTY_SESSION_DIR = dir;
+    const name = uniqueName();
+
+    // The stub launcher exits without starting a real daemon, so spawnDaemon
+    // will reject on socket timeout — we only care that the launcher was invoked.
+    await expect(spawnDaemon({
+      name,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      cwd: dir,
+      launcher: { command: launcherScript, args: ["--prelude"] },
+    })).rejects.toThrow();
+
+    const recorded = fs.readFileSync(argFile, "utf-8").split("\n").filter(Boolean);
+    expect(recorded[0]).toBe("--prelude");
+    expect(recorded[1]).toMatch(/server\.js$/);
   }, 15000);
 
   it("surfaces a missing cwd explicitly instead of failing silently", async () => {

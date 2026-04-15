@@ -21,6 +21,25 @@ export interface SpawnDaemonOptions {
   rows?: number;
   cols?: number;
   tags?: Record<string, string>;
+  /** Override the runtime used to launch the detached daemon process.
+   *
+   *  By default the daemon is spawned with `process.execPath` — the same
+   *  runtime as the caller. That breaks when the caller is running under a
+   *  non-Node runtime (e.g. Bun): the daemon needs to be launched under Node
+   *  so the PTY server can load its `node-pty` native addon.
+   *
+   *  Set `launcher` to point at a Node binary (and optional leading args) to
+   *  route daemon launches through it, regardless of the caller's runtime.
+   *
+   *  @example
+   *  ```ts
+   *  await spawnDaemon({
+   *    // ...existing fields...
+   *    launcher: { command: "/usr/local/bin/node" },
+   *  });
+   *  ```
+   */
+  launcher?: { command: string; args?: string[] };
 }
 
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
@@ -41,7 +60,9 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
   });
 
-  const child = spawn(process.execPath, [serverModule], {
+  const launcherCmd = options.launcher?.command ?? process.execPath;
+  const launcherArgs = options.launcher?.args ?? [];
+  const child = spawn(launcherCmd, [...launcherArgs, serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
     env: { ...process.env, PTY_SERVER_CONFIG: config },

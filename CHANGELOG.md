@@ -17,6 +17,7 @@
 ### Client API
 - Export `extractFilterTags` and `matchesAllTags` from `@myobie/pty/client` so third-party tools (e.g., pty-relay) can accept and apply the same `--filter-tag key=value` syntax
 - Add optional `tags?: Record<string, string>` on remote session entries so pty-relay can surface tags in `ls --json` and have the interactive TUI filter remote sessions by them
+- Add `launcher?: { command: string; args?: string[] }` to `SpawnDaemonOptions` so non-Node callers (Bun, Deno) can route the detached daemon launch through a Node binary — the daemon needs Node to load the `node-pty` native addon (closes #17)
 
 ### Project files
 - `pty up` now removes tags that were removed from `pty.toml` — toml-managed tag keys are tracked in a `ptyfile.tags` meta tag so manually-added tags (set via `pty tag`) are preserved
