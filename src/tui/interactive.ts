@@ -43,7 +43,7 @@ function autoName(dir: string, cmd: string, cmdArgs: string[]): string {
 const sessions = signal<SessionInfo[]>([]);
 const filterText = signal("");
 const selectedIndex = signal(0);
-const currentScreen = signal<"list" | "create">("list");
+const currentScreen = signal<"list" | "create" | "remote-create">("list");
 
 // Theme — persisted to ~/.local/state/pty/theme
 const themeNames = Object.keys(themes);
@@ -85,6 +85,12 @@ const sessionCommand = signal("");
 const nameManuallyEdited = signal(false);
 const focusedField = signal<"name" | "command">("command");
 const existingNames = signal<Set<string>>(new Set());
+
+// Remote create wizard state
+const remoteCreateHost = signal<RelayHost | null>(null);
+const remoteSessionName = signal("");
+const remoteSessionCommand = signal("bash");
+const remoteFocusedField = signal<"name" | "command">("name");
 
 // ============================================================
 // Relay integration
@@ -136,9 +142,10 @@ function refreshRelayHosts(): void {
 // ============================================================
 
 interface ListItem {
-  type: "session" | "create" | "remote";
+  type: "session" | "create" | "remote" | "remote-create";
   session?: SessionInfo;
   remote?: { host: RelayHost; session: RemoteSession };
+  remoteHost?: RelayHost;
 }
 
 const sortedSessions = computed<SessionInfo[]>(() => sortSessions(sessions.get()));
@@ -198,8 +205,12 @@ const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
       remote: { host, session: s },
     }));
     const filtered = filter ? filterAndSort(filter, remoteItems) : remoteItems;
-    if (filtered.length > 0 || !filter) {
-      groups.push({ title: host.label, items: filtered });
+    const items: ListItem[] = [...filtered];
+    if (host.spawn_enabled) {
+      items.push({ type: "remote-create", remoteHost: host });
+    }
+    if (items.length > 0 || !filter) {
+      groups.push({ title: host.label, items });
     }
   }
 
@@ -219,6 +230,10 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const sel = selected ? "\u25b8 " : "  ";
   if (item.type === "create") {
     return [text(sel + "+ Create new session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
+  }
+
+  if (item.type === "remote-create") {
+    return [text(sel + "+ Spawn remote session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
   }
 
   if (item.type === "remote" && item.remote) {
@@ -333,6 +348,16 @@ const listScreen = screen({
           createStep.set("dir-initial");
           createSelectedIndex.set(0);
           existingNames.set(new Set(sessions.peek().map(s => s.name)));
+        });
+        return true;
+      }
+      if (item.type === "remote-create" && item.remoteHost) {
+        batch(() => {
+          remoteCreateHost.set(item.remoteHost!);
+          remoteSessionName.set("");
+          remoteSessionCommand.set("bash");
+          remoteFocusedField.set("name");
+          currentScreen.set("remote-create");
         });
         return true;
       }
@@ -678,6 +703,28 @@ function doAttachRemote(host: RelayHost, session: RemoteSession): void {
   })();
 }
 
+function doSpawnRemote(host: RelayHost, name: string): void {
+  if (!relayBin) return;
+  myApp?.pause();
+
+  const result = spawnSync(relayBin, ["connect", host.url, "--spawn", name], {
+    stdio: "inherit",
+  });
+
+  (async () => {
+    const updated = await listSessions();
+    refreshRelayHosts();
+    batch(() => {
+      sessions.set(updated);
+      currentScreen.set("list");
+      filterText.set("");
+      const maxIdx = Math.max(0, totalItems.get() - 1);
+      if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
+    });
+    myApp?.resume();
+  })();
+}
+
 function doAttach(name: string): void {
   myApp?.pause();
   attach({
@@ -770,6 +817,60 @@ async function doCreate(dir: string, name: string, command: string): Promise<voi
 }
 
 // ============================================================
+// Remote create screen
+// ============================================================
+
+const remoteCreateScreen = screen({
+  id: "remote-create",
+
+  render(_ctx: ScreenContext): UINode[] {
+    const host = remoteCreateHost.get();
+    if (!host) return [text("No host selected", "error")];
+
+    const name = remoteSessionName.get();
+
+    return [
+      panel(`Spawn on ${host.label}`, [
+        text("", "muted"),
+        text("  Session name: " + name + "\u2588", "primary"),
+        text("", "muted"),
+        text("  Enter to spawn, Escape to cancel", "muted", { dim: true }),
+      ]),
+    ];
+  },
+
+  handleKey(key: KeyEvent, _ctx: ScreenContext): boolean {
+    if (key.name === "escape") {
+      batch(() => {
+        currentScreen.set("list");
+        remoteCreateHost.set(null);
+      });
+      return true;
+    }
+
+    if (key.name === "return") {
+      const host = remoteCreateHost.peek();
+      const name = remoteSessionName.peek().trim();
+      if (!host || !name) return true;
+      doSpawnRemote(host, name);
+      return true;
+    }
+
+    if (key.name === "backspace") {
+      remoteSessionName.set(remoteSessionName.peek().slice(0, -1));
+      return true;
+    }
+
+    if (key.char && !key.ctrl && !key.alt) {
+      remoteSessionName.set(remoteSessionName.peek() + key.char);
+      return true;
+    }
+
+    return true;
+  },
+});
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -781,7 +882,12 @@ export async function runInteractive(): Promise<void> {
   refreshRelayHosts();
 
   myApp = app({
-    screen: () => currentScreen.get() === "list" ? listScreen : createScreen,
+    screen: () => {
+      const s = currentScreen.get();
+      if (s === "remote-create") return remoteCreateScreen;
+      if (s === "create") return createScreen;
+      return listScreen;
+    },
     theme: () => currentTheme(),
     onKey: (key) => {
       if (key.name === "g" && key.ctrl) { cycleTheme(); return true; }
