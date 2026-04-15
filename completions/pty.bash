@@ -6,7 +6,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a peek send events list ls stats restart kill rm remove gc tag supervisor up down wrap unwrap test help"
+  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag supervisor up down wrap unwrap test help"
 
   # Complete subcommand
   if [[ ${COMP_CWORD} -eq 1 ]]; then

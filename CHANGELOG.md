@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### pty exec
+- Add `pty exec -- <command> [args...]` to replace the current session's command from inside the session
+- Updates session metadata so the supervisor restarts the new command, not the original
+- Errors if not inside a pty session (`PTY_SESSION` not set) or if the session is managed by a pty.toml
+- Preserves existing tags and other metadata
+- Emits `session_exec` event with previous and new command
+- Interactive TUI shows "Create new session..." for spawn-enabled remote hosts
+
 ## 0.8.0
 
 ### Relay integration
@@ -18,6 +28,8 @@
 - `groupedSelectable` `renderHeader` callback now receives the full group object instead of `(title, count)`
 - Empty groups are now rendered (header shown) instead of being silently skipped
 
+## 0.7.2
+
 ### launchd
 - `pty supervisor launchd install` now compiles a small C wrapper binary (`pty-supervisor`) that validates Full Disk Access before exec'ing node — grant FDA to this binary, not to node itself
 - Install flow checks FDA via a one-shot launchd job (no false positives from terminal's FDA)
@@ -31,6 +43,12 @@
 - Fix `events --wait` timeout not being cancelled when event is found (caused exit code 1 even on match)
 - Fix `displayCommand` duplication in `pty list` for toml-spawned sessions
 - `displayCommand` now includes full command + args for `pty run` sessions
+- Supervisor logs every skip reason in `doRestart` for debugging
+- Supervisor state directory moved to `~/.local/state/pty/supervisor/` (no longer pollutes session dir)
+
+## 0.7.1
+
+### Fixes
 - `pty peek` now works on exited sessions by reading saved output from metadata
 - `pty peek --wait` handles exited sessions: checks saved output, shows last lines and exit code if pattern not found
 - `--wait` accepts multiple patterns (`--wait "passed" --wait "failed"`) — matches on any
@@ -38,13 +56,6 @@
 - Exit metadata saved twice: immediately in `onExit` (for status display) and again in `close()` (for complete output after all PTY data has flushed)
 - Fix TUI race where session showed as "running" after exit (delay list refresh 200ms to let metadata flush)
 - Fix SKILL.md examples to use multiple `--wait` flags instead of regex syntax
-- Supervisor logs every skip reason in `doRestart` for debugging
-- Supervisor state directory moved to `~/.local/state/pty/supervisor/` (no longer pollutes session dir)
-
-### TUI framework
-- Export `SelectableGroup<T>` interface from `@myobie/pty/tui`
-- `groupedSelectable` `renderHeader` callback now receives the full group object instead of `(title, count)` — allows custom group rendering
-- Empty groups are now rendered (header shown) instead of being silently skipped
 
 ## 0.7.0
 

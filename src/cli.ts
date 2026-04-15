@@ -16,11 +16,12 @@ import {
   releaseLock,
   updateTags,
   readMetadata,
+  writeMetadata,
   getSessionDir,
   type SessionInfo,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
-import { EventFollower, readRecentEvents, formatEvent } from "./events.ts";
+import { EventFollower, EventWriter, EventType, readRecentEvents, formatEvent } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
 
@@ -41,6 +42,7 @@ function usage(): void {
   pty run --tag key=value -- <command>    Tag a session with metadata
   pty run --cwd /path -- <command>        Run in a specific directory
   pty attach <name>                        Attach to an existing session
+  pty exec -- <command> [args...]          Replace the current session's command
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
   pty peek --plain <name>                  Print current screen as plain text (no ANSI)
@@ -251,6 +253,19 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       await cmdAttach(attachName, autoRestart);
+      break;
+    }
+
+    case "exec": {
+      // pty exec -- <command> [args...]
+      const dashDash = args.indexOf("--", 1);
+      if (dashDash === -1 || dashDash + 1 >= args.length) {
+        console.error("Usage: pty exec -- <command> [args...]");
+        process.exit(1);
+      }
+      const execCmd = args[dashDash + 1];
+      const execArgs = args.slice(dashDash + 2);
+      await cmdExec(execCmd, execArgs);
       break;
     }
 
@@ -821,6 +836,63 @@ function doAttach(name: string): void {
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });
+}
+
+async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
+  const sessionName = process.env.PTY_SESSION;
+  if (!sessionName) {
+    console.error("pty exec: not inside a pty session (PTY_SESSION not set).");
+    process.exit(1);
+  }
+
+  const meta = readMetadata(sessionName);
+  if (!meta) {
+    console.error(`pty exec: session "${sessionName}" metadata not found.`);
+    process.exit(1);
+  }
+
+  if (meta.tags?.ptyfile) {
+    console.error(`pty exec: session "${sessionName}" is managed by ${meta.tags.ptyfile}`);
+    console.error("Edit the pty.toml to change the command instead.");
+    process.exit(1);
+  }
+
+  // Resolve the command to an absolute path
+  let resolved: string;
+  try {
+    resolved = resolveCommand(command);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  // Update metadata with the new command
+  const previousCommand = meta.displayCommand ?? [meta.command, ...(meta.args ?? [])].join(" ");
+  const displayCommand = [command, ...cmdArgs].join(" ");
+  writeMetadata(sessionName, {
+    ...meta,
+    command: resolved,
+    args: cmdArgs,
+    displayCommand,
+  });
+
+  // Emit exec event
+  const writer = new EventWriter(sessionName);
+  writer.append({
+    session: sessionName,
+    type: EventType.SESSION_EXEC,
+    ts: new Date().toISOString(),
+    previousCommand,
+    command: displayCommand,
+  } as any);
+  await writer.flush();
+
+  // Replace this process with the new command
+  const result = spawnSync(resolved, cmdArgs, {
+    stdio: "inherit",
+    env: process.env,
+  });
+  process.exit(result.status ?? 1);
 }
 
 async function cmdPeekWait(name: string, patterns: string[], timeoutSec: number, plain: boolean): Promise<void> {

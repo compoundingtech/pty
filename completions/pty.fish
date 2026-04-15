@@ -47,6 +47,7 @@ complete -c pty -f
 complete -c pty -n __pty_needs_command -a run -d 'Create a session and attach'
 complete -c pty -n __pty_needs_command -a attach -d 'Attach to an existing session'
 complete -c pty -n __pty_needs_command -a a -d 'Attach to an existing session'
+complete -c pty -n __pty_needs_command -a exec -d 'Replace the current session command'
 complete -c pty -n __pty_needs_command -a peek -d 'Print current screen or follow output'
 complete -c pty -n __pty_needs_command -a send -d 'Send text or keys to a session'
 complete -c pty -n __pty_needs_command -a events -d 'Follow terminal events from sessions'

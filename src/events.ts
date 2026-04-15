@@ -10,6 +10,7 @@ export const EventType = {
   CURSOR_VISIBLE: "cursor_visible",
   SESSION_START: "session_start",
   SESSION_EXIT: "session_exit",
+  SESSION_EXEC: "session_exec",
   SESSION_RESTART: "session_restart",
   SESSION_FAILED: "session_failed",
   SUPERVISOR_START: "supervisor_start",
@@ -58,6 +59,12 @@ export interface SessionExitEvent extends EventBase {
   exitCode: number;
 }
 
+export interface SessionExecEvent extends EventBase {
+  type: "session_exec";
+  previousCommand: string;
+  command: string;
+}
+
 export interface SessionRestartEvent extends EventBase {
   type: "session_restart";
   restartCount: number;
@@ -86,6 +93,7 @@ export type EventRecord =
   | CursorVisibleEvent
   | SessionStartEvent
   | SessionExitEvent
+  | SessionExecEvent
   | SessionRestartEvent
   | SessionFailedEvent
   | SupervisorStartEvent
@@ -297,6 +305,8 @@ export function formatEvent(event: EventRecord): string {
     }
     case "session_exit":
       return `${prefix} exited (code ${event.exitCode})`;
+    case "session_exec":
+      return `${prefix} exec ${event.command} (was ${event.previousCommand})`;
     case "session_restart":
       return `${prefix} restarted (attempt ${event.restartCount}, backoff ${event.backoffMs}ms)`;
     case "session_failed":

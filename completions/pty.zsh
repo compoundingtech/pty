@@ -27,6 +27,7 @@ _pty() {
     'run:Create a session and attach'
     'attach:Attach to an existing session'
     'a:Attach to an existing session'
+    'exec:Replace the current session command'
     'peek:Print current screen or follow output'
     'send:Send text or keys to a session'
     'events:Follow terminal events from sessions'

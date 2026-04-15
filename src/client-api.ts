@@ -33,7 +33,7 @@ export {
   type EventRecord, type EventBase,
   type BellEvent, type TitleChangeEvent, type NotificationEvent,
   type FocusRequestEvent, type CursorVisibleEvent,
-  type SessionStartEvent, type SessionExitEvent,
+  type SessionStartEvent, type SessionExitEvent, type SessionExecEvent,
   type SessionRestartEvent, type SessionFailedEvent,
   type SupervisorStartEvent, type SupervisorStopEvent,
   type FollowerOptions,

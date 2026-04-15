@@ -63,6 +63,7 @@ pty list --remote                         # include remote sessions via pty-rela
 
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
+pty exec -- codex                         # replace this session's process (inside a session)
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)
 pty peek --full myserver                  # print full scrollback

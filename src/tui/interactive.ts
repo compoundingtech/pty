@@ -233,7 +233,7 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   }
 
   if (item.type === "remote-create") {
-    return [text(sel + "+ Spawn remote session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
+    return [text(sel + "+ Create new session...", selected ? "accent" : "muted", { bold: selected, truncate: true })];
   }
 
   if (item.type === "remote" && item.remote) {
