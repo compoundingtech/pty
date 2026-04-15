@@ -217,6 +217,69 @@ describe("spawnDaemon options", () => {
     expect(recorded[1]).toMatch(/server\.js$/);
   }, 15000);
 
+  it("--isolate-env scrubs inherited environment variables from the session child (BUG-4)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+
+    // Run the child with a command that prints its env, set a secret var that
+    // should NOT propagate to the isolated child. `pty run -d` spawns the
+    // session, then we peek.
+    const secret = "pty_isolated_test_secret_must_not_leak";
+
+    const runResult = spawnSync(nodeBin, [
+      cliPath, "run", "-d", "--name", name, "--isolate-env",
+      "--", "sh", "-c", "env > /tmp/pty-iso-env.txt; sleep 30",
+    ], {
+      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SECRET_TEST: secret },
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    expect(runResult.status).toBe(0);
+
+    // Give the child a tick to write.
+    await new Promise((r) => setTimeout(r, 500));
+
+    const dumped = fs.readFileSync("/tmp/pty-iso-env.txt", "utf-8");
+    expect(dumped).not.toContain("PTY_SECRET_TEST");
+    expect(dumped).toContain("PATH="); // PATH still propagates
+    expect(dumped).toContain(`PTY_SESSION=${name}`); // set unconditionally
+
+    // Clean up
+    const pidFile = path.join(dir, `${name}.pid`);
+    try {
+      const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+      bgPids.push(pid);
+    } catch {}
+    try { fs.unlinkSync("/tmp/pty-iso-env.txt"); } catch {}
+  }, 15000);
+
+  it("without --isolate-env, custom env vars propagate to the session child (legacy behaviour)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+
+    const marker = "pty_legacy_env_test_marker";
+    const runResult = spawnSync(nodeBin, [
+      cliPath, "run", "-d", "--name", name,
+      "--", "sh", "-c", "env > /tmp/pty-legacy-env.txt; sleep 30",
+    ], {
+      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_LEGACY_MARKER: marker },
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    expect(runResult.status).toBe(0);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const dumped = fs.readFileSync("/tmp/pty-legacy-env.txt", "utf-8");
+    expect(dumped).toContain(`PTY_LEGACY_MARKER=${marker}`);
+
+    const pidFile = path.join(dir, `${name}.pid`);
+    try {
+      const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+      bgPids.push(pid);
+    } catch {}
+    try { fs.unlinkSync("/tmp/pty-legacy-env.txt"); } catch {}
+  }, 15000);
+
   it("surfaces a missing cwd explicitly instead of failing silently", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

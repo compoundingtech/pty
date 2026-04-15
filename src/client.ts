@@ -98,7 +98,12 @@ export function peek(options: PeekOptions): void {
   });
 
   socket.on("data", (data: Buffer) => {
-    const packets = reader.feed(data);
+    let packets;
+    try { packets = reader.feed(data); } catch (err: any) {
+      console.error(`pty client: dropping connection — ${err.message}`);
+      try { socket.destroy(); } catch {}
+      return;
+    }
     for (const packet of packets) {
       switch (packet.type) {
         case MessageType.SCREEN:
@@ -239,7 +244,12 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
     });
 
     socket.on("data", (data: Buffer) => {
-      const packets = reader.feed(data);
+      let packets;
+    try { packets = reader.feed(data); } catch (err: any) {
+      console.error(`pty client: dropping connection — ${err.message}`);
+      try { socket.destroy(); } catch {}
+      return;
+    }
       for (const packet of packets) {
         if (packet.type === MessageType.STATUS) {
           clearTimeout(timer);
@@ -386,7 +396,12 @@ export function attach(options: AttachOptions): void {
   });
 
   socket.on("data", (data: Buffer) => {
-    const packets = reader.feed(data);
+    let packets;
+    try { packets = reader.feed(data); } catch (err: any) {
+      console.error(`pty client: dropping connection — ${err.message}`);
+      try { socket.destroy(); } catch {}
+      return;
+    }
     for (const packet of packets) {
       switch (packet.type) {
         case MessageType.DATA:

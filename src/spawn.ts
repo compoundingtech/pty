@@ -21,6 +21,14 @@ export interface SpawnDaemonOptions {
   rows?: number;
   cols?: number;
   tags?: Record<string, string>;
+  /** When true, strip the daemon's env down to a small allow-list before
+   *  spawning the session child — prevents cloud tokens / OAuth / SSH agent
+   *  vars from leaking into a session that may be reached via pty-relay.
+   *  See BUG-4. */
+  isolateEnv?: boolean;
+  /** Additional `KEY=VALUE` env entries to add on top of the isolation
+   *  allow-list. Ignored unless `isolateEnv` is true. */
+  extraEnv?: Record<string, string>;
   /** Override the runtime used to launch the detached daemon process.
    *
    *  By default the daemon is spawned with `process.execPath` — the same
@@ -58,6 +66,8 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     cols,
     ephemeral: options.ephemeral ?? false,
     ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+    ...(options.isolateEnv ? { isolateEnv: true } : {}),
+    ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
   });
 
   const launcherCmd = options.launcher?.command ?? process.execPath;

@@ -9,6 +9,10 @@ const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const VALID_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 
+// Maximum bytes available to `sockaddr_un.sun_path`. Darwin/BSD = 104,
+// Linux = 108. Pick the smallest so the same name works everywhere.
+const SUN_PATH_MAX = 104;
+
 export function validateName(name: string): void {
   if (!name || name.length === 0) {
     throw new Error("Session name cannot be empty.");
@@ -19,6 +23,20 @@ export function validateName(name: string): void {
   if (!VALID_NAME_RE.test(name)) {
     throw new Error(
       `Invalid session name "${name}". Names may only contain letters, numbers, dots, hyphens, and underscores.`
+    );
+  }
+
+  // Reject names whose resulting Unix-socket path would exceed the kernel
+  // limit. Without this check the daemon's listen() fails with EINVAL inside
+  // an error handler that used to silently log and hang. See BUG-1.
+  const socketPath = path.join(getSessionDir(), `${name}.sock`);
+  const byteLen = Buffer.byteLength(socketPath, "utf-8");
+  if (byteLen > SUN_PATH_MAX) {
+    const overflow = byteLen - SUN_PATH_MAX;
+    throw new Error(
+      `Session name "${name}" produces a socket path of ${byteLen} bytes, ` +
+      `which exceeds the ${SUN_PATH_MAX}-byte kernel limit by ${overflow}. ` +
+      `Shorten the name or set PTY_SESSION_DIR to a shorter path.`
     );
   }
 }
@@ -262,43 +280,58 @@ function getLockPath(name: string): string {
  * Acquire an exclusive lock for a session name. Prevents concurrent
  * `pty run` calls from racing to create the same session.
  * Returns true if acquired, false if another process holds it.
+ *
+ * BUG-2 fix: the whole acquisition is built on `open(O_CREAT|O_EXCL)` via
+ * `openSync(..., "wx")`. Two racing processes can't both win because
+ * `O_EXCL` is a kernel-level atomic create. When the lock looks stale, we
+ * unlink it and retry the exclusive open: whichever process wins the
+ * post-unlink open owns the lock; the other gets EEXIST and gives up.
  */
 export function acquireLock(name: string): boolean {
   ensureSessionDir();
   const lockPath = getLockPath(name);
-  try {
-    fs.writeFileSync(lockPath, process.pid.toString(), { flag: "wx" });
-    return true;
-  } catch (e: any) {
-    if (e.code === "EEXIST") {
-      // Lock file exists — check if the holding process is still alive
-      let shouldSteal = false;
-      try {
-        const pid = parseInt(fs.readFileSync(lockPath, "utf-8").trim(), 10);
-        if (isNaN(pid)) {
-          // Garbage content — treat as stale
-          shouldSteal = true;
-        } else {
-          process.kill(pid, 0); // throws if process is dead
-          return false; // process is alive, lock is valid
-        }
-      } catch {
-        // Couldn't read, or holding process is dead
-        shouldSteal = true;
-      }
 
-      if (shouldSteal) {
-        try {
-          fs.unlinkSync(lockPath);
-          fs.writeFileSync(lockPath, process.pid.toString(), { flag: "wx" });
-          return true;
-        } catch {
-          return false;
-        }
+  const tryCreate = (): boolean => {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      try {
+        fs.writeSync(fd, process.pid.toString());
+      } finally {
+        fs.closeSync(fd);
       }
+      return true;
+    } catch (e: any) {
+      if (e.code === "EEXIST") return false;
+      throw e;
     }
-    return false;
+  };
+
+  if (tryCreate()) return true;
+
+  // Lock file exists — inspect the holder.
+  let holderAlive = false;
+  try {
+    const pid = parseInt(fs.readFileSync(lockPath, "utf-8").trim(), 10);
+    if (!isNaN(pid)) {
+      process.kill(pid, 0); // throws if process is dead
+      holderAlive = true;
+    }
+  } catch {
+    // Garbage content, unreadable, or holder dead → treat as stale.
   }
+
+  if (holderAlive) return false;
+
+  // Stale lock. Unlink and retry the exclusive create exactly once. If
+  // another process is racing us to steal, only one wins the wx open; the
+  // loser returns false instead of stomping on the winner's lock.
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (e: any) {
+    // Someone else unlinked it first — that's fine, fall through to create.
+    if (e.code !== "ENOENT") return false;
+  }
+  return tryCreate();
 }
 
 export function releaseLock(name: string): void {

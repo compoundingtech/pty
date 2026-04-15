@@ -48,6 +48,48 @@ export interface ServerOptions {
   cols: number;
   tags?: Record<string, string>;
   onExit?: (code: number) => void;
+  /** When true, spawn the child with a scrubbed environment containing only
+   *  a small allow-list of variables (plus any entries in `extraEnv`).
+   *  Intended for contexts where the daemon may have inherited secrets that
+   *  shouldn't leak into the session (e.g., a daemon launched by pty-relay
+   *  for a remote client). See BUG-4. */
+  isolateEnv?: boolean;
+  /** Additional `KEY=VALUE` env entries to add on top of the isolation
+   *  allow-list. Only consulted when `isolateEnv` is true. */
+  extraEnv?: Record<string, string>;
+}
+
+/** Env variables that are safe to pass through to a session child when
+ *  `isolateEnv` is on. Keeps terminal/locale/path functionality working
+ *  without propagating the operator's shell secrets. */
+const ISOLATED_ENV_ALLOWLIST = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+  "TERM", "COLORTERM", "LANG", "TZ", "PWD", "TMPDIR",
+  // pty-internal
+  "PTY_SESSION_DIR",
+]);
+
+function buildChildEnv(options: ServerOptions): Record<string, string> {
+  const source = process.env as Record<string, string>;
+
+  if (!options.isolateEnv) {
+    // Legacy behaviour: full inheritance, minus the server-config handoff.
+    const env = { ...source };
+    delete env.PTY_SERVER_CONFIG;
+    env.PTY_SESSION = options.name;
+    return env;
+  }
+
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(source)) {
+    if (v === undefined) continue;
+    if (ISOLATED_ENV_ALLOWLIST.has(k) || k.startsWith("LC_")) env[k] = v;
+  }
+  if (options.extraEnv) {
+    for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
+  }
+  env.PTY_SESSION = options.name;
+  return env;
 }
 
 const LAST_LINES_COUNT = 200;
@@ -338,9 +380,7 @@ export class PtyServer {
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
-    const childEnv = { ...process.env };
-    delete childEnv.PTY_SERVER_CONFIG;
-    childEnv.PTY_SESSION = options.name;
+    const childEnv = buildChildEnv(options);
 
     const invalidCwd = describeInvalidCwd(options.cwd);
     if (invalidCwd !== undefined) {
@@ -409,7 +449,17 @@ export class PtyServer {
     this.socketServer = net.createServer((socket) =>
       this.handleClient(socket)
     );
-    this.ready = new Promise((resolve) => {
+    // Tighten umask around listen() so the socket inode is never transiently
+    // group/world-readable (BUG-5). The chmodSync below is kept as
+    // belt-and-suspenders for good measure.
+    const prevUmask = process.umask(0o077);
+    this.ready = new Promise((resolve, reject) => {
+      let settled = false;
+      this.socketServer.once("error", (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
       this.socketServer.listen(socketPath, () => {
         try { fs.chmodSync(socketPath, 0o600); } catch {}
         fs.writeFileSync(getPidPath(this.name), process.pid.toString());
@@ -424,10 +474,16 @@ export class PtyServer {
         this.emitEvent(EventType.SESSION_START, {
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
         });
+        if (settled) return;
+        settled = true;
         resolve();
       });
     });
+    process.umask(prevUmask);
 
+    // Post-listen errors (e.g., socket file unlinked out from under us) must
+    // not crash the process, but they also mustn't interfere with the
+    // initial ready resolution above.
     this.socketServer.on("error", (err) => {
       console.error(`Socket server error: ${err.message}`);
     });
@@ -445,7 +501,16 @@ export class PtyServer {
     this.clients.set(socket, client);
 
     socket.on("data", (data: Buffer) => {
-      const packets = client.reader.feed(data);
+      let packets;
+      try {
+        packets = client.reader.feed(data);
+      } catch (err: any) {
+        // BUG-3: peer sent an oversize length header (or some other malformed
+        // frame) — drop them rather than buffer unbounded.
+        console.error(`Rejected client packet: ${err.message}`);
+        try { socket.destroy(); } catch {}
+        return;
+      }
       for (const packet of packets) {
         switch (packet.type) {
           case MessageType.ATTACH: {
@@ -781,6 +846,8 @@ if (process.argv[1]?.endsWith("/server.js")) {
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
     tags: config.tags,
+    isolateEnv: config.isolateEnv === true,
+    extraEnv: config.extraEnv,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
       setTimeout(() => cleanShutdown(code), 500);

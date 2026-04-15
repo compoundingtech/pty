@@ -21,6 +21,25 @@ export interface Packet {
 // Packet wire format: [type: uint8][length: uint32BE][payload: N bytes]
 const HEADER_SIZE = 5;
 
+// BUG-3: cap legitimate packet size. SCREEN replays carry the serialized
+// xterm buffer (rows × cols × attrs × scrollback). With the 10k-line default
+// scrollback plus mode prefixes, 32 MiB is generously above any real payload
+// while still small enough to bound a single malformed-length attack.
+export const MAX_PACKET_LENGTH = 32 * 1024 * 1024;
+
+/** Thrown when an inbound packet declares a length larger than
+ *  `MAX_PACKET_LENGTH`. Socket handlers should destroy the connection. */
+export class PacketTooLargeError extends Error {
+  readonly declaredLength: number;
+  constructor(declaredLength: number) {
+    super(
+      `Packet length ${declaredLength} exceeds maximum ${MAX_PACKET_LENGTH}`
+    );
+    this.name = "PacketTooLargeError";
+    this.declaredLength = declaredLength;
+  }
+}
+
 export function encodePacket(type: MessageType, payload: Buffer): Buffer {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt8(type, 0);
@@ -92,7 +111,9 @@ export function decodeExit(payload: Buffer): number {
   return payload.readInt32BE(0);
 }
 
-/** Streaming packet parser that handles partial reads on a stream socket. */
+/** Streaming packet parser that handles partial reads on a stream socket.
+ *  Throws `PacketTooLargeError` if a peer declares a length exceeding
+ *  `MAX_PACKET_LENGTH` — handlers should destroy the socket. */
 export class PacketReader {
   private buffer = Buffer.alloc(0);
 
@@ -103,6 +124,13 @@ export class PacketReader {
     while (this.buffer.length >= HEADER_SIZE) {
       const type = this.buffer.readUInt8(0) as MessageType;
       const length = this.buffer.readUInt32BE(1);
+
+      if (length > MAX_PACKET_LENGTH) {
+        // Poison the buffer so subsequent feed() calls can't continue past
+        // the bad header (even though the caller should drop the connection).
+        this.buffer = Buffer.alloc(0);
+        throw new PacketTooLargeError(length);
+      }
 
       if (this.buffer.length < HEADER_SIZE + length) break;
 

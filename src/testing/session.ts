@@ -382,7 +382,11 @@ export class Session {
     });
 
     backend.socket.on("data", (data: Buffer) => {
-      const packets = backend.reader.feed(data);
+      let packets;
+      try { packets = backend.reader.feed(data); } catch {
+        try { backend.socket.destroy(); } catch {}
+        return;
+      }
       for (const packet of packets) {
         switch (packet.type) {
           case MessageType.SCREEN:

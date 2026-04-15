@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   MessageType,
   PacketReader,
+  PacketTooLargeError,
+  MAX_PACKET_LENGTH,
   encodePacket,
   encodeData,
   encodeAttach,
@@ -14,6 +16,7 @@ import {
   decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
+import { Buffer } from "node:buffer";
 
 describe("protocol", () => {
   describe("encodePacket / PacketReader", () => {
@@ -196,6 +199,49 @@ describe("protocol", () => {
       expect(packets).toHaveLength(1);
       expect(packets[0].type).toBe(MessageType.STATUS);
       expect(packets[0].payload.length).toBe(0);
+    });
+
+    it("rejects packets whose declared length exceeds MAX_PACKET_LENGTH (BUG-3)", () => {
+      const reader = new PacketReader();
+      // Craft a header with length = MAX + 1 and no payload
+      const header = Buffer.alloc(5);
+      header.writeUInt8(MessageType.DATA, 0);
+      header.writeUInt32BE(MAX_PACKET_LENGTH + 1, 1);
+
+      expect(() => reader.feed(header)).toThrow(PacketTooLargeError);
+    });
+
+    it("rejects the max-uint32 length (worst case attack)", () => {
+      const reader = new PacketReader();
+      const header = Buffer.alloc(5);
+      header.writeUInt8(MessageType.DATA, 0);
+      header.writeUInt32BE(0xffffffff, 1);
+
+      expect(() => reader.feed(header)).toThrow(PacketTooLargeError);
+    });
+
+    it("poisons the buffer after oversize throw (subsequent feeds don't buffer unbounded)", () => {
+      const reader = new PacketReader();
+      const header = Buffer.alloc(5);
+      header.writeUInt8(MessageType.DATA, 0);
+      header.writeUInt32BE(0xffffffff, 1);
+
+      try { reader.feed(header); } catch {}
+      // Buffer is cleared, so subsequent valid packets parse correctly from
+      // the new boundary (not treating their bytes as payload of the bad one).
+      const packets = reader.feed(encodeData("hi"));
+      expect(packets).toHaveLength(1);
+      expect(packets[0].payload.toString()).toBe("hi");
+    });
+
+    it("accepts packets at exactly MAX_PACKET_LENGTH", () => {
+      // Build a valid packet with length exactly at the cap (but small payload;
+      // we just want the length field to be valid).
+      const reader = new PacketReader();
+      const encoded = encodeData("ok");
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].payload.toString()).toBe("ok");
     });
 
     it("round-trips a STATUS response (JSON payload)", () => {

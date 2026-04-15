@@ -639,7 +639,11 @@ export async function attachPty(
   };
 
   socket.on("data", (data: Buffer) => {
-    const packets = reader.feed(data);
+    let packets;
+    try { packets = reader.feed(data); } catch {
+      try { socket.destroy(); } catch {}
+      return;
+    }
     for (const packet of packets) {
       switch (packet.type) {
         case MessageType.SCREEN:

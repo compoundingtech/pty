@@ -54,6 +54,7 @@ function usage(): void {
   pty run -a -- <command> [args...]        Create or attach if already running
   pty run --tag key=value -- <command>    Tag a session with metadata
   pty run --cwd /path -- <command>        Run in a specific directory
+  pty run --isolate-env -- <command>       Scrub env down to a safe allow-list (for remote-reachable sessions)
   pty attach <name>                        Attach to an existing session
   pty exec -- <command> [args...]          Replace the current session's command
   pty attach -r <name>                     Attach, auto-restart if exited
@@ -168,6 +169,7 @@ async function main(): Promise<void> {
       let detach = false;
       let attachExisting = false;
       let ephemeral = false;
+      let isolateEnv = false;
       let name: string | null = null;
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
@@ -176,6 +178,7 @@ async function main(): Promise<void> {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
         else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
         else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
+        else if (args[i] === "--isolate-env") { isolateEnv = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
         else if (args[i] === "--tag" && i + 1 < args.length) {
@@ -271,7 +274,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv);
       break;
     }
 
@@ -762,6 +765,7 @@ async function cmdRun(
   ephemeral = false,
   tags: Record<string, string> = {},
   explicitCwd: string | null = null,
+  isolateEnv = false,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -794,7 +798,7 @@ async function cmdRun(
   try {
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
     const cwdOpt = explicitCwd ?? previousCwd;
-    await spawnDaemon({ name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt });
+    await spawnDaemon({ name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt, ...(isolateEnv ? { isolateEnv: true } : {}) });
   } finally {
     releaseLock(name);
   }

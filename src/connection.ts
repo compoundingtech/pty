@@ -72,7 +72,11 @@ export class SessionConnection extends EventEmitter {
       let initialScreenResolved = false;
 
       socket.on("data", (raw: Buffer) => {
-        const packets = this.reader.feed(raw);
+        let packets;
+        try { packets = this.reader.feed(raw); } catch {
+          try { socket.destroy(); } catch {}
+          return;
+        }
         for (const packet of packets) {
           switch (packet.type) {
             case MessageType.SCREEN: {
@@ -188,7 +192,12 @@ export function peekScreen(options: PeekScreenOptions): Promise<string> {
     });
 
     socket.on("data", (raw: Buffer) => {
-      const packets = reader.feed(raw);
+      let packets;
+      try { packets = reader.feed(raw); } catch (err: any) {
+        try { socket.destroy(); } catch {}
+        reject(err);
+        return;
+      }
       for (const packet of packets) {
         if (packet.type === MessageType.SCREEN) {
           socket.destroy();

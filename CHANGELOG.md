@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Security
+- BUG-1: `validateName` now rejects session names whose Unix-socket path would exceed the 104-byte `sun_path` limit; previously the daemon's `listen()` failed silently inside an error handler and the `ready` Promise never resolved, hanging every caller. `server.ready` also now rejects on listen errors.
+- BUG-2: `acquireLock` is now built on `open(O_CREAT|O_EXCL)` (`openSync(path, "wx")`); two processes racing to steal a stale lock can no longer both win.
+- BUG-3: `PacketReader` enforces a 32 MiB `MAX_PACKET_LENGTH` cap and throws `PacketTooLargeError` on oversize length headers; socket handlers catch and destroy the peer. Previously a crafted `length=0xFFFFFFFF` frame would cause unbounded buffer growth.
+- BUG-4: Add `pty run --isolate-env` (and `isolateEnv: true` / `extraEnv` on `SpawnDaemonOptions` / `ServerOptions`) to spawn session children with a scrubbed env limited to an allow-list (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `COLORTERM`, `LANG`, `TZ`, `PWD`, `TMPDIR`, `LC_*`, `PTY_SESSION_DIR`, `PTY_SESSION`). Intended for pty-relay to apply when spawning daemons for remote clients — prevents operator secrets (cloud tokens, OAuth, `PTY_RELAY_PASSPHRASE`, etc.) from leaking into a session reachable by a remote user. Default behaviour is unchanged.
+- BUG-5: The Unix-socket file is now created under `umask 0o077`, closing the microsecond window where the inode was group/world-readable before `chmod 0o600`.
+
 ### Fixes
 - Fix mouse tracking modes (1000/1002/1003) not being replayed when a client reattaches to a session with mouse tracking already enabled — the server previously only replayed the SGR encoding (1006), cursor visibility, and kitty keyboard flags. Clients (e.g., pty-layout) checking tracking mode to decide whether to forward mouse events will now see the correct state.
 
