@@ -152,6 +152,53 @@ describe("session tags", () => {
     expect(sessions.map((s: any) => s.name)).toEqual([bothName]);
   }, 15000);
 
+  it("pty list shows tags by default as hashtags (no --tags needed)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat", [], { role: "web", env: "dev" });
+
+    const output = runCli(dir, "list");
+    expect(output).toContain(name);
+    expect(output).toContain("#role=web");
+    expect(output).toContain("#env=dev");
+  }, 15000);
+
+  it("pty list hides internal bookkeeping tags by default", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat", [], {
+      role: "web",
+      ptyfile: "/some/path/pty.toml",
+      "ptyfile.session": "s",
+      "ptyfile.tags": "role",
+      strategy: "permanent",
+    });
+
+    const output = runCli(dir, "list");
+    expect(output).toContain("#role=web");
+    expect(output).not.toContain("#ptyfile=");
+    expect(output).not.toContain("#ptyfile.session=");
+    expect(output).not.toContain("#ptyfile.tags=");
+    expect(output).not.toContain("#strategy=");
+    // strategy still surfaces via the [permanent] marker
+    expect(output).toContain("[permanent]");
+  }, 15000);
+
+  it("pty list --tags includes internal bookkeeping tags", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat", [], {
+      role: "web",
+      ptyfile: "/some/path/pty.toml",
+      strategy: "permanent",
+    });
+
+    const output = runCli(dir, "list", "--tags");
+    expect(output).toContain("#role=web");
+    expect(output).toContain("#ptyfile=");
+    expect(output).toContain("#strategy=permanent");
+  }, 15000);
+
   it("pty list --filter-tag filters text output too", async () => {
     const dir = makeSessionDir();
     const matchName = uniqueName();

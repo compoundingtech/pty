@@ -274,6 +274,17 @@ const totalItems = computed(() => {
 // List screen
 // ============================================================
 
+/** Render user-facing tags as a " #key=value" string. Hides internal
+ *  bookkeeping keys that already have dedicated markers or aren't meaningful. */
+function renderTagsInline(tags: Record<string, string> | undefined): string {
+  if (!tags) return "";
+  const entries = Object.entries(tags).filter(([k]) =>
+    k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags" &&
+    k !== "supervisor.status" && k !== "strategy",
+  );
+  return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
+}
+
 function renderListItem(item: ListItem, _index: number, selected: boolean): UINode[] {
   const sel = selected ? "\u25b8 " : "  ";
   if (item.type === "create") {
@@ -289,7 +300,8 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
     const icon = rs.status === "running" ? "\u25cf" : "\u25cb";
     const cwdStr = rs.cwd ? shortPath(rs.cwd) : "";
     const cmd = rs.command ?? "";
-    const nameStr = `${sel}${icon} ${rs.name}`;
+    const tagStr = renderTagsInline(rs.tags);
+    const nameStr = `${sel}${icon} ${rs.name}${tagStr}`;
     const detailStr = `  ${cwdStr}  ${cmd}`;
     const line = nameStr + detailStr;
 
@@ -316,8 +328,9 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const supStatus = s.metadata?.tags?.["supervisor.status"];
   const strategy = s.metadata?.tags?.strategy;
   const marker = supStatus === "failed" ? " [failed]" : strategy === "permanent" ? " [permanent]" : strategy === "temporary" ? " [temporary]" : "";
+  const tagStr = renderTagsInline(s.metadata?.tags);
 
-  const nameStr = `${sel}${icon} ${s.name}${marker}`;
+  const nameStr = `${sel}${icon} ${s.name}${marker}${tagStr}`;
   const detailStr = `  ${pathStr}  ${cmd}`;
   const line = nameStr + detailStr;
 
@@ -755,19 +768,24 @@ function doAttachRemote(host: RelayHost, session: RemoteSession): void {
   })();
 }
 
+/** Build the argv for `pty-relay connect <url> --spawn <name>` with tags
+ *  forwarded as `--tag key=value`. Exported for unit testing. */
+export function buildSpawnRemoteArgs(url: string, name: string, tags: Record<string, string>): string[] {
+  const argv = ["connect", url, "--spawn", name];
+  for (const [k, v] of Object.entries(tags)) {
+    argv.push("--tag", `${k}=${v}`);
+  }
+  return argv;
+}
+
 function doSpawnRemote(host: RelayHost, name: string): void {
   if (!relayBin) return;
   myApp?.pause();
 
   // Forward --filter-tag tags to the relay so the newly-spawned remote
   // session is tagged and stays within the filtered view.
-  const tags = filterTags.peek();
-  const tagArgs: string[] = [];
-  for (const [k, v] of Object.entries(tags)) {
-    tagArgs.push("--tag", `${k}=${v}`);
-  }
-
-  const result = spawnSync(relayBin, ["connect", host.url, "--spawn", name, ...tagArgs], {
+  const argv = buildSpawnRemoteArgs(host.url, name, filterTags.peek());
+  const result = spawnSync(relayBin, argv, {
     stdio: "inherit",
   });
 

@@ -7,6 +7,7 @@
 - Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions (local and remote) stay in the filtered view (e.g., pty-layout layouts)
 - Remote session spawns forward filter tags to pty-relay as `--tag key=value` so remote sessions created from a filtered TUI are tagged on the remote side and stay in the filtered view
 - Tag filter is shown in the Filter line; remote groups are filtered by their `tags` field when a tag filter is active
+- Session rows in the interactive list now show user-facing tags inline (`#key=value`) alongside cwd and command (matches `pty list` output)
 
 ### Listing
 - `pty list` now shows tags by default (hashtag format, e.g., `#role=web`) — internal bookkeeping keys (`ptyfile*`, `strategy`, `supervisor.status`) are hidden

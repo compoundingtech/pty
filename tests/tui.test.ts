@@ -305,6 +305,90 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "interactive list renders user tags inline as #key=value next to session name",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+
+      const { pid } = await createBackgroundSession(sessionDir, name, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(pid);
+
+      // Tag the session via the CLI
+      spawn(nodeBin, [cliPath, "tag", name, "role=web"], {
+        env: { ...process.env, PTY_SESSION_DIR: sessionDir },
+        stdio: "ignore",
+      }).on("exit", () => {});
+      await new Promise((r) => setTimeout(r, 500));
+
+      const tui = createTuiSession(sessionDir);
+      const ss = await tui.waitForText("#role=web", 10000);
+      const sessionLine = ss.lines.find((l) => l.includes(name));
+      expect(sessionLine).toBeDefined();
+      // Tag sits between the name and the rest of the detail (cwd/command)
+      const nameIdx = sessionLine!.indexOf(name);
+      const tagIdx = sessionLine!.indexOf("#role=web");
+      expect(tagIdx).toBeGreaterThan(nameIdx);
+      // Internal bookkeeping keys should not render as hashtags
+      expect(ss.text).not.toContain("#ptyfile=");
+    },
+    15000
+  );
+
+  it(
+    "--filter-tag auto-applies the tag to sessions created from the TUI",
+    async () => {
+      const sessionDir = makeSessionDir();
+
+      const tui = Session.spawn(nodeBin, [cliPath, "--preselect-new", "--filter-tag", "role=web"], {
+        rows: 24,
+        cols: 80,
+        env: { PTY_SESSION_DIR: sessionDir, TERM: "xterm-256color" },
+      });
+      tuiSessions.push(tui);
+
+      // Create item is preselected; walk the wizard
+      await tui.waitForText("#role=web", 10000); // filter line visible
+      tui.press("return");
+      await tui.waitForText("Choose Directory", 5000);
+      tui.press("return"); // use current directory
+      await tui.waitForText("Name:", 5000);
+      tui.type("cat");
+      await new Promise((r) => setTimeout(r, 200));
+      tui.press("return"); // create
+
+      // Wait for the session metadata file to appear and contain the tag
+      const start = Date.now();
+      let found: any = null;
+      while (Date.now() - start < 5000) {
+        const entries = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".json"));
+        for (const e of entries) {
+          try {
+            const meta = JSON.parse(fs.readFileSync(path.join(sessionDir, e), "utf-8"));
+            if (meta.tags?.role === "web") {
+              found = meta;
+              break;
+            }
+          } catch {}
+        }
+        if (found) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(found).not.toBeNull();
+      expect(found.tags.role).toBe("web");
+
+      // Clean up the spawned session
+      const pidFiles = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".pid"));
+      for (const p of pidFiles) {
+        try {
+          const pid = parseInt(fs.readFileSync(path.join(sessionDir, p), "utf-8").trim(), 10);
+          bgPids.push(pid);
+        } catch {}
+      }
+    },
+    20000
+  );
+
+  it(
     "--filter-tag hides sessions that lack the tag",
     async () => {
       const sessionDir = makeSessionDir();

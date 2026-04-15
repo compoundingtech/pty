@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildFilteredGroups, type ListItem, type RelayHost } from "../src/tui/interactive.ts";
+import { buildFilteredGroups, buildSpawnRemoteArgs, type ListItem, type RelayHost } from "../src/tui/interactive.ts";
 import type { SessionInfo } from "../src/sessions.ts";
 
 function makeSession(name: string, status: "running" | "exited" = "running", opts?: { command?: string; cwd?: string; tags?: Record<string, string> }): SessionInfo {
@@ -223,5 +223,35 @@ describe("buildFilteredGroups", () => {
       expect(sessionItems[0].session!.name).toBe("api-worker");
       expect(sessionItems[1].session!.name).toBe("api-server");
     });
+  });
+});
+
+describe("buildSpawnRemoteArgs", () => {
+  it("builds the base argv with no tags", () => {
+    expect(buildSpawnRemoteArgs("https://host#tok", "myses", {})).toEqual([
+      "connect", "https://host#tok", "--spawn", "myses",
+    ]);
+  });
+
+  it("forwards tags as --tag key=value pairs", () => {
+    expect(buildSpawnRemoteArgs("https://host", "myses", { role: "web" })).toEqual([
+      "connect", "https://host", "--spawn", "myses", "--tag", "role=web",
+    ]);
+  });
+
+  it("forwards multiple tags in a stable order", () => {
+    const tags = { role: "web", env: "prod" };
+    const argv = buildSpawnRemoteArgs("https://h", "s", tags);
+    expect(argv).toEqual([
+      "connect", "https://h", "--spawn", "s",
+      "--tag", "role=web",
+      "--tag", "env=prod",
+    ]);
+  });
+
+  it("preserves = in values", () => {
+    expect(buildSpawnRemoteArgs("u", "n", { note: "k=v" })).toEqual([
+      "connect", "u", "--spawn", "n", "--tag", "note=k=v",
+    ]);
   });
 });
