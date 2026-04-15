@@ -4,8 +4,9 @@
 
 ### Interactive TUI
 - Add `--preselect-new` flag: `pty --preselect-new` opens the interactive TUI with "Create new session..." pre-selected (useful for pty-layout panes that should land on the create prompt)
-- Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions stay in the filtered view (e.g., pty-layout layouts)
-- Tag filter is shown in the Filter line; remote groups are hidden when a tag filter is active (remote session tags aren't surfaced by pty-relay)
+- Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions (local and remote) stay in the filtered view (e.g., pty-layout layouts)
+- Remote session spawns forward filter tags to pty-relay as `--tag key=value` so remote sessions created from a filtered TUI are tagged on the remote side and stay in the filtered view
+- Tag filter is shown in the Filter line; remote groups are filtered by their `tags` field when a tag filter is active
 
 ### Listing
 - `pty list` now shows tags by default (hashtag format, e.g., `#role=web`) — internal bookkeeping keys (`ptyfile*`, `strategy`, `supervisor.status`) are hidden

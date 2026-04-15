@@ -759,7 +759,15 @@ function doSpawnRemote(host: RelayHost, name: string): void {
   if (!relayBin) return;
   myApp?.pause();
 
-  const result = spawnSync(relayBin, ["connect", host.url, "--spawn", name], {
+  // Forward --filter-tag tags to the relay so the newly-spawned remote
+  // session is tagged and stays within the filtered view.
+  const tags = filterTags.peek();
+  const tagArgs: string[] = [];
+  for (const [k, v] of Object.entries(tags)) {
+    tagArgs.push("--tag", `${k}=${v}`);
+  }
+
+  const result = spawnSync(relayBin, ["connect", host.url, "--spawn", name, ...tagArgs], {
     stdio: "inherit",
   });
 
