@@ -258,6 +258,12 @@ export interface PtyHandle {
   readonly cursorCol: number;
   /** Whether the child process has enabled mouse tracking (modes 1000/1002/1003). */
   readonly mouseMode: boolean;
+  /** Whether the child is using the alternate screen buffer (mode 1049). */
+  readonly alternateScreen: boolean;
+  /** Stack of kitty keyboard protocol flags pushed by the child (CSI > N u
+   *  pushes, CSI < u pops). Empty array means the protocol is not active.
+   *  Returned as a defensive copy — mutating it has no effect on the PTY. */
+  readonly kittyKeyboardFlags: number[];
   /** Configured scrollback line count. */
   readonly scrollback: number;
   /** Total lines in the buffer (viewport + scrollback history). */

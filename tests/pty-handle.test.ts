@@ -119,6 +119,64 @@ describe("mouseMode", () => {
   });
 });
 
+// --- alternateScreen ---
+
+describe("alternateScreen", () => {
+  it("is false by default (primary buffer)", () => {
+    const h = spawn("cat");
+    expect(h.alternateScreen).toBe(false);
+  });
+
+  it("becomes true when child enters alternate screen (mode 1049)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[?1049h'; sleep 10"]);
+    await waitFor(h, () => h.alternateScreen === true);
+    expect(h.alternateScreen).toBe(true);
+  });
+
+  it("becomes false when child leaves alternate screen", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[?1049h'; sleep 0.1; printf '\\x1b[?1049l'; sleep 10"]);
+    await waitFor(h, () => h.alternateScreen === true);
+    await waitFor(h, () => h.alternateScreen === false);
+    expect(h.alternateScreen).toBe(false);
+  });
+});
+
+// --- kittyKeyboardFlags ---
+
+describe("kittyKeyboardFlags", () => {
+  it("is empty by default", () => {
+    const h = spawn("cat");
+    expect(h.kittyKeyboardFlags).toEqual([]);
+  });
+
+  it("tracks a single pushed flag", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[>7u'; sleep 10"]);
+    await waitFor(h, () => h.kittyKeyboardFlags.length > 0);
+    expect(h.kittyKeyboardFlags).toEqual([7]);
+  });
+
+  it("tracks multiple nested pushes", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[>1u\\x1b[>15u'; sleep 10"]);
+    await waitFor(h, () => h.kittyKeyboardFlags.length === 2);
+    expect(h.kittyKeyboardFlags).toEqual([1, 15]);
+  });
+
+  it("pops the most recent flag on CSI < u", async () => {
+    // Sequences land together — just wait for the final state after the pop.
+    const h = spawn("bash", ["-c", "printf '\\x1b[>1u\\x1b[>15u\\x1b[<u'; sleep 10"]);
+    await waitFor(h, () => h.kittyKeyboardFlags.length === 1);
+    expect(h.kittyKeyboardFlags).toEqual([1]);
+  });
+
+  it("returns a defensive copy (mutation does not affect internal state)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[>7u'; sleep 10"]);
+    await waitFor(h, () => h.kittyKeyboardFlags.length > 0);
+    const snapshot = h.kittyKeyboardFlags;
+    snapshot.push(999);
+    expect(h.kittyKeyboardFlags).toEqual([7]);
+  });
+});
+
 // --- scrollback ---
 
 describe("scrollback", () => {

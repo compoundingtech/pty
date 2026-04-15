@@ -409,6 +409,24 @@ export function createPty(
     },
   );
 
+  // Track kitty keyboard protocol flag stack
+  const kittyKeyboardStack: number[] = [];
+  terminal.parser.registerCsiHandler(
+    { prefix: ">", final: "u" },
+    (params: any) => {
+      const p = params[0];
+      kittyKeyboardStack.push(typeof p === "number" ? p : p[0]);
+      return false;
+    },
+  );
+  terminal.parser.registerCsiHandler(
+    { prefix: "<", final: "u" },
+    () => {
+      kittyKeyboardStack.pop();
+      return false;
+    },
+  );
+
   const childEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
     ...opts?.env,
@@ -477,6 +495,8 @@ export function createPty(
     get cursorRow() { return terminal.buffer.active.cursorY; },
     get cursorCol() { return terminal.buffer.active.cursorX; },
     get mouseMode() { return mouseMode; },
+    get alternateScreen() { return terminal.buffer.active.type === "alternate"; },
+    get kittyKeyboardFlags() { return [...kittyKeyboardStack]; },
     get scrollback() { return scrollbackSize; },
     get bufferLength() { return terminal.buffer.active.length; },
     get baseY() { return terminal.buffer.active.baseY; },
@@ -539,6 +559,25 @@ export async function attachPty(
       return false;
     },
   );
+
+  // Track kitty keyboard protocol flag stack
+  const kittyKeyboardStack: number[] = [];
+  terminal.parser.registerCsiHandler(
+    { prefix: ">", final: "u" },
+    (params: any) => {
+      const p = params[0];
+      kittyKeyboardStack.push(typeof p === "number" ? p : p[0]);
+      return false;
+    },
+  );
+  terminal.parser.registerCsiHandler(
+    { prefix: "<", final: "u" },
+    () => {
+      kittyKeyboardStack.pop();
+      return false;
+    },
+  );
+
   const socketPath = getSocketPath(name);
 
   // Connect to the daemon socket
@@ -592,6 +631,8 @@ export async function attachPty(
     get cursorRow() { return terminal.buffer.active.cursorY; },
     get cursorCol() { return terminal.buffer.active.cursorX; },
     get mouseMode() { return mouseMode; },
+    get alternateScreen() { return terminal.buffer.active.type === "alternate"; },
+    get kittyKeyboardFlags() { return [...kittyKeyboardStack]; },
     get scrollback() { return scrollbackSize; },
     get bufferLength() { return terminal.buffer.active.length; },
     get baseY() { return terminal.buffer.active.baseY; },
