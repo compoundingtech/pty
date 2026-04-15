@@ -9,6 +9,9 @@
 - Preserves existing tags and other metadata
 - Emits `session_exec` event with previous and new command
 - Interactive TUI shows "Create new session..." for spawn-enabled remote hosts
+- Interactive filter hides "Create new session..." items when filter doesn't match "new"
+- `host/session` filter syntax: type `prod/api` to filter by host then session
+- Extracted `buildFilteredGroups` as a pure function for unit testing
 
 ## 0.8.0
 

@@ -329,7 +329,8 @@ describe("interactive TUI", () => {
 
       let ss = tui.screenshot();
       expect(ss.text).toContain(name1);
-      expect(ss.text).toContain("Create new session...");
+      // "Create new session..." should be hidden when filter doesn't match "new"
+      expect(ss.text).not.toContain("Create new session...");
 
       // Backspace to remove filter
       for (let i = 0; i < filterText.length; i++) {

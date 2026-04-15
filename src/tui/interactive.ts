@@ -96,14 +96,14 @@ const remoteFocusedField = signal<"name" | "command">("name");
 // Relay integration
 // ============================================================
 
-interface RemoteSession {
+export interface RemoteSession {
   name: string;
   status: string;
   command?: string;
   cwd?: string;
 }
 
-interface RelayHost {
+export interface RelayHost {
   label: string;
   url: string;
   sessions: RemoteSession[];
@@ -141,7 +141,7 @@ function refreshRelayHosts(): void {
 // Computed values
 // ============================================================
 
-interface ListItem {
+export interface ListItem {
   type: "session" | "create" | "remote" | "remote-create";
   session?: SessionInfo;
   remote?: { host: RelayHost; session: RemoteSession };
@@ -184,29 +184,46 @@ function filterAndSort(filter: string, items: ListItem[]): ListItem[] {
   return matches.map(m => m.item);
 }
 
-const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
-  const filter = filterText.get();
+/** Build filtered groups from local sessions and relay hosts.
+ *  Exported for unit testing. */
+export function buildFilteredGroups(
+  filter: string,
+  localSessions: SessionInfo[],
+  hosts: RelayHost[],
+): SelectableGroup<ListItem>[] {
+  // Parse "host/session" filter syntax
+  let hostFilter = "";
+  let sessionFilter = filter;
+  if (filter.includes("/")) {
+    const slashIdx = filter.indexOf("/");
+    hostFilter = filter.slice(0, slashIdx).trim();
+    sessionFilter = filter.slice(slashIdx + 1).trim();
+  }
 
-  // Local group
-  const localItems: ListItem[] = sortedSessions.get().map(s => ({ type: "session" as const, session: s }));
-  const filteredLocal = filter ? filterAndSort(filter, localItems) : localItems;
-  // Always add "Create new session" at the end of local group
-  const localWithCreate: ListItem[] = [...filteredLocal, { type: "create" }];
+  const showCreate = !filter || "new".startsWith(filter.toLowerCase());
 
-  const groups: SelectableGroup<ListItem>[] = [
-    { title: "Local", items: localWithCreate },
-  ];
+  // Local group — skip if host filter is set (user is filtering by remote host)
+  const groups: SelectableGroup<ListItem>[] = [];
+  if (!hostFilter || fuzzyMatch(hostFilter, "local").match) {
+    const localItems: ListItem[] = localSessions.map(s => ({ type: "session" as const, session: s }));
+    const filteredLocal = sessionFilter ? filterAndSort(sessionFilter, localItems) : localItems;
+    const localWithCreate: ListItem[] = showCreate ? [...filteredLocal, { type: "create" }] : filteredLocal;
+    groups.push({ title: "Local", items: localWithCreate });
+  }
 
   // Remote groups from relay
-  for (const host of relayHosts.get()) {
+  for (const host of hosts) {
     if (host.error) continue;
+    // If host filter is set, only include matching hosts
+    if (hostFilter && !fuzzyMatch(hostFilter, host.label).match) continue;
+
     const remoteItems: ListItem[] = host.sessions.map(s => ({
       type: "remote" as const,
       remote: { host, session: s },
     }));
-    const filtered = filter ? filterAndSort(filter, remoteItems) : remoteItems;
+    const filtered = sessionFilter ? filterAndSort(sessionFilter, remoteItems) : remoteItems;
     const items: ListItem[] = [...filtered];
-    if (host.spawn_enabled) {
+    if (host.spawn_enabled && showCreate) {
       items.push({ type: "remote-create", remoteHost: host });
     }
     if (items.length > 0 || !filter) {
@@ -215,6 +232,14 @@ const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
   }
 
   return groups;
+}
+
+const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
+  return buildFilteredGroups(
+    filterText.get(),
+    sortedSessions.get(),
+    relayHosts.get(),
+  );
 });
 
 // Total item count across all groups (for scroll region)

@@ -40,7 +40,7 @@ Run `pty` with no arguments to launch the interactive session manager:
  ↑↓ select  ⏎ attach  q quit
 ```
 
-Arrow keys to navigate, type to filter, Enter to attach, `q` to quit. Creating a new session walks through a directory picker and name/command prompt.
+Arrow keys to navigate, type to filter, Enter to attach, `q` to quit. When pty-relay is installed, remote sessions appear grouped by host. Use `host/session` syntax to filter by host (e.g., `prod/api`). Creating a new session walks through a directory picker and name/command prompt.
 
 When you detach from a session entered via the interactive list (`Ctrl+\`), you return to the list. The session keeps running in the background.
 
