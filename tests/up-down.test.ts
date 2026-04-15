@@ -34,6 +34,7 @@ function writePtyToml(dir: string, content: string): void {
 
 function runCli(sessionDir: string, ...args: string[]): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(nodeBin, [cliPath, ...args], {
+    cwd: os.tmpdir(),
     env: { ...process.env, PTY_SESSION_DIR: sessionDir },
     encoding: "utf-8",
     timeout: 15000,
@@ -188,6 +189,119 @@ tags = { role = "server" }
     expect(session.tags.role).toBe("server");
     expect(session.tags.custom).toBe("yes");
   }, 15000);
+
+  it("removes tags that were removed from pty.toml", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+
+    writePtyToml(projDir, `
+[sessions.remover]
+command = "cat"
+tags = { role = "server", env = "dev" }
+`);
+    runCli(sessDir, "up", projDir);
+
+    let sessions = listJson(sessDir);
+    let session = sessions.find((s: any) => s.name === "remover");
+    expect(session.tags.role).toBe("server");
+    expect(session.tags.env).toBe("dev");
+
+    // Remove env from the toml
+    writePtyToml(projDir, `
+[sessions.remover]
+command = "cat"
+tags = { role = "server" }
+`);
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.stdout).toContain("-env");
+
+    sessions = listJson(sessDir);
+    session = sessions.find((s: any) => s.name === "remover");
+    expect(session.tags.role).toBe("server");
+    expect(session.tags.env).toBeUndefined();
+    // Metadata tags should still be present
+    expect(session.tags.ptyfile).toBeDefined();
+    expect(session.tags["ptyfile.session"]).toBe("remover");
+  }, 20000);
+
+  it("removes all toml tags when the tags table is deleted", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+
+    writePtyToml(projDir, `
+[sessions.cleared]
+command = "cat"
+tags = { role = "server", env = "dev" }
+`);
+    runCli(sessDir, "up", projDir);
+
+    // Remove the tags table entirely
+    writePtyToml(projDir, `
+[sessions.cleared]
+command = "cat"
+`);
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.stdout).toContain("-env");
+    expect(result.stdout).toContain("-role");
+
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "cleared");
+    expect(session.tags.role).toBeUndefined();
+    expect(session.tags.env).toBeUndefined();
+    expect(session.tags.ptyfile).toBeDefined();
+  }, 20000);
+
+  it("preserves manually-added tags when toml tags are removed", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+
+    writePtyToml(projDir, `
+[sessions.mixer]
+command = "cat"
+tags = { role = "server" }
+`);
+    runCli(sessDir, "up", projDir);
+
+    // Add a manual tag
+    runCli(sessDir, "tag", "mixer", "custom=yes");
+
+    // Remove the toml tag
+    writePtyToml(projDir, `
+[sessions.mixer]
+command = "cat"
+`);
+    runCli(sessDir, "up", projDir);
+
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "mixer");
+    expect(session.tags.role).toBeUndefined();
+    expect(session.tags.custom).toBe("yes");
+  }, 20000);
+
+  it("replaces a toml tag's value (not remove+re-add)", () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+
+    writePtyToml(projDir, `
+[sessions.mover]
+command = "cat"
+tags = { env = "dev" }
+`);
+    runCli(sessDir, "up", projDir);
+
+    writePtyToml(projDir, `
+[sessions.mover]
+command = "cat"
+tags = { env = "prod" }
+`);
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.stdout).toContain("env=prod");
+    expect(result.stdout).not.toContain("-env");
+
+    const sessions = listJson(sessDir);
+    const session = sessions.find((s: any) => s.name === "mover");
+    expect(session.tags.env).toBe("prod");
+  }, 20000);
 
   it("no output for already-running sessions with matching tags", () => {
     const projDir = makeProjectDir();

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Interactive TUI
+- Add `--preselect-new` flag: `pty --preselect-new` opens the interactive TUI with "Create new session..." pre-selected (useful for pty-layout panes that should land on the create prompt)
+- Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions stay in the filtered view (e.g., pty-layout layouts)
+- Tag filter is shown in the Filter line; remote groups are hidden when a tag filter is active (remote session tags aren't surfaced by pty-relay)
+
+### Listing
+- `pty list` now shows tags by default (hashtag format, e.g., `#role=web`) — internal bookkeeping keys (`ptyfile*`, `strategy`, `supervisor.status`) are hidden
+- `pty list --tags` now means "show all tags including internal bookkeeping" (previously required to show any tags)
+- Add `pty list --filter-tag key=value` (repeatable): show only sessions matching all given tags
+
+### Client API
+- Export `extractFilterTags` and `matchesAllTags` from `@myobie/pty/client` so third-party tools (e.g., pty-relay) can accept and apply the same `--filter-tag key=value` syntax
+- Add optional `tags?: Record<string, string>` on remote session entries so pty-relay can surface tags in `ls --json` and have the interactive TUI filter remote sessions by them
+
+### Project files
+- `pty up` now removes tags that were removed from `pty.toml` — toml-managed tag keys are tracked in a `ptyfile.tags` meta tag so manually-added tags (set via `pty tag`) are preserved
+
 ### Fixes
 - Fix garbage characters in `less`/`git log`: respond to terminal queries (OSC 10/11/4, DA2, DSR, XTVERSION) and strip them from client broadcast so the client's terminal doesn't respond with duplicate input
 

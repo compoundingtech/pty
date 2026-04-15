@@ -128,6 +128,42 @@ describe("session tags", () => {
     expect(session.tags).toEqual({ owner: "myapp" });
   }, 15000);
 
+  it("pty list --filter-tag filters JSON output to matching sessions", async () => {
+    const dir = makeSessionDir();
+    const matchName = uniqueName();
+    const otherName = uniqueName();
+    await startDaemon(dir, matchName, "cat", [], { layout: "work", role: "srv" });
+    await startDaemon(dir, otherName, "cat", [], { layout: "play" });
+
+    const output = runCli(dir, "list", "--json", "--filter-tag", "layout=work");
+    const sessions = JSON.parse(output);
+    expect(sessions.map((s: any) => s.name)).toEqual([matchName]);
+  }, 15000);
+
+  it("pty list --filter-tag requires all tags to match (AND)", async () => {
+    const dir = makeSessionDir();
+    const bothName = uniqueName();
+    const oneName = uniqueName();
+    await startDaemon(dir, bothName, "cat", [], { layout: "work", role: "srv" });
+    await startDaemon(dir, oneName, "cat", [], { layout: "work" });
+
+    const output = runCli(dir, "list", "--json", "--filter-tag", "layout=work", "--filter-tag", "role=srv");
+    const sessions = JSON.parse(output);
+    expect(sessions.map((s: any) => s.name)).toEqual([bothName]);
+  }, 15000);
+
+  it("pty list --filter-tag filters text output too", async () => {
+    const dir = makeSessionDir();
+    const matchName = uniqueName();
+    const otherName = uniqueName();
+    await startDaemon(dir, matchName, "cat", [], { layout: "work" });
+    await startDaemon(dir, otherName, "cat", [], { layout: "play" });
+
+    const output = runCli(dir, "list", "--filter-tag", "layout=work");
+    expect(output).toContain(matchName);
+    expect(output).not.toContain(otherName);
+  }, 15000);
+
   it("sessions without tags have no tags field in metadata", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

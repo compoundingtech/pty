@@ -273,6 +273,74 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "--preselect-new pre-selects the Create new session item",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+
+      const { pid } = await createBackgroundSession(
+        sessionDir,
+        name,
+        "sh",
+        ["-c", "sleep 300"],
+        os.tmpdir()
+      );
+      bgPids.push(pid);
+
+      const tui = Session.spawn(nodeBin, [cliPath, "--preselect-new"], {
+        rows: 24,
+        cols: 80,
+        env: { PTY_SESSION_DIR: sessionDir, TERM: "xterm-256color" },
+      });
+      tuiSessions.push(tui);
+
+      const ss = await tui.waitForText("\u25b8 + Create new session", 10000);
+      // Selected marker (▸) should precede the create item, not the session
+      expect(ss.text).toMatch(/\u25b8 \+ Create new session/);
+      const sessionLine = ss.lines.find((l) => l.includes(name));
+      expect(sessionLine).toBeDefined();
+      expect(sessionLine!).not.toMatch(/\u25b8 /);
+    },
+    15000
+  );
+
+  it(
+    "--filter-tag hides sessions that lack the tag",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const matchName = uniqueName();
+      const otherName = uniqueName();
+
+      const { pid: p1 } = await createBackgroundSession(sessionDir, matchName, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(p1);
+      const { pid: p2 } = await createBackgroundSession(sessionDir, otherName, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(p2);
+
+      // Tag one of them — use the CLI so the metadata write goes through the
+      // same code path as a real user.
+      spawn(nodeBin, [cliPath, "tag", matchName, "layout=work"], {
+        env: { ...process.env, PTY_SESSION_DIR: sessionDir },
+        stdio: "ignore",
+      }).on("exit", () => {});
+      await new Promise((r) => setTimeout(r, 500));
+
+      const tui = Session.spawn(nodeBin, [cliPath, "--filter-tag", "layout=work"], {
+        rows: 24,
+        cols: 80,
+        env: { PTY_SESSION_DIR: sessionDir, TERM: "xterm-256color" },
+      });
+      tuiSessions.push(tui);
+
+      const ss = await tui.waitForText(matchName, 10000);
+      expect(ss.text).toContain(matchName);
+      expect(ss.text).not.toContain(otherName);
+      // Tag filter is shown in the Filter line
+      expect(ss.text).toContain("#layout=work");
+    },
+    15000
+  );
+
+  it(
     "arrow keys move selection",
     async () => {
       const sessionDir = makeSessionDir();

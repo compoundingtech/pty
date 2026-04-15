@@ -8,6 +8,7 @@ import {
   cleanupAll, getSession, getSessionDir, type SessionInfo,
 } from "../sessions.ts";
 import { spawnDaemon, resolveCommand } from "../spawn.ts";
+import { matchesAllTags } from "../tags.ts";
 import {
   app, screen, signal, computed, batch,
   text, row, spacer, panel, selectable, footer, canvas,
@@ -44,6 +45,10 @@ const sessions = signal<SessionInfo[]>([]);
 const filterText = signal("");
 const selectedIndex = signal(0);
 const currentScreen = signal<"list" | "create" | "remote-create">("list");
+
+/** Tag filter from `--filter-tag key=value`. Filters the list AND auto-applies
+ *  to any session created from this TUI instance. */
+const filterTags = signal<Record<string, string>>({});
 
 // Theme — persisted to ~/.local/state/pty/theme
 const themeNames = Object.keys(themes);
@@ -101,6 +106,9 @@ export interface RemoteSession {
   status: string;
   command?: string;
   cwd?: string;
+  /** Optional tags reported by the relay (e.g., pty-relay ls --json). Used
+   *  by the interactive TUI's --filter-tag to filter remote sessions. */
+  tags?: Record<string, string>;
 }
 
 export interface RelayHost {
@@ -148,7 +156,12 @@ export interface ListItem {
   remoteHost?: RelayHost;
 }
 
-const sortedSessions = computed<SessionInfo[]>(() => sortSessions(sessions.get()));
+const sortedSessions = computed<SessionInfo[]>(() => {
+  const all = sortSessions(sessions.get());
+  const required = filterTags.get();
+  if (Object.keys(required).length === 0) return all;
+  return all.filter((s) => matchesAllTags(s.metadata?.tags, required));
+});
 
 function filterAndSort(filter: string, items: ListItem[]): ListItem[] {
   if (!filter) return items;
@@ -235,10 +248,20 @@ export function buildFilteredGroups(
 }
 
 const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
+  // When --filter-tag is active, filter remote sessions by tag too. Hosts
+  // whose relay reports no tags will simply render no matching sessions.
+  const required = filterTags.get();
+  const requireTagMatch = Object.keys(required).length > 0;
+  const hosts = requireTagMatch
+    ? relayHosts.get().map((h) => ({
+        ...h,
+        sessions: h.sessions.filter((s) => matchesAllTags(s.tags, required)),
+      }))
+    : relayHosts.get();
   return buildFilteredGroups(
     filterText.get(),
     sortedSessions.get(),
-    relayHosts.get(),
+    hosts,
   );
 });
 
@@ -321,9 +344,13 @@ const listScreen = screen({
     );
 
     const filter = filterText.get();
+    const tagFilter = filterTags.get();
+    const tagFilterStr = Object.entries(tagFilter).map(([k, v]) => `#${k}=${v}`).join(" ");
     const filterLine = filter
-      ? text("  Filter: " + filter, "primary")
-      : text("  Filter: (type to filter)", "muted", { dim: true });
+      ? text("  Filter: " + filter + (tagFilterStr ? "  " + tagFilterStr : ""), "primary")
+      : tagFilterStr
+        ? text("  Filter: " + tagFilterStr, "primary")
+        : text("  Filter: (type to filter)", "muted", { dim: true });
 
     const hasRelay = relayHosts.get().length > 0;
 
@@ -824,8 +851,12 @@ async function doCreate(dir: string, name: string, command: string): Promise<voi
   const shellCmd = "/bin/sh";
   const shellArgs = ["-c", command];
 
+  // Auto-apply --filter-tag tags so the new session stays in the layout.
+  const tags = filterTags.peek();
+  const spawnOpts = { name, command: shellCmd, args: shellArgs, displayCommand: command, cwd: dir, ...(Object.keys(tags).length > 0 ? { tags } : {}) };
+
   try {
-    await spawnDaemon({ name, command: shellCmd, args: shellArgs, displayCommand: command, cwd: dir });
+    await spawnDaemon(spawnOpts);
   } catch (e: any) {
     releaseLock(name);
     console.error(e.message);
@@ -899,9 +930,35 @@ const remoteCreateScreen = screen({
 // Entry point
 // ============================================================
 
-export async function runInteractive(): Promise<void> {
+export interface RunInteractiveOptions {
+  /** Pre-select the local "+ Create new session..." item on startup. */
+  preselectNew?: boolean;
+  /** Filter the local list to sessions with all matching tags, and apply
+   *  them to any session created from this TUI. */
+  filterTags?: Record<string, string>;
+}
+
+export async function runInteractive(options?: RunInteractiveOptions): Promise<void> {
+  if (options?.filterTags && Object.keys(options.filterTags).length > 0) {
+    filterTags.set(options.filterTags);
+  }
+
   const sessionList = await listSessions();
   sessions.set(sessionList);
+
+  if (options?.preselectNew) {
+    const groups = filteredGroups.get();
+    let idx = 0;
+    outer: for (const g of groups) {
+      for (const item of g.items) {
+        if (item.type === "create") {
+          selectedIndex.set(idx);
+          break outer;
+        }
+        idx++;
+      }
+    }
+  }
 
   // Fetch relay hosts in the background (non-blocking)
   refreshRelayHosts();

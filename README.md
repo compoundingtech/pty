@@ -48,6 +48,8 @@ When you detach from a session entered via the interactive list (`Ctrl+\`), you 
 
 ```sh
 pty                                       # interactive session manager
+pty --preselect-new                       # open the TUI with "Create new session..." selected
+pty --filter-tag layout=work              # TUI filtered by tag; new sessions inherit the tag
 pty run -- node server.js                 # start a session (auto-named)
 pty run --name myserver -- node server.js # start with an explicit name
 pty run -d -- node server.js              # start in the background
@@ -56,10 +58,11 @@ pty run -e -- npm test                    # ephemeral: auto-remove on exit
 pty run --tag owner=forge -- node srv.js  # tag a session with metadata
 pty run --cwd /path -- node server.js    # run in a specific directory
 
-pty list                                  # show active sessions
-pty list --tags                           # show sessions with tags (#key=value)
+pty list                                  # show active sessions (tags shown by default)
+pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
 pty list --json                           # show as JSON
 pty list --remote                         # include remote sessions via pty-relay
+pty list --filter-tag role=web            # show only sessions with matching tag (repeatable)
 
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
@@ -209,6 +212,7 @@ import {
   spawnDaemon, listSessions, getSession,
   SessionConnection, sendData, peekScreen, queryStats,
   EventFollower, readRecentEvents,
+  extractFilterTags, matchesAllTags,
 } from "@myobie/pty/client";
 import { PtyServer } from "@myobie/pty/server";         // native addon (node-pty)
 import { resolveKey } from "@myobie/pty/keys";           // browser-safe

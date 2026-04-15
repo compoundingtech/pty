@@ -42,6 +42,9 @@ export {
 // Project files
 export { readPtyFile, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
 
+// Tag filter helpers (used by --filter-tag; shared with pty-relay)
+export { extractFilterTags, matchesAllTags } from "./tags.ts";
+
 // Keys
 export { resolveKey, parseSeqValue } from "./keys.ts";
 

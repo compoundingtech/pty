@@ -24,17 +24,30 @@ import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { EventFollower, EventWriter, EventType, readRecentEvents, formatEvent } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
+import { extractFilterTags as extractFilterTagsImpl, matchesAllTags } from "./tags.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
-async function runInteractive(): Promise<void> {
+async function runInteractive(options?: { preselectNew?: boolean; filterTags?: Record<string, string> }): Promise<void> {
   const mod = await import("./tui/interactive.ts");
-  await mod.runInteractive();
+  await mod.runInteractive(options);
+}
+
+/** CLI wrapper around `extractFilterTags` that exits on invalid input. */
+function extractFilterTags(args: string[]): Record<string, string> {
+  try {
+    return extractFilterTagsImpl(args);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
 }
 
 function usage(): void {
   console.log(`Usage:
   pty                                       Interactive session manager
+  pty --preselect-new                       Open the TUI with "Create new session..." pre-selected
+  pty --filter-tag key=value                Filter TUI to sessions with a tag; auto-applied to new sessions
   pty run -- <command> [args...]            Create a session and attach (auto-named)
   pty run --name <n> -- <command> [args...] Create a named session and attach
   pty run -d -- <command> [args...]        Create in the background
@@ -59,9 +72,10 @@ function usage(): void {
   pty events --all                         Follow events from all sessions
   pty events --recent <name>               Show recent events and exit
   pty events --json <name>                 Output raw JSONL
-  pty list                                 List active sessions
-  pty list --tags                          List sessions with tags (#key=value)
+  pty list                                 List active sessions (with tags)
+  pty list --tags                          Show all tags including internal bookkeeping (ptyfile*, strategy, etc.)
   pty list --json                          List sessions as JSON
+  pty list --filter-tag key=value          List only sessions matching the tag (repeatable)
   pty up                                   Start all sessions from pty.toml
   pty up <dir>                             Start sessions from <dir>/pty.toml
   pty up <name> [<name>...]               Start specific sessions from pty.toml
@@ -111,17 +125,41 @@ function autoName(cmd: string, cmdArgs: string[]): string {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
-  if (args.length === 0) {
-    await runInteractive();
+  // Interactive-mode flags (--preselect-new, --filter-tag) can appear before
+  // the subcommand. Peek at the subcommand without consuming flags; if it's
+  // the interactive TUI (none, "i", or "interactive"), consume those flags
+  // here. Otherwise leave them in args for the subcommand to parse itself.
+  //
+  // Detect the subcommand: first positional that isn't a flag or a value for
+  // a known flag that takes a value (currently just --filter-tag).
+  let subcommand = "";
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--filter-tag") { i++; continue; }
+    if (a.startsWith("-")) continue;
+    subcommand = a;
+    break;
+  }
+
+  let preselectNew = false;
+  let interactiveFilterTags: Record<string, string> = {};
+  if (!subcommand || subcommand === "i" || subcommand === "interactive") {
+    preselectNew = args.includes("--preselect-new");
+    interactiveFilterTags = extractFilterTags(args);
+  }
+  const dispatchArgs = args.filter((a) => a !== "--preselect-new");
+
+  if (dispatchArgs.length === 0) {
+    await runInteractive({ preselectNew, filterTags: interactiveFilterTags });
     return;
   }
 
-  const command = args[0];
+  const command = dispatchArgs[0];
 
   switch (command) {
     case "interactive":
     case "i": {
-      await runInteractive();
+      await runInteractive({ preselectNew, filterTags: interactiveFilterTags });
       break;
     }
 
@@ -401,10 +439,12 @@ async function main(): Promise<void> {
 
     case "list":
     case "ls": {
-      const jsonFlag = args.includes("--json");
-      const tagsFlag = args.includes("--tags");
-      const remoteFlag = args.includes("--remote");
-      await cmdList(jsonFlag, tagsFlag, remoteFlag);
+      const listArgs = args.slice();
+      const listFilterTags = extractFilterTags(listArgs);
+      const jsonFlag = listArgs.includes("--json");
+      const tagsFlag = listArgs.includes("--tags");
+      const remoteFlag = listArgs.includes("--remote");
+      await cmdList(jsonFlag, tagsFlag, remoteFlag, listFilterTags);
       break;
     }
 
@@ -969,8 +1009,11 @@ async function cmdPeek(name: string, follow: boolean, plain: boolean, full = fal
   });
 }
 
-async function cmdList(json = false, showTags = false, remote = false): Promise<void> {
-  const sessions = await listSessions();
+async function cmdList(json = false, showTags = false, remote = false, filterTags: Record<string, string> = {}): Promise<void> {
+  let sessions = await listSessions();
+  if (Object.keys(filterTags).length > 0) {
+    sessions = sessions.filter((s) => matchesAllTags(s.metadata?.tags, filterTags));
+  }
 
   // Fetch relay hosts if --remote
   let remoteHosts: { label: string; sessions: { name: string; status: string; command?: string; cwd?: string }[]; error: string | null }[] = [];
@@ -1014,6 +1057,17 @@ async function cmdList(json = false, showTags = false, remote = false): Promise<
   const running = sessions.filter((s) => s.status === "running");
   const exited = sessions.filter((s) => s.status === "exited");
 
+  // Render tags as hashtags. When `showAll` is false, hide internal bookkeeping
+  // keys (ptyfile*, supervisor.status) since those have dedicated markers or
+  // aren't meaningful to users. `--tags` (showAll=true) includes everything.
+  const renderTags = (tags: Record<string, string> | undefined, showAll: boolean): string => {
+    if (!tags) return "";
+    const entries = Object.entries(tags).filter(([k]) =>
+      showAll || (k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags" && k !== "supervisor.status" && k !== "strategy"),
+    );
+    return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
+  };
+
   if (running.length > 0) {
     console.log("Active sessions:");
     for (const session of running) {
@@ -1023,9 +1077,7 @@ async function cmdList(json = false, showTags = false, remote = false): Promise<
       const cwd = session.metadata?.cwd
         ? shortPath(session.metadata.cwd)
         : "";
-      const tagStr = showTags && session.metadata?.tags
-        ? " " + Object.entries(session.metadata.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
-        : "";
+      const tagStr = renderTags(session.metadata?.tags, showTags);
       const marker = strategyMarker(session.metadata?.tags);
       console.log(`  \x1b[1;36m${session.name}\x1b[0m${marker}${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
@@ -1042,9 +1094,7 @@ async function cmdList(json = false, showTags = false, remote = false): Promise<
       const cmd = meta
         ? meta.displayCommand
         : "";
-      const tagStr = showTags && meta?.tags
-        ? " " + Object.entries(meta.tags).map(([k, v]) => `#${k}=${v}`).join(" ")
-        : "";
+      const tagStr = renderTags(meta?.tags, showTags);
       const marker = strategyMarker(meta?.tags);
       console.log(`  \x1b[1m${session.name}\x1b[0m${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
@@ -1720,21 +1770,49 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
   let skipped = 0;
 
   for (const sess of sessions) {
+    const tomlPath = path.join(ptyFile.dir, "pty.toml");
+    const userTomlKeys = Object.keys(sess.tags ?? {}).sort();
+    const ptyfileTagsValue = userTomlKeys.join(",");
+    const tomlTags: Record<string, string> = {
+      ...sess.tags,
+      ptyfile: tomlPath,
+      "ptyfile.session": sess.shortName,
+      "ptyfile.tags": ptyfileTagsValue,
+    };
+
     if (runningNames.has(sess.name)) {
-      // Sync tags from toml to the running session (including ptyfile metadata)
+      // Sync tags from toml to the running session (including ptyfile metadata).
+      // Track which tag keys came from the toml via "ptyfile.tags" so that
+      // removing a tag from the toml causes it to be removed here (but
+      // manually-added tags — those not in "ptyfile.tags" — are preserved).
       const currentMeta = readMetadata(sess.name);
-      const tomlPath = path.join(ptyFile.dir, "pty.toml");
-      const tomlTags = { ...sess.tags, ptyfile: tomlPath, "ptyfile.session": sess.shortName };
       const currentTags = currentMeta?.tags ?? {};
+
       const updates: Record<string, string> = {};
       for (const [k, v] of Object.entries(tomlTags)) {
         if (currentTags[k] !== v) updates[k] = v;
       }
-      if (Object.keys(updates).length > 0) {
+
+      const prevTomlKeys = (currentTags["ptyfile.tags"] ?? "")
+        .split(",")
+        .map((k) => k.trim())
+        .filter((k) => k.length > 0);
+      const newKeySet = new Set(userTomlKeys);
+      const removals = prevTomlKeys.filter((k) => !newKeySet.has(k));
+
+      if (Object.keys(updates).length > 0 || removals.length > 0) {
         try {
-          updateTags(sess.name, updates);
-          const changed = Object.entries(updates).map(([k, v]) => `${k}=${v}`).join(", ");
-          console.log(`  ● ${sess.name} (already running, updated tags: ${changed})`);
+          updateTags(sess.name, updates, removals);
+          const changedTagUpdates = Object.entries(updates)
+            .filter(([k]) => k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags")
+            .map(([k, v]) => `${k}=${v}`);
+          const changedRemovals = removals.map((k) => `-${k}`);
+          const changed = [...changedTagUpdates, ...changedRemovals].join(", ");
+          if (changed) {
+            console.log(`  ● ${sess.name} (already running, updated tags: ${changed})`);
+          } else {
+            console.log(`  ● ${sess.name} (already running)`);
+          }
         } catch {
           console.log(`  ● ${sess.name} (already running)`);
         }
@@ -1752,19 +1830,13 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
     }
 
     try {
-      const tomlPath = path.join(ptyFile.dir, "pty.toml");
-      const tags = {
-        ...sess.tags,
-        ptyfile: tomlPath,
-        "ptyfile.session": sess.shortName,
-      };
       await spawnDaemon({
         name: sess.name,
         command: "/bin/sh",
         args: ["-c", sess.command],
         displayCommand: sess.command,
         cwd: ptyFile.dir,
-        tags,
+        tags: tomlTags,
       });
       console.log(`  ● ${sess.name} (started)`);
       started++;
