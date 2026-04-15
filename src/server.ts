@@ -243,6 +243,67 @@ export class PtyServer {
       return false;
     });
 
+    // ── Terminal query responses ──
+    // Programs send queries expecting the terminal to respond on stdin.
+    // xterm-headless doesn't answer, so the query leaks to the client's
+    // real terminal, whose response comes back as garbage input. We
+    // intercept common queries and respond directly to the PTY process.
+
+    // OSC 10: foreground color query (less, vim)
+    this.terminal.parser.registerOscHandler(10, (data: string) => {
+      if (data === "?") {
+        this.ptyProcess.write("\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\");
+      }
+      return false;
+    });
+    // OSC 11: background color query (less, vim)
+    this.terminal.parser.registerOscHandler(11, (data: string) => {
+      if (data === "?") {
+        this.ptyProcess.write("\x1b]11;rgb:0000/0000/0000\x1b\\");
+      }
+      return false;
+    });
+    // OSC 4: palette color query (vim, emacs)
+    this.terminal.parser.registerOscHandler(4, (data: string) => {
+      if (data.includes("?")) {
+        // Format: "N;?" — respond with color N's value
+        const idx = parseInt(data, 10);
+        if (!isNaN(idx)) {
+          // Respond with xterm-256color default for this index
+          this.ptyProcess.write(`\x1b]4;${idx};rgb:0000/0000/0000\x1b\\`);
+        }
+      }
+      return false;
+    });
+    // DA2: secondary device attributes (vim, tmux)
+    this.terminal.parser.registerCsiHandler(
+      { prefix: ">", final: "c" },
+      (_params) => {
+        // Respond as xterm version 382
+        this.ptyProcess.write("\x1b[>0;382;0c");
+        return false;
+      }
+    );
+    // DSR: cursor position query (CSI 6 n, vim, readline)
+    this.terminal.parser.registerCsiHandler(
+      { final: "n" },
+      (params) => {
+        if (params.length === 1 && params[0] === 6) {
+          const buf = this.terminal.buffer.active;
+          this.ptyProcess.write(`\x1b[${buf.cursorY + 1};${buf.cursorX + 1}R`);
+        }
+        return false;
+      }
+    );
+    // XTVERSION: terminal version query (CSI > 0 q, vim)
+    this.terminal.parser.registerCsiHandler(
+      { prefix: ">", final: "q" },
+      (_params) => {
+        this.ptyProcess.write("\x1bP>|pty(0.8)\x1b\\");
+        return false;
+      }
+    );
+
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
