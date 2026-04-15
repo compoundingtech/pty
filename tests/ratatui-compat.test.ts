@@ -599,6 +599,99 @@ setTimeout(() => {}, 300000);
     },
     20000
   );
+
+  it(
+    "mouse tracking modes (1000/1002/1003) are replayed in getModePrefix on reattach",
+    async () => {
+      const dir = makeTmpDir();
+      const scriptPath = path.join(dir, "mouse-tracking.ts");
+      fs.writeFileSync(
+        scriptPath,
+        `
+// Enable button-motion tracking (what TUI apps like claude/vim typically use)
+process.stdout.write('\\x1b[?1002h');
+// Also enable SGR encoding (the existing case — should still work)
+process.stdout.write('\\x1b[?1006h');
+process.stdout.write('MOUSE-TRACKING-OK\\n');
+setTimeout(() => {}, 300000);
+`
+      );
+
+      const session = await createSession(
+        process.execPath,
+        [scriptPath],
+        { rows: 24, cols: 80, cwd: dir }
+      );
+
+      await session.waitForText("MOUSE-TRACKING-OK", 10000);
+
+      const rawScreen = await getRawScreenPayload(session.name, 24, 80);
+      // Bug #NN: the tracking mode itself (1002) must be replayed, not just
+      // the SGR encoding (1006). Without this, clients checking whether
+      // mouse tracking is active see it as off.
+      expect(rawScreen).toMatch(/\x1b\[\?1002h/);
+      expect(rawScreen).toMatch(/\x1b\[\?1006h/);
+    },
+    20000
+  );
+
+  it(
+    "mouse tracking modes are cleared when child disables them",
+    async () => {
+      const dir = makeTmpDir();
+      const scriptPath = path.join(dir, "mouse-tracking-off.ts");
+      fs.writeFileSync(
+        scriptPath,
+        `
+process.stdout.write('\\x1b[?1003h');   // turn on any-motion
+process.stdout.write('\\x1b[?1003l');   // turn off again
+process.stdout.write('MOUSE-OFF-OK\\n');
+setTimeout(() => {}, 300000);
+`
+      );
+
+      const session = await createSession(
+        process.execPath,
+        [scriptPath],
+        { rows: 24, cols: 80, cwd: dir }
+      );
+
+      await session.waitForText("MOUSE-OFF-OK", 10000);
+
+      const rawScreen = await getRawScreenPayload(session.name, 24, 80);
+      // Neither the set nor the tracking mode should be in the prefix
+      expect(rawScreen).not.toMatch(/\x1b\[\?1003h/);
+    },
+    20000
+  );
+
+  it(
+    "button tracking (1000) is also tracked and replayed",
+    async () => {
+      const dir = makeTmpDir();
+      const scriptPath = path.join(dir, "mouse-1000.ts");
+      fs.writeFileSync(
+        scriptPath,
+        `
+process.stdout.write('\\x1b[?1000h');
+process.stdout.write('MOUSE-1000-OK\\n');
+setTimeout(() => {}, 300000);
+`
+      );
+
+      const session = await createSession(
+        process.execPath,
+        [scriptPath],
+        { rows: 24, cols: 80, cwd: dir }
+      );
+
+      await session.waitForText("MOUSE-1000-OK", 10000);
+
+      const rawScreen = await getRawScreenPayload(session.name, 24, 80);
+      expect(rawScreen).toMatch(/\x1b\[\?1000h/);
+    },
+    20000
+  );
 });
 
 // ============================================================================

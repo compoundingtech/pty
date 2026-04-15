@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixes
+- Fix mouse tracking modes (1000/1002/1003) not being replayed when a client reattaches to a session with mouse tracking already enabled — the server previously only replayed the SGR encoding (1006), cursor visibility, and kitty keyboard flags. Clients (e.g., pty-layout) checking tracking mode to decide whether to forward mouse events will now see the correct state.
+
 ### Interactive TUI
 - Add `--preselect-new` flag: `pty --preselect-new` opens the interactive TUI with "Create new session..." pre-selected (useful for pty-layout panes that should land on the create prompt)
 - Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions (local and remote) stay in the filtered view (e.g., pty-layout layouts)

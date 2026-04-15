@@ -131,6 +131,15 @@ export class PtyServer {
   private sgrMouseMode = false;
   private cursorHidden = false;
   private kittyKeyboardStack: number[] = [];
+  // Mouse tracking modes — these are separate DEC private modes (set/cleared
+  // independently by the child process) that control WHICH events the
+  // terminal should report. SGR mode (1006) only controls the ENCODING of
+  // reports, not whether tracking is active. Clients attaching to a session
+  // that's already mid-stream need all active modes replayed so their own
+  // mouse forwarding logic sees the correct state.
+  private mouseTracking1000 = false; // button press/release tracking
+  private mouseTracking1002 = false; // button-motion tracking
+  private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private lastTitle = "";
@@ -158,6 +167,9 @@ export class PtyServer {
         for (const p of params) {
           const v = typeof p === "number" ? p : p[0];
           if (v === 1006) this.sgrMouseMode = true;
+          if (v === 1000) this.mouseTracking1000 = true;
+          if (v === 1002) this.mouseTracking1002 = true;
+          if (v === 1003) this.mouseTracking1003 = true;
           if (v === 25) {
             if (this.cursorHidden) this.emitEvent(EventType.CURSOR_VISIBLE);
             this.cursorHidden = false;
@@ -173,6 +185,9 @@ export class PtyServer {
         for (const p of params) {
           const v = typeof p === "number" ? p : p[0];
           if (v === 1006) this.sgrMouseMode = false;
+          if (v === 1000) this.mouseTracking1000 = false;
+          if (v === 1002) this.mouseTracking1002 = false;
+          if (v === 1003) this.mouseTracking1003 = false;
           if (v === 25) this.cursorHidden = true;
         }
         return false;
@@ -542,6 +557,9 @@ export class PtyServer {
 
   private getModePrefix(): string {
     let prefix = "";
+    if (this.mouseTracking1000) prefix += "\x1b[?1000h";
+    if (this.mouseTracking1002) prefix += "\x1b[?1002h";
+    if (this.mouseTracking1003) prefix += "\x1b[?1003h";
     if (this.sgrMouseMode) prefix += "\x1b[?1006h";
     if (this.cursorHidden) prefix += "\x1b[?25l";
     for (const flags of this.kittyKeyboardStack) {
