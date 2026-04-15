@@ -1,0 +1,5 @@
+prefix = "pty"
+
+[sessions.claude]
+command = "claude --dangerously-skip-permissions --resume $(cat .claude-session-id) || claude --dangerously-skip-permissions --session-id $(cat .claude-session-id)"
+tags = { role = "agent", strategy = "permanent" }

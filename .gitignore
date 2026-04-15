@@ -2,3 +2,4 @@ node_modules/
 dist/
 result
 .swp
+.claude-session-id
