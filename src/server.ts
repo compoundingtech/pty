@@ -103,6 +103,20 @@ function describeInvalidCwd(cwd: string): string | undefined {
   return undefined;
 }
 
+/** Strip terminal query sequences that should not be forwarded to clients.
+ *  Exported for unit testing. */
+export function stripTerminalQueries(data: string): string {
+  return data
+    .replace(/\x1b\]1[01];\?\x07/g, "")           // OSC 10/11 with BEL
+    .replace(/\x1b\]1[01];\?\x1b\\/g, "")         // OSC 10/11 with ST
+    .replace(/\x1b\]4;\d+;\?\x07/g, "")           // OSC 4 with BEL
+    .replace(/\x1b\]4;\d+;\?\x1b\\/g, "")         // OSC 4 with ST
+    .replace(/\x1b\[c/g, "")                       // DA1
+    .replace(/\x1b\[>c/g, "")                      // DA2
+    .replace(/\x1b\[6n/g, "")                      // DSR cursor position
+    .replace(/\x1b\[>0q/g, "");                    // XTVERSION
+}
+
 export class PtyServer {
   private terminal: Terminal;
   private serialize: SerializeAddon;
@@ -250,9 +264,11 @@ export class PtyServer {
     // intercept common queries and respond directly to the PTY process.
 
     // OSC 10: foreground color query (less, vim)
+    // Return true to consume the sequence so it doesn't leak to clients.
     this.terminal.parser.registerOscHandler(10, (data: string) => {
       if (data === "?") {
         this.ptyProcess.write("\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\");
+        return true; // consume — don't pass to client
       }
       return false;
     });
@@ -260,18 +276,18 @@ export class PtyServer {
     this.terminal.parser.registerOscHandler(11, (data: string) => {
       if (data === "?") {
         this.ptyProcess.write("\x1b]11;rgb:0000/0000/0000\x1b\\");
+        return true;
       }
       return false;
     });
     // OSC 4: palette color query (vim, emacs)
     this.terminal.parser.registerOscHandler(4, (data: string) => {
       if (data.includes("?")) {
-        // Format: "N;?" — respond with color N's value
         const idx = parseInt(data, 10);
         if (!isNaN(idx)) {
-          // Respond with xterm-256color default for this index
           this.ptyProcess.write(`\x1b]4;${idx};rgb:0000/0000/0000\x1b\\`);
         }
+        return true;
       }
       return false;
     });
@@ -340,10 +356,16 @@ export class PtyServer {
       throw err;
     }
 
-    // Feed PTY output into xterm-headless and broadcast to clients
+    // Feed PTY output into xterm-headless and broadcast to clients.
+    // Query sequences (OSC 10/11, DA1, etc.) are intercepted by parser
+    // handlers above and must NOT be forwarded to clients — otherwise the
+    // client's terminal responds and its response appears as garbage input.
     this.ptyProcess.onData((data: string) => {
       this.terminal.write(data);
-      this.broadcast(encodeData(data));
+      const cleaned = stripTerminalQueries(data);
+      if (cleaned.length > 0) {
+        this.broadcast(encodeData(cleaned));
+      }
     });
 
     this.ptyProcess.onExit(({ exitCode }) => {

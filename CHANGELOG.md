@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixes
-- Respond to terminal queries that expect a response on stdin — prevents garbage input in programs like `less` and `git log`: OSC 10/11 (foreground/background color), OSC 4 (palette color), DA2 (secondary device attributes), DSR (cursor position), XTVERSION
+- Fix garbage characters in `less`/`git log`: respond to terminal queries (OSC 10/11/4, DA2, DSR, XTVERSION) and strip them from client broadcast so the client's terminal doesn't respond with duplicate input
 
 ### pty exec
 - Add `pty exec -- <command> [args...]` to replace the current session's command from inside the session
