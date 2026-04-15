@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixes
+- Respond to terminal queries that expect a response on stdin — prevents garbage input in programs like `less` and `git log`: OSC 10/11 (foreground/background color), OSC 4 (palette color), DA2 (secondary device attributes), DSR (cursor position), XTVERSION
+
 ### pty exec
 - Add `pty exec -- <command> [args...]` to replace the current session's command from inside the session
 - Updates session metadata so the supervisor restarts the new command, not the original
