@@ -50,13 +50,19 @@ When you detach from a session entered via the interactive list (`Ctrl+\`), you 
 pty                                       # interactive session manager
 pty --preselect-new                       # open the TUI with "Create new session..." selected
 pty --filter-tag layout=work              # TUI filtered by tag; new sessions inherit the tag
-pty run -- node server.js                 # start a session (auto-named)
-pty run --name myserver -- node server.js # start with an explicit name
+pty run -- node server.js                 # start a session (random name + auto displayName)
+pty run --name myserver -- node server.js # start with an explicit name (still gets a displayName)
+pty run --no-display-name -- bash         # random name, no friendly label (good for throwaway shells)
 pty run -d -- node server.js              # start in the background
 pty run -a -- node server.js              # create or attach if already running
 pty run -e -- npm test                    # ephemeral: auto-remove on exit
 pty run --tag owner=forge -- node srv.js  # tag a session with metadata
 pty run --cwd /path -- node server.js    # run in a specific directory
+
+pty rename my-label                       # inside a session: add/change its displayName
+pty rename <ref> my-label                 # outside: set displayName on <ref>
+pty rename --show <ref>                   # show current displayName
+pty rename --clear [ref]                  # remove displayName
 
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)

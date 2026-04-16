@@ -75,6 +75,11 @@ export interface SessionMetadata {
   exitedAt?: string;
   lastLines?: string[];
   tags?: Record<string, string>;
+  /** Optional human-friendly alias for the session. Mutable via `pty rename`.
+   *  The immutable stable id is always `SessionInfo.name`. Most code should
+   *  keep using `name`; `displayName` is purely for presentation and as an
+   *  additional lookup key alongside `name`. */
+  displayName?: string;
 }
 
 export interface SessionInfo {
@@ -91,6 +96,21 @@ export function writeMetadata(name: string, metadata: SessionMetadata): void {
   const tmp = target + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(metadata, null, 2));
   fs.renameSync(tmp, target);
+}
+
+/** Set or clear the displayName on an existing session. Atomic read-modify-write.
+ *  Pass `null` to remove the alias. Throws if `name` doesn't exist. */
+export function setDisplayName(name: string, displayName: string | null): void {
+  const metadata = readMetadata(name);
+  if (!metadata) {
+    throw new Error(`Session "${name}" not found.`);
+  }
+  if (displayName === null || displayName === "") {
+    delete metadata.displayName;
+  } else {
+    metadata.displayName = displayName;
+  }
+  writeMetadata(name, metadata);
 }
 
 /** Update tags on an existing session. Performs an atomic read-modify-write. */
@@ -197,9 +217,27 @@ export async function listSessions(): Promise<SessionInfo[]> {
   return sessions;
 }
 
-export async function getSession(name: string): Promise<SessionInfo | null> {
+/** Look up a session by either its stable `name` (immutable id) or its
+ *  mutable `displayName` alias. Name match takes precedence over displayName
+ *  match so the stable id always wins in case both happen to resolve. */
+export async function getSession(ref: string): Promise<SessionInfo | null> {
   const sessions = await listSessions();
-  return sessions.find((s) => s.name === name) ?? null;
+  const byName = sessions.find((s) => s.name === ref);
+  if (byName) return byName;
+  const byDisplay = sessions.find((s) => s.metadata?.displayName === ref);
+  return byDisplay ?? null;
+}
+
+/** Return every reference (name or displayName) currently claimed by a live
+ *  or exited session. Used for uniqueness checks at creation/rename time. */
+export async function allRefs(): Promise<Set<string>> {
+  const sessions = await listSessions();
+  const refs = new Set<string>();
+  for (const s of sessions) {
+    refs.add(s.name);
+    if (s.metadata?.displayName) refs.add(s.metadata.displayName);
+  }
+  return refs;
 }
 
 /** Remove all exited sessions. Returns the names of removed sessions. */

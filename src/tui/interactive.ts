@@ -168,10 +168,12 @@ function filterAndSort(filter: string, items: ListItem[]): ListItem[] {
   const matches: { item: ListItem; score: number }[] = [];
   for (const item of items) {
     let name = "";
+    let displayName = "";
     let cmd = "";
     let cwd = "";
     if (item.type === "session" && item.session) {
       name = item.session.name;
+      displayName = item.session.metadata?.displayName ?? "";
       cmd = item.session.metadata?.displayCommand ?? "";
       cwd = item.session.metadata?.cwd ?? "";
     } else if (item.type === "remote" && item.remote) {
@@ -182,11 +184,13 @@ function filterAndSort(filter: string, items: ListItem[]): ListItem[] {
       continue; // skip "create" items during filter
     }
     const nameResult = fuzzyMatch(filter, name);
+    const displayNameResult = displayName ? fuzzyMatch(filter, displayName) : { match: false, score: 0 };
     const cwdResult = fuzzyMatch(filter, cwd);
     const cmdResult = fuzzyMatch(filter, cmd);
-    if (!nameResult.match && !cwdResult.match && !cmdResult.match) continue;
+    if (!nameResult.match && !displayNameResult.match && !cwdResult.match && !cmdResult.match) continue;
     const runningBonus = (item.type === "session" && item.session?.status === "running") || (item.type === "remote" && item.remote?.session.status === "running") ? 100000 : 0;
     const score = runningBonus + Math.max(
+      displayNameResult.match ? displayNameResult.score + 10000 : 0,
       nameResult.match ? nameResult.score + 10000 : 0,
       cwdResult.match ? cwdResult.score : 0,
       cmdResult.match ? cmdResult.score : 0,
@@ -330,7 +334,12 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
   const marker = supStatus === "failed" ? " [failed]" : strategy === "permanent" ? " [permanent]" : strategy === "temporary" ? " [temporary]" : "";
   const tagStr = renderTagsInline(s.metadata?.tags);
 
-  const nameStr = `${sel}${icon} ${s.name}${marker}${tagStr}`;
+  // Prefer displayName for the primary label; show the stable id secondarily
+  // when both exist, so users can still type either in CLI commands.
+  const displayName = s.metadata?.displayName;
+  const labelStr = displayName ? `${displayName} (${s.name})` : s.name;
+
+  const nameStr = `${sel}${icon} ${labelStr}${marker}${tagStr}`;
   const detailStr = `  ${pathStr}  ${cmd}`;
   const line = nameStr + detailStr;
 

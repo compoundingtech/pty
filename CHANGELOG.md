@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Session naming
+- **Breaking (default behaviour):** `pty run` without `--name` now assigns a short random id (Crockford-ish base32, 8 chars) to the session's `name` field, and stores the old human-friendly cwd+command label in a new optional `displayName` field. `PTY_SESSION`, events, `ptyfile.session`, and anything else that references a session by its stable id will see the random id for sessions created after this release. Sessions created before this release continue to work unchanged (their `name` stays what it was).
+- Add `pty run --no-display-name` — generates the random id but skips the `displayName` auto-gen. Useful for throwaway shells you might promote later.
+- Add `pty rename`:
+  - `pty rename <new>` inside a session — sets `displayName` on the current session (uses `PTY_SESSION`)
+  - `pty rename <ref> <new>` outside — sets `displayName` on `<ref>`
+  - `pty rename --show <ref>` — prints the current `displayName`
+  - `pty rename --clear [ref]` — removes the `displayName`
+  - `name` is immutable; rename only ever writes `displayName`.
+- Lookup-by-ref (`pty attach`, `peek`, `send`, `stats`, `kill`, `rm`, `tag`, `restart`, `events`) now accepts either the stable `name` or the mutable `displayName`. Collisions between a name and a displayName across live sessions are rejected at create/rename time.
+- `pty list` and the interactive TUI now render `displayName` as the primary label when set, with the stable `name` shown in parens for disambiguation; when no `displayName` is set, just the `name`.
+- New workflow this enables: `pty run --no-display-name -- bash` → work in the shell → `pty rename my-claude` → `pty exec -- claude` (promote an anonymous shell into a named, long-lived agent session without exiting).
+
 ### Security
 - BUG-1: `validateName` now rejects session names whose Unix-socket path would exceed the 104-byte `sun_path` limit; previously the daemon's `listen()` failed silently inside an error handler and the `ready` Promise never resolved, hanging every caller. `server.ready` also now rejects on listen errors.
 - BUG-2: `acquireLock` is now built on `open(O_CREAT|O_EXCL)` (`openSync(path, "wx")`); two processes racing to steal a stale lock can no longer both win.
@@ -31,6 +44,8 @@
 - Add optional `tags?: Record<string, string>` on remote session entries so pty-relay can surface tags in `ls --json` and have the interactive TUI filter remote sessions by them
 - Add `launcher?: { command: string; args?: string[] }` to `SpawnDaemonOptions` so non-Node callers (Bun, Deno) can route the detached daemon launch through a Node binary — the daemon needs Node to load the `node-pty` native addon (closes #17)
 - Add `PtyHandle.alternateScreen: boolean` and `PtyHandle.kittyKeyboardFlags: number[]` so hosts like pty-layout can proxy alternate-screen state and kitty keyboard protocol enable/disable to the outer terminal (for Shift+Enter and friends in the focused pane)
+- Export `setDisplayName(name, displayName | null)` from `@myobie/pty/client` for programmatic renames
+- Add `displayName?: string` to `SessionMetadata`, `ServerOptions`, and `SpawnDaemonOptions` — set at spawn time or later via `setDisplayName` / `pty rename`
 
 ### Project files
 - `pty up` now removes tags that were removed from `pty.toml` — toml-managed tag keys are tracked in a `ptyfile.tags` meta tag so manually-added tags (set via `pty tag`) are preserved

@@ -21,6 +21,9 @@ export interface SpawnDaemonOptions {
   rows?: number;
   cols?: number;
   tags?: Record<string, string>;
+  /** Optional human-friendly alias for the session, stored in
+   *  SessionMetadata.displayName. `name` stays the immutable id. */
+  displayName?: string;
   /** When true, strip the daemon's env down to a small allow-list before
    *  spawning the session child — prevents cloud tokens / OAuth / SSH agent
    *  vars from leaking into a session that may be reached via pty-relay.
@@ -66,6 +69,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     cols,
     ephemeral: options.ephemeral ?? false,
     ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+    ...(options.displayName ? { displayName: options.displayName } : {}),
     ...(options.isolateEnv ? { isolateEnv: true } : {}),
     ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
   });

@@ -1,0 +1,235 @@
+import { describe, it, expect, afterEach, afterAll } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const nodeBin = process.execPath;
+const cliPath = path.join(__dirname, "..", "dist", "cli.js");
+
+const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-dn-"));
+afterAll(() => {
+  fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+});
+
+let sessionDirs: string[] = [];
+let bgPids: number[] = [];
+
+function makeSessionDir(): string {
+  const dir = fs.mkdtempSync(path.join(testRoot, "d-"));
+  sessionDirs.push(dir);
+  return dir;
+}
+
+function runCli(sessionDir: string, env: Record<string, string>, ...args: string[]) {
+  // Strip PTY_SESSION from the parent environment so tests can explicitly
+  // decide whether the CLI invocation should look like it's "inside" a
+  // session. Otherwise the test runner's own PTY_SESSION (if any) leaks in.
+  const baseEnv = { ...process.env } as Record<string, string | undefined>;
+  delete baseEnv.PTY_SESSION;
+  return spawnSync(nodeBin, [cliPath, ...args], {
+    cwd: os.tmpdir(),
+    env: { ...baseEnv, PTY_SESSION_DIR: sessionDir, ...env } as Record<string, string>,
+    encoding: "utf-8",
+    timeout: 15000,
+  });
+}
+
+function listJson(sessionDir: string): any[] {
+  const r = runCli(sessionDir, {}, "list", "--json");
+  if (!r.stdout.trim()) return [];
+  return JSON.parse(r.stdout);
+}
+
+function collectPid(dir: string, name: string) {
+  try {
+    const pidFile = path.join(dir, `${name}.pid`);
+    const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    if (!isNaN(pid)) bgPids.push(pid);
+  } catch {}
+}
+
+afterEach(() => {
+  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  bgPids = [];
+  for (const dir of sessionDirs) {
+    try {
+      for (const e of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, e)); } catch {} }
+    } catch {}
+  }
+  sessionDirs = [];
+});
+
+describe("pty run default: random name + auto displayName", () => {
+  it("generates a short random name and a cwd+command-style displayName", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    // Random names from randomSessionName() are 8 chars, all lowercase alnum
+    expect(s.name).toMatch(/^[a-z0-9]{6,12}$/);
+    expect(typeof s.displayName).toBe("string");
+    expect(s.displayName.length).toBeGreaterThan(0);
+    collectPid(dir, s.name);
+  });
+});
+
+describe("--no-display-name: random name, no displayName", () => {
+  it("leaves displayName unset", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--no-display-name", "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.name).toMatch(/^[a-z0-9]{6,12}$/);
+    expect(s.displayName).toBeUndefined();
+    collectPid(dir, s.name);
+  });
+});
+
+describe("--name: explicit name + auto displayName (unless --no-display-name)", () => {
+  it("honors --name and generates a displayName", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--name", "mysvc", "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    const s = sessions.find((s: any) => s.name === "mysvc")!;
+    expect(s).toBeDefined();
+    expect(s.displayName).toBeTruthy();
+    collectPid(dir, "mysvc");
+  });
+
+  it("--name combined with --no-display-name skips displayName", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--name", "raw", "--no-display-name", "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    const s = sessions.find((s: any) => s.name === "raw")!;
+    expect(s.displayName).toBeUndefined();
+    collectPid(dir, "raw");
+  });
+});
+
+describe("pty rename (outside a session)", () => {
+  it("pty rename <ref> <new> sets displayName", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "webapp", "--no-display-name", "--", "cat");
+
+    const r = runCli(dir, {}, "rename", "webapp", "my-label");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("my-label");
+
+    const s = listJson(dir).find((s: any) => s.name === "webapp")!;
+    expect(s.displayName).toBe("my-label");
+    collectPid(dir, "webapp");
+  });
+
+  it("pty rename --show <ref> prints current displayName", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "api", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "rename", "api", "friendly-api");
+
+    const r = runCli(dir, {}, "rename", "--show", "api");
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("friendly-api");
+    collectPid(dir, "api");
+  });
+
+  it("pty rename --show <ref> without displayName prints a hint", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "bare", "--no-display-name", "--", "cat");
+
+    const r = runCli(dir, {}, "rename", "--show", "bare");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("no displayName");
+    collectPid(dir, "bare");
+  });
+
+  it("pty rename --clear <ref> removes displayName", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "svc", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "rename", "svc", "pretty");
+    expect(listJson(dir).find((s: any) => s.name === "svc")!.displayName).toBe("pretty");
+
+    const r = runCli(dir, {}, "rename", "--clear", "svc");
+    expect(r.status).toBe(0);
+    expect(listJson(dir).find((s: any) => s.name === "svc")!.displayName).toBeUndefined();
+    collectPid(dir, "svc");
+  });
+
+  it("pty rename with one positional arg OUTSIDE a session errors with usage", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "rename", "only-one");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("only allowed inside a pty session");
+  });
+
+  it("rejects displayName that collides with another session's name", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "aaa", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--name", "bbb", "--no-display-name", "--", "cat");
+
+    const r = runCli(dir, {}, "rename", "aaa", "bbb");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("already in use");
+    collectPid(dir, "aaa");
+    collectPid(dir, "bbb");
+  });
+
+  it("rejects displayName equal to the session's own name", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "same", "--no-display-name", "--", "cat");
+    const r = runCli(dir, {}, "rename", "same", "same");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("cannot equal");
+    collectPid(dir, "same");
+  });
+});
+
+describe("pty rename (inside a session)", () => {
+  it("pty rename <new> with PTY_SESSION set renames the current session", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "insider", "--no-display-name", "--", "cat");
+
+    const r = runCli(dir, { PTY_SESSION: "insider" }, "rename", "from-inside");
+    expect(r.status).toBe(0);
+    const s = listJson(dir).find((s: any) => s.name === "insider")!;
+    expect(s.displayName).toBe("from-inside");
+    collectPid(dir, "insider");
+  });
+
+  it("pty rename --clear with PTY_SESSION clears the current session's displayName", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "i2", "--no-display-name", "--", "cat");
+    runCli(dir, { PTY_SESSION: "i2" }, "rename", "has-a-display");
+
+    const r = runCli(dir, { PTY_SESSION: "i2" }, "rename", "--clear");
+    expect(r.status).toBe(0);
+    expect(listJson(dir).find((s: any) => s.name === "i2")!.displayName).toBeUndefined();
+    collectPid(dir, "i2");
+  });
+});
+
+describe("lookup by displayName", () => {
+  it("pty list references a session by its displayName for peek/stats/etc", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", "raw1", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "rename", "raw1", "friendly");
+
+    // stats by displayName should resolve the same session as by name
+    const r = runCli(dir, {}, "stats", "friendly", "--json");
+    expect(r.status).toBe(0);
+    const stats = JSON.parse(r.stdout);
+    expect(stats.name).toBe("raw1");
+    collectPid(dir, "raw1");
+  });
+});

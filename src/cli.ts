@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { attach, peek, send, queryStats, type StatsResult } from "./client.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
@@ -15,6 +16,8 @@ import {
   acquireLock,
   releaseLock,
   updateTags,
+  setDisplayName,
+  allRefs,
   readMetadata,
   writeMetadata,
   getSessionDir,
@@ -55,6 +58,11 @@ function usage(): void {
   pty run --tag key=value -- <command>    Tag a session with metadata
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>       Scrub env down to a safe allow-list (for remote-reachable sessions)
+  pty run --no-display-name -- <command>   Skip the friendly cwd+command label (just a random id)
+  pty rename <new>                        Inside a session, set its displayName
+  pty rename <ref> <new>                  Outside, set displayName on <ref>
+  pty rename --show <ref>                 Show current displayName for <ref>
+  pty rename --clear [ref]                Remove displayName (ref required outside a session)
   pty attach <name>                        Attach to an existing session
   pty exec -- <command> [args...]          Replace the current session's command
   pty attach -r <name>                     Attach, auto-restart if exited
@@ -101,6 +109,31 @@ function usage(): void {
   pty test -t "pattern"                    Run matching tests
 
 Detach from a session with Ctrl+\\ (press twice to send Ctrl+\\ to the process)`);
+}
+
+/** Resolve a user-supplied session reference (name OR displayName) to the
+ *  stable `name`. Errors and exits if no session matches. Use this whenever
+ *  a command is about to hit the socket, metadata file, or anything else
+ *  keyed by the stable id — it ensures typing the displayName works the
+ *  same as typing the underlying name. */
+async function resolveRef(ref: string): Promise<string> {
+  const session = await getSession(ref);
+  if (!session) {
+    console.error(`Session "${ref}" not found.`);
+    process.exit(1);
+  }
+  return session.name;
+}
+
+/** Generate a short random session id. Base32 (Crockford-ish, no 0/O/1/I
+ *  confusion). 8 chars = 40 bits — plenty of headroom against collisions
+ *  even with thousands of sessions per machine. */
+function randomSessionName(): string {
+  const alphabet = "23456789abcdefghjkmnpqrstuvwxyz";
+  const bytes = randomBytes(8);
+  let out = "";
+  for (const b of bytes) out += alphabet[b % alphabet.length];
+  return out;
 }
 
 /** Generate a session name from the cwd and command. */
@@ -170,6 +203,7 @@ async function main(): Promise<void> {
       let attachExisting = false;
       let ephemeral = false;
       let isolateEnv = false;
+      let noDisplayName = false;
       let name: string | null = null;
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
@@ -179,6 +213,7 @@ async function main(): Promise<void> {
         else if (args[i] === "-a" || args[i] === "--attach") { attachExisting = true; i++; }
         else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
         else if (args[i] === "--isolate-env") { isolateEnv = true; i++; }
+        else if (args[i] === "--no-display-name") { noDisplayName = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
         else if (args[i] === "--tag" && i + 1 < args.length) {
@@ -250,21 +285,20 @@ async function main(): Promise<void> {
         process.exit(result.status ?? 1);
       }
 
-      // Auto-generate name if not provided
+      const existingRefs = await allRefs();
+
+      // Resolve `name` (stable id). If the user didn't pass --name, generate
+      // a short random id (6 chars of Crockford-ish base32). Collisions are
+      // astronomically unlikely but we retry if one shows up.
       if (!name) {
-        const sessions = await listSessions();
-        const existing = new Set(sessions.map(s => s.name));
-        let candidate = autoName(autoNameCmd, cmdArgs);
-        // Sanitize: validateName allows [a-zA-Z0-9._-]
-        candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-        // Dedup
-        if (existing.has(candidate)) {
-          for (let n = 2; ; n++) {
-            const c = `${candidate}-${n}`;
-            if (!existing.has(c)) { candidate = c; break; }
-          }
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const candidate = randomSessionName();
+          if (!existingRefs.has(candidate)) { name = candidate; break; }
         }
-        name = candidate;
+        if (!name) {
+          console.error("Could not generate a unique session id after 8 attempts.");
+          process.exit(1);
+        }
       }
 
       try {
@@ -274,7 +308,23 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv);
+      // Resolve `displayName`. Skip if --no-display-name. Otherwise
+      // auto-generate the old human-friendly cwd+command label and dedup
+      // against existing names/displayNames.
+      let displayName: string | null = null;
+      if (!noDisplayName) {
+        let candidate = autoName(autoNameCmd, cmdArgs);
+        candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+        if (existingRefs.has(candidate)) {
+          for (let n = 2; ; n++) {
+            const c = `${candidate}-${n}`;
+            if (!existingRefs.has(c)) { candidate = c; break; }
+          }
+        }
+        displayName = candidate;
+      }
+
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName);
       break;
     }
 
@@ -293,7 +343,8 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
-      await cmdAttach(attachName, autoRestart);
+      const resolvedAttachName = await resolveRef(attachName);
+      await cmdAttach(resolvedAttachName, autoRestart);
       break;
     }
 
@@ -336,10 +387,11 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
+      const resolvedPeekName = await resolveRef(peekName);
       if (waitPatterns.length > 0) {
-        await cmdPeekWait(peekName, waitPatterns, timeoutSec, plain);
+        await cmdPeekWait(resolvedPeekName, waitPatterns, timeoutSec, plain);
       } else {
-        cmdPeek(peekName, follow, plain, full);
+        cmdPeek(resolvedPeekName, follow, plain, full);
       }
       break;
     }
@@ -401,7 +453,8 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      send({ name: sendName, data, delayMs: delaySecs != null ? delaySecs * 1000 : undefined });
+      const resolvedSendName = await resolveRef(sendName);
+      send({ name: resolvedSendName, data, delayMs: delaySecs != null ? delaySecs * 1000 : undefined });
       break;
     }
 
@@ -427,6 +480,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
+      let resolvedEventsName: string | null = null;
       if (eventsName) {
         try {
           validateName(eventsName);
@@ -434,9 +488,10 @@ async function main(): Promise<void> {
           console.error(e.message);
           process.exit(1);
         }
+        resolvedEventsName = await resolveRef(eventsName);
       }
 
-      await cmdEvents(eventsName ?? null, { all, recent, json, waitEventType, timeout: eventsTimeout });
+      await cmdEvents(resolvedEventsName, { all, recent, json, waitEventType, timeout: eventsTimeout });
       break;
     }
 
@@ -471,7 +526,8 @@ async function main(): Promise<void> {
         console.error("Usage: pty restart [-y] <name>");
         process.exit(1);
       }
-      await cmdRestart(restartName, forceRestart);
+      const resolvedRestartName = await resolveRef(restartName);
+      await cmdRestart(resolvedRestartName, forceRestart);
       break;
     }
 
@@ -486,7 +542,8 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
-      await cmdKill(args[1]);
+      const resolvedKillName = await resolveRef(args[1]);
+      await cmdKill(resolvedKillName);
       break;
     }
 
@@ -507,6 +564,7 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
+      const resolvedTagName = await resolveRef(tagName);
 
       const updates: Record<string, string> = {};
       const removals: string[] = [];
@@ -526,13 +584,13 @@ async function main(): Promise<void> {
 
       // No updates or removals — show current tags
       if (Object.keys(updates).length === 0 && removals.length === 0) {
-        const meta = readMetadata(tagName);
+        const meta = readMetadata(resolvedTagName);
         if (!meta) {
           console.error(`Session "${tagName}" not found.`);
           process.exit(1);
         }
         if (!meta.tags || Object.keys(meta.tags).length === 0) {
-          console.log(`No tags on "${tagName}".`);
+          console.log(`No tags on "${resolvedTagName}".`);
         } else {
           for (const [k, v] of Object.entries(meta.tags)) {
             console.log(`  ${k}=${v}`);
@@ -543,15 +601,15 @@ async function main(): Promise<void> {
 
       try {
         // Check if session is managed by a pty.toml before modifying
-        const beforeMeta = readMetadata(tagName);
+        const beforeMeta = readMetadata(resolvedTagName);
         const ptyfilePath = beforeMeta?.tags?.ptyfile;
 
-        updateTags(tagName, updates, removals);
-        const meta = readMetadata(tagName);
+        updateTags(resolvedTagName, updates, removals);
+        const meta = readMetadata(resolvedTagName);
         if (!meta?.tags || Object.keys(meta.tags).length === 0) {
-          console.log(`Tags cleared on "${tagName}".`);
+          console.log(`Tags cleared on "${resolvedTagName}".`);
         } else {
-          console.log(`Tags on "${tagName}":`);
+          console.log(`Tags on "${resolvedTagName}":`);
           for (const [k, v] of Object.entries(meta.tags)) {
             console.log(`  ${k}=${v}`);
           }
@@ -615,6 +673,11 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "rename": {
+      await cmdRename(args.slice(1));
+      break;
+    }
+
     case "rm":
     case "remove": {
       if (args.length < 2) {
@@ -627,7 +690,8 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
-      await cmdRm(args[1]);
+      const resolvedRmName = await resolveRef(args[1]);
+      await cmdRm(resolvedRmName);
       break;
     }
 
@@ -766,6 +830,7 @@ async function cmdRun(
   tags: Record<string, string> = {},
   explicitCwd: string | null = null,
   isolateEnv = false,
+  displayName: string | null = null,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -798,7 +863,16 @@ async function cmdRun(
   try {
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
     const cwdOpt = explicitCwd ?? previousCwd;
-    await spawnDaemon({ name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt, ...(isolateEnv ? { isolateEnv: true } : {}) });
+    // If the session had a previous displayName (e.g., it was renamed before
+    // exiting), prefer preserving it over the fresh auto-generated label so
+    // `pty run -a` re-creates the session feeling-identical to the last one.
+    const prevDisplayName = session?.status === "exited" ? session.metadata?.displayName : undefined;
+    const displayNameOpt = displayName ?? prevDisplayName;
+    await spawnDaemon({
+      name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
+      ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
+      ...(isolateEnv ? { isolateEnv: true } : {}),
+    });
   } finally {
     releaseLock(name);
   }
@@ -1044,6 +1118,7 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
       exitCode: s.metadata?.exitCode ?? null,
       exitedAt: s.metadata?.exitedAt ?? null,
       ...(s.metadata?.tags ? { tags: s.metadata.tags } : {}),
+      ...(s.metadata?.displayName ? { displayName: s.metadata.displayName } : {}),
     }));
     if (remote && remoteHosts.length > 0) {
       console.log(JSON.stringify({ local: localOutput, remote: remoteHosts }));
@@ -1072,6 +1147,17 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
     return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
   };
 
+  // Render the session's primary label. If displayName is set, it appears
+  // first with the stable id in parens for disambiguation; otherwise just
+  // the id. Users can match either in any CLI command.
+  const renderLabel = (session: SessionInfo, boldCode: string): string => {
+    const dn = session.metadata?.displayName;
+    if (dn) {
+      return `${boldCode}${dn}\x1b[0m \x1b[2m(${session.name})\x1b[0m`;
+    }
+    return `${boldCode}${session.name}\x1b[0m`;
+  };
+
   if (running.length > 0) {
     console.log("Active sessions:");
     for (const session of running) {
@@ -1083,7 +1169,8 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
         : "";
       const tagStr = renderTags(session.metadata?.tags, showTags);
       const marker = strategyMarker(session.metadata?.tags);
-      console.log(`  \x1b[1;36m${session.name}\x1b[0m${marker}${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+      const label = renderLabel(session, "\x1b[1;36m");
+      console.log(`  ${label}${marker}${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 
@@ -1100,7 +1187,8 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
         : "";
       const tagStr = renderTags(meta?.tags, showTags);
       const marker = strategyMarker(meta?.tags);
-      console.log(`  \x1b[1m${session.name}\x1b[0m${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+      const label = renderLabel(session, "\x1b[1m");
+      console.log(`  ${label}${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 
@@ -1149,7 +1237,9 @@ async function cmdStats(
     }
 
     try {
-      const stats = await queryStats(name);
+      // Use the resolved stable `name` so queryStats connects to the right
+      // socket when the caller passed a `displayName`.
+      const stats = await queryStats(session.name);
       if (json) {
         console.log(JSON.stringify(stats));
       } else {
@@ -1309,6 +1399,141 @@ async function cmdKill(name: string): Promise<void> {
   if (wasSupervised && session.metadata?.tags?.ptyfile) {
     console.error(`Note: this session is managed by ${session.metadata.tags.ptyfile}`);
     console.error("The strategy tag will be restored on the next 'pty up'.");
+  }
+}
+
+function renameUsage(): void {
+  console.error(
+    "Usage:\n" +
+    "  pty rename <new-display-name>         Inside a session: set displayName on the current session\n" +
+    "  pty rename <ref> <new-display-name>   Outside: set displayName on <ref>\n" +
+    "  pty rename --show <ref>               Show the current displayName for <ref>\n" +
+    "  pty rename --clear                    Inside a session: clear displayName\n" +
+    "  pty rename --clear <ref>              Outside: clear displayName on <ref>\n" +
+    "\n" +
+    "displayName is a mutable alias. The session's stable id (name) never changes."
+  );
+}
+
+async function cmdRename(rawArgs: string[]): Promise<void> {
+  const insideSession = !!process.env.PTY_SESSION;
+
+  // Parse flags
+  let show = false;
+  let clear = false;
+  const positional: string[] = [];
+  for (const a of rawArgs) {
+    if (a === "--show") show = true;
+    else if (a === "--clear") clear = true;
+    else if (a === "-h" || a === "--help") { renameUsage(); return; }
+    else positional.push(a);
+  }
+
+  // --show <ref>
+  if (show) {
+    if (positional.length !== 1) {
+      console.error("pty rename --show requires exactly one ref.");
+      renameUsage();
+      process.exit(1);
+    }
+    const session = await getSession(positional[0]);
+    if (!session) {
+      console.error(`Session "${positional[0]}" not found.`);
+      process.exit(1);
+    }
+    const dn = session.metadata?.displayName;
+    if (dn) {
+      console.log(dn);
+    } else {
+      console.log(`(no displayName; session is referenced by its id: ${session.name})`);
+    }
+    return;
+  }
+
+  // --clear
+  if (clear) {
+    let targetName: string;
+    if (positional.length === 0) {
+      if (!insideSession) {
+        console.error("pty rename --clear with no ref requires being inside a pty session (PTY_SESSION not set).");
+        renameUsage();
+        process.exit(1);
+      }
+      targetName = process.env.PTY_SESSION!;
+    } else if (positional.length === 1) {
+      const session = await getSession(positional[0]);
+      if (!session) {
+        console.error(`Session "${positional[0]}" not found.`);
+        process.exit(1);
+      }
+      targetName = session.name;
+    } else {
+      console.error("pty rename --clear takes at most one ref.");
+      renameUsage();
+      process.exit(1);
+    }
+    try {
+      setDisplayName(targetName, null);
+      console.log(`Cleared displayName on "${targetName}".`);
+    } catch (e: any) {
+      console.error(e.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Set form — resolve target and new display
+  let targetName: string;
+  let newDisplay: string;
+  if (positional.length === 1) {
+    if (!insideSession) {
+      console.error("pty rename with a single arg is only allowed inside a pty session.");
+      console.error("Outside, use: pty rename <ref> <new-display-name>");
+      renameUsage();
+      process.exit(1);
+    }
+    targetName = process.env.PTY_SESSION!;
+    newDisplay = positional[0];
+  } else if (positional.length === 2) {
+    const session = await getSession(positional[0]);
+    if (!session) {
+      console.error(`Session "${positional[0]}" not found.`);
+      process.exit(1);
+    }
+    targetName = session.name;
+    newDisplay = positional[1];
+  } else {
+    renameUsage();
+    process.exit(1);
+  }
+
+  // Validate the new display like a name — same charset rules keep things
+  // predictable in URLs, file names, and CLI args.
+  try {
+    validateName(newDisplay);
+  } catch (e: any) {
+    console.error(`Invalid displayName: ${e.message}`);
+    process.exit(1);
+  }
+
+  // Uniqueness across (name ∪ displayName), excluding the target session itself.
+  const refs = await allRefs();
+  const currentDn = (await getSession(targetName))?.metadata?.displayName;
+  if (newDisplay === targetName) {
+    console.error(`displayName cannot equal the session's id ("${targetName}").`);
+    process.exit(1);
+  }
+  if (refs.has(newDisplay) && newDisplay !== currentDn) {
+    console.error(`"${newDisplay}" is already in use by another session (as a name or displayName).`);
+    process.exit(1);
+  }
+
+  try {
+    setDisplayName(targetName, newDisplay);
+    console.log(`Set displayName on "${targetName}" → "${newDisplay}".`);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
   }
 }
 

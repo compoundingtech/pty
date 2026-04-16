@@ -47,6 +47,9 @@ export interface ServerOptions {
   rows: number;
   cols: number;
   tags?: Record<string, string>;
+  /** Optional human-friendly alias recorded in SessionMetadata.displayName.
+   *  Mutable via `pty rename`; `name` stays the immutable stable id. */
+  displayName?: string;
   onExit?: (code: number) => void;
   /** When true, spawn the child with a scrubbed environment containing only
    *  a small allow-list of variables (plus any entries in `extraEnv`).
@@ -479,6 +482,7 @@ export class PtyServer {
           cwd: options.cwd,
           createdAt: new Date().toISOString(),
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+          ...(options.displayName ? { displayName: options.displayName } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
@@ -865,6 +869,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
     tags: config.tags,
+    displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
     onExit: (code) => {
