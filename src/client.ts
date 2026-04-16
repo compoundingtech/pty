@@ -176,7 +176,7 @@ export function send(options: SendOptions): void {
     process.exit(1);
   });
 
-  socket.on("close", () => {
+  socket.on("finish", () => {
     process.exit(0);
   });
 }
