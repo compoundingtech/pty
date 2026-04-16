@@ -11,6 +11,8 @@
 
 ### Fixes
 - Fix mouse tracking modes (1000/1002/1003) not being replayed when a client reattaches to a session with mouse tracking already enabled — the server previously only replayed the SGR encoding (1006), cursor visibility, and kitty keyboard flags. Clients (e.g., pty-layout) checking tracking mode to decide whether to forward mouse events will now see the correct state.
+- Fix `EventFollower` starting at EOF when its directory watcher detected a brand-new `.events.jsonl` — `session_start` was already on disk by the time the dir event fired, so followers were skipping it. New-file detections now start at offset 0 while existing-file watches still start at EOF.
+- Fix `session_exit` sometimes missing from the events log when the daemon was killed via SIGTERM (`pty kill` and similar). The event was queued on the `EventWriter` chain but the daemon exited before the append flushed. `close()` now waits for the child process's `onExit` (bounded at 2s) and then drains the writer before resolving.
 
 ### Interactive TUI
 - Add `--preselect-new` flag: `pty --preselect-new` opens the interactive TUI with "Create new session..." pre-selected (useful for pty-layout panes that should land on the create prompt)

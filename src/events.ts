@@ -187,7 +187,7 @@ export class EventFollower {
   start(): void {
     if (this.options.names) {
       for (const name of this.options.names) {
-        this.watchFile(name);
+        this.watchFile(name, { fromStart: false });
       }
     } else {
       this.scanAndWatchAll();
@@ -203,20 +203,29 @@ export class EventFollower {
     this.dirWatcher = null;
   }
 
-  private watchFile(name: string): void {
+  private watchFile(name: string, opts: { fromStart: boolean }): void {
     const filePath = getEventsPath(name);
 
-    // Start at the end of the current file
+    // Pre-existing files: start at current EOF (don't replay history).
+    // Freshly-created files detected by the dirWatcher: start at offset 0 so
+    // the session_start line, which is almost always already in the file by
+    // the time the directory event fires, isn't skipped.
     let offset = 0;
-    try {
-      offset = fs.statSync(filePath).size;
-    } catch {}
+    if (!opts.fromStart) {
+      try {
+        offset = fs.statSync(filePath).size;
+      } catch {}
+    }
 
     try {
       const watcher = fs.watch(filePath, () => {
         this.readNewLines(name, filePath);
       });
       this.watchers.set(name, { watcher, offset });
+      // Seed: if the file already has content we want to replay, do it now.
+      if (opts.fromStart) {
+        this.readNewLines(name, filePath);
+      }
     } catch {}
   }
 
@@ -252,17 +261,20 @@ export class EventFollower {
   private scanAndWatchAll(): void {
     const dir = getSessionDir();
 
-    // Watch existing .events.jsonl files
+    // Watch existing .events.jsonl files — they've been running, so start at
+    // EOF rather than replaying their history.
     try {
       for (const entry of fs.readdirSync(dir)) {
         if (entry.endsWith(".events.jsonl")) {
           const name = entry.replace(/\.events\.jsonl$/, "");
-          this.watchFile(name);
+          this.watchFile(name, { fromStart: false });
         }
       }
     } catch {}
 
-    // Watch directory for new .events.jsonl files
+    // Watch directory for new .events.jsonl files. For a brand-new file the
+    // session_start line is almost always already present by the time the
+    // directory-change event fires, so start at offset 0 to include it.
     try {
       this.dirWatcher = fs.watch(dir, (_eventType, filename) => {
         if (
@@ -271,7 +283,7 @@ export class EventFollower {
           !this.watchers.has(filename.replace(/\.events\.jsonl$/, ""))
         ) {
           const name = filename.replace(/\.events\.jsonl$/, "");
-          this.watchFile(name);
+          this.watchFile(name, { fromStart: true });
         }
       });
     } catch {}

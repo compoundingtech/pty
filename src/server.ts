@@ -186,11 +186,19 @@ export class PtyServer {
   private eventWriter: EventWriter;
   private lastTitle = "";
   readonly ready: Promise<void>;
+  // Resolves when the child process's onExit has fired — used by close() to
+  // make sure session_exit has been queued to the event chain before we
+  // flush and exit the daemon. See flake #2.
+  private childExited: Promise<void>;
+  private resolveChildExited!: () => void;
 
   constructor(options: ServerOptions) {
     this.name = options.name;
     this.options = options;
     this.eventWriter = new EventWriter(options.name);
+    this.childExited = new Promise<void>((resolve) => {
+      this.resolveChildExited = resolve;
+    });
 
     // Set up xterm-headless for screen buffer tracking
     this.terminal = new xterm.Terminal({
@@ -433,6 +441,7 @@ export class PtyServer {
       // here since PTY data could still be in-flight — close() will
       // update with the final output.
       this.saveExitMetadata(exitCode);
+      this.resolveChildExited();
       options.onExit?.(exitCode);
     });
 
@@ -809,11 +818,21 @@ export class PtyServer {
       for (const client of this.clients.values()) {
         client.socket.destroy();
       }
-      this.socketServer.close(() => {
+      this.socketServer.close(async () => {
         cleanup(this.name);
         try {
           this.ptyProcess.kill();
         } catch {}
+        // Wait for the child's onExit to fire (which enqueues session_exit)
+        // before draining the writer. Without this, SIGTERM-initiated
+        // shutdowns race: kill() returns synchronously but onExit fires
+        // later, after we've already flushed. Bound with a short timeout in
+        // case the child never exits (shouldn't happen — we just killed it).
+        await Promise.race([
+          this.childExited,
+          new Promise<void>((r) => setTimeout(r, 2000)),
+        ]);
+        try { await this.eventWriter.flush(); } catch {}
         resolve();
       });
     });

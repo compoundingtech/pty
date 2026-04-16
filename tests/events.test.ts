@@ -303,6 +303,39 @@ describe("EventFollower", () => {
     expect(received[0].type).toBe("bell");
   });
 
+  it("dirWatcher-detected new files start at offset 0 so session_start is not skipped", async () => {
+    const name = uniqueName();
+    // Make sure the file does not exist yet
+    try { fs.unlinkSync(getEventsPath(name)); } catch {}
+
+    // Start a follower with no specific names — it uses scanAndWatchAll and
+    // relies on dirWatcher to pick up new files.
+    const received: EventRecord[] = [];
+    const follower = new EventFollower({
+      onEvent: (event) => { if (event.session === name) received.push(event); },
+    });
+    follower.start();
+    await sleep(100);
+
+    // Create the file with a session_start already present. In the real
+    // daemon, session_start is appended immediately on socket listen, and
+    // the dirWatcher usually fires *after* that line is on disk.
+    const writer = new EventWriter(name);
+    writer.append({
+      session: name,
+      type: "session_start",
+      ts: "2026-04-05T00:00:00Z",
+    });
+    await writer.flush();
+
+    // Wait for dirWatcher + readNewLines
+    await sleep(500);
+    follower.stop();
+
+    const starts = received.filter((e) => e.type === "session_start");
+    expect(starts.length).toBe(1);
+  });
+
   it("handles file truncation gracefully", async () => {
     const name = uniqueName();
     clearEvents(name);
