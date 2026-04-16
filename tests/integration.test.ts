@@ -1098,4 +1098,32 @@ describe("integration", () => {
       client2.destroy();
     });
   }
+
+  it("send-style DATA socket resolves 'finish' promptly without waiting for server FIN", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    // Simulate the send() pattern: connect, write DATA packets, end, wait for 'finish'.
+    // This must resolve quickly — if it hangs, the socket is waiting for the server
+    // to send FIN ('close' event) which is unreliable in some container environments.
+    const socketPath = getSocketPath(name);
+    const start = Date.now();
+    const result = await Promise.race([
+      new Promise<"ok">((resolve, reject) => {
+        const socket = net.createConnection(socketPath);
+        socket.on("connect", () => {
+          socket.write(encodeData("hello from send\n"));
+          socket.end();
+        });
+        socket.on("finish", () => resolve("ok"));
+        socket.on("error", reject);
+      }),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 3000)),
+    ]);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe("ok");
+    // 'finish' should fire almost immediately after socket.end(), not after 3s timeout
+    expect(elapsed).toBeLessThan(2000);
+  });
 });
