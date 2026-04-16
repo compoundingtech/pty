@@ -335,7 +335,7 @@ describe("interactive TUI", () => {
   );
 
   it(
-    "--filter-tag auto-applies the tag to sessions created from the TUI",
+    "--filter-tag auto-applies the tag to sessions created from the TUI (one-keystroke create)",
     async () => {
       const sessionDir = makeSessionDir();
 
@@ -346,17 +346,12 @@ describe("interactive TUI", () => {
       });
       tuiSessions.push(tui);
 
-      // Create item is preselected; walk the wizard
-      await tui.waitForText("#role=web", 10000); // filter line visible
+      // Create item is preselected; a single Enter now spawns the shell
+      // directly — no prompts.
+      await tui.waitForText("#role=web", 10000);
       tui.press("return");
-      await tui.waitForText("Choose Directory", 5000);
-      tui.press("return"); // use current directory
-      await tui.waitForText("Name:", 5000);
-      tui.type("cat");
-      await new Promise((r) => setTimeout(r, 200));
-      tui.press("return"); // create
 
-      // Wait for the session metadata file to appear and contain the tag
+      // Wait for the session metadata file to appear with the tag applied.
       const start = Date.now();
       let found: any = null;
       while (Date.now() - start < 5000) {
@@ -364,10 +359,7 @@ describe("interactive TUI", () => {
         for (const e of entries) {
           try {
             const meta = JSON.parse(fs.readFileSync(path.join(sessionDir, e), "utf-8"));
-            if (meta.tags?.role === "web") {
-              found = meta;
-              break;
-            }
+            if (meta.tags?.role === "web") { found = meta; break; }
           } catch {}
         }
         if (found) break;
@@ -375,8 +367,10 @@ describe("interactive TUI", () => {
       }
       expect(found).not.toBeNull();
       expect(found.tags.role).toBe("web");
+      // No displayName should be set — the "new anonymous" flow matches
+      // pty run --no-display-name.
+      expect(found.displayName).toBeUndefined();
 
-      // Clean up the spawned session
       const pidFiles = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".pid"));
       for (const p of pidFiles) {
         try {
@@ -554,7 +548,7 @@ describe("interactive TUI", () => {
   );
 
   it(
-    "create wizard: shows directory picker",
+    "Enter on 'Create new session...' spawns a shell with a random id and no displayName",
     async () => {
       const sessionDir = makeSessionDir();
       const tui = createTuiSession(sessionDir);
@@ -562,93 +556,31 @@ describe("interactive TUI", () => {
       await tui.waitForText("Create new session...", 10000);
       tui.press("return");
 
-      const ss = await tui.waitForText("Choose Directory", 5000);
-      expect(ss.text).toContain("current directory");
+      // Wait for a session metadata file to materialize; verify it has
+      // no displayName and a random-looking name.
+      const start = Date.now();
+      let meta: any = null;
+      while (Date.now() - start < 5000) {
+        const entries = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".json"));
+        if (entries.length > 0) {
+          try { meta = JSON.parse(fs.readFileSync(path.join(sessionDir, entries[0]), "utf-8")); } catch {}
+          if (meta) break;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(meta).not.toBeNull();
+      expect(meta.displayName).toBeUndefined();
+
+      // Record the spawned session pid for cleanup
+      const pidFiles = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".pid"));
+      for (const p of pidFiles) {
+        try {
+          const pid = parseInt(fs.readFileSync(path.join(sessionDir, p), "utf-8").trim(), 10);
+          bgPids.push(pid);
+        } catch {}
+      }
     },
-    15000
-  );
-
-  it(
-    "create wizard: name auto-fills from directory",
-    async () => {
-      const sessionDir = makeSessionDir();
-      const tui = createTuiSession(sessionDir);
-
-      await tui.waitForText("Create new session...", 10000);
-      tui.press("return");
-      await tui.waitForText("Choose Directory", 5000);
-      tui.press("return");
-
-      const ss = await tui.waitForText("Name:", 5000);
-      expect(ss.text).toContain("Command:");
-    },
-    15000
-  );
-
-  it(
-    "create wizard: name updates as command is typed",
-    async () => {
-      const sessionDir = makeSessionDir();
-      const tui = createTuiSession(sessionDir);
-
-      await tui.waitForText("Create new session...", 10000);
-      tui.press("return");
-      await tui.waitForText("Choose Directory", 5000);
-      tui.press("return");
-      await tui.waitForText("Name:", 5000);
-
-      // Name should start as the directory basename
-      let ss = tui.screenshot();
-      const nameLine = ss.lines.find(l => l.includes("Name:"));
-      expect(nameLine).toBeDefined();
-
-      // Type a command — the name should auto-update to include it
-      tui.type("node server.js");
-      await new Promise(r => setTimeout(r, 300));
-
-      ss = tui.screenshot();
-      const updatedName = ss.lines.find(l => l.includes("Name:"));
-      expect(updatedName).toBeDefined();
-      // Should contain "node-server" somewhere in the name field
-      expect(updatedName).toMatch(/node-server/i);
-    },
-    15000
-  );
-
-  it(
-    "create wizard: manually edited name is not overwritten by command typing",
-    async () => {
-      const sessionDir = makeSessionDir();
-      const tui = createTuiSession(sessionDir);
-
-      await tui.waitForText("Create new session...", 10000);
-      tui.press("return");
-      await tui.waitForText("Choose Directory", 5000);
-      tui.press("return");
-      await tui.waitForText("Name:", 5000);
-
-      // Tab to name field, type a custom name
-      tui.press("tab");
-      await new Promise(r => setTimeout(r, 200));
-      // Clear auto-filled name and type custom
-      for (let i = 0; i < 30; i++) tui.press("backspace");
-      await new Promise(r => setTimeout(r, 200));
-      tui.type("custom");
-      await new Promise(r => setTimeout(r, 200));
-
-      // Tab back to command and type something
-      tui.press("tab");
-      await new Promise(r => setTimeout(r, 200));
-      tui.type("echo hi");
-      await new Promise(r => setTimeout(r, 300));
-
-      // Name should still be "custom", not auto-generated
-      const ss = tui.screenshot();
-      const nameLine = ss.lines.find(l => l.includes("Name:"));
-      expect(nameLine).toContain("custom");
-      expect(nameLine).not.toContain("echo");
-    },
-    15000
+    20000
   );
 
   it(

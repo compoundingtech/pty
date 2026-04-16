@@ -28,6 +28,7 @@
 - Fix `session_exit` sometimes missing from the events log when the daemon was killed via SIGTERM (`pty kill` and similar). The event was queued on the `EventWriter` chain but the daemon exited before the append flushed. `close()` now waits for the child process's `onExit` (bounded at 2s) and then drains the writer before resolving.
 
 ### Interactive TUI
+- **"Create new session..." is now a one-keystroke action.** Pressing Enter spawns `$SHELL` (fallback `bash`) in `$HOME` with a random id and no `displayName`. No wizard, no directory picker, no name/command prompts. Use `pty rename` and `pty exec` from inside the new session to promote it into something specific. Remote "Create new session..." mirrors the same one-shot flow via `pty-relay connect <url> --spawn <random-id>` (the relay is responsible for the remote-side shell/cwd defaults).
 - Add `--preselect-new` flag: `pty --preselect-new` opens the interactive TUI with "Create new session..." pre-selected (useful for pty-layout panes that should land on the create prompt)
 - Add `--filter-tag key=value` flag (repeatable): filters the TUI to sessions matching all given tags AND auto-applies those tags to any session created from this TUI instance — so new sessions (local and remote) stay in the filtered view (e.g., pty-layout layouts)
 - Remote session spawns forward filter tags to pty-relay as `--tag key=value` so remote sessions created from a filtered TUI are tagged on the remote side and stay in the filtered view
