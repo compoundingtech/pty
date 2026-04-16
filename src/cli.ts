@@ -1094,7 +1094,18 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
   }
 
   // Fetch relay hosts if --remote
-  let remoteHosts: { label: string; sessions: { name: string; status: string; command?: string; cwd?: string }[]; error: string | null }[] = [];
+  let remoteHosts: {
+    label: string;
+    sessions: {
+      name: string;
+      status: string;
+      command?: string;
+      cwd?: string;
+      tags?: Record<string, string>;
+      displayName?: string;
+    }[];
+    error: string | null;
+  }[] = [];
   if (remote) {
     try {
       const relayBin = execFileSync("which", ["pty-relay"], { encoding: "utf-8" }).trim();
@@ -1192,7 +1203,8 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
     }
   }
 
-  // Remote hosts
+  // Remote hosts — render with the same treatment as local: displayName
+  // in parens after the id, strategy marker, user-facing tags inline.
   for (const host of remoteHosts) {
     console.log("");
     if (host.error) {
@@ -1204,7 +1216,12 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
       const icon = s.status === "running" ? "\u25cf" : "\u25cb";
       const cwd = s.cwd ? shortPath(s.cwd) : "";
       const cmd = s.command ?? "";
-      console.log(`  \x1b[1;36m${icon} ${s.name}\x1b[0m — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+      const labelBase = s.displayName
+        ? `\x1b[1;36m${s.displayName}\x1b[0m \x1b[2m(${s.name})\x1b[0m`
+        : `\x1b[1;36m${s.name}\x1b[0m`;
+      const tagStr = renderTags(s.tags, showTags);
+      const marker = strategyMarker(s.tags);
+      console.log(`  ${icon} ${labelBase}${marker}${tagStr} — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
 }
