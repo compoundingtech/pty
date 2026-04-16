@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0
+
 ### Session naming
 - **Breaking (default behaviour):** `pty run` without `--name` now assigns a short random id (Crockford-ish base32, 8 chars) to the session's `name` field, and stores the old human-friendly cwd+command label in a new optional `displayName` field. `PTY_SESSION`, events, `ptyfile.session`, and anything else that references a session by its stable id will see the random id for sessions created after this release. Sessions created before this release continue to work unchanged (their `name` stays what it was).
 - Add `pty run --no-display-name` — generates the random id but skips the `displayName` auto-gen. Useful for throwaway shells you might promote later.
@@ -28,6 +30,7 @@
 - Fix mouse tracking modes (1000/1002/1003) not being replayed when a client reattaches to a session with mouse tracking already enabled — the server previously only replayed the SGR encoding (1006), cursor visibility, and kitty keyboard flags. Clients (e.g., pty-layout) checking tracking mode to decide whether to forward mouse events will now see the correct state.
 - Fix `EventFollower` starting at EOF when its directory watcher detected a brand-new `.events.jsonl` — `session_start` was already on disk by the time the dir event fired, so followers were skipping it. New-file detections now start at offset 0 while existing-file watches still start at EOF.
 - Fix `session_exit` sometimes missing from the events log when the daemon was killed via SIGTERM (`pty kill` and similar). The event was queued on the `EventWriter` chain but the daemon exited before the append flushed. `close()` now waits for the child process's `onExit` (bounded at 2s) and then drains the writer before resolving.
+- Fix garbage characters in `less`/`git log`: respond to terminal queries (OSC 10/11/4, DA2, DSR, XTVERSION) and strip them from client broadcast so the client's terminal doesn't respond with duplicate input
 
 ### Interactive TUI
 - **"Create new session..." is now a one-keystroke action.** Pressing Enter spawns `$SHELL` (fallback `bash`) in `$HOME` with a random id and no `displayName`. No wizard, no directory picker, no name/command prompts. Use `pty rename` and `pty exec` from inside the new session to promote it into something specific. Remote "Create new session..." mirrors the same one-shot flow via `pty-relay connect <url> --spawn <random-id>` (the relay is responsible for the remote-side shell/cwd defaults).
@@ -36,6 +39,10 @@
 - Remote session spawns forward filter tags to pty-relay as `--tag key=value` so remote sessions created from a filtered TUI are tagged on the remote side and stay in the filtered view
 - Tag filter is shown in the Filter line; remote groups are filtered by their `tags` field when a tag filter is active
 - Session rows in the interactive list now show user-facing tags inline (`#key=value`) alongside cwd and command (matches `pty list` output)
+- Interactive TUI shows "Create new session..." for spawn-enabled remote hosts
+- Interactive filter hides "Create new session..." items when filter doesn't match "new"
+- `host/session` filter syntax: type `prod/api` to filter by host then session
+- Extracted `buildFilteredGroups` as a pure function for unit testing
 
 ### Listing
 - `pty list` now shows tags by default (hashtag format, e.g., `#role=web`) — internal bookkeeping keys (`ptyfile*`, `strategy`, `supervisor.status`) are hidden
@@ -53,19 +60,12 @@
 ### Project files
 - `pty up` now removes tags that were removed from `pty.toml` — toml-managed tag keys are tracked in a `ptyfile.tags` meta tag so manually-added tags (set via `pty tag`) are preserved
 
-### Fixes
-- Fix garbage characters in `less`/`git log`: respond to terminal queries (OSC 10/11/4, DA2, DSR, XTVERSION) and strip them from client broadcast so the client's terminal doesn't respond with duplicate input
-
 ### pty exec
 - Add `pty exec -- <command> [args...]` to replace the current session's command from inside the session
 - Updates session metadata so the supervisor restarts the new command, not the original
 - Errors if not inside a pty session (`PTY_SESSION` not set) or if the session is managed by a pty.toml
 - Preserves existing tags and other metadata
 - Emits `session_exec` event with previous and new command
-- Interactive TUI shows "Create new session..." for spawn-enabled remote hosts
-- Interactive filter hides "Create new session..." items when filter doesn't match "new"
-- `host/session` filter syntax: type `prod/api` to filter by host then session
-- Extracted `buildFilteredGroups` as a pure function for unit testing
 
 ## 0.8.0
 
