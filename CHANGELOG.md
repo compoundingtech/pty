@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Client API
+- Add `env?: Record<string, string>` to `SpawnDaemonOptions` and `ServerOptions` — use this to spawn a session child with a verbatim environment (no inheritance from the daemon's `process.env`, no allow-list). `PTY_SESSION` is always injected on top so nesting detection and `pty exec` keep working. Mutually exclusive with `isolateEnv` / `extraEnv` (throws at daemon startup if both are passed). Requested by the pty-layout dev to spawn a launcher shell with a shim `tmux` on `PATH`, a custom `TMUX` marker, and a filter-tag env var.
+
 ## 0.9.0
 
 ### Session naming

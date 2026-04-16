@@ -32,6 +32,13 @@ export interface SpawnDaemonOptions {
   /** Additional `KEY=VALUE` env entries to add on top of the isolation
    *  allow-list. Ignored unless `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Use this env dict verbatim for the spawned child — no inheritance from
+   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
+   *  injected on top so nesting detection and `pty exec` keep working.
+   *
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
+   *  together with either will throw at daemon startup. */
+  env?: Record<string, string>;
   /** Override the runtime used to launch the detached daemon process.
    *
    *  By default the daemon is spawned with `process.execPath` — the same
@@ -72,6 +79,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     ...(options.displayName ? { displayName: options.displayName } : {}),
     ...(options.isolateEnv ? { isolateEnv: true } : {}),
     ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+    ...(options.env ? { env: options.env } : {}),
   });
 
   const launcherCmd = options.launcher?.command ?? process.execPath;

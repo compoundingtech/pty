@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { queryStats } from "../src/client.ts";
-import { spawnDaemon } from "../src/spawn.ts";
+import { spawnDaemon, setServerModulePath } from "../src/spawn.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -16,6 +16,11 @@ const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-spawn-opts-"));
 afterAll(() => {
   fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
+
+// Tests that invoke spawnDaemon directly (rather than via the CLI) need to
+// point it at the built dist/server.js — otherwise __dirname resolves to
+// src/ where server.js doesn't exist.
+setServerModulePath(serverModule);
 
 let bgPids: number[] = [];
 let sessionDirs: string[] = [];
@@ -278,6 +283,86 @@ describe("spawnDaemon options", () => {
       bgPids.push(pid);
     } catch {}
     try { fs.unlinkSync("/tmp/pty-legacy-env.txt"); } catch {}
+  }, 15000);
+
+  it("env option replaces the child's environment verbatim (no inheritance)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const dumpFile = path.join(dir, "verbatim-env.txt");
+
+    // Set a var in the caller that would normally leak through via
+    // inheritance, then spawn with `env:` set to a minimal dict — the dump
+    // must NOT contain the caller-side var. Child exits right after writing
+    // so we don't leave a sleeping process behind.
+    process.env.PTY_VERBATIM_LEAK_CANARY = "leaked";
+    process.env.PTY_SESSION_DIR = dir;
+
+    try {
+      await spawnDaemon({
+        name,
+        command: "/bin/sh",
+        args: ["-c", `env > ${JSON.stringify(dumpFile)}; exit 0`],
+        displayCommand: "env dump",
+        cwd: dir,
+        env: {
+          // Minimal env the shell needs to run at all
+          PATH: "/usr/bin:/bin",
+          // Plus a marker that only the test knows
+          PTY_VERBATIM_MARKER: "from-verbatim-env",
+        },
+      });
+    } finally {
+      delete process.env.PTY_VERBATIM_LEAK_CANARY;
+    }
+
+    // Wait for child to write + exit (daemon cleans up on its own).
+    const start = Date.now();
+    while (Date.now() - start < 3000) {
+      try {
+        if (fs.existsSync(dumpFile) && fs.statSync(dumpFile).size > 0) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const dumped = fs.readFileSync(dumpFile, "utf-8");
+    expect(dumped).toContain("PTY_VERBATIM_MARKER=from-verbatim-env");
+    expect(dumped).not.toContain("PTY_VERBATIM_LEAK_CANARY");
+    expect(dumped).not.toContain("leaked");
+    // PTY_SESSION is always injected on top so nesting/exec keep working
+    expect(dumped).toContain(`PTY_SESSION=${name}`);
+  }, 15000);
+
+  it("env option combined with isolateEnv fails daemon startup", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+
+    // Daemon should exit immediately with a descriptive error; spawnDaemon
+    // rejects once it detects the early exit.
+    await expect(spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      displayCommand: "sh",
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin" },
+      isolateEnv: true,
+    })).rejects.toThrow(/mutually exclusive/);
+  }, 15000);
+
+  it("env option combined with extraEnv fails daemon startup", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+
+    await expect(spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      displayCommand: "sh",
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin" },
+      extraEnv: { EXTRA: "nope" },
+    })).rejects.toThrow(/mutually exclusive/);
   }, 15000);
 
   it("surfaces a missing cwd explicitly instead of failing silently", async () => {

@@ -60,6 +60,15 @@ export interface ServerOptions {
   /** Additional `KEY=VALUE` env entries to add on top of the isolation
    *  allow-list. Only consulted when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Use this env dict verbatim for the spawned child — no inheritance from
+   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
+   *  injected on top so nesting detection and `pty exec` keep working.
+   *
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
+   *  together with either throws. Use this when the caller wants total
+   *  control of the child environment (e.g., pty-layout's launcher shell
+   *  that injects a shim tmux on `PATH`). */
+  env?: Record<string, string>;
 }
 
 /** Env variables that are safe to pass through to a session child when
@@ -73,6 +82,25 @@ const ISOLATED_ENV_ALLOWLIST = new Set([
 ]);
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
+  // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
+  // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
+  // you pass `env`; if you want scrub+extras you pass `isolateEnv`. Picking
+  // one implicitly would hide intent.
+  if (options.env && (options.isolateEnv || options.extraEnv)) {
+    throw new Error(
+      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv. " +
+      "Use env for verbatim control, or isolateEnv (+ optional extraEnv) for allow-list semantics — not both."
+    );
+  }
+
+  // Explicit verbatim env. No inheritance. Only PTY_SESSION is forced on
+  // top so internal pty tooling (nesting prevention, `pty exec`) works.
+  if (options.env) {
+    const env = { ...options.env };
+    env.PTY_SESSION = options.name;
+    return env;
+  }
+
   const source = process.env as Record<string, string>;
 
   if (!options.isolateEnv) {
@@ -872,6 +900,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
+    env: config.env,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
       setTimeout(() => cleanShutdown(code), 500);
