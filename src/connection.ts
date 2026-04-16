@@ -174,7 +174,15 @@ export function sendData(options: SendDataOptions): Promise<void> {
       }
     });
 
-    socket.on("close", () => {
+    // Resolve on 'finish' (writable side fully flushed to the kernel) rather
+    // than 'close' (both halves closed). 'close' requires the server's FIN
+    // to come back, which is unreliable in Linux namespace containers where
+    // the auto-half-close behavior on the server's socket can stall. For a
+    // fire-and-forget send over a Unix domain socket, 'finish' is exactly
+    // the right guarantee: the bytes are in the server's recv buffer, which
+    // the kernel will hold until the server reads them regardless of what
+    // happens to our userspace socket. (closes #18)
+    socket.on("finish", () => {
       resolve();
     });
   });
