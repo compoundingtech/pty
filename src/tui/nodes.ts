@@ -239,6 +239,19 @@ export interface PtyHandle {
    * @param scrollOffset Lines to scroll back into history (0 = live viewport).
    */
   readCells(scrollOffset?: number): { char: string; fg: [number, number, number] | null; bg: [number, number, number] | null; bold: boolean; dim: boolean; italic: boolean; underline: boolean }[][];
+  /**
+   * Read per-row "wrapped" flags aligned with the rows returned by
+   * `readCells(scrollOffset)`. A `true` at index `r` means row `r`
+   * continues from row `r-1` because the terminal wrapped a long line
+   * rather than the child emitting a real newline — the same signal
+   * xterm.js exposes via `IBufferLine.isWrapped`.
+   *
+   * Intended use: reconstructing logical lines from a multi-row text
+   * selection (e.g., copying a wrapped URL to the clipboard without a
+   * spurious `\n` in the middle).
+   * @param scrollOffset Lines to scroll back into history (0 = live viewport).
+   */
+  readWrappedFlags(scrollOffset?: number): boolean[];
   /** Current PTY dimensions. */
   cols: number;
   rows: number;

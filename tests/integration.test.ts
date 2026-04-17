@@ -1049,9 +1049,11 @@ describe("integration", () => {
         }
       });
 
-      // Send items with 200ms delay between each
-      const { send } = await import("../src/client.ts");
-      send({ name, data: ["A", "B", "C"], delayMs: 200 });
+      // Send items with 200ms delay between each. Use the programmatic
+      // `sendData` (Promise-returning, no process.exit) — the CLI `send`
+      // shape is for binaries, not tests.
+      const { sendData } = await import("../src/connection.ts");
+      void sendData({ name, data: ["A", "B", "C"], delayMs: 200 });
 
       // Wait for all items to arrive
       await new Promise((r) => setTimeout(r, 1000));

@@ -177,6 +177,61 @@ describe("kittyKeyboardFlags", () => {
   });
 });
 
+// --- readWrappedFlags ---
+
+describe("readWrappedFlags", () => {
+  it("returns one flag per visible row", () => {
+    const h = spawn("cat", [], { rows: 10, cols: 40 });
+    const flags = h.readWrappedFlags();
+    expect(flags).toHaveLength(10);
+    expect(flags.every((f) => typeof f === "boolean")).toBe(true);
+  });
+
+  it("marks continuation rows as wrapped when a long line overflows", async () => {
+    // 120-char line at 40-col terminal → wraps to 3 rows. First row is
+    // not wrapped (it's the start of the line); the next two rows are
+    // continuations and should both be flagged.
+    const h = spawn("bash", ["-c", "printf '%0.sa' {1..120}; sleep 5"], {
+      rows: 12, cols: 40,
+    });
+    await waitFor(h, () => h.readWrappedFlags().some((f) => f === true));
+    const flags = h.readWrappedFlags();
+    // First row: start of the logical line, not a wrap continuation.
+    expect(flags[0]).toBe(false);
+    // Next two rows: wrapped continuations.
+    expect(flags[1]).toBe(true);
+    expect(flags[2]).toBe(true);
+    // Remaining empty rows after the wrapped content: not wrapped.
+    expect(flags[3]).toBe(false);
+  });
+
+  it("short lines followed by a newline produce no wrapped flags", async () => {
+    const h = spawn("bash", ["-c", "printf 'short\\n'; sleep 5"], {
+      rows: 8, cols: 40,
+    });
+    await waitFor(h, () => h.cursorRow >= 1);
+    const flags = h.readWrappedFlags();
+    expect(flags.every((f) => f === false)).toBe(true);
+  });
+
+  it("scrollOffset shifts the window in sync with readCells", async () => {
+    // Emit many short lines to push earlier content into scrollback,
+    // then read with a nonzero offset and confirm flags array length
+    // still matches readCells rows.
+    const h = spawn("bash", ["-c", "for i in $(seq 1 30); do echo line $i; done; sleep 5"], {
+      rows: 10, cols: 40, scrollback: 100,
+    });
+    await waitFor(h, () => h.bufferLength > h.rows);
+    const flags0 = h.readWrappedFlags(0);
+    const cells0 = h.readCells(0);
+    expect(flags0.length).toBe(cells0.length);
+
+    const flags5 = h.readWrappedFlags(5);
+    const cells5 = h.readCells(5);
+    expect(flags5.length).toBe(cells5.length);
+  });
+});
+
 // --- scrollback ---
 
 describe("scrollback", () => {

@@ -366,6 +366,28 @@ function readXtermCells(
   return grid;
 }
 
+/** Read per-row `isWrapped` flags aligned with `readXtermCells(scrollOffset)`.
+ *  A `true` at index `r` means that row continues the previous row because
+ *  xterm wrapped a long line (not because the child emitted `\n`). Used by
+ *  consumers reconstructing logical lines from a visually-multi-row
+ *  selection — e.g., copying a wrapped URL without a spurious newline. */
+function readXtermWrappedFlags(
+  terminal: any,
+  rows: number,
+  scrollOffset: number = 0,
+): boolean[] {
+  const buf = terminal.buffer.active;
+  const baseY = buf.baseY as number;
+  const startLine = Math.max(0, baseY - scrollOffset);
+  const flags: boolean[] = new Array(rows);
+  for (let r = 0; r < rows; r++) {
+    const lineIdx = startLine + r;
+    const line = lineIdx < buf.length ? buf.getLine(lineIdx) : null;
+    flags[r] = !!(line?.isWrapped);
+  }
+  return flags;
+}
+
 export function createPty(
   command: string,
   args: string[] = [],
@@ -471,6 +493,10 @@ export function createPty(
 
     readCells(scrollOffset?: number) {
       return readXtermCells(terminal, handle.rows, handle.cols, scrollOffset ?? 0);
+    },
+
+    readWrappedFlags(scrollOffset?: number) {
+      return readXtermWrappedFlags(terminal, handle.rows, scrollOffset ?? 0);
     },
 
     kill() {
@@ -607,6 +633,10 @@ export async function attachPty(
 
     readCells(scrollOffset?: number) {
       return readXtermCells(terminal, handle.rows, handle.cols, scrollOffset ?? 0);
+    },
+
+    readWrappedFlags(scrollOffset?: number) {
+      return readXtermWrappedFlags(terminal, handle.rows, scrollOffset ?? 0);
     },
 
     kill() {

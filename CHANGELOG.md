@@ -4,6 +4,7 @@
 
 ### Client API
 - Add `env?: Record<string, string>` to `SpawnDaemonOptions` and `ServerOptions` — use this to spawn a session child with a verbatim environment (no inheritance from the daemon's `process.env`, no allow-list). `PTY_SESSION` is always injected on top so nesting detection and `pty exec` keep working. Mutually exclusive with `isolateEnv` / `extraEnv` (throws at daemon startup if both are passed). Requested by the pty-layout dev to spawn a launcher shell with a shim `tmux` on `PATH`, a custom `TMUX` marker, and a filter-tag env var.
+- Add `PtyHandle.readWrappedFlags(scrollOffset?): boolean[]` — per-row flags aligned with `readCells`, where `true` means the row continues the previous row because xterm wrapped a long line (not because the child emitted `\n`). Intended for consumers reconstructing logical lines from a visually-multi-row text selection (e.g., copying a wrapped URL to the clipboard without a spurious newline). Passes through xterm.js's `IBufferLine.isWrapped`; works for both `createPty` embedded terminals and `attachPty` remote sessions since the serialize/replay path preserves wrap state.
 
 ## 0.9.0
 
