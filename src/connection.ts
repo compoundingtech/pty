@@ -12,6 +12,7 @@ import {
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
 import { resolveKey } from "./keys.ts";
+import { BRACKETED_PASTE_START, BRACKETED_PASTE_END } from "./paste.ts";
 
 export interface SessionConnectionOptions {
   name: string;
@@ -23,6 +24,14 @@ export interface SendDataOptions {
   name: string;
   data: string[];
   delayMs?: number;
+  /** Wrap the entire payload (all `data` entries taken together) in
+   *  bracketed-paste markers (CSI 200 ~ … CSI 201 ~). The receiving TUI
+   *  treats everything between the markers as one paste event rather
+   *  than a sequence of keystrokes — useful for injecting multi-line
+   *  prompts into agent sessions without premature submission. Receiver
+   *  must have bracketed paste enabled (DECSET 2004); most modern
+   *  shells and TUIs do by default. */
+  paste?: boolean;
 }
 
 export interface PeekScreenOptions {
@@ -157,11 +166,17 @@ export function sendData(options: SendDataOptions): Promise<void> {
     const socket = net.createConnection(socketPath);
 
     socket.on("connect", async () => {
+      if (options.paste && options.data.length > 0) {
+        socket.write(encodeData(BRACKETED_PASTE_START));
+      }
       for (let i = 0; i < options.data.length; i++) {
         if (i > 0 && options.delayMs) {
           await new Promise((r) => setTimeout(r, options.delayMs));
         }
         socket.write(encodeData(options.data[i]));
+      }
+      if (options.paste && options.data.length > 0) {
+        socket.write(encodeData(BRACKETED_PASTE_END));
       }
       socket.end();
     });

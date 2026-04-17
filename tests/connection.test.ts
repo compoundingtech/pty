@@ -208,7 +208,10 @@ describe("sendData", () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     process.env.PTY_SESSION_DIR = dir;
-    await startDaemon(dir, name, "cat");
+    // `stty raw -echo` lets the ESC markers appear verbatim in the
+    // buffer instead of being munged to `^[` by ECHOCTL.
+    await startDaemon(dir, name, "sh", ["-c", "stty raw -echo; cat"]);
+    await new Promise((r) => setTimeout(r, 150));
 
     await sendData({ name, data: ["hello-send"] });
 
@@ -225,6 +228,90 @@ describe("sendData", () => {
     await expect(
       sendData({ name: "nonexistent", data: ["test"] })
     ).rejects.toThrow("not found or not running");
+  }, 15000);
+
+  // xterm-headless parses bracketed-paste START/END as valid CSI
+  // sequences and absorbs them — they don't appear in the rendered
+  // buffer. To verify the raw bytes that reach the child, we use a
+  // child that dumps its stdin to a file and then read the file.
+  // `stty raw -echo` keeps line discipline from munging control bytes.
+  async function startDumper(dir: string, name: string, dumpFile: string) {
+    await startDaemon(dir, name, "sh", [
+      "-c",
+      `stty raw -echo; cat > ${JSON.stringify(dumpFile)}`,
+    ]);
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  async function waitForDump(dumpFile: string, minBytes: number, timeoutMs: number): Promise<Buffer> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const buf = fs.readFileSync(dumpFile);
+        if (buf.length >= minBytes) return buf;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return fs.existsSync(dumpFile) ? fs.readFileSync(dumpFile) : Buffer.alloc(0);
+  }
+
+  it("paste:true wraps the payload in bracketed-paste markers", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const dump = path.join(dir, "dump.bin");
+    await startDumper(dir, name, dump);
+
+    await sendData({ name, data: ["hello-paste"], paste: true });
+    const received = await waitForDump(dump, "hello-paste".length + 12, 3000);
+    const text = received.toString("utf-8");
+    expect(text).toBe("\x1b[200~hello-paste\x1b[201~");
+  }, 15000);
+
+  it("paste:true wraps a multi-item payload as one bracket pair (not per item)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const dump = path.join(dir, "dump.bin");
+    await startDumper(dir, name, dump);
+
+    await sendData({ name, data: ["line1\n", "line2\n", "line3"], paste: true });
+    const expected = "\x1b[200~line1\nline2\nline3\x1b[201~";
+    const received = await waitForDump(dump, expected.length, 3000);
+    const text = received.toString("utf-8");
+    expect((text.match(/\x1b\[200~/g) ?? []).length).toBe(1);
+    expect((text.match(/\x1b\[201~/g) ?? []).length).toBe(1);
+    expect(text).toBe(expected);
+  }, 15000);
+
+  it("paste:false (default) does not add bracketed-paste markers", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const dump = path.join(dir, "dump.bin");
+    await startDumper(dir, name, dump);
+
+    await sendData({ name, data: ["no-paste"] });
+    const received = await waitForDump(dump, "no-paste".length, 3000);
+    expect(received.toString("utf-8")).toBe("no-paste");
+    expect(received.toString("utf-8")).not.toContain("\x1b[200~");
+    expect(received.toString("utf-8")).not.toContain("\x1b[201~");
+  }, 15000);
+
+  it("paste:true on an empty data array does not emit markers alone", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const dump = path.join(dir, "dump.bin");
+    await startDumper(dir, name, dump);
+
+    // No content → no markers. (Sending nothing shouldn't write a bare
+    // START/END pair to the session.)
+    await sendData({ name, data: [], paste: true });
+    await new Promise((r) => setTimeout(r, 300));
+
+    const received = fs.existsSync(dump) ? fs.readFileSync(dump) : Buffer.alloc(0);
+    expect(received.length).toBe(0);
   }, 15000);
 });
 

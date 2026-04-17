@@ -84,6 +84,7 @@ pty send myserver "hello"                 # send text (no implicit newline)
 pty send myserver $'hello\n'              # send text with newline (shell syntax)
 pty send myserver --seq "git status" --seq key:return  # ordered sequence
 pty send myserver --seq key:ctrl+c        # send control keys
+pty send myserver --paste "$(cat prompt.md)"           # wrap as bracketed paste
 
 pty stats                                 # live metrics for all sessions
 pty stats myserver                        # stats for a specific session

@@ -75,6 +75,7 @@ function usage(): void {
   pty send <name> "text"                   Send text to a session
   pty send <name> --seq "text" --seq key:return  Send an ordered sequence
   pty send <name> --with-delay 0.5 --seq ...     Delay between each --seq item
+  pty send <name> --paste "<big text>"           Wrap payload in bracketed-paste markers
   pty restart <name>                       Restart a session (prompts if running)
   pty restart -y <name>                    Restart without confirmation
   pty events <name>                        Follow events from a session
@@ -410,6 +411,13 @@ async function main(): Promise<void> {
       }
 
       let sendArgs = args.slice(2);
+      // --paste can appear anywhere; pull it out before the rest of the
+      // parsing so its position relative to --seq / text doesn't matter.
+      let paste = false;
+      sendArgs = sendArgs.filter((a) => {
+        if (a === "--paste") { paste = true; return false; }
+        return true;
+      });
       let delaySecs: number | undefined;
       if (sendArgs[0] === "--with-delay") {
         sendArgs = sendArgs.slice(1);
@@ -454,7 +462,12 @@ async function main(): Promise<void> {
       }
 
       const resolvedSendName = await resolveRef(sendName);
-      send({ name: resolvedSendName, data, delayMs: delaySecs != null ? delaySecs * 1000 : undefined });
+      send({
+        name: resolvedSendName,
+        data,
+        delayMs: delaySecs != null ? delaySecs * 1000 : undefined,
+        ...(paste ? { paste: true } : {}),
+      });
       break;
     }
 
