@@ -378,7 +378,12 @@ function renderStatusBar(node: StatusBarNode, rect: Rect, theme: Theme): string 
 }
 
 function renderFooter(node: FooterNode, rect: Rect, theme: Theme): string {
-  return fgColor(theme.fgMu) + writeAt(rect.y + 1, rect.x + 2, node.hints) + RESET;
+  let out = fgColor(theme.fgMu) + writeAt(rect.y + 1, rect.x + 2, node.hints);
+  if (node.right) {
+    const rightWidth = visibleLength(node.right);
+    out += writeAt(rect.y + 1, rect.x + rect.width - rightWidth - 2, node.right);
+  }
+  return out + RESET;
 }
 
 function renderAskBar(

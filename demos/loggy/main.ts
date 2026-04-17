@@ -203,29 +203,12 @@ if (process.stdin.isTTY) {
 }
 process.stdin.resume();
 
-// Reactive render loop, throttled to at most one render per macrotask so
-// a fast-emitting child (e.g., `find /`) doesn't starve the event loop
-// of its chance to service stdin keystrokes. The effect body registers
-// deps explicitly by reading every signal that should trigger a
-// re-render, then schedules renderFrame for the next tick.
-let renderPending = false;
-effect(() => {
-  visibleLogs.get();
-  filter.get();
-  searchQuery.get();
-  searchActive.get();
-  follow.get();
-  selectedIndex.get();
-  scrollOffset.get();
-  childState.get();
-  quitPending.get();
-  if (renderPending) return;
-  renderPending = true;
-  setImmediate(() => {
-    renderPending = false;
-    renderFrame();
-  });
-});
+// Reactive render loop. Deps are auto-registered by reads inside
+// renderFrame. The store's `version` is a debouncedSignal so a
+// firehose of appends coalesces to at most one notification per tick
+// — the effect naturally runs at most once per tick without any
+// render-side throttling.
+effect(() => { renderFrame(); });
 
 process.stdin.on("data", (data: Buffer | string) => {
   const buf = typeof data === "string" ? Buffer.from(data) : data;

@@ -161,7 +161,12 @@ export interface StatusBarNode {
 
 export interface FooterNode {
   type: "footer";
+  /** Left-aligned text. For a single-column footer, pass only this. */
   hints: string;
+  /** Optional right-aligned text. When set, the footer renders two
+   *  columns — hints on the left, this on the right — padded to fill
+   *  the viewport width. */
+  right?: string;
   _rect?: Rect;
 }
 

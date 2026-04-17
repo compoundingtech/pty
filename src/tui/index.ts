@@ -4,7 +4,11 @@
 export { parseKey, type KeyEvent } from "./input.ts";
 
 // Signals
-export { signal, computed, effect, batch, type Signal } from "./signals.ts";
+export {
+  signal, computed, effect, batch,
+  debouncedSignal,
+  type Signal, type Computed, type DebouncedSignal,
+} from "./signals.ts";
 
 // Types
 export type { Cell, Screen, ScreenContext } from "./types.ts";

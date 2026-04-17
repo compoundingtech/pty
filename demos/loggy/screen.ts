@@ -56,36 +56,49 @@ export function buildLoggyScreen(state: ScreenState) {
       const entries = state.visibleLogs.get();
       const viewport = Math.max(1, ctx.rows - 4); // panel top + bottom + footer
 
-      // Follow mode: keep selectedIndex pinned to the last entry so the
-      // scroll region clamps its offset to show the bottom.
-      if (state.follow.get() && entries.length > 0) {
-        const last = entries.length - 1;
-        if (state.selectedIndex.peek() !== last) state.selectedIndex.set(last);
-      }
+      // If follow mode is on, always position the viewport at the bottom
+      // regardless of the stored selectedIndex. We do NOT write to the
+      // signal from inside render — that causes cascading re-renders and
+      // stale-state bugs. Keeping this read-only keeps the render
+      // deterministic; manual scrolling flips follow off in handleKey.
+      const follow = state.follow.get();
+      const last = Math.max(0, entries.length - 1);
+      const effectiveSelected = follow
+        ? last
+        : Math.min(state.selectedIndex.get(), last);
 
       const region = updateScrollRegion(
         {
           offset: state.scrollOffset.get(),
-          selectedIndex: state.selectedIndex.get(),
+          selectedIndex: effectiveSelected,
           totalItems: entries.length,
           viewportHeight: viewport,
         },
         entries.length,
         viewport,
       );
-      // Persist the clamped offset so subsequent ticks don't fight with it
-      if (region.offset !== state.scrollOffset.peek()) state.scrollOffset.set(region.offset);
 
       const title = "loggy — " + state.commandDisplay;
 
+      // When entries is empty we still want the panel at full height —
+      // otherwise layoutPanel shrinks to fit the fixed-height text node
+      // and the panel collapses to one row. Pair the text with a flex
+      // spacer so the panel stays the same size regardless of state.
+      const panelBody = entries.length === 0
+        ? [
+            text("  (waiting for matching output…)", "muted", { dim: true }),
+            canvas(() => {}, {}), // fills remaining height
+          ]
+        : [
+            // selectable is already flex — DO NOT add a sibling flex
+            // spacer here, or the panel's flex budget will be split and
+            // only half the viewport will show log lines.
+            selectable(region, entries, (entry, _i, _selected) =>
+              renderLogLine(entry, follow)),
+          ];
+
       return [
-        panel(title, [
-          entries.length === 0
-            ? text("  (waiting for output…)", "muted", { dim: true })
-            : selectable(region, entries, (entry, _i, _selected) =>
-                renderLogLine(entry, state.follow.get())),
-          canvas(() => {}, {}), // flex spacer
-        ]),
+        panel(title, panelBody),
         renderFooter(state),
       ];
     },
@@ -141,9 +154,10 @@ function renderFooter(state: ScreenState): UINode {
     ? `\u2717 signaled (${child.signal})`
     : `\u25cb exited (code ${child.exitCode ?? "?"})`;
 
-  // footer() is a single dim line anchored to the bottom by the framework's
-  // root layout. We join the two halves with a middle-dot for visual weight.
-  return footer(`${leftText}  \u00b7  ${statusText}`);
+  // Two-column bottom bar: keybindings / search prompt on the left,
+  // child process status right-aligned. Anchored to the bottom by the
+  // framework's root layout.
+  return footer(leftText, statusText);
 }
 
 function marker(letter: string, active: boolean): string {

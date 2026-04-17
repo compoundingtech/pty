@@ -602,6 +602,11 @@ function renderNodeToBuffer(
     }
     case "footer": {
       writeStringBuf(buf, rect.y, rect.x + 1, node.hints, theme.fgMu, null);
+      if (node.right) {
+        const rightWidth = visibleLength(node.right);
+        const plain = node.right.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+        writeStringBuf(buf, rect.y, rect.x + rect.width - rightWidth - 2, plain, theme.fgMu, null);
+      }
       break;
     }
     case "askBar": {

@@ -1,21 +1,19 @@
 // In-memory log store + pure filter/search over entries.
 //
-// Design notes
-// ------------
-// Backing storage is a single mutable array (`buffer`). We never allocate
-// a new array on append — that would be O(n) per append and for a
-// high-volume source like `find /` quickly drags the event loop to a
-// halt. Instead we `.push()` (amortized O(1)) and do a bulk
-// `.splice(0, …)` only when we've drifted past `scrollbackLimit * 2`,
-// which amortizes ring-buffer maintenance to O(1) per append.
+// Design
+// ------
+// Backing storage is a single mutable array (`buffer`). Append pushes
+// onto it (amortized O(1)) and triggers a DEBOUNCED change notification
+// via `debouncedSignal` — writers mark the store dirty as often as they
+// like; subscribers only hear about it once per `setImmediate` tick.
+// That keeps a firehose child from saturating the reactive graph and
+// gives the TUI a predictable at-most-one-render-per-tick cadence
+// without the render layer needing to know anything about throttling.
 //
-// Reactivity is a `version` signal bumped on each mutation. `entries.get`
-// registers a dep on `version` so the effect-driven render loop re-runs
-// when new lines arrive, without allocating a fresh array each time.
-// `applyView` is a pure function over a snapshot — unit-testable without
-// the store.
+// `applyView` is a pure function over an array snapshot so it's easy
+// to unit-test.
 
-import { signal, stripAnsi } from "../../src/tui/index.ts";
+import { debouncedSignal, stripAnsi, type DebouncedSignal } from "../../src/tui/index.ts";
 
 export type LogSource = "out" | "err";
 
@@ -27,21 +25,31 @@ export interface LogEntry {
   source: LogSource;
   /** Raw line, possibly containing ANSI escape sequences. No trailing \n. */
   line: string;
+  /** Lazy cache of `stripAnsi(line).toLowerCase()` — materialized on
+   *  first search to avoid redoing the work on every render. */
+  _plainLower?: string;
 }
 
 export type FilterMode = "both" | "out" | "err";
 
 export interface ReadableEntries {
   /** Returns the current window of entries (at most `scrollbackLimit`).
-   *  Registers a dep on the underlying version signal so reactive effects
-   *  re-run on append. Returned array MUST NOT be mutated by callers. */
+   *  Registers a dep on the underlying debounced signal so reactive
+   *  effects re-run on append (coalesced to once per tick). Returned
+   *  array MUST NOT be mutated by callers. */
   get(): readonly LogEntry[];
+  /** Same as `get()` but without subscribing. Safe outside effects. */
+  peek(): readonly LogEntry[];
 }
 
 export interface LogStore {
   readonly entries: ReadableEntries;
   append(source: LogSource, line: string, now?: number): LogEntry;
   clear(): void;
+  /** Force the debounced change notification to fire synchronously.
+   *  Useful in tests that want to observe post-append state without
+   *  waiting a tick. */
+  flush(): void;
   readonly scrollbackLimit: number;
 }
 
@@ -49,45 +57,51 @@ export function createStore(scrollbackLimit: number): LogStore {
   if (scrollbackLimit <= 0) throw new Error("scrollbackLimit must be positive");
 
   const buffer: LogEntry[] = [];
-  const version = signal(0);
+  const version: DebouncedSignal = debouncedSignal();
   let nextSeq = 0;
   const compactAt = scrollbackLimit * 2;
+
+  function snapshot(): readonly LogEntry[] {
+    if (buffer.length > scrollbackLimit) {
+      return buffer.slice(buffer.length - scrollbackLimit);
+    }
+    return buffer;
+  }
 
   return {
     scrollbackLimit,
     entries: {
       get(): readonly LogEntry[] {
-        version.get(); // register dep so effects re-fire on mutation
-        // Trim the viewer's window to the scrollback size without
-        // compacting the underlying buffer on every read.
-        if (buffer.length > scrollbackLimit) {
-          return buffer.slice(buffer.length - scrollbackLimit);
-        }
-        return buffer;
+        version.get(); // subscribe (coalesced) — triggers at-most-once-per-tick
+        return snapshot();
+      },
+      peek(): readonly LogEntry[] {
+        return snapshot();
       },
     },
     append(source, line, now = Date.now()) {
       const entry: LogEntry = { seq: nextSeq++, ts: now, source, line };
       buffer.push(entry);
-      // Amortized O(1): only compact when we've drifted past 2x the
-      // scrollback limit. Single bulk splice, not one-shift-per-append.
       if (buffer.length >= compactAt) {
         buffer.splice(0, buffer.length - scrollbackLimit);
       }
-      version.set(version.peek() + 1);
+      version.bump();
       return entry;
     },
     clear() {
       buffer.length = 0;
-      version.set(version.peek() + 1);
+      version.bump();
+    },
+    flush() {
+      version.flush();
     },
   };
 }
 
 /** Apply the active filter + search to a list of entries. Pure function.
- *  Search is case-insensitive substring match against the *plain text* of
- *  the line (ANSI stripped), so users can search for literal text that
- *  might be wrapped in color codes. */
+ *  Search is case-insensitive substring match against the *plain text*
+ *  of the line (ANSI stripped, lowercased), cached on the entry so the
+ *  expensive regex doesn't re-run per render. */
 export function applyView(
   entries: readonly LogEntry[],
   filter: FilterMode,
@@ -99,7 +113,13 @@ export function applyView(
     if (filter === "out" && entry.source !== "out") continue;
     if (filter === "err" && entry.source !== "err") continue;
     if (q) {
-      const plain = stripAnsi(entry.line).toLowerCase();
+      // Cache the plain-text form; stripAnsi + toLowerCase is the hot
+      // path for searches over a large scrollback.
+      let plain = entry._plainLower;
+      if (plain === undefined) {
+        plain = stripAnsi(entry.line).toLowerCase();
+        entry._plainLower = plain;
+      }
       if (!plain.includes(q)) continue;
     }
     result.push(entry);

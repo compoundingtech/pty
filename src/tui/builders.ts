@@ -215,8 +215,8 @@ export function statusBar(left: string, right: string): StatusBarNode {
   return { type: "statusBar", left, right };
 }
 
-export function footer(hints: string): FooterNode {
-  return { type: "footer", hints };
+export function footer(hints: string, right?: string): FooterNode {
+  return right == null ? { type: "footer", hints } : { type: "footer", hints, right };
 }
 
 export function askBar(
