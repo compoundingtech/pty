@@ -40,6 +40,21 @@ const removed = await gc();
 console.log(`Cleaned up ${removed.length} sessions`);
 ```
 
+### `pruneOrphanLayoutTags(): Promise<PrunedTagResult[]>`
+
+Walks running sessions and removes tag keys of the form `:l<pid>-<rand>` whose encoded PID is no longer alive. `pty gc` calls this after removing exited sessions.
+
+```typescript
+interface PrunedTagResult {
+  name: string;
+  removedKeys: string[];
+}
+```
+
+### `isReservedTagKey(key: string): boolean`
+
+Returns `true` for pty's internal bookkeeping keys (`ptyfile`, `ptyfile.session`, `ptyfile.tags`, `supervisor.status`, `strategy`) and for any key starting with `:` (the tool-owned-tag convention). Downstream tools should hide reserved keys from user-facing listings by default but still allow writes — set and unset them as needed.
+
 ### `cleanupSocket(name: string): void`
 
 Remove a session's `.sock` and `.pid` files.

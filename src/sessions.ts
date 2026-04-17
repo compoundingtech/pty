@@ -250,6 +250,56 @@ export async function gc(): Promise<string[]> {
   return exited.map((s) => s.name);
 }
 
+/**
+ * Layout tool tag keys follow `:l<pid>-<rand>` where the PID is the
+ * pty-layout process that owns the view. When that process dies the
+ * tag becomes an orphan. Same shape as the `:` reserved prefix
+ * documented in `isReservedTagKey`.
+ */
+const ORPHAN_LAYOUT_TAG_RE = /^:l(\d+)-[a-z0-9]+$/;
+
+export interface PrunedTagResult {
+  name: string;
+  removedKeys: string[];
+}
+
+/**
+ * Walk **running** sessions and remove `:l<pid>-<rand>` tag keys whose
+ * encoded PID no longer exists. Called by `pty gc` to clean up after a
+ * pty-layout process that exited without clearing its tags.
+ *
+ * Returns a list of sessions that had at least one tag pruned, and
+ * which keys were removed from each.
+ */
+export async function pruneOrphanLayoutTags(): Promise<PrunedTagResult[]> {
+  const sessions = await listSessions();
+  const results: PrunedTagResult[] = [];
+  for (const s of sessions) {
+    if (s.status !== "running") continue;
+    const tags = s.metadata?.tags;
+    if (!tags) continue;
+    const toRemove: string[] = [];
+    for (const key of Object.keys(tags)) {
+      const match = ORPHAN_LAYOUT_TAG_RE.exec(key);
+      if (!match) continue;
+      const pid = parseInt(match[1], 10);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        toRemove.push(key);
+        continue;
+      }
+      if (!isProcessAlive(pid)) toRemove.push(key);
+    }
+    if (toRemove.length === 0) continue;
+    try {
+      updateTags(s.name, {}, toRemove);
+      results.push({ name: s.name, removedKeys: toRemove });
+    } catch {
+      // Session metadata vanished between listing and update — ignore.
+    }
+  }
+  return results;
+}
+
 function readPid(name: string): number | null {
   try {
     const content = fs.readFileSync(getPidPath(name), "utf-8").trim();

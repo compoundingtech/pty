@@ -3,10 +3,11 @@
 
 // Session management
 export {
-  listSessions, getSession, gc, validateName, updateTags, setDisplayName,
+  listSessions, getSession, gc, pruneOrphanLayoutTags,
+  validateName, updateTags, setDisplayName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
-  type SessionInfo, type SessionMetadata,
+  type SessionInfo, type SessionMetadata, type PrunedTagResult,
 } from "./sessions.ts";
 
 // Session creation
@@ -43,7 +44,7 @@ export {
 export { readPtyFile, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
 
 // Tag filter helpers (used by --filter-tag; shared with pty-relay)
-export { extractFilterTags, matchesAllTags } from "./tags.ts";
+export { extractFilterTags, matchesAllTags, isReservedTagKey } from "./tags.ts";
 
 // Keys
 export { resolveKey, parseSeqValue } from "./keys.ts";

@@ -44,3 +44,35 @@ export function matchesAllTags(
   }
   return true;
 }
+
+/**
+ * Keys that pty itself treats as internal bookkeeping. These drive
+ * dedicated markers (`[permanent]`, `[failed]`) or wire up the
+ * supervisor / ptyfile plumbing — they're visible in `pty list --tags`
+ * but hidden from the default listing.
+ */
+const EXACT_RESERVED = new Set([
+  "ptyfile",
+  "ptyfile.session",
+  "ptyfile.tags",
+  "supervisor.status",
+  "strategy",
+]);
+
+/**
+ * Returns `true` if the tag key is "reserved" — either one of pty's
+ * internal bookkeeping keys (see above) or any key starting with `:`.
+ *
+ * The `:` prefix is a convention for **tool-owned tags** (e.g.,
+ * pty-layout stamps `:l<pid>-<rand>` keys on sessions it owns a view
+ * of). Consumers should hide reserved keys from user-facing listings
+ * by default but still allow writes — tools need to set and unset them.
+ *
+ * Exposed on `@myobie/pty/client` so downstream tools (pty-relay,
+ * pty-layout) can use the same rule without duplicating deny-lists.
+ */
+export function isReservedTagKey(key: string): boolean {
+  if (EXACT_RESERVED.has(key)) return true;
+  if (key.startsWith(":")) return true;
+  return false;
+}

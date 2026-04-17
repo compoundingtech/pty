@@ -199,6 +199,25 @@ describe("session tags", () => {
     expect(output).toContain("#strategy=permanent");
   }, 15000);
 
+  it("pty list hides `:` tool-owned tags by default, shows them with --tags", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "cat", [], {
+      role: "web",
+      ":l1234-abc": "1",
+      ":layout": "grid",
+    });
+
+    const defaultOutput = runCli(dir, "list");
+    expect(defaultOutput).toContain("#role=web");
+    expect(defaultOutput).not.toContain(":l1234-abc");
+    expect(defaultOutput).not.toContain(":layout");
+
+    const tagsOutput = runCli(dir, "list", "--tags");
+    expect(tagsOutput).toContain("#:l1234-abc=1");
+    expect(tagsOutput).toContain("#:layout=grid");
+  }, 15000);
+
   it("pty list --filter-tag filters text output too", async () => {
     const dir = makeSessionDir();
     const matchName = uniqueName();

@@ -10,7 +10,7 @@ import {
   cleanupAll, getSession, getSessionDir, type SessionInfo,
 } from "../sessions.ts";
 import { spawnDaemon } from "../spawn.ts";
-import { matchesAllTags } from "../tags.ts";
+import { matchesAllTags, isReservedTagKey } from "../tags.ts";
 import {
   app, screen, signal, computed, batch,
   text, panel, footer,
@@ -267,14 +267,12 @@ const totalItems = computed(() => {
 // List screen
 // ============================================================
 
-/** Render user-facing tags as a " #key=value" string. Hides internal
- *  bookkeeping keys that already have dedicated markers or aren't meaningful. */
+/** Render user-facing tags as a " #key=value" string. Hides reserved
+ *  keys (pty-internal bookkeeping + any key starting with `:`, the
+ *  tool-owned-tag convention). */
 function renderTagsInline(tags: Record<string, string> | undefined): string {
   if (!tags) return "";
-  const entries = Object.entries(tags).filter(([k]) =>
-    k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags" &&
-    k !== "supervisor.status" && k !== "strategy",
-  );
+  const entries = Object.entries(tags).filter(([k]) => !isReservedTagKey(k));
   return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
 }
 

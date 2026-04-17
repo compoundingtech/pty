@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractFilterTags, matchesAllTags } from "../src/tags.ts";
+import { extractFilterTags, matchesAllTags, isReservedTagKey } from "../src/tags.ts";
 
 describe("extractFilterTags", () => {
   it("returns empty object when no --filter-tag flags present", () => {
@@ -56,5 +56,33 @@ describe("matchesAllTags", () => {
   it("values must match exactly", () => {
     expect(matchesAllTags({ role: "web" }, { role: "Web" })).toBe(false);
     expect(matchesAllTags({ role: "web" }, { role: "" })).toBe(false);
+  });
+});
+
+describe("isReservedTagKey", () => {
+  it("flags pty's internal bookkeeping keys", () => {
+    expect(isReservedTagKey("ptyfile")).toBe(true);
+    expect(isReservedTagKey("ptyfile.session")).toBe(true);
+    expect(isReservedTagKey("ptyfile.tags")).toBe(true);
+    expect(isReservedTagKey("supervisor.status")).toBe(true);
+    expect(isReservedTagKey("strategy")).toBe(true);
+  });
+
+  it("flags any key starting with `:` (tool-owned convention)", () => {
+    expect(isReservedTagKey(":l12345-abc")).toBe(true);
+    expect(isReservedTagKey(":layout")).toBe(true);
+    expect(isReservedTagKey(":x")).toBe(true);
+  });
+
+  it("does not flag ordinary user tag keys", () => {
+    expect(isReservedTagKey("role")).toBe(false);
+    expect(isReservedTagKey("env")).toBe(false);
+    expect(isReservedTagKey("owner")).toBe(false);
+    expect(isReservedTagKey("ptyfile-extra")).toBe(false); // not an exact match
+    expect(isReservedTagKey("strategy.extra")).toBe(false);
+  });
+
+  it("empty string is not reserved", () => {
+    expect(isReservedTagKey("")).toBe(false);
   });
 });

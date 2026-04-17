@@ -10,6 +10,7 @@ import {
   listSessions,
   getSession,
   gc,
+  pruneOrphanLayoutTags,
   cleanupAll,
   cleanupSocket,
   validateName,
@@ -27,7 +28,7 @@ import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import { EventFollower, EventWriter, EventType, readRecentEvents, formatEvent } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
-import { extractFilterTags as extractFilterTagsImpl, matchesAllTags } from "./tags.ts";
+import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
@@ -1160,14 +1161,14 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
   const running = sessions.filter((s) => s.status === "running");
   const exited = sessions.filter((s) => s.status === "exited");
 
-  // Render tags as hashtags. When `showAll` is false, hide internal bookkeeping
-  // keys (ptyfile*, supervisor.status) since those have dedicated markers or
-  // aren't meaningful to users. `--tags` (showAll=true) includes everything.
+  // Render tags as hashtags. When `showAll` is false, hide reserved keys
+  // (pty-internal bookkeeping like `ptyfile*`/`strategy`, plus any key
+  // starting with `:` which is the tool-owned-tag convention — e.g.,
+  // pty-layout's `:l<pid>-<rand>` view membership markers). `--tags`
+  // (showAll=true) shows everything.
   const renderTags = (tags: Record<string, string> | undefined, showAll: boolean): string => {
     if (!tags) return "";
-    const entries = Object.entries(tags).filter(([k]) =>
-      showAll || (k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags" && k !== "supervisor.status" && k !== "strategy"),
-    );
+    const entries = Object.entries(tags).filter(([k]) => showAll || !isReservedTagKey(k));
     return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
   };
 
@@ -1586,16 +1587,29 @@ async function cmdRm(name: string): Promise<void> {
 
 async function cmdGc(): Promise<void> {
   const removed = await gc();
-
-  if (removed.length === 0) {
-    console.log("No exited sessions to clean up.");
-    return;
-  }
+  const prunedTags = await pruneOrphanLayoutTags();
 
   for (const name of removed) {
     console.log(`Removed: ${name}`);
   }
-  console.log(`Cleaned up ${removed.length} exited session${removed.length === 1 ? "" : "s"}.`);
+  for (const { name, removedKeys } of prunedTags) {
+    console.log(`Pruned orphan tags on ${name}: ${removedKeys.map((k) => `#${k}`).join(" ")}`);
+  }
+
+  const totalTags = prunedTags.reduce((sum, r) => sum + r.removedKeys.length, 0);
+  if (removed.length === 0 && totalTags === 0) {
+    console.log("Nothing to clean up.");
+    return;
+  }
+
+  const parts: string[] = [];
+  if (removed.length > 0) {
+    parts.push(`${removed.length} exited session${removed.length === 1 ? "" : "s"}`);
+  }
+  if (totalTags > 0) {
+    parts.push(`${totalTags} orphan tag${totalTags === 1 ? "" : "s"}`);
+  }
+  console.log(`Cleaned up ${parts.join(" and ")}.`);
 }
 
 async function cmdSupervisorStart(): Promise<void> {
