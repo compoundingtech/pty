@@ -313,13 +313,14 @@ See **[docs/testing.md](docs/testing.md)** for the full API reference, key names
 
 > **Alpha** — the TUI framework API is unstable and will change. Use it for experiments, not production.
 
-The `demos/` directory has three working apps built with the framework:
+The `demos/` directory has four working apps built with the framework:
 
 - **file-browser** — two-pane directory tree + file preview with soft-wrap and markdown highlighting
 - **reminders** — full CRUD backed by `.md` files, three views (list, board, calendar), overlays
 - **agent-teams** — live dashboard of a simulated AI agent hierarchy with real-time updates
+- **loggy** — live log viewer that wraps a command, captures stdout and stderr as separate streams (via pipes, not a PTY), and renders them with interactive filter (`o`/`e`/`b`), search (`/`), and follow-mode (`f`). Optional tee to `--out` / `--err` / `--log` files.
 
-Run them with `node --experimental-strip-types demos/{name}/main.ts`. Each demo includes unit tests and PTY integration tests that exercise the testing library.
+Run them with `node --experimental-strip-types demos/{name}/main.ts` (or `./demos/run <name>`). Each demo includes unit tests and PTY integration tests that exercise the testing library.
 
 ## Skill Reference
 
