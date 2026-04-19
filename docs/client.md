@@ -31,18 +31,25 @@ Returns the session directory path (`PTY_SESSION_DIR` env var or `~/.local/state
 
 Returns the Unix socket path for a session.
 
-### `gc(): Promise<string[]>`
+### `gc(opts?: { dryRun?: boolean }): Promise<string[]>`
 
-Remove all exited sessions. Returns the names of removed sessions.
+Remove all exited **and** vanished sessions. Returns the names of removed sessions. Pass `{ dryRun: true }` to walk the same set without deleting anything — useful for preview UIs.
 
 ```typescript
 const removed = await gc();
 console.log(`Cleaned up ${removed.length} sessions`);
+
+const would = await gc({ dryRun: true });
+console.log(`Would clean up: ${would.join(", ")}`);
 ```
 
-### `pruneOrphanLayoutTags(): Promise<PrunedTagResult[]>`
+### `isGone(status): boolean`
 
-Walks running sessions and removes tag keys of the form `:l<pid>-<rand>` whose encoded PID is no longer alive. `pty gc` calls this after removing exited sessions.
+Semantic helper — returns `true` when `status` is `"exited"` or `"vanished"` (i.e. the session has metadata on disk but no live daemon). Use this in branches that mean "there's a record we might want to reuse" rather than the hand-rolled two-branch check.
+
+### `pruneOrphanLayoutTags(opts?: { dryRun?: boolean }): Promise<PrunedTagResult[]>`
+
+Walks running sessions and removes tag keys of the form `:l<pid>-<rand>` whose encoded PID is no longer alive. `pty gc` calls this after removing exited sessions. Pass `{ dryRun: true }` to preview without mutating metadata.
 
 ```typescript
 interface PrunedTagResult {
@@ -70,7 +77,10 @@ interface SessionInfo {
   name: string;
   socketPath: string;
   pid: number | null;
-  status: "running" | "exited";
+  // "running"  — daemon alive, socket reachable.
+  // "exited"   — daemon wrote an exit record before shutting down.
+  // "vanished" — daemon is gone with no exit record (SIGKILL / OOM / crash).
+  status: "running" | "exited" | "vanished";
   metadata: SessionMetadata | null;
 }
 

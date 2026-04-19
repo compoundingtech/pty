@@ -86,8 +86,26 @@ export interface SessionInfo {
   name: string;
   socketPath: string;
   pid: number | null;
-  status: "running" | "exited";
+  /**
+   * `running`  — daemon process is alive and its socket is reachable.
+   * `exited`   — daemon wrote an exit record (`exitCode` / `exitedAt`) before
+   *              shutting down; we know how it ended.
+   * `vanished` — the daemon process is gone but no exit record was written.
+   *              Most commonly caused by SIGKILL / OOM / power-loss, where the
+   *              daemon had no chance to finalise metadata. Same reapability
+   *              as `exited` (still cleaned up by `pty gc`), but the exit
+   *              details are forever unknown.
+   */
+  status: "running" | "exited" | "vanished";
   metadata: SessionMetadata | null;
+}
+
+/** Semantic helper: session has metadata but no live daemon (either `exited`
+ *  or `vanished`). Use this wherever the branch is "there's a record and we
+ *  might want to re-use cwd/tags/displayName"; reserve `=== "exited"` for
+ *  branches that specifically care about clean-exit details. */
+export function isGone(status: SessionInfo["status"]): boolean {
+  return status === "exited" || status === "vanished";
 }
 
 export function writeMetadata(name: string, metadata: SessionMetadata): void {
@@ -196,20 +214,29 @@ export async function listSessions(): Promise<SessionInfo[]> {
       continue;
     }
 
-    // Auto-clean dead sessions older than 24h
-    if (metadata.exitedAt) {
-      const exitedAt = new Date(metadata.exitedAt).getTime();
-      if (Date.now() - exitedAt > DEAD_SESSION_TTL_MS) {
+    // Auto-clean dead sessions older than 24h. For cleanly-exited sessions
+    // this keys off exitedAt; for vanished sessions (no exit record written)
+    // fall back to createdAt so they don't accumulate indefinitely. A session
+    // with a missing daemon and a metadata file older than 24h is not coming
+    // back regardless of why it died.
+    const ageAnchor = metadata.exitedAt ?? metadata.createdAt;
+    if (ageAnchor) {
+      const anchoredAt = new Date(ageAnchor).getTime();
+      if (Date.now() - anchoredAt > DEAD_SESSION_TTL_MS) {
         cleanupAll(name);
         continue;
       }
     }
 
+    // Vanished = dead daemon with no exit record. SIGKILL / OOM / crash.
+    const vanished =
+      metadata.exitedAt == null && metadata.exitCode == null;
+
     sessions.push({
       name,
       socketPath: getSocketPath(name),
       pid: null,
-      status: "exited",
+      status: vanished ? "vanished" : "exited",
       metadata,
     });
   }
@@ -240,14 +267,16 @@ export async function allRefs(): Promise<Set<string>> {
   return refs;
 }
 
-/** Remove all exited sessions. Returns the names of removed sessions. */
-export async function gc(): Promise<string[]> {
+/** Remove all exited **and** vanished sessions. Returns the names of removed
+ *  sessions. `dryRun: true` performs the same walk but doesn't delete — useful
+ *  for preview UIs. */
+export async function gc(opts: { dryRun?: boolean } = {}): Promise<string[]> {
   const sessions = await listSessions();
-  const exited = sessions.filter((s) => s.status === "exited");
-  for (const s of exited) {
-    cleanupAll(s.name);
+  const gone = sessions.filter((s) => isGone(s.status));
+  if (!opts.dryRun) {
+    for (const s of gone) cleanupAll(s.name);
   }
-  return exited.map((s) => s.name);
+  return gone.map((s) => s.name);
 }
 
 /**
@@ -269,9 +298,12 @@ export interface PrunedTagResult {
  * pty-layout process that exited without clearing its tags.
  *
  * Returns a list of sessions that had at least one tag pruned, and
- * which keys were removed from each.
+ * which keys were removed from each. `dryRun: true` performs the same
+ * walk but doesn't call `updateTags`.
  */
-export async function pruneOrphanLayoutTags(): Promise<PrunedTagResult[]> {
+export async function pruneOrphanLayoutTags(
+  opts: { dryRun?: boolean } = {},
+): Promise<PrunedTagResult[]> {
   const sessions = await listSessions();
   const results: PrunedTagResult[] = [];
   for (const s of sessions) {
@@ -290,12 +322,15 @@ export async function pruneOrphanLayoutTags(): Promise<PrunedTagResult[]> {
       if (!isProcessAlive(pid)) toRemove.push(key);
     }
     if (toRemove.length === 0) continue;
-    try {
-      updateTags(s.name, {}, toRemove);
-      results.push({ name: s.name, removedKeys: toRemove });
-    } catch {
-      // Session metadata vanished between listing and update — ignore.
+    if (!opts.dryRun) {
+      try {
+        updateTags(s.name, {}, toRemove);
+      } catch {
+        // Session metadata disappeared between listing and update — ignore.
+        continue;
+      }
     }
+    results.push({ name: s.name, removedKeys: toRemove });
   }
   return results;
 }

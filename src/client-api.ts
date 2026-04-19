@@ -3,7 +3,7 @@
 
 // Session management
 export {
-  listSessions, getSession, gc, pruneOrphanLayoutTags,
+  listSessions, getSession, gc, pruneOrphanLayoutTags, isGone,
   validateName, updateTags, setDisplayName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
@@ -45,6 +45,10 @@ export { readPtyFile, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
 
 // Tag filter helpers (used by --filter-tag; shared with pty-relay)
 export { extractFilterTags, matchesAllTags, isReservedTagKey } from "./tags.ts";
+
+// Duration parse/format — used by `pty list --older-than/--newer-than`,
+// available here so downstream tools can accept the same grammar.
+export { parseDuration, formatDuration } from "./duration.ts";
 
 // Keys
 export { resolveKey, parseSeqValue } from "./keys.ts";

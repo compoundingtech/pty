@@ -185,4 +185,82 @@ describe("pty gc", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("Nothing to clean up.");
   }, 15000);
+
+  it("--dry-run previews exited-session removal without deleting", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "true");
+    await new Promise((r) => setTimeout(r, 1000));
+
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+
+    const dry = runCli(dir, "gc", "--dry-run");
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toContain(`Would remove: ${name}`);
+    expect(dry.stdout).toContain("Dry run");
+    // Metadata still on disk after dry-run.
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+
+    // And the real gc then actually removes it.
+    const real = runCli(dir, "gc");
+    expect(real.status).toBe(0);
+    expect(real.stdout).toContain(`Removed: ${name}`);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(false);
+  }, 15000);
+
+  it("--dry-run previews orphan tag pruning without mutating metadata", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const deadPid = findDeadPid();
+    const tagKey = `:l${deadPid}-abc`;
+
+    await startDaemon(dir, name, "cat", [], { [tagKey]: "1" });
+    expect(readMeta(dir, name).tags[tagKey]).toBe("1");
+
+    const dry = runCli(dir, "gc", "--dry-run");
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toContain(`Would prune orphan tags on ${name}: #${tagKey}`);
+    // Tag is still there after dry-run.
+    expect(readMeta(dir, name).tags[tagKey]).toBe("1");
+
+    // And a real gc then actually removes it.
+    const real = runCli(dir, "gc");
+    expect(real.status).toBe(0);
+    expect(real.stdout).toContain(`Pruned orphan tags on ${name}: #${tagKey}`);
+    // The pruned key was the only tag on the session, so `tags` is cleared
+    // entirely by updateTags — either form proves the orphan is gone.
+    expect(readMeta(dir, name).tags?.[tagKey]).toBeUndefined();
+  }, 15000);
+
+  it("-n is accepted as an alias for --dry-run", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "true");
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const result = runCli(dir, "gc", "-n");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Would remove: ${name}`);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+  }, 15000);
+
+  it("reaps vanished sessions (dead PID, no exit record)", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    // Simulate a vanished session: metadata file with no exitedAt/exitCode
+    // and no pid/sock files. listSessions will infer status=vanished.
+    const metaPath = path.join(dir, `${name}.json`);
+    fs.writeFileSync(metaPath, JSON.stringify({
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      cwd: os.tmpdir(),
+      createdAt: new Date().toISOString(),
+    }));
+
+    const result = runCli(dir, "gc");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed: ${name}`);
+    expect(fs.existsSync(metaPath)).toBe(false);
+  }, 10000);
 });

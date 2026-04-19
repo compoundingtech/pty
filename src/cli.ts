@@ -11,6 +11,7 @@ import {
   getSession,
   gc,
   pruneOrphanLayoutTags,
+  isGone,
   cleanupAll,
   cleanupSocket,
   validateName,
@@ -29,6 +30,7 @@ import { EventFollower, EventWriter, EventType, readRecentEvents, formatEvent } 
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
+import { parseDuration, formatDuration } from "./duration.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
@@ -530,10 +532,53 @@ async function main(): Promise<void> {
     case "ls": {
       const listArgs = args.slice();
       const listFilterTags = extractFilterTags(listArgs);
-      const jsonFlag = listArgs.includes("--json");
-      const tagsFlag = listArgs.includes("--tags");
-      const remoteFlag = listArgs.includes("--remote");
-      await cmdList(jsonFlag, tagsFlag, remoteFlag, listFilterTags);
+
+      // Consume optional flag+value pairs (--status / --older-than / --newer-than)
+      // in a single pass so they can appear in any order. Presence checks for
+      // boolean flags happen after this loop.
+      let statusFilter: "running" | "exited" | "vanished" | null = null;
+      let olderThanMs: number | null = null;
+      let newerThanMs: number | null = null;
+      const consumed = new Set<number>();
+      for (let i = 1; i < listArgs.length; i++) {
+        const arg = listArgs[i];
+        const val = listArgs[i + 1];
+        if (arg === "--status") {
+          if (val !== "running" && val !== "exited" && val !== "vanished") {
+            console.error(`--status expects one of: running, exited, vanished`);
+            process.exit(1);
+          }
+          statusFilter = val;
+          consumed.add(i); consumed.add(i + 1);
+          i++;
+        } else if (arg === "--older-than" || arg === "--newer-than") {
+          const parsed = val == null ? null : parseDuration(val);
+          if (parsed == null) {
+            console.error(`${arg} expects a duration like 30s, 5m, 2h, 1d`);
+            process.exit(1);
+          }
+          if (arg === "--older-than") olderThanMs = parsed;
+          else newerThanMs = parsed;
+          consumed.add(i); consumed.add(i + 1);
+          i++;
+        }
+      }
+      const remainingArgs = listArgs.filter((_, i) => !consumed.has(i));
+
+      const jsonFlag = remainingArgs.includes("--json");
+      const tagsFlag = remainingArgs.includes("--tags");
+      const remoteFlag = remainingArgs.includes("--remote");
+      const summaryFlag = remainingArgs.includes("--summary");
+      await cmdList({
+        json: jsonFlag,
+        showTags: tagsFlag,
+        remote: remoteFlag,
+        filterTags: listFilterTags,
+        statusFilter,
+        olderThanMs,
+        newerThanMs,
+        summary: summaryFlag,
+      });
       break;
     }
 
@@ -579,7 +624,8 @@ async function main(): Promise<void> {
     }
 
     case "gc": {
-      await cmdGc();
+      const dryRun = args.slice(1).some((a) => a === "--dry-run" || a === "-n");
+      await cmdGc(dryRun);
       break;
     }
 
@@ -885,9 +931,9 @@ async function cmdRun(
 
   // Clean up any dead session with the same name, but preserve cwd and tags
   // so that `run -a` re-creates the session in the original directory with original tags.
-  const previousCwd = session?.status === "exited" ? session.metadata?.cwd : undefined;
-  const previousTags = session?.status === "exited" ? session.metadata?.tags : undefined;
-  if (session?.status === "exited") {
+  const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
+  const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
+  if (session && isGone(session.status)) {
     cleanupAll(name);
   }
 
@@ -897,7 +943,7 @@ async function cmdRun(
     // If the session had a previous displayName (e.g., it was renamed before
     // exiting), prefer preserving it over the fresh auto-generated label so
     // `pty run -a` re-creates the session feeling-identical to the last one.
-    const prevDisplayName = session?.status === "exited" ? session.metadata?.displayName : undefined;
+    const prevDisplayName = session && isGone(session.status) ? session.metadata?.displayName : undefined;
     const displayNameOpt = displayName ?? prevDisplayName;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
@@ -1096,14 +1142,15 @@ async function cmdPeekWait(name: string, patterns: string[], timeoutSec: number,
 }
 
 async function cmdPeek(name: string, follow: boolean, plain: boolean, full = false): Promise<void> {
-  // Check if session is exited — fall back to saved lastLines
+  // Dead daemon (cleanly exited or vanished) — fall back to saved lastLines.
   const session = await getSession(name);
-  if (session?.status === "exited") {
+  if (session && isGone(session.status)) {
     const meta = session.metadata;
     if (meta?.lastLines && meta.lastLines.length > 0) {
       process.stdout.write(meta.lastLines.join("\n") + "\n");
     } else {
-      console.error(`Session "${name}" has exited with no saved output.`);
+      const verb = session.status === "vanished" ? "vanished" : "exited";
+      console.error(`Session "${name}" has ${verb} with no saved output.`);
     }
     return;
   }
@@ -1118,10 +1165,49 @@ async function cmdPeek(name: string, follow: boolean, plain: boolean, full = fal
   });
 }
 
-async function cmdList(json = false, showTags = false, remote = false, filterTags: Record<string, string> = {}): Promise<void> {
+interface ListOptions {
+  json?: boolean;
+  showTags?: boolean;
+  remote?: boolean;
+  filterTags?: Record<string, string>;
+  statusFilter?: "running" | "exited" | "vanished" | null;
+  olderThanMs?: number | null;
+  newerThanMs?: number | null;
+  summary?: boolean;
+}
+
+async function cmdList(opts: ListOptions = {}): Promise<void> {
+  const {
+    json = false,
+    showTags = false,
+    remote = false,
+    filterTags = {},
+    statusFilter = null,
+    olderThanMs = null,
+    newerThanMs = null,
+    summary = false,
+  } = opts;
+
   let sessions = await listSessions();
   if (Object.keys(filterTags).length > 0) {
     sessions = sessions.filter((s) => matchesAllTags(s.metadata?.tags, filterTags));
+  }
+  if (statusFilter) {
+    sessions = sessions.filter((s) => s.status === statusFilter);
+  }
+  if (olderThanMs != null || newerThanMs != null) {
+    const now = Date.now();
+    sessions = sessions.filter((s) => {
+      // Anchor age on exitedAt when available (true exit), else createdAt.
+      // Running sessions have no exit yet, so use createdAt. Missing
+      // metadata entirely means we can't filter on age — include by default.
+      const anchor = s.metadata?.exitedAt ?? s.metadata?.createdAt;
+      if (!anchor) return olderThanMs == null && newerThanMs == null;
+      const ageMs = now - new Date(anchor).getTime();
+      if (olderThanMs != null && ageMs < olderThanMs) return false;
+      if (newerThanMs != null && ageMs > newerThanMs) return false;
+      return true;
+    });
   }
 
   // Fetch relay hosts if --remote
@@ -1147,7 +1233,49 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
     } catch {}
   }
 
+  // Build the summary payload — used by both --json --summary and the
+  // human-facing --summary rendering below. Oldest/newest are picked from
+  // the filtered `sessions` so they match whatever the caller narrowed to.
+  const buildSummary = () => {
+    const byStatus: Record<string, number> = {
+      running: 0, exited: 0, vanished: 0,
+    };
+    for (const s of sessions) byStatus[s.status] = (byStatus[s.status] ?? 0) + 1;
+
+    let oldest: SessionInfo | null = null;
+    let newest: SessionInfo | null = null;
+    let oldestTs = Infinity;
+    let newestTs = -Infinity;
+    for (const s of sessions) {
+      const anchor = s.metadata?.createdAt;
+      if (!anchor) continue;
+      const ts = new Date(anchor).getTime();
+      if (ts < oldestTs) { oldestTs = ts; oldest = s; }
+      if (ts > newestTs) { newestTs = ts; newest = s; }
+    }
+    const now = Date.now();
+    const pickEndpoint = (s: SessionInfo | null, ts: number) => {
+      if (!s) return null;
+      return {
+        name: s.name,
+        status: s.status,
+        ageSeconds: Math.max(0, Math.floor((now - ts) / 1000)),
+        ...(s.metadata?.displayName ? { displayName: s.metadata.displayName } : {}),
+      };
+    };
+    return {
+      total: sessions.length,
+      byStatus,
+      oldest: pickEndpoint(oldest, oldestTs),
+      newest: pickEndpoint(newest, newestTs),
+    };
+  };
+
   if (json) {
+    if (summary) {
+      console.log(JSON.stringify(buildSummary()));
+      return;
+    }
     const localOutput = sessions.map((s) => ({
       name: s.name,
       status: s.status,
@@ -1170,6 +1298,28 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
     return;
   }
 
+  if (summary) {
+    const s = buildSummary();
+    if (s.total === 0) {
+      console.log("No matching sessions.");
+      return;
+    }
+    const parts: string[] = [];
+    if (s.byStatus.running) parts.push(`${s.byStatus.running} running`);
+    if (s.byStatus.exited) parts.push(`${s.byStatus.exited} exited`);
+    if (s.byStatus.vanished) parts.push(`${s.byStatus.vanished} vanished`);
+    console.log(`${s.total} session${s.total === 1 ? "" : "s"} — ${parts.join(", ")}`);
+    const label = (e: { name: string; status: string; displayName?: string }) =>
+      e.displayName ? `${e.displayName} (${e.name})` : e.name;
+    if (s.oldest) {
+      console.log(`oldest: ${label(s.oldest)} (${s.oldest.status}, ${formatDuration(s.oldest.ageSeconds * 1000)})`);
+    }
+    if (s.newest && (!s.oldest || s.newest.name !== s.oldest.name)) {
+      console.log(`newest: ${label(s.newest)} (${s.newest.status}, ${formatDuration(s.newest.ageSeconds * 1000)})`);
+    }
+    return;
+  }
+
   if (sessions.length === 0 && remoteHosts.length === 0) {
     console.log("No active sessions.");
     return;
@@ -1177,6 +1327,7 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
 
   const running = sessions.filter((s) => s.status === "running");
   const exited = sessions.filter((s) => s.status === "exited");
+  const vanished = sessions.filter((s) => s.status === "vanished");
 
   // Render tags as hashtags. When `showAll` is false, hide reserved keys
   // (pty-internal bookkeeping like `ptyfile*`/`strategy`, plus any key
@@ -1234,6 +1385,25 @@ async function cmdList(json = false, showTags = false, remote = false, filterTag
     }
   }
 
+  if (vanished.length > 0) {
+    if (running.length > 0 || exited.length > 0) console.log("");
+    // Dim-yellow header because vanished is a warning state — daemon was
+    // killed (SIGKILL / OOM / crash) without writing an exit record, so we
+    // can't say *why* it's gone, only that the socket stopped responding.
+    // `pty gc` cleans these up alongside normal exits.
+    console.log("\x1b[33mVanished sessions (no exit record — killed or crashed):\x1b[0m");
+    for (const session of vanished) {
+      const meta = session.metadata;
+      const ago = meta?.createdAt ? timeAgo(new Date(meta.createdAt)) : "unknown";
+      const cwd = meta?.cwd ? shortPath(meta.cwd) : "";
+      const cmd = meta ? meta.displayCommand : "";
+      const tagStr = renderTags(meta?.tags, showTags);
+      const marker = strategyMarker(meta?.tags);
+      const label = renderLabel(session, "\x1b[1;33m");
+      console.log(`  \u26a0 ${label}${marker}${tagStr} (vanished, started ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
+    }
+  }
+
   // Remote hosts — render with the same treatment as local: displayName
   // in parens after the id, strategy marker, user-facing tags inline.
   for (const host of remoteHosts) {
@@ -1268,15 +1438,17 @@ async function cmdStats(
       console.error(`Session "${name}" not found.`);
       process.exit(1);
     }
-    if (session.status === "exited") {
+    if (isGone(session.status)) {
       if (json) {
         console.log(JSON.stringify({
           name: session.name,
-          status: "exited",
+          status: session.status,
           exitCode: session.metadata?.exitCode ?? null,
           exitedAt: session.metadata?.exitedAt ?? null,
           ...(session.metadata?.tags ? { tags: session.metadata.tags } : {}),
         }));
+      } else if (session.status === "vanished") {
+        console.log(`Session "${name}" has vanished (no exit record — killed or crashed).`);
       } else {
         const code = session.metadata?.exitCode ?? "?";
         console.log(`Session "${name}" has exited (code ${code}).`);
@@ -1303,9 +1475,9 @@ async function cmdStats(
   // All sessions
   const sessions = await listSessions();
   const running = sessions.filter((s) => s.status === "running");
-  const exited = sessions.filter((s) => s.status === "exited");
+  const gone = sessions.filter((s) => isGone(s.status));
 
-  if (running.length === 0 && (!all || exited.length === 0)) {
+  if (running.length === 0 && (!all || gone.length === 0)) {
     console.log("No running sessions.");
     return;
   }
@@ -1326,9 +1498,9 @@ async function cmdStats(
     const output = [
       ...results.map((r) => r.stats ?? { name: r.session.name, error: r.error }),
       ...(all
-        ? exited.map((s) => ({
+        ? gone.map((s) => ({
             name: s.name,
-            status: "exited" as const,
+            status: s.status,
             exitCode: s.metadata?.exitCode ?? null,
             exitedAt: s.metadata?.exitedAt ?? null,
             ...(s.metadata?.tags ? { tags: s.metadata.tags } : {}),
@@ -1350,13 +1522,25 @@ async function cmdStats(
     if (i < results.length - 1) console.log("");
   }
 
-  if (all && exited.length > 0) {
+  if (all && gone.length > 0) {
     if (results.length > 0) console.log("");
-    console.log("Exited sessions:");
-    for (const s of exited) {
-      const code = s.metadata?.exitCode ?? "?";
-      const ago = s.metadata?.exitedAt ? timeAgo(new Date(s.metadata.exitedAt)) : "unknown";
-      console.log(`  ${s.name} (exited with code ${code}, ${ago})`);
+    const exited = gone.filter((s) => s.status === "exited");
+    const vanished = gone.filter((s) => s.status === "vanished");
+    if (exited.length > 0) {
+      console.log("Exited sessions:");
+      for (const s of exited) {
+        const code = s.metadata?.exitCode ?? "?";
+        const ago = s.metadata?.exitedAt ? timeAgo(new Date(s.metadata.exitedAt)) : "unknown";
+        console.log(`  ${s.name} (exited with code ${code}, ${ago})`);
+      }
+    }
+    if (vanished.length > 0) {
+      if (exited.length > 0) console.log("");
+      console.log("Vanished sessions (no exit record):");
+      for (const s of vanished) {
+        const ago = s.metadata?.createdAt ? timeAgo(new Date(s.metadata.createdAt)) : "unknown";
+        console.log(`  \u26a0 ${s.name} (started ${ago})`);
+      }
     }
   }
 }
@@ -1602,31 +1786,40 @@ async function cmdRm(name: string): Promise<void> {
   console.log(`Session "${name}" removed.`);
 }
 
-async function cmdGc(): Promise<void> {
-  const removed = await gc();
-  const prunedTags = await pruneOrphanLayoutTags();
+async function cmdGc(dryRun: boolean): Promise<void> {
+  const removed = await gc({ dryRun });
+  const prunedTags = await pruneOrphanLayoutTags({ dryRun });
+
+  const verb = dryRun ? "Would remove" : "Removed";
+  const prunedVerb = dryRun ? "Would prune" : "Pruned";
 
   for (const name of removed) {
-    console.log(`Removed: ${name}`);
+    console.log(`${verb}: ${name}`);
   }
   for (const { name, removedKeys } of prunedTags) {
-    console.log(`Pruned orphan tags on ${name}: ${removedKeys.map((k) => `#${k}`).join(" ")}`);
+    console.log(
+      `${prunedVerb} orphan tags on ${name}: ${removedKeys.map((k) => `#${k}`).join(" ")}`,
+    );
   }
 
   const totalTags = prunedTags.reduce((sum, r) => sum + r.removedKeys.length, 0);
   if (removed.length === 0 && totalTags === 0) {
-    console.log("Nothing to clean up.");
+    console.log(dryRun ? "Nothing would be cleaned up." : "Nothing to clean up.");
     return;
   }
 
   const parts: string[] = [];
   if (removed.length > 0) {
-    parts.push(`${removed.length} exited session${removed.length === 1 ? "" : "s"}`);
+    parts.push(`${removed.length} stale session${removed.length === 1 ? "" : "s"}`);
   }
   if (totalTags > 0) {
     parts.push(`${totalTags} orphan tag${totalTags === 1 ? "" : "s"}`);
   }
-  console.log(`Cleaned up ${parts.join(" and ")}.`);
+  console.log(
+    dryRun
+      ? `Would clean up ${parts.join(" and ")}. (Dry run — no changes made.)`
+      : `Cleaned up ${parts.join(" and ")}.`,
+  );
 }
 
 async function cmdSupervisorStart(): Promise<void> {
@@ -2113,9 +2306,10 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       continue;
     }
 
-    // Clean up exited session with the same name
+    // Clean up any stale session (exited or vanished) with the same name
+    // so the respawn can reuse the slot.
     const existingSession = existing.find((s) => s.name === sess.name);
-    if (existingSession?.status === "exited") {
+    if (existingSession && isGone(existingSession.status)) {
       cleanupAll(sess.name);
     }
 
@@ -2183,7 +2377,7 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
         console.error(`  ✗ ${sess.name}: failed to stop`);
       }
       cleanupSocket(sess.name);
-    } else if (existingSession.status === "exited") {
+    } else if (isGone(existingSession.status)) {
       cleanupAll(sess.name);
       console.log(`  ○ ${sess.name} (cleaned up)`);
       stopped++;
@@ -2390,6 +2584,7 @@ function timeAgo(date: Date): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
 
 // ── Wrap/Unwrap ──
 

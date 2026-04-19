@@ -422,7 +422,9 @@ const listScreen = screen({
         return true;
       }
       if (item.session) {
-        if (item.session.status === "exited") {
+        // Both `exited` (clean) and `vanished` (killed) are dead daemons
+        // that can be restarted with the same metadata.
+        if (item.session.status !== "running") {
           doRestart(item.session);
         } else {
           doAttach(item.session.name);
