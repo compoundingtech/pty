@@ -217,3 +217,47 @@ describe("pty send --paste", () => {
     expect((received.match(/\x1b\[201~/g) ?? []).length).toBe(1);
   }, 15_000);
 });
+
+// Arg-parsing validation runs before any socket connection, so these
+// tests don't need a daemon — just spawn the CLI and check stderr/exit.
+describe("pty send strict flag parsing (#20)", () => {
+  it("rejects an unknown flag after positional text", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, "send", "somename", "hello world", "--bogus");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("Unexpected argument");
+    expect(r.stderr).toContain("--bogus");
+  }, 10_000);
+
+  it("suggests --seq key:return when --enter is used", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, "send", "somename", "sudo cmd", "--enter");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("--enter");
+    expect(r.stderr).toContain("--seq");
+    expect(r.stderr).toContain("key:return");
+  }, 10_000);
+
+  it("suggests the real syntax for --newline and --return aliases too", () => {
+    const dir = makeSessionDir();
+    for (const flag of ["--newline", "--return", "--cr"]) {
+      const r = runCli(dir, "send", "somename", "text", flag);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain(flag);
+      expect(r.stderr).toContain("key:return");
+    }
+  }, 15_000);
+
+  it("plain positional text still works (regression guard)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const dump = path.join(dir, "dump.bin");
+    await startDumpSession(dir, name, dump);
+
+    const r = runCli(dir, "send", name, "still-works");
+    expect(r.status).toBe(0);
+
+    const received = await waitForDump(dump, "still-works".length, 3000);
+    expect(received).toBe("still-works");
+  }, 15_000);
+});

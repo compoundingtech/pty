@@ -439,6 +439,16 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
+      // Common typos for "send a return key" — accepted nowhere; suggest
+      // the real syntax so agents / humans don't silently lose a keystroke.
+      const ENTER_TYPOS = new Set(["--enter", "--newline", "--return", "--cr"]);
+      for (const a of sendArgs) {
+        if (ENTER_TYPOS.has(a)) {
+          console.error(`Unknown flag "${a}". Use \`--seq "<text>" --seq key:return\` to send text followed by Enter.`);
+          process.exit(1);
+        }
+      }
+
       let data: string[];
       if (hasSeq) {
         data = [];
@@ -456,6 +466,13 @@ async function main(): Promise<void> {
           }
         }
       } else if (hasPositional) {
+        // Mirror the --seq branch's strictness: reject any trailing args
+        // after the positional text so unknown flags (e.g. --enter) no
+        // longer get silently dropped on the floor (closes #20).
+        if (sendArgs.length > 1) {
+          console.error(`Unexpected argument: ${sendArgs[1]}`);
+          process.exit(1);
+        }
         data = [sendArgs[0]];
       } else {
         console.error("Nothing to send.");
