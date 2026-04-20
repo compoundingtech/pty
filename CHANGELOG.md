@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### TUI framework
+- **Shift+Tab (backtab) now fires as a proper key event.** The raw-stdin parser in `src/tui/input.ts` previously dropped the legacy `ESC[Z` encoding as "unknown CSI" and ignored the shift modifier in the kitty keyboard protocol for code 9 (tab). Both paths now produce `{ name: "backtab", shift: true, ctrl: false, alt: false }`, so form widgets across apps can bind shift-tab for backward field navigation. Added `shift: boolean` to `KeyEvent` as a required field — existing consumers that only read ctrl/alt are unaffected. Surfaced while building the `reminders` app where the form widget needed backtab to move between fields.
+
 ### Fixes
 - **Shift+Enter / kitty keyboard protocol inside supervised (launchd-started) sessions.** Children of a daemon started from a minimal env (launchd, systemd, sparse CI runners) previously had no `TERM` at all, which caused modern TUIs — Claude Code, vim, nvim — to fall back to legacy key encoding where Shift+Enter is indistinguishable from Enter. Two related fixes:
   - `buildChildEnv` in `server.ts` now defaults `TERM=xterm-256color` in the child's env whenever it would otherwise be absent. Never overrides an explicit value. Covers all three env paths (legacy inheritance, `isolateEnv` allow-list, verbatim `env:`).
