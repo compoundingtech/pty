@@ -404,4 +404,104 @@ describe("spawnDaemon options", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).not.toContain("uv_cwd");
   }, 15000);
+
+  // Regression: when the daemon inherits a minimal env (launchd, systemd,
+  // sparse CI runners) the child pty ends up without TERM, and modern TUIs
+  // fall back to legacy key encoding where Shift+Enter is indistinguishable
+  // from Enter. Guarantee that the PTY boundary always provides a usable
+  // TERM, without clobbering an explicit one.
+  it("defaults TERM to xterm-256color in the child when env has no TERM", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const dumpFile = path.join(dir, "term-default.txt");
+    process.env.PTY_SESSION_DIR = dir;
+
+    await spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", `env > ${JSON.stringify(dumpFile)}; exit 0`],
+      displayCommand: "env dump",
+      cwd: dir,
+      env: {
+        // Intentionally omit TERM. Minimal PATH only.
+        PATH: "/usr/bin:/bin",
+      },
+    });
+
+    const start = Date.now();
+    while (Date.now() - start < 3000) {
+      try {
+        if (fs.existsSync(dumpFile) && fs.statSync(dumpFile).size > 0) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const dumped = fs.readFileSync(dumpFile, "utf-8");
+    expect(dumped).toContain("TERM=xterm-256color");
+  }, 15000);
+
+  it("preserves an explicit TERM from the verbatim env", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const dumpFile = path.join(dir, "term-explicit.txt");
+    process.env.PTY_SESSION_DIR = dir;
+
+    await spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", `env > ${JSON.stringify(dumpFile)}; exit 0`],
+      displayCommand: "env dump",
+      cwd: dir,
+      env: {
+        PATH: "/usr/bin:/bin",
+        TERM: "xterm-kitty",
+      },
+    });
+
+    const start = Date.now();
+    while (Date.now() - start < 3000) {
+      try {
+        if (fs.existsSync(dumpFile) && fs.statSync(dumpFile).size > 0) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const dumped = fs.readFileSync(dumpFile, "utf-8");
+    expect(dumped).toContain("TERM=xterm-kitty");
+    expect(dumped).not.toContain("TERM=xterm-256color");
+  }, 15000);
+
+  it("defaults TERM under --isolate-env too (TERM not inherited, must be supplied)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const dumpFile = `/tmp/pty-iso-term-${name}.txt`;
+
+    // Strip TERM from the caller before invoking. --isolate-env then has
+    // nothing to inherit, and the default has to kick in. Explicit assertion
+    // that the scrubbed path still ends up with a usable TERM.
+    const callerEnv: Record<string, string> = {
+      ...process.env,
+      PTY_SESSION_DIR: dir,
+    };
+    delete callerEnv.TERM;
+
+    const runResult = spawnSync(nodeBin, [
+      cliPath, "run", "-d", "--name", name, "--isolate-env",
+      "--", "sh", "-c", `env > ${JSON.stringify(dumpFile)}; sleep 30`,
+    ], {
+      env: callerEnv,
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    expect(runResult.status).toBe(0);
+
+    await new Promise((r) => setTimeout(r, 500));
+    const dumped = fs.readFileSync(dumpFile, "utf-8");
+    expect(dumped).toContain("TERM=xterm-256color");
+
+    const pidFile = path.join(dir, `${name}.pid`);
+    try {
+      const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+      bgPids.push(pid);
+    } catch {}
+    try { fs.unlinkSync(dumpFile); } catch {}
+  }, 15000);
 });

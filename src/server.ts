@@ -81,6 +81,22 @@ const ISOLATED_ENV_ALLOWLIST = new Set([
   "PTY_SESSION_DIR",
 ]);
 
+/** Fallback TERM for child PTYs when no value was inherited. `xterm-256color`
+ *  is the lowest common denominator every modern TUI knows how to drive; the
+ *  kitty keyboard / modifyOtherKeys handshakes are dynamic CSI probes that
+ *  work fine on top of it. Important specifically for daemons launched from
+ *  a parent with a minimal env (launchd, systemd, cron, sparse CI runners) —
+ *  those contexts drop TERM entirely, and a child without TERM causes many
+ *  TUIs (Claude Code, vim, etc.) to fall back to legacy key encoding where
+ *  Shift+Enter is indistinguishable from Enter. */
+const DEFAULT_CHILD_TERM = "xterm-256color";
+
+/** Apply the TERM default in-place after the env has been assembled. Never
+ *  overrides an explicit value — only fills in when it's absent. */
+function ensureChildTerm(env: Record<string, string>): void {
+  if (!env.TERM) env.TERM = DEFAULT_CHILD_TERM;
+}
+
 function buildChildEnv(options: ServerOptions): Record<string, string> {
   // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
   // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
@@ -98,6 +114,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
   if (options.env) {
     const env = { ...options.env };
     env.PTY_SESSION = options.name;
+    ensureChildTerm(env);
     return env;
   }
 
@@ -108,6 +125,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
     env.PTY_SESSION = options.name;
+    ensureChildTerm(env);
     return env;
   }
 
@@ -120,6 +138,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
   env.PTY_SESSION = options.name;
+  ensureChildTerm(env);
   return env;
 }
 
@@ -429,11 +448,17 @@ export class PtyServer {
     }
 
     try {
+      // NOTE: intentionally no `name:` option here — node-pty's `name`
+      // unconditionally clobbers env.TERM, which would hide any TERM the
+      // caller inherited or set explicitly. `buildChildEnv` guarantees
+      // childEnv.TERM is populated (defaulting to xterm-256color if absent),
+      // so node-pty will pick it up naturally. Was `name: "xterm-256color"`
+      // before; removing it lets inherited values like `xterm-kitty` flow
+      // through and lets TUIs negotiate the richer capabilities they allow.
       this.ptyProcess = pty.spawn(
         "/bin/sh",
         ["-c", 'exec "$@"', "sh", options.command, ...options.args],
         {
-          name: "xterm-256color",
           cols: options.cols,
           rows: options.rows,
           cwd: options.cwd,

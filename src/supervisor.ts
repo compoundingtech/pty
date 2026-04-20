@@ -61,6 +61,16 @@ export class Supervisor {
   start(): void {
     ensureSessionDir();
 
+    // launchd starts us with a minimal env — no TERM, no COLORTERM. That
+    // propagates all the way down into each supervised session's child PTY,
+    // which makes TUIs like Claude Code fall back to legacy key encoding
+    // where Shift+Enter is indistinguishable from Enter. server.ts now
+    // defaults TERM at the PTY boundary, but we also seed it here so the
+    // supervisor's own process.env looks consistent (useful for any
+    // subprocess spawned outside the spawnDaemon path).
+    if (!process.env.TERM) process.env.TERM = "xterm-256color";
+    if (!process.env.COLORTERM) process.env.COLORTERM = "truecolor";
+
     // Acquire lock to prevent multiple supervisors
     if (!acquireLock("supervisor")) {
       console.error("[supervisor] another supervisor is already running");
