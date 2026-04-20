@@ -27,8 +27,7 @@
     "LICENSE"
   ],
   "bin": {
-    "pty": "./bin/pty",
-    "loggy": "./bin/loggy"
+    "pty": "./bin/pty"
   },
   "exports": {
     "./testing": {
