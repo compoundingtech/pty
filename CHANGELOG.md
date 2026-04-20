@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Supervisor
+- Add `pty supervisor systemd install|uninstall` for Linux user services. The installer writes a unit to `~/.config/systemd/user/`, sets `PATH`, `TERM`, `COLORTERM`, and `PTY_SESSION_DIR`, runs `systemctl --user daemon-reload`, and enables/starts the service immediately. If linger is disabled, the command now prints a hint explaining that the service will only stay up while the user session exists and how to enable boot-time startup with `loginctl enable-linger`.
+- Add `pty supervisor runit install|uninstall`. The installer writes a `run` script plus symlink-ready service directory (defaulting to `~/.config/runit/{sv,service}`), exporting the same environment variables before execing the supervisor entry point. This is aimed at runit-based systems like Void Linux, while still being easy to test from a private `runsvdir`.
+- Add integration coverage for both installers: a real `systemctl --user` install/uninstall test and a runit install test that boots the generated service under a private `runsvdir`.
+
 ### TUI framework
 - **Shift+Tab (backtab) now fires as a proper key event.** The raw-stdin parser in `src/tui/input.ts` previously dropped the legacy `ESC[Z` encoding as "unknown CSI" and ignored the shift modifier in the kitty keyboard protocol for code 9 (tab). Both paths now produce `{ name: "backtab", shift: true, ctrl: false, alt: false }`, so form widgets across apps can bind shift-tab for backward field navigation. Added `shift: boolean` to `KeyEvent` as a required field — existing consumers that only read ctrl/alt are unaffected. Surfaced while building the `reminders` app where the form widget needed backtab to move between fields.
 

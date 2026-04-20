@@ -107,6 +107,9 @@ pty supervisor stop                       # stop the supervisor
 pty supervisor status                     # show supervised sessions
 pty supervisor forget myserver            # stop supervising a session
 pty supervisor reset myserver             # reset a failed session for retry
+pty supervisor launchd install            # install launchd auto-start (macOS)
+pty supervisor systemd install            # install user-level systemd auto-start (Linux)
+pty supervisor runit install              # install runit service files
 
 pty up                                    # start all sessions from ./pty.toml
 pty up ./backend                          # start sessions from ./backend/pty.toml
@@ -204,7 +207,11 @@ command = "bin/serve"
 tags = { strategy = "permanent" }
 ```
 
-For macOS auto-start on login: `pty supervisor launchd install`. The install will compile a small wrapper binary and prompt you to grant it Full Disk Access (required for sessions on external/removable volumes). Linux (systemd) and other OS integrations are a TODO — contributions welcome.
+For auto-start:
+
+- macOS: `pty supervisor launchd install` — compiles a small wrapper binary and prompts for Full Disk Access (required for sessions on external/removable volumes)
+- Linux/systemd: `pty supervisor systemd install` — installs a user service in `~/.config/systemd/user/` and enables it immediately. If you want it to start at boot before login, enable linger with `sudo loginctl enable-linger $USER`.
+- runit: `pty supervisor runit install` — writes a `run` script and symlinkable service directory. By default it uses `~/.config/runit/{sv,service}`; on systems like Void you can point it at `/etc/sv` and `/var/service`.
 
 ### Plugins
 

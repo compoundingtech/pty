@@ -105,6 +105,12 @@ function usage(): void {
   pty supervisor status                    Show supervised sessions
   pty supervisor forget <name>             Stop supervising a session
   pty supervisor reset <name>              Reset a failed session for retry
+  pty supervisor launchd install [--path PATH]                     Register with macOS launchd
+  pty supervisor launchd uninstall                              Remove launchd registration
+  pty supervisor systemd install [--name NAME] [--path PATH]     Register with user systemd
+  pty supervisor systemd uninstall [--name NAME]                 Remove user systemd registration
+  pty supervisor runit install [--name NAME] [--svdir PATH] [--service-dir PATH] [--path PATH]  Register with runit
+  pty supervisor runit uninstall [--name NAME] [--svdir PATH] [--service-dir PATH]               Remove runit registration
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -781,8 +787,12 @@ async function main(): Promise<void> {
   pty supervisor status           Show supervised sessions
   pty supervisor forget <name>    Stop supervising a session
   pty supervisor reset <name>     Reset a failed session for retry
-  pty supervisor launchd install [--path PATH]  Register with macOS launchd (requires FDA)
-  pty supervisor launchd uninstall Remove from launchd`);
+  pty supervisor launchd install [--path PATH]                     Register with macOS launchd (requires FDA)
+  pty supervisor launchd uninstall                              Remove from launchd
+  pty supervisor systemd install [--name NAME] [--path PATH]     Register with user systemd
+  pty supervisor systemd uninstall [--name NAME]                 Remove from user systemd
+  pty supervisor runit install [--name NAME] [--svdir PATH] [--service-dir PATH] [--path PATH]  Register with runit
+  pty supervisor runit uninstall [--name NAME] [--svdir PATH] [--service-dir PATH]               Remove from runit`);
         break;
       }
       switch (subCmd) {
@@ -816,7 +826,6 @@ async function main(): Promise<void> {
         case "launchd": {
           const launchdCmd = args[2];
           if (launchdCmd === "install") {
-            // Parse --path flag
             let userPath: string | undefined;
             for (let li = 3; li < args.length; li++) {
               if (args[li] === "--path" && li + 1 < args.length) {
@@ -829,6 +838,54 @@ async function main(): Promise<void> {
             cmdSupervisorLaunchdUninstall();
           } else {
             console.error("Usage: pty supervisor launchd install|uninstall");
+            process.exit(1);
+          }
+          break;
+        }
+        case "systemd": {
+          const systemdCmd = args[2];
+          let unitName: string | undefined;
+          let userPath: string | undefined;
+          for (let si = 3; si < args.length; si++) {
+            if (args[si] === "--name" && si + 1 < args.length) {
+              unitName = args[++si];
+            } else if (args[si] === "--path" && si + 1 < args.length) {
+              userPath = args[++si];
+            }
+          }
+          if (systemdCmd === "install") {
+            cmdSupervisorSystemdInstall(unitName, userPath);
+          } else if (systemdCmd === "uninstall") {
+            cmdSupervisorSystemdUninstall(unitName);
+          } else {
+            console.error("Usage: pty supervisor systemd install|uninstall");
+            process.exit(1);
+          }
+          break;
+        }
+        case "runit": {
+          const runitCmd = args[2];
+          let serviceName: string | undefined;
+          let svDir: string | undefined;
+          let serviceDir: string | undefined;
+          let userPath: string | undefined;
+          for (let ri = 3; ri < args.length; ri++) {
+            if (args[ri] === "--name" && ri + 1 < args.length) {
+              serviceName = args[++ri];
+            } else if (args[ri] === "--svdir" && ri + 1 < args.length) {
+              svDir = args[++ri];
+            } else if (args[ri] === "--service-dir" && ri + 1 < args.length) {
+              serviceDir = args[++ri];
+            } else if (args[ri] === "--path" && ri + 1 < args.length) {
+              userPath = args[++ri];
+            }
+          }
+          if (runitCmd === "install") {
+            cmdSupervisorRunitInstall(serviceName, svDir, serviceDir, userPath);
+          } else if (runitCmd === "uninstall") {
+            cmdSupervisorRunitUninstall(serviceName, svDir, serviceDir);
+          } else {
+            console.error("Usage: pty supervisor runit install|uninstall");
             process.exit(1);
           }
           break;
@@ -1981,6 +2038,192 @@ async function cmdSupervisorReset(name: string): Promise<void> {
   } catch {}
 
   console.log(`Reset "${name}". The supervisor will try restarting it.`);
+}
+
+function stopExistingSupervisorIfRunning(): void {
+  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
+  try {
+    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    try { fs.unlinkSync(pidPath); } catch {}
+    console.log("Stopped existing supervisor.");
+  } catch {}
+}
+
+function getSourceRoot(): string {
+  return path.join(
+    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    "..",
+  );
+}
+
+function getSupervisorEntryPoint(): string {
+  return path.join(getSourceRoot(), "dist", "supervisor-entry.js");
+}
+
+function ensureSupervisorBuildExists(): void {
+  const entryPoint = getSupervisorEntryPoint();
+  if (!fs.existsSync(entryPoint)) {
+    console.error(`Missing ${entryPoint}. Run: npm run build`);
+    process.exit(1);
+  }
+}
+
+function getConfigHome(): string {
+  return process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function systemdQuote(value: string): string {
+  return `"${value.replace(/["\\$`]/g, "\\$&")}"`;
+}
+
+function normalizeServiceName(name: string | undefined, suffix: string): string {
+  const raw = (name && name.trim()) ? name.trim() : `pty-supervisor${suffix}`;
+  return raw.endsWith(suffix) ? raw : `${raw}${suffix}`;
+}
+
+function runChecked(command: string, args: string[], options: Parameters<typeof spawnSync>[2] = {}): ReturnType<typeof spawnSync> {
+  const result = spawnSync(command, args, { encoding: "utf-8", ...options });
+  if (result.status !== 0) {
+    const stderr = String(result.stderr ?? "").trim();
+    const stdout = String(result.stdout ?? "").trim();
+    console.error(`Failed: ${command} ${args.join(" ")}`);
+    if (stderr) console.error(stderr);
+    else if (stdout) console.error(stdout);
+    process.exit(result.status ?? 1);
+  }
+  return result;
+}
+
+function maybePrintSystemdLingerHint(): void {
+  const user = os.userInfo().username;
+  const result = spawnSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], {
+    encoding: "utf-8",
+  });
+  if (result.status === 0 && result.stdout.trim().toLowerCase() !== "yes") {
+    console.log("");
+    console.log(`Note: loginctl linger is disabled for ${user}.`);
+    console.log("This user service will start while you're logged in, but not at boot.");
+    console.log(`To keep it running across reboots, run: sudo loginctl enable-linger ${user}`);
+  }
+}
+
+function cmdSupervisorSystemdInstall(unitName?: string, userPath?: string): void {
+  ensureSupervisorBuildExists();
+  stopExistingSupervisorIfRunning();
+
+  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  const entryPoint = getSupervisorEntryPoint();
+  const resolvedUnit = normalizeServiceName(unitName, ".service");
+  const unitDir = path.join(getConfigHome(), "systemd", "user");
+  const unitPath = path.join(unitDir, resolvedUnit);
+  const sessionDir = getSessionDir();
+
+  fs.mkdirSync(unitDir, { recursive: true });
+  fs.writeFileSync(unitPath, `[Unit]
+Description=pty supervisor
+
+[Service]
+Type=simple
+Environment=${systemdQuote(`PATH=${envPath}`)}
+Environment=${systemdQuote(`TERM=xterm-256color`)}
+Environment=${systemdQuote(`COLORTERM=truecolor`)}
+Environment=${systemdQuote(`PTY_SESSION_DIR=${sessionDir}`)}
+WorkingDirectory=${os.homedir()}
+ExecStart=${process.execPath} ${entryPoint}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`);
+
+  runChecked("systemctl", ["--user", "daemon-reload"]);
+  runChecked("systemctl", ["--user", "enable", "--now", resolvedUnit]);
+
+  console.log(`Installed systemd user unit: ${unitPath}`);
+  console.log(`Manage it with: systemctl --user status ${resolvedUnit}`);
+  maybePrintSystemdLingerHint();
+}
+
+function cmdSupervisorSystemdUninstall(unitName?: string): void {
+  const resolvedUnit = normalizeServiceName(unitName, ".service");
+  const unitPath = path.join(getConfigHome(), "systemd", "user", resolvedUnit);
+
+  spawnSync("systemctl", ["--user", "disable", "--now", resolvedUnit], { encoding: "utf-8" });
+  try { fs.unlinkSync(unitPath); } catch {}
+  runChecked("systemctl", ["--user", "daemon-reload"]);
+  spawnSync("systemctl", ["--user", "reset-failed", resolvedUnit], { encoding: "utf-8" });
+  stopExistingSupervisorIfRunning();
+
+  console.log(`Removed systemd user unit: ${unitPath}`);
+}
+
+function cmdSupervisorRunitInstall(
+  serviceName?: string,
+  svDir?: string,
+  serviceDir?: string,
+  userPath?: string,
+): void {
+  ensureSupervisorBuildExists();
+  stopExistingSupervisorIfRunning();
+
+  const resolvedName = normalizeServiceName(serviceName, "");
+  const resolvedSvDir = path.resolve(svDir ?? path.join(getConfigHome(), "runit", "sv"));
+  const resolvedServiceDir = path.resolve(serviceDir ?? path.join(getConfigHome(), "runit", "service"));
+  const servicePath = path.join(resolvedSvDir, resolvedName);
+  const runPath = path.join(servicePath, "run");
+  const linkPath = path.join(resolvedServiceDir, resolvedName);
+  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  const sessionDir = getSessionDir();
+  const entryPoint = getSupervisorEntryPoint();
+
+  fs.mkdirSync(resolvedSvDir, { recursive: true });
+  fs.mkdirSync(resolvedServiceDir, { recursive: true });
+  fs.rmSync(servicePath, { recursive: true, force: true });
+  fs.mkdirSync(servicePath, { recursive: true, mode: 0o755 });
+
+  fs.writeFileSync(runPath, `#!/bin/sh
+export PATH=${shellQuote(envPath)}
+export TERM=${shellQuote("xterm-256color")}
+export COLORTERM=${shellQuote("truecolor")}
+export PTY_SESSION_DIR=${shellQuote(sessionDir)}
+exec ${shellQuote(process.execPath)} ${shellQuote(entryPoint)}
+`);
+  fs.chmodSync(runPath, 0o755);
+
+  try {
+    const stat = fs.lstatSync(linkPath);
+    if (stat.isSymbolicLink() || stat.isFile()) fs.unlinkSync(linkPath);
+    else {
+      console.error(`Refusing to replace non-symlink path: ${linkPath}`);
+      process.exit(1);
+    }
+  } catch {}
+  fs.symlinkSync(servicePath, linkPath);
+
+  console.log(`Installed runit service: ${servicePath}`);
+  console.log(`Enabled via symlink: ${linkPath}`);
+  console.log(`Start it with: runsvdir ${shellQuote(resolvedServiceDir)}`);
+}
+
+function cmdSupervisorRunitUninstall(serviceName?: string, svDir?: string, serviceDir?: string): void {
+  const resolvedName = normalizeServiceName(serviceName, "");
+  const resolvedSvDir = path.resolve(svDir ?? path.join(getConfigHome(), "runit", "sv"));
+  const resolvedServiceDir = path.resolve(serviceDir ?? path.join(getConfigHome(), "runit", "service"));
+  const servicePath = path.join(resolvedSvDir, resolvedName);
+  const linkPath = path.join(resolvedServiceDir, resolvedName);
+
+  try { fs.unlinkSync(linkPath); } catch {}
+  try { fs.rmSync(servicePath, { recursive: true, force: true }); } catch {}
+  stopExistingSupervisorIfRunning();
+
+  console.log(`Removed runit service: ${servicePath}`);
+  console.log(`Removed symlink: ${linkPath}`);
 }
 
 async function cmdSupervisorLaunchdInstall(userPath?: string): Promise<void> {
