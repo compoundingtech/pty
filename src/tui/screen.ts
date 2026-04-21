@@ -699,6 +699,12 @@ function renderNodeToBuffer(
         node._lastCols = rect.width;
         node._lastRows = rect.height;
       }
+      // Subscribe the enclosing effect() to the handle's revision signal
+      // so the next data arrival / exit / resize / theme change triggers
+      // a re-render automatically. Without this, output from the embedded
+      // pty would "buffer" until some OTHER signal read forced a render
+      // (like a keypress), because nothing else in this path is tracked.
+      node.handle.rev.get();
       // Read xterm cells directly — no serialize round-trip
       const ptyCells = node.handle.readCells();
       for (let r = 0; r < Math.min(ptyCells.length, rect.height); r++) {

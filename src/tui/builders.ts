@@ -11,6 +11,7 @@ import type {
 import type { BoxStyle, Theme } from "./colors.ts";
 import type { ScrollRegion } from "./scrollable.ts";
 import type { TextInputState } from "./text-input.ts";
+import { signal } from "./signals.ts";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
@@ -473,16 +474,23 @@ export function createPty(
 
   let exited = false;
   let dirty = false;
+  // Reactive revision bumped on every state change that could alter the
+  // rendered view. `ptyView()` reads this during render so the framework's
+  // effect() rewires automatically whenever the terminal content changes.
+  const rev = signal(0);
+  const bumpRev = () => rev.set(rev.peek() + 1);
 
   proc.onData((data: string) => {
     terminal.write(data, () => {
       dirty = true;
+      bumpRev();
       handle.onActivity?.();
     });
   });
   proc.onExit(() => {
     exited = true;
     dirty = true;
+    bumpRev();
     handle.onActivity?.();
   });
 
@@ -496,6 +504,7 @@ export function createPty(
         proc.resize(newCols, newRows);
         terminal.resize(newCols, newRows);
         dirty = true;
+        bumpRev();
       }
     },
 
@@ -518,6 +527,7 @@ export function createPty(
     setTheme(t: Theme) {
       terminal.options.theme = themeToXterm(t);
       dirty = true;
+      bumpRev();
     },
 
     cols,
@@ -526,6 +536,7 @@ export function createPty(
     get dirty() { return dirty; },
     set dirty(v: boolean) { dirty = v; },
     onActivity: null,
+    rev,
     get cursorRow() { return terminal.buffer.active.cursorY; },
     get cursorCol() { return terminal.buffer.active.cursorX; },
     get mouseMode() { return mouseMode; },
@@ -624,6 +635,9 @@ export async function attachPty(
   let exited = false;
   let exitCode: number | null = null;
   let dirty = false;
+  // See createPty for rationale — same pattern applies to attached sessions.
+  const rev = signal(0);
+  const bumpRev = () => rev.set(rev.peek() + 1);
   const reader = new PacketReader();
 
   const handle: PtyHandle = {
@@ -636,6 +650,7 @@ export async function attachPty(
         socket.write(encodeResize(newRows, newCols));
         terminal.resize(newCols, newRows);
         dirty = true;
+        bumpRev();
       }
     },
 
@@ -658,6 +673,7 @@ export async function attachPty(
     setTheme(t: Theme) {
       terminal.options.theme = themeToXterm(t);
       dirty = true;
+      bumpRev();
     },
 
     cols,
@@ -666,6 +682,7 @@ export async function attachPty(
     get dirty() { return dirty; },
     set dirty(v: boolean) { dirty = v; },
     onActivity: null,
+    rev,
     get cursorRow() { return terminal.buffer.active.cursorY; },
     get cursorCol() { return terminal.buffer.active.cursorX; },
     get mouseMode() { return mouseMode; },
@@ -688,11 +705,13 @@ export async function attachPty(
           terminal.reset();
           terminal.write(packet.payload.toString());
           dirty = true;
+          bumpRev();
           handle.onActivity?.();
           break;
         case MessageType.DATA:
           terminal.write(packet.payload.toString(), () => {
             dirty = true;
+            bumpRev();
             handle.onActivity?.();
           });
           break;
@@ -700,6 +719,7 @@ export async function attachPty(
           exitCode = packet.payload.readInt32BE(0);
           exited = true;
           dirty = true;
+          bumpRev();
           handle.onActivity?.();
           break;
       }

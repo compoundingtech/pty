@@ -275,8 +275,17 @@ export interface PtyHandle {
   exited: boolean;
   /** True when the PTY has received new data since the last render. Cleared by the consumer. */
   dirty: boolean;
-  /** Optional callback fired when the PTY receives data. Used for event-driven rendering. */
+  /** Optional callback fired when the PTY receives data. Still supported as
+   *  an escape hatch for consumers that want to react to activity beyond
+   *  re-rendering — but you no longer need to wire it up just to get the
+   *  framework to re-render. Reading `rev.get()` during render (which
+   *  `ptyView()` does automatically) subscribes the reactive effect. */
   onActivity: (() => void) | null;
+  /** Reactive revision counter. Bumps on every child-process data arrival,
+   *  exit, resize, and theme change. `ptyView()` reads this during render
+   *  so the framework's `effect()` re-renders automatically whenever the
+   *  terminal content changes. Consumers shouldn't write to this. */
+  rev: import("./signals.ts").Signal<number>;
   /** Update the xterm terminal's color theme. Call when the app theme changes. */
   setTheme(theme: import("./colors.ts").Theme): void;
   /** Cursor row position (0-indexed, relative to viewport). */
