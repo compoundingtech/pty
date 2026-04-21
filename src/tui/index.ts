@@ -1,7 +1,12 @@
 // Public API for the declarative TUI framework
 
 // Input
-export { parseKey, type KeyEvent } from "./input.ts";
+export {
+  parseKey, parseInput, isMouseEvent,
+  MOUSE_ENABLE_SGR, MOUSE_DISABLE_SGR,
+  type KeyEvent, type MouseEvent, type MouseButton, type MouseAction,
+  type InputEvent,
+} from "./input.ts";
 
 // Signals
 export {
@@ -80,6 +85,12 @@ export { renderToAnsi, resolveColor, type RenderOpts } from "./renderer.ts";
 // Screen wrapper
 export { screen, overlay, type DeclarativeScreenConfig, type OverlayConfig } from "./screen.ts";
 
+// Hit-testing (for mouse handlers)
+export { hitTest, findInPath, type HitResult } from "./hit-test.ts";
+
+// Focus manager — stack-based key/mouse routing for panes, overlays, nested widgets.
+export { createFocusManager, type FocusManager, type FocusScope } from "./focus.ts";
+
 // Animation
 export {
   spinnerChar, startSpinnerTimer, stopSpinnerTimer, isSpinnerRunning,
@@ -92,6 +103,9 @@ export {
 
 // App lifecycle
 export { app, type AppConfig, type App } from "./app.ts";
+
+// Widgets — higher-level components built on the core primitives.
+export * from "./widgets/index.ts";
 
 // Session management
 export {

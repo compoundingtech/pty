@@ -37,9 +37,15 @@ export interface TextNode {
   type: "text";
   text: string;
   color?: Color;
+  /** Explicit background color. Default is the ambient panel/screen bg. */
+  background?: Color;
   bold?: boolean;
   dim?: boolean;
   italic?: boolean;
+  /** Swap fg/bg for the rendered cells. Used for text cursors (paint the
+   *  character UNDER the cursor with colors swapped, so the glyph doesn't
+   *  push neighbors sideways). */
+  inverse?: boolean;
   truncate?: boolean;
   /** Soft-wrap text to fit the available width. Expands height as needed. */
   wrap?: boolean;
@@ -130,6 +136,9 @@ export interface HStackNode {
 export interface PanelNode {
   type: "panel";
   title: string;
+  /** Optional caption rendered on the bottom border (like mactop's
+   *  "4/17 layout (skyblue)" strip). Same style as the top title. */
+  footerTitle?: string;
   children: UINode[];
   style?: BoxStyle;
   _rect?: Rect;

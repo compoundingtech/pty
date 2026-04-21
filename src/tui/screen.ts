@@ -43,6 +43,7 @@ export interface DeclarativeScreenConfig {
   id: string;
   render: (ctx: ScreenContext) => UINode[];
   handleKey?: (key: KeyEvent, ctx: ScreenContext) => boolean;
+  handleMouse?: (event: import("./input.ts").MouseEvent, ctx: ScreenContext) => boolean;
   onEnter?: (ctx: ScreenContext) => void;
   onLeave?: (ctx: ScreenContext) => void;
   /**
@@ -121,6 +122,10 @@ export function screen(config: DeclarativeScreenConfig): Screen {
       return config.handleKey?.(key, ctx) ?? true;
     },
 
+    handleMouse(event, ctx) {
+      return config.handleMouse?.(event, ctx) ?? false;
+    },
+
     onEnter(ctx: ScreenContext): void {
       config.onEnter?.(ctx);
       if (config.tick && !tickTimer) {
@@ -151,6 +156,7 @@ export interface OverlayConfig {
   height: number | ((rows: number) => number);
   render: (ctx: ScreenContext) => UINode[];
   handleKey?: (key: KeyEvent, ctx: ScreenContext) => boolean;
+  handleMouse?: (event: import("./input.ts").MouseEvent, ctx: ScreenContext) => boolean;
   onEnter?: (ctx: ScreenContext) => void;
   onLeave?: (ctx: ScreenContext) => void;
 }
@@ -248,6 +254,10 @@ export function overlay(config: OverlayConfig): Screen {
 
     handleKey(key: KeyEvent, ctx: ScreenContext): boolean {
       return config.handleKey?.(key, ctx) ?? true;
+    },
+
+    handleMouse(event, ctx) {
+      return config.handleMouse?.(event, ctx) ?? false;
     },
 
     onEnter(ctx: ScreenContext): void {
@@ -427,11 +437,17 @@ function hSepBuf(
 ): void {
   if (row < 0 || row >= buf.rows) return;
   const b = boxChars(style);
-  if (col >= 0 && col < buf.cols) buf.cells[row][col] = makeCell(b.lj, fgc, bgc);
+  // Preserve the existing background at each cell. Separators live inside
+  // panels; if we zero the bg to null here the row renders with the
+  // terminal's default background, showing through as a grey band.
+  const bgAt = (c: number): [number, number, number] | null =>
+    bgc ?? buf.cells[row][c]?.bg ?? null;
+  if (col >= 0 && col < buf.cols) buf.cells[row][col] = makeCell(b.lj, fgc, bgAt(col));
   for (let c = col + 1; c < col + width - 1; c++) {
-    if (c >= 0 && c < buf.cols) buf.cells[row][c] = makeCell(b.h, fgc, bgc);
+    if (c >= 0 && c < buf.cols) buf.cells[row][c] = makeCell(b.h, fgc, bgAt(c));
   }
-  if (col + width - 1 >= 0 && col + width - 1 < buf.cols) buf.cells[row][col + width - 1] = makeCell(b.rj, fgc, bgc);
+  const last = col + width - 1;
+  if (last >= 0 && last < buf.cols) buf.cells[row][last] = makeCell(b.rj, fgc, bgAt(last));
 }
 
 // --- Main tree-to-buffer renderer ---
@@ -461,7 +477,17 @@ function renderNodeToBuffer(
 
   switch (node.type) {
     case "text": {
-      const defaultColor = resolveColor(node.color, theme);
+      let fgColor = resolveColor(node.color, theme);
+      let bgColor = resolveColor(node.background, theme);
+      // inverse: swap fg/bg. If bg wasn't set, fall back to a sensible
+      // default so the cell is visibly "highlighted" — use the ambient
+      // foreground as the new bg, and the ambient bg as the new fg.
+      if (node.inverse) {
+        const fallbackBg = fgColor ?? theme.fg1;
+        const fallbackFg = bgColor ?? theme.bg1;
+        fgColor = fallbackFg;
+        bgColor = fallbackBg;
+      }
       const defaultBold = node.bold ?? false;
       const defaultDim = node.dim ?? false;
       const defaultItalic = node.italic ?? false;
@@ -478,9 +504,9 @@ function renderNodeToBuffer(
           const lineY = rect.y + i;
           if (lineY >= buf.rows) break;
           if (spans) {
-            writeSpannedBuf(buf, lineY, rect.x, lines[i], offsets[i], spans, defaultColor, defaultBold, defaultDim, defaultItalic, theme, rect.width);
+            writeSpannedBuf(buf, lineY, rect.x, lines[i], offsets[i], spans, fgColor, defaultBold, defaultDim, defaultItalic, theme, rect.width);
           } else {
-            writeStringBuf(buf, lineY, rect.x, lines[i], defaultColor, null, defaultBold, defaultDim, defaultItalic);
+            writeStringBuf(buf, lineY, rect.x, lines[i], fgColor, bgColor, defaultBold, defaultDim, defaultItalic);
           }
         }
       } else {
@@ -502,9 +528,9 @@ function renderNodeToBuffer(
           }
         }
         if (spans) {
-          writeSpannedBuf(buf, rect.y, rect.x, displayContent, 0, spans, defaultColor, defaultBold, defaultDim, defaultItalic, theme, rect.width);
+          writeSpannedBuf(buf, rect.y, rect.x, displayContent, 0, spans, fgColor, defaultBold, defaultDim, defaultItalic, theme, rect.width);
         } else {
-          writeStringBuf(buf, rect.y, rect.x, displayContent, defaultColor, null, defaultBold, defaultDim, defaultItalic);
+          writeStringBuf(buf, rect.y, rect.x, displayContent, fgColor, bgColor, defaultBold, defaultDim, defaultItalic);
         }
       }
       break;
@@ -561,12 +587,21 @@ function renderNodeToBuffer(
       fillBufRect(buf, rect.y, rect.x, rect.width, rect.height, null, theme.bg2);
       // Draw border
       drawBoxBuf(buf, rect.y, rect.x, rect.width, rect.height, style, theme.border, theme.bg2);
-      // Title
+      // Top title
       if (node.title) {
         writeStringBuf(buf, rect.y, rect.x + 2, " ", theme.border, theme.bg2);
         writeStringBuf(buf, rect.y, rect.x + 3, node.title, theme.fgAc, theme.bg2, true);
         const titleEnd = rect.x + 3 + textWidth(node.title);
         writeStringBuf(buf, rect.y, titleEnd, " ", theme.border, theme.bg2);
+      }
+      // Bottom caption (optional) — rendered on the bottom border with the
+      // same chrome as the top title. Left-aligned to mirror the top.
+      if (node.footerTitle) {
+        const by = rect.y + rect.height - 1;
+        writeStringBuf(buf, by, rect.x + 2, " ", theme.border, theme.bg2);
+        writeStringBuf(buf, by, rect.x + 3, node.footerTitle, theme.fgAc, theme.bg2, true);
+        const capEnd = rect.x + 3 + textWidth(node.footerTitle);
+        writeStringBuf(buf, by, capEnd, " ", theme.border, theme.bg2);
       }
       // Render children
       for (const child of node.children) {

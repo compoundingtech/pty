@@ -326,6 +326,7 @@ The `demos/` directory has four working apps built with the framework:
 - **file-browser** — two-pane directory tree + file preview with soft-wrap and markdown highlighting
 - **reminders** — full CRUD backed by `.md` files, three views (list, board, calendar), overlays
 - **agent-teams** — live dashboard of a simulated AI agent hierarchy with real-time updates
+- **playground** — interactive catalog of every TUI widget — atoms, layout, inputs, lists, data, overlays, and composition patterns, each with a live example and source snippet. A reference for anyone building on the TUI framework.
 
 Run them with `node --experimental-strip-types demos/{name}/main.ts` (or `./demos/run <name>`). Each demo includes unit tests and PTY integration tests that exercise the testing library.
 

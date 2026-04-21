@@ -2,6 +2,7 @@
 # Run a demo app: ./demos/run file-browser [path]
 #                  ./demos/run reminders
 #                  ./demos/run agent-teams
+#                  ./demos/run playground
 set -e
 
 demo="$1"
@@ -14,6 +15,7 @@ if [ -z "$demo" ]; then
   echo "  file-browser [path]       Two-pane file browser with preview"
   echo "  reminders                 CRUD reminders backed by .md files"
   echo "  agent-teams               Live AI agent hierarchy dashboard (SPEED=6 for fast)"
+  echo "  playground                Interactive catalog of every TUI widget"
   exit 1
 fi
 
@@ -21,7 +23,7 @@ script="$(dirname "$0")/$demo/main.ts"
 
 if [ ! -f "$script" ]; then
   echo "Unknown demo: $demo"
-  echo "Available: file-browser, reminders, agent-teams"
+  echo "Available: file-browser, reminders, agent-teams, playground"
   exit 1
 fi
 

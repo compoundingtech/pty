@@ -62,7 +62,12 @@ export function themeToXterm(theme: Theme): Record<string, string> {
 export function text(
   str: string,
   color?: Color,
-  opts?: { bold?: boolean; dim?: boolean; italic?: boolean; truncate?: boolean; wrap?: boolean; highlight?: (text: string) => import("./nodes.ts").Span[] },
+  opts?: {
+    bold?: boolean; dim?: boolean; italic?: boolean; inverse?: boolean;
+    background?: Color;
+    truncate?: boolean; wrap?: boolean;
+    highlight?: (text: string) => import("./nodes.ts").Span[];
+  },
 ): TextNode {
   return { type: "text", text: str, color, ...opts };
 }
@@ -127,9 +132,12 @@ export function hstack(
 export function panel(
   title: string,
   children: UINode[],
-  style?: BoxStyle,
+  opts?: BoxStyle | { style?: BoxStyle; footerTitle?: string },
 ): PanelNode {
-  return { type: "panel", title, children, style };
+  if (opts == null || typeof opts === "string") {
+    return { type: "panel", title, children, style: opts };
+  }
+  return { type: "panel", title, children, style: opts.style, footerTitle: opts.footerTitle };
 }
 
 export function scrollable<T>(

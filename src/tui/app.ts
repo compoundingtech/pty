@@ -2,8 +2,9 @@
 // Supports pause/resume for handing the terminal to another process (e.g. attach).
 import type { Screen, ScreenContext } from "./types.ts";
 import type { Theme, BoxStyle } from "./colors.ts";
-import type { KeyEvent } from "./input.ts";
-import { parseKey } from "./input.ts";
+import type { KeyEvent, MouseEvent, InputEvent } from "./input.ts";
+import { parseInput, isMouseEvent, MOUSE_ENABLE_SGR, MOUSE_DISABLE_SGR } from "./input.ts";
+import { createFocusManager, type FocusManager } from "./focus.ts";
 import { hideCursor, showCursor, reset } from "./colors.ts";
 import { CellBuffer, diff, fullRender } from "./buffer.ts";
 import { recordFrame, getCurrentFPS, isFPSVisible } from "./fps.ts";
@@ -21,10 +22,20 @@ export interface AppConfig {
   overlay?: () => Screen | null;
   /** Called before the screen's handleKey. Return true = key consumed, false = pass to screen. */
   onKey?: (key: KeyEvent) => boolean;
+  /** Called before the screen's handleMouse. Return true = consumed. */
+  onMouse?: (event: MouseEvent) => boolean;
   /** Theme provider. Defaults to coolBlue. */
   theme?: () => Theme;
   /** Box style provider. Defaults to "rounded". */
   boxStyle?: () => BoxStyle;
+  /** Enable SGR mouse reporting on start (CSI ?1002h + ?1006h) and disable
+   *  on stop. Default: false. Enable this when your app wants to receive
+   *  mouse events via screen.handleMouse / onMouse. */
+  mouse?: boolean;
+  /** Shared focus manager. If omitted, `app()` creates one automatically
+   *  and exposes it as `ctx.focus` on every screen render/handleKey call.
+   *  Provide your own to share focus state across app instances (rare). */
+  focus?: FocusManager;
 }
 
 /** A running TUI app with lifecycle control. */
@@ -53,6 +64,7 @@ export function app(config: AppConfig): App {
   let exitHandler: (() => void) | null = null;
   let activeScreen: Screen | null = null;
   let activeOverlay: Screen | null = null;
+  const focus: FocusManager = config.focus ?? createFocusManager();
 
   function getSize(): [number, number] {
     return [(stdout as any).rows ?? 35, (stdout as any).columns ?? 120];
@@ -82,6 +94,11 @@ export function app(config: AppConfig): App {
       closeOverlay: () => {},
       isTextInputActive: () => false,
       setTextInputActive: () => {},
+      quit: () => {
+        self.stop();
+        process.exit(0);
+      },
+      focus,
     };
   }
 
@@ -166,19 +183,40 @@ export function app(config: AppConfig): App {
   function registerListeners(): void {
     stdinHandler = (data: Buffer | string) => {
       const buf = typeof data === "string" ? Buffer.from(data) : data;
-      const keys = parseKey(buf);
-      for (const key of keys) {
-        // Global key interceptor
+      const events = parseInput(buf);
+      for (const event of events) {
+        if (isMouseEvent(event)) {
+          // Global mouse interceptor.
+          if (config.onMouse && config.onMouse(event)) continue;
+          const [rows, cols] = getSize();
+          const ctx = createContext(rows, cols);
+          const scr = resolveScreen();
+          scr.handleMouse?.(event, ctx);
+          continue;
+        }
+        const key = event;
+
+        // Global key interceptor — if onKey returns true, the screen never
+        // sees the event (used for global shortcuts like command palette).
         if (config.onKey && config.onKey(key)) continue;
-        // Screen key handler
+
+        // Default ctrl+c handler: quits unless the global onKey already
+        // consumed it above. Screens that want to override this (e.g. a
+        // composer with double-ctrl-c to confirm) can intercept via
+        // config.onKey.
+        if (key.name === "c" && key.ctrl) {
+          self.stop();
+          process.exit(130);
+        }
+
+        // Screen key handler. Return value is a hint for nested routing;
+        // the app ignores it. Screens that want to quit call ctx.quit()
+        // explicitly — returning false from here used to quit the app
+        // and was a footgun.
         const [rows, cols] = getSize();
         const ctx = createContext(rows, cols);
         const scr = resolveScreen();
-        const cont = scr.handleKey(key, ctx);
-        if (!cont) {
-          self.stop();
-          process.exit(0);
-        }
+        scr.handleKey(key, ctx);
       }
     };
     stdin.on("data", stdinHandler);
@@ -207,11 +245,13 @@ export function app(config: AppConfig): App {
 
   function enterTerminal(): void {
     stdout.write(enterAltScreen + hideCursor());
+    if (config.mouse) stdout.write(MOUSE_ENABLE_SGR);
     if (stdin.isTTY) stdin.setRawMode(true);
     stdin.resume();
   }
 
   function leaveTerminal(full: boolean): void {
+    if (config.mouse) stdout.write(MOUSE_DISABLE_SGR);
     if (full) {
       stdout.write(showCursor() + reset() + leaveAltScreen);
     } else {

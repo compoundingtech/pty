@@ -49,6 +49,16 @@ export interface ScreenContext {
   closeOverlay: () => void;
   isTextInputActive: () => boolean;
   setTextInputActive: (active: boolean) => void;
+  /** Explicit app-exit hook. Screens that want to quit (on q, ctrl+c,
+   *  a menu action, etc.) call this instead of returning false from
+   *  handleKey — returning false used to quit the app and was a footgun.
+   *  Safe to call from anywhere; tears down the app and exits the process. */
+  quit: () => void;
+  /** Stack-based focus manager for routing keys/mouse to nested scopes.
+   *  Provided by `app()` automatically — every screen has access to the
+   *  same instance. Screens opt into it by calling `ctx.focus.dispatchKey`
+   *  from their `handleKey` (or ignore it entirely). */
+  focus: import("./focus.ts").FocusManager;
   [key: string]: any;
 }
 
@@ -58,6 +68,9 @@ export interface Screen {
   render(ctx: ScreenContext): string;
   renderToBuffer(ctx: ScreenContext): import("./buffer.ts").CellBuffer;
   handleKey(key: KeyEvent, ctx: ScreenContext): boolean;
+  /** Optional mouse event handler. Only fires when AppConfig.mouse is on.
+   *  Return value is a hint for parent routing; app() ignores it. */
+  handleMouse?(event: import("./input.ts").MouseEvent, ctx: ScreenContext): boolean;
   onEnter?(ctx: ScreenContext): void;
   onLeave?(ctx: ScreenContext): void;
 }

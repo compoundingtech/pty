@@ -1,6 +1,9 @@
-// Raw stdin keypress parsing
+// Raw stdin input parsing — keyboard + mouse.
 
 export interface KeyEvent {
+  /** Discriminator for InputEvent union. Implicit on the existing API so
+   *  pre-mouse consumers keep working — the default is "key" when absent. */
+  kind?: "key";
   name: string;
   char?: string;
   ctrl: boolean;
@@ -8,8 +11,84 @@ export interface KeyEvent {
   shift: boolean;
 }
 
+export type MouseButton = "left" | "middle" | "right" | "none";
+export type MouseAction = "press" | "release" | "drag" | "move" | "scrollUp" | "scrollDown";
+
+export interface MouseEvent {
+  kind: "mouse";
+  action: MouseAction;
+  button: MouseButton;
+  /** 0-based column of the cell the pointer is over. */
+  x: number;
+  /** 0-based row. */
+  y: number;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+}
+
+export type InputEvent = KeyEvent | MouseEvent;
+
+/** Type guard: narrows an InputEvent to a MouseEvent. */
+export function isMouseEvent(e: InputEvent): e is MouseEvent {
+  return (e as MouseEvent).kind === "mouse";
+}
+
+/** ANSI sequences to enable / disable SGR mouse reporting. Use these when
+ *  your app wants to receive mouse events. `parseInput` knows how to
+ *  decode them once enabled. */
+export const MOUSE_ENABLE_SGR = "\x1b[?1002h\x1b[?1006h";
+export const MOUSE_DISABLE_SGR = "\x1b[?1006l\x1b[?1002l";
+
+function decodeMouse(
+  buttonCode: number, x: number, y: number, isRelease: boolean,
+): MouseEvent | null {
+  // SGR mouse button-code encoding:
+  //   low 2 bits:   button (0=left, 1=middle, 2=right, 3=none for motion)
+  //   bit 2 (0x04): shift
+  //   bit 3 (0x08): alt
+  //   bit 4 (0x10): ctrl
+  //   bit 5 (0x20): motion flag (drag when a button is down)
+  //   bit 6 (0x40): wheel (64 = scroll-up, 65 = scroll-down)
+  const shift = (buttonCode & 0x04) !== 0;
+  const alt   = (buttonCode & 0x08) !== 0;
+  const ctrl  = (buttonCode & 0x10) !== 0;
+  const motion = (buttonCode & 0x20) !== 0;
+  const wheel = (buttonCode & 0x40) !== 0;
+  const low = buttonCode & 0x03;
+
+  const common = { x: Math.max(0, x - 1), y: Math.max(0, y - 1), ctrl, alt, shift };
+
+  if (wheel) {
+    return {
+      kind: "mouse",
+      action: low === 0 ? "scrollUp" : "scrollDown",
+      button: "none",
+      ...common,
+    };
+  }
+
+  const button: MouseButton =
+    low === 0 ? "left" : low === 1 ? "middle" : low === 2 ? "right" : "none";
+
+  if (isRelease) {
+    return { kind: "mouse", action: "release", button, ...common };
+  }
+  if (motion) {
+    return { kind: "mouse", action: button === "none" ? "move" : "drag", button, ...common };
+  }
+  return { kind: "mouse", action: "press", button, ...common };
+}
+
+/** Legacy entry point — keyboard only. Existing consumers keep using this;
+ *  new code that wants mouse should call `parseInput` instead. */
 export function parseKey(data: Buffer): KeyEvent[] {
-  const events: KeyEvent[] = [];
+  return parseInput(data).filter((e): e is KeyEvent => !isMouseEvent(e));
+}
+
+/** Parse a stdin chunk into an ordered list of keyboard + mouse events. */
+export function parseInput(data: Buffer): InputEvent[] {
+  const events: InputEvent[] = [];
   const str = data.toString("utf8");
   let i = 0;
 
@@ -20,6 +99,24 @@ export function parseKey(data: Buffer): KeyEvent[] {
       if (i + 1 < str.length && str[i + 1] === "[") {
         const rest = str.slice(i + 2);
 
+        // SGR mouse: ESC[<b;x;y;(M|m)
+        // Recognised BEFORE the generic-arrow branches because the leading
+        // `<` disambiguates unambiguously and any other CSI starts with a
+        // parameter or a letter (never `<`).
+        if (rest[0] === "<") {
+          const mouseMatch = rest.match(/^<(\d+);(\d+);(\d+)([Mm])/);
+          if (mouseMatch) {
+            const b = parseInt(mouseMatch[1], 10);
+            const x = parseInt(mouseMatch[2], 10);
+            const y = parseInt(mouseMatch[3], 10);
+            const release = mouseMatch[4] === "m";
+            const ev = decodeMouse(b, x, y, release);
+            if (ev) events.push(ev);
+            i += 2 + mouseMatch[0].length;
+            continue;
+          }
+        }
+
         // Arrow keys, home, end
         if (rest[0] === "A") { events.push({ name: "up", ctrl: false, alt: false, shift: false }); i += 3; continue; }
         if (rest[0] === "B") { events.push({ name: "down", ctrl: false, alt: false, shift: false }); i += 3; continue; }
@@ -27,6 +124,24 @@ export function parseKey(data: Buffer): KeyEvent[] {
         if (rest[0] === "D") { events.push({ name: "left", ctrl: false, alt: false, shift: false }); i += 3; continue; }
         if (rest[0] === "H") { events.push({ name: "home", ctrl: false, alt: false, shift: false }); i += 3; continue; }
         if (rest[0] === "F") { events.push({ name: "end", ctrl: false, alt: false, shift: false }); i += 3; continue; }
+
+        // Arrows with modifiers: ESC[1;<mods><letter>.
+        // mods - 1 is a bitmask: bit0=shift, bit1=alt, bit2=ctrl (same scheme
+        // as the kitty keyboard protocol). Terminal.app and kitty both emit
+        // this form for option+arrow (alt) and shift+arrow.
+        const modArrow = rest.match(/^1;(\d+)([ABCDHF])/);
+        if (modArrow) {
+          const mods = parseInt(modArrow[1], 10) - 1;
+          const shift = (mods & 0x01) !== 0;
+          const alt   = (mods & 0x02) !== 0;
+          const ctrl  = (mods & 0x04) !== 0;
+          const letterToName: Record<string, string> = {
+            A: "up", B: "down", C: "right", D: "left", H: "home", F: "end",
+          };
+          events.push({ name: letterToName[modArrow[2]], ctrl, alt, shift });
+          i += 2 + modArrow[0].length;
+          continue;
+        }
 
         // Shift+Tab (legacy xterm encoding): ESC[Z
         if (rest[0] === "Z") { events.push({ name: "backtab", ctrl: false, alt: false, shift: true }); i += 3; continue; }

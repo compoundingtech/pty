@@ -375,7 +375,7 @@ const listScreen = screen({
     ];
   },
 
-  handleKey(key: KeyEvent, _ctx: ScreenContext): boolean {
+  handleKey(key: KeyEvent, ctx: ScreenContext): boolean {
     const total = totalItems.get();
     const idx = selectedIndex.peek();
     const maxIndex = total - 1;
@@ -437,14 +437,17 @@ const listScreen = screen({
         batch(() => { filterText.set(""); selectedIndex.set(0); });
         return true;
       }
-      return false; // quit
+      ctx.quit();
+      return true;
     }
     if (key.char === "q" && !key.ctrl && !key.alt && !filterText.peek()) {
-      return false; // quit
+      ctx.quit();
+      return true;
     }
-    if (key.name === "c" && key.ctrl) {
-      return false; // quit
-    }
+    // ctrl+c is now handled globally by app(); leave the explicit check off
+    // here so the global default fires. If someone binds it in a context
+    // that should NOT quit (e.g. a composer with double-ctrl-c semantics),
+    // they intercept via AppConfig.onKey.
     if (key.name === "backspace") {
       if (filterText.peek().length > 0) {
         batch(() => { filterText.set(filterText.peek().slice(0, -1)); selectedIndex.set(0); });

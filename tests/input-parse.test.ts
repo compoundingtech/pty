@@ -74,6 +74,29 @@ describe("parseKey: shift+tab (backtab)", () => {
   });
 });
 
+describe("parseKey: modified arrow keys (ESC[1;mods<letter>)", () => {
+  it("option+left (mods=3 → alt) -> left with alt true", () => {
+    expect(parse("\x1b[1;3D")).toEqual([
+      { name: "left", ctrl: false, alt: true, shift: false },
+    ]);
+  });
+  it("option+right -> right with alt true", () => {
+    expect(parse("\x1b[1;3C")).toEqual([
+      { name: "right", ctrl: false, alt: true, shift: false },
+    ]);
+  });
+  it("shift+up (mods=2) -> up with shift true", () => {
+    expect(parse("\x1b[1;2A")).toEqual([
+      { name: "up", ctrl: false, alt: false, shift: true },
+    ]);
+  });
+  it("ctrl+shift+alt+end (mods=8) -> all three modifiers on end", () => {
+    expect(parse("\x1b[1;8F")).toEqual([
+      { name: "end", ctrl: true, alt: true, shift: true },
+    ]);
+  });
+});
+
 describe("parseKey: kitty protocol modifier extraction", () => {
   // Regression guard: before this change, shift was never extracted from
   // the kitty modifier bitmask. Now it is — keep it that way.
