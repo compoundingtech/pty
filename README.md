@@ -95,6 +95,17 @@ pty events --all                          # follow events from all sessions
 pty events --recent myserver              # show recent events and exit
 pty events --json myserver                # output raw JSONL
 
+pty emit user.deploy.started              # emit a user event (inside a session)
+pty emit myserver user.build.finished --json '{"ok":true}'  # with JSON payload
+pty emit myserver user.note --text "checkpoint reached"     # with a text payload
+
+pty state set myserver port 3000          # set a JSON-parsed state key
+pty state set myserver config < cfg.json  # pipe a bigger value from stdin
+pty state get myserver port               # print a single key's JSON value
+pty state get myserver                    # print the whole bag (pretty JSON)
+pty state keys myserver                   # list keys (one per line)
+pty state delete myserver port            # remove a key
+
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata

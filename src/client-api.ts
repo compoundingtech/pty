@@ -7,6 +7,7 @@ export {
   validateName, updateTags, setDisplayName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
+  getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo, type SessionMetadata, type PrunedTagResult,
 } from "./sessions.ts";
 
@@ -31,12 +32,14 @@ export {
 export {
   EventType,
   EventFollower, readRecentEvents, formatEvent,
+  emitUserEvent, appendEvent, isUserEvent, validateUserEventType,
   type EventRecord, type EventBase,
   type BellEvent, type TitleChangeEvent, type NotificationEvent,
   type FocusRequestEvent, type CursorVisibleEvent,
   type SessionStartEvent, type SessionExitEvent, type SessionExecEvent,
   type SessionRestartEvent, type SessionFailedEvent,
   type SupervisorStartEvent, type SupervisorStopEvent,
+  type UserEvent, type StateSetEvent, type StateDeleteEvent,
   type FollowerOptions,
 } from "./events.ts";
 

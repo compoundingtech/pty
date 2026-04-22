@@ -23,10 +23,15 @@ import {
   readMetadata,
   writeMetadata,
   getSessionDir,
+  getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
-import { EventFollower, EventWriter, EventType, readRecentEvents, formatEvent } from "./events.ts";
+import {
+  EventFollower, EventWriter, EventType,
+  readRecentEvents, formatEvent,
+  emitUserEvent, appendEvent,
+} from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
@@ -707,6 +712,16 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
+      break;
+    }
+
+    case "emit": {
+      await cmdEmit(args.slice(1));
+      break;
+    }
+
+    case "state": {
+      await cmdState(args.slice(1));
       break;
     }
 
@@ -1877,6 +1892,243 @@ async function cmdGc(dryRun: boolean): Promise<void> {
       ? `Would clean up ${parts.join(" and ")}. (Dry run — no changes made.)`
       : `Cleaned up ${parts.join(" and ")}.`,
   );
+}
+
+// --- emit: publish a user.* event to a session's events log ---
+
+async function cmdEmit(argv: string[]): Promise<void> {
+  // pty emit <type> [--json <payload>] [--text <string>]
+  // pty emit <ref> <type> [--json <payload>] [--text <string>]
+  // Inside a session, $PTY_SESSION provides the default ref.
+  let ref: string | null = null;
+  let type: string | null = null;
+  let jsonStr: string | null = null;
+  let textStr: string | null = null;
+  const positional: string[] = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json" && i + 1 < argv.length) { jsonStr = argv[++i]; continue; }
+    if (a === "--text" && i + 1 < argv.length) { textStr = argv[++i]; continue; }
+    if (a === "-h" || a === "--help") {
+      printEmitHelp();
+      return;
+    }
+    positional.push(a);
+  }
+
+  if (positional.length === 2) { ref = positional[0]; type = positional[1]; }
+  else if (positional.length === 1) { ref = null; type = positional[0]; }
+  else {
+    printEmitHelp();
+    process.exit(1);
+  }
+
+  // Default to $PTY_SESSION when no explicit ref given.
+  if (ref == null) ref = process.env.PTY_SESSION ?? null;
+  if (!ref) {
+    console.error("pty emit: no session ref given and not running inside a pty session");
+    console.error("  tip: run inside a pty session, or: pty emit <session-ref> <type>");
+    process.exit(1);
+  }
+
+  try {
+    validateName(ref);
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+  const resolvedName = await resolveRef(ref);
+
+  let data: unknown;
+  if (jsonStr != null) {
+    try { data = JSON.parse(jsonStr); }
+    catch (e: any) {
+      console.error(`pty emit: --json payload is not valid JSON: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
+  try {
+    const event = await emitUserEvent(resolvedName, type!, {
+      ...(data !== undefined ? { data } : {}),
+      ...(textStr != null ? { text: textStr } : {}),
+    });
+    // Silent by default; -v isn't implemented. Return the type so scripts
+    // can chain `pty emit ... | ...` if they want.
+    void event;
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+}
+
+function printEmitHelp(): void {
+  console.log(`Usage:
+  pty emit <type> [--json <payload>] [--text <string>]
+  pty emit <session-ref> <type> [--json <payload>] [--text <string>]
+
+Publishes a user.* event to a session's events log. Inside a pty
+session, the ref defaults to $PTY_SESSION. Event types must start
+with "user." — "session_*", "state.*", "bell", etc. are reserved.
+
+Examples:
+  pty emit user.build-done
+  pty emit user.progress --json '{"pct": 40}'
+  pty emit user.note --text "starting deploy"
+  pty emit myserver user.tests-passed --json '{"n": 42}'`);
+}
+
+// --- state: per-session JSON data bag ---
+
+async function cmdState(argv: string[]): Promise<void> {
+  const sub = argv[0];
+  if (!sub || sub === "-h" || sub === "--help") {
+    printStateHelp();
+    return;
+  }
+
+  // pty state <sub> [ref] [key] [value]
+  // ref defaults to $PTY_SESSION inside a session.
+  const rest = argv.slice(1);
+
+  // Figure out whether the first positional is a session-ref or a key.
+  // Heuristic: if it names an existing session, treat it as the ref;
+  // otherwise fall back to $PTY_SESSION. This matches the `pty exec`,
+  // `pty rename` etc. pattern.
+  async function resolveStateTarget(): Promise<{ name: string; rest: string[] }> {
+    const inside = process.env.PTY_SESSION;
+    if (rest.length > 0) {
+      const candidate = rest[0];
+      try {
+        validateName(candidate);
+        const existing = await getSession(candidate);
+        if (existing) return { name: candidate, rest: rest.slice(1) };
+      } catch {
+        // Not a valid session name — treat as the key instead.
+      }
+    }
+    if (!inside) {
+      console.error(`pty state ${sub}: no session ref given and not running inside a pty session`);
+      console.error(`  tip: run inside a pty session, or pass the session-ref: pty state ${sub} <session-ref> ...`);
+      process.exit(1);
+    }
+    return { name: await resolveRef(inside), rest };
+  }
+
+  try {
+    switch (sub) {
+      case "get": {
+        const { name, rest: r } = await resolveStateTarget();
+        if (r.length === 0) {
+          const bag = getState(name);
+          console.log(JSON.stringify(bag, null, 2));
+          return;
+        }
+        if (r.length > 1) {
+          console.error("pty state get: unexpected extra args");
+          process.exit(1);
+        }
+        const value = getStateKey(name, r[0]);
+        if (value === undefined) {
+          process.exit(1); // "missing key" — silent, non-zero exit
+        }
+        console.log(JSON.stringify(value, null, 2));
+        return;
+      }
+      case "set": {
+        const { name, rest: r } = await resolveStateTarget();
+        if (r.length < 1) {
+          console.error("pty state set: expected <key> [value]. If value is omitted, JSON is read from stdin.");
+          process.exit(1);
+        }
+        if (r.length > 2) {
+          console.error("pty state set: too many positional arguments. Quote the JSON value so the shell keeps it as one argument: pty state set <ref> <key> '<json>'.");
+          process.exit(1);
+        }
+        const key = r[0];
+        let raw: string;
+        if (r.length === 2) {
+          raw = r[1];
+        } else {
+          raw = await readAllStdin();
+        }
+        let value: unknown;
+        try { value = JSON.parse(raw); }
+        catch (e: any) {
+          console.error(`pty state set: value is not valid JSON: ${e.message}`);
+          process.exit(1);
+        }
+        setState(name, key, value);
+        await appendEvent(name, {
+          session: name, type: "state.set", ts: new Date().toISOString(),
+          key, value,
+        });
+        return;
+      }
+      case "delete":
+      case "rm": {
+        const { name, rest: r } = await resolveStateTarget();
+        if (r.length !== 1) {
+          console.error(`pty state ${sub}: expected <key>`);
+          process.exit(1);
+        }
+        const key = r[0];
+        const removed = deleteState(name, key);
+        if (removed) {
+          await appendEvent(name, {
+            session: name, type: "state.delete", ts: new Date().toISOString(),
+            key,
+          });
+        }
+        return;
+      }
+      case "keys": {
+        const { name, rest: r } = await resolveStateTarget();
+        if (r.length > 0) {
+          console.error("pty state keys: unexpected extra args");
+          process.exit(1);
+        }
+        const keys = listStateKeys(name);
+        for (const k of keys) console.log(k);
+        return;
+      }
+      default:
+        printStateHelp();
+        process.exit(1);
+    }
+  } catch (e: any) {
+    console.error(e.message);
+    process.exit(1);
+  }
+}
+
+function printStateHelp(): void {
+  console.log(`Usage:
+  pty state get    [<ref>] [<key>]     # print full bag or one key (JSON)
+  pty state set    [<ref>] <key> [v]   # set <key> to JSON value v (or stdin)
+  pty state delete [<ref>] <key>       # remove a key
+  pty state keys   [<ref>]             # list keys
+
+Inside a pty session, <ref> defaults to $PTY_SESSION. Every set/delete
+emits a matching state.set / state.delete event so followers of
+'pty events <ref>' see state transitions live.
+
+Values are JSON — "42" is the number 42, '"42"' is the string "42".
+Use 'pty state set foo "$(cat payload.json)"' for larger payloads,
+or pipe via stdin:  cat payload.json | pty state set foo`);
+}
+
+async function readAllStdin(): Promise<string> {
+  // Collect all of stdin. Used by 'pty state set <key>' when no value arg
+  // is given — allows shell piping for large JSON payloads.
+  return await new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { data += chunk; });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
 }
 
 async function cmdSupervisorStart(): Promise<void> {

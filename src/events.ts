@@ -21,7 +21,11 @@ export type EventType = (typeof EventType)[keyof typeof EventType];
 
 export interface EventBase {
   session: string;
-  type: EventType;
+  /** Type string. Known system types live in the `EventType` enum; user
+   *  events are `user.*`; state bag changes are `state.set` / `state.delete`.
+   *  Kept as a plain `string` here so subtype interfaces can carry their
+   *  own literal types without fighting the compiler. */
+  type: string;
   ts: string;
 }
 
@@ -85,6 +89,29 @@ export interface SupervisorStopEvent extends EventBase {
   type: "supervisor_stop";
 }
 
+/** User-published event. `type` must begin with `user.` — the CLI
+ *  (`pty emit`) rejects anything else, and the client-API `emitEvent`
+ *  helper throws on bad types. Payload is free-form JSON. */
+export interface UserEvent extends EventBase {
+  type: `user.${string}`;
+  data?: unknown;
+  text?: string;
+}
+
+/** Emitted automatically whenever `setState` writes a key. Mirrors
+ *  what `pty state set` records. Consumers of the event stream can
+ *  react to state changes without polling the metadata file. */
+export interface StateSetEvent extends EventBase {
+  type: "state.set";
+  key: string;
+  value: unknown;
+}
+
+export interface StateDeleteEvent extends EventBase {
+  type: "state.delete";
+  key: string;
+}
+
 export type EventRecord =
   | BellEvent
   | TitleChangeEvent
@@ -97,11 +124,92 @@ export type EventRecord =
   | SessionRestartEvent
   | SessionFailedEvent
   | SupervisorStartEvent
-  | SupervisorStopEvent;
+  | SupervisorStopEvent
+  | UserEvent
+  | StateSetEvent
+  | StateDeleteEvent;
+
+/** Type guard: narrows an EventRecord to a UserEvent. */
+export function isUserEvent(e: EventRecord): e is UserEvent {
+  return typeof e.type === "string" && e.type.startsWith("user.");
+}
+
+/** Validate a user-emitted event type. Returns null if valid, an error
+ *  message otherwise. Shared between the CLI and the client-API helper
+ *  so both surface the same message. */
+export function validateUserEventType(type: string): string | null {
+  if (typeof type !== "string" || type.length === 0) {
+    return "event type must be a non-empty string";
+  }
+  if (!type.startsWith("user.")) {
+    return `custom events must start with "user." (got ${JSON.stringify(type)})`;
+  }
+  if (type === "user.") {
+    return `event type "user." needs a suffix (e.g. "user.build-done")`;
+  }
+  // Reserve ASCII whitespace / control chars — they'd break JSONL round-trip
+  // and any shell that tries to grep the events file.
+  if (/[\s\x00-\x1f]/.test(type)) {
+    return `event type may not contain whitespace or control characters`;
+  }
+  return null;
+}
 
 const MAX_LINES = 1000;
 const KEEP_LINES = 500;
 const TRUNCATE_CHECK_INTERVAL = 100;
+
+/** One-shot helper to append a single event to a session's events log
+ *  without keeping an EventWriter around. Used by CLI subcommands like
+ *  `pty emit` and `pty state set` that run outside the daemon process.
+ *  Applies the same MAX_LINES/KEEP_LINES retention as `EventWriter` so
+ *  scripts that write in a loop don't grow the log unbounded — the
+ *  truncate path is skipped via a cheap stat when the file is small. */
+export async function appendEvent(name: string, event: EventRecord): Promise<void> {
+  ensureSessionDir();
+  const filePath = getEventsPath(name);
+  const line = JSON.stringify(event) + "\n";
+  await fsp.appendFile(filePath, line);
+  await maybeTruncate(filePath);
+}
+
+/** Cheap retention check. Only reads + rewrites when the file's byte size
+ *  suggests it might exceed MAX_LINES — avoids paying a readFile per
+ *  append in the common case. */
+async function maybeTruncate(filePath: string): Promise<void> {
+  try {
+    const stat = await fsp.stat(filePath);
+    // Very conservative lower bound: shortest plausible JSONL event line is
+    // ~40 bytes. If the file is smaller than MAX_LINES * 40, skip the line
+    // count entirely. In practice most events are 100-400 bytes so this
+    // fast path covers the overwhelming majority of calls.
+    if (stat.size < MAX_LINES * 40) return;
+    await truncate(filePath);
+  } catch {
+    // File might have been concurrently removed — ignore.
+  }
+}
+
+/** Validate + append a user.* event. Throws on an invalid type so the
+ *  caller surfaces the error cleanly. Timestamped here so callers don't
+ *  need to remember to set `ts`. */
+export async function emitUserEvent(
+  sessionName: string,
+  type: string,
+  opts: { data?: unknown; text?: string } = {},
+): Promise<UserEvent> {
+  const err = validateUserEventType(type);
+  if (err) throw new Error(err);
+  const event: UserEvent = {
+    session: sessionName,
+    type: type as `user.${string}`,
+    ts: new Date().toISOString(),
+    ...(opts.data !== undefined ? { data: opts.data } : {}),
+    ...(opts.text !== undefined ? { text: opts.text } : {}),
+  };
+  await appendEvent(sessionName, event);
+  return event;
+}
 
 /** Manages async, serialized writes to a session's events JSONL file. */
 export class EventWriter {
@@ -327,5 +435,18 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} supervisor started`;
     case "supervisor_stop":
       return `${prefix} supervisor stopped`;
+    case "state.set":
+      return `${prefix} state.set ${event.key} = ${JSON.stringify(event.value)}`;
+    case "state.delete":
+      return `${prefix} state.delete ${event.key}`;
+    default: {
+      // user.* events + anything else unknown-at-compile-time.
+      const e = event as EventBase & { data?: unknown; text?: string };
+      const suffix =
+        e.text != null ? ` "${e.text}"`
+        : e.data !== undefined ? ` ${JSON.stringify(e.data)}`
+        : "";
+      return `${prefix} ${e.type}${suffix}`;
+    }
   }
 }

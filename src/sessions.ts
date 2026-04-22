@@ -75,6 +75,14 @@ export interface SessionMetadata {
   exitedAt?: string;
   lastLines?: string[];
   tags?: Record<string, string>;
+  /** Free-form per-session data bag. Separate from `tags` (which are
+   *  string-valued, filterable, and rendered in `pty list`) — `state`
+   *  holds complex JSON values a session or a consumer wants to track
+   *  (web server port, agent turn count, cached result, etc.). Mutated
+   *  via `setState` / `deleteState`, which emit `state.set` /
+   *  `state.delete` events automatically. Keep to small-to-medium JSON
+   *  — the metadata file is rewritten on every update. */
+  state?: Record<string, unknown>;
   /** Optional human-friendly alias for the session. Mutable via `pty rename`.
    *  The immutable stable id is always `SessionInfo.name`. Most code should
    *  keep using `name`; `displayName` is purely for presentation and as an
@@ -154,6 +162,68 @@ export function updateTags(
     delete metadata.tags;
   }
   writeMetadata(name, metadata);
+}
+
+/** Read a session's state bag. Returns an empty object when the session
+ *  has no state. Throws if the session doesn't exist. */
+export function getState(name: string): Record<string, unknown> {
+  const metadata = readMetadata(name);
+  if (!metadata) throw new Error(`Session "${name}" not found.`);
+  return { ...(metadata.state ?? {}) };
+}
+
+/** Read a single state key. Returns `undefined` if the key isn't set.
+ *  Uses own-property lookup so prototype names like `toString` /
+ *  `hasOwnProperty` return `undefined` instead of leaking inherited
+ *  methods. */
+export function getStateKey(name: string, key: string): unknown {
+  const metadata = readMetadata(name);
+  if (!metadata) throw new Error(`Session "${name}" not found.`);
+  const state = metadata.state;
+  if (!state || !Object.prototype.hasOwnProperty.call(state, key)) return undefined;
+  return state[key];
+}
+
+/** Set a key on the state bag. Atomic read-modify-write of the metadata
+ *  file. Caller is responsible for calling `appendEvent` with the
+ *  matching `state.set` record if event emission is desired — the CLI
+ *  wrapper (`pty state set`) does this. Keeping the event-emit decoupled
+ *  from the write keeps this function usable from contexts that don't
+ *  want to emit (e.g. tests, bulk imports). */
+export function setState(name: string, key: string, value: unknown): void {
+  const metadata = readMetadata(name);
+  if (!metadata) throw new Error(`Session "${name}" not found.`);
+  const state = { ...(metadata.state ?? {}) };
+  state[key] = value;
+  metadata.state = state;
+  writeMetadata(name, metadata);
+}
+
+/** Delete a key from the state bag. Returns `true` when the key existed and
+ *  was removed, `false` when the key wasn't set (no write performed).
+ *  Callers that emit a `state.delete` event should gate on the return value
+ *  so a delete on a missing key doesn't produce a ghost event. Uses
+ *  own-property lookup — inherited names like `toString` never match. */
+export function deleteState(name: string, key: string): boolean {
+  const metadata = readMetadata(name);
+  if (!metadata) throw new Error(`Session "${name}" not found.`);
+  if (!metadata.state || !Object.prototype.hasOwnProperty.call(metadata.state, key)) return false;
+  const state = { ...metadata.state };
+  delete state[key];
+  if (Object.keys(state).length > 0) {
+    metadata.state = state;
+  } else {
+    delete metadata.state;
+  }
+  writeMetadata(name, metadata);
+  return true;
+}
+
+/** List every key currently set on the state bag. */
+export function listStateKeys(name: string): string[] {
+  const metadata = readMetadata(name);
+  if (!metadata) throw new Error(`Session "${name}" not found.`);
+  return Object.keys(metadata.state ?? {});
 }
 
 export function readMetadata(name: string): SessionMetadata | null {
