@@ -62,7 +62,7 @@ export type {
   ScrollableNode, SelectableNode,
   StatusBarNode, FooterNode, AskBarNode, TextInputNode,
   FPSCounterNode, CanvasNode, CanvasCell, DrawContext,
-  PtyHandle, PtyViewNode,
+  PtyHandle, PtyViewNode, PtyCell,
 } from "./nodes.ts";
 
 // Builders

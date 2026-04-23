@@ -331,3 +331,87 @@ describe("readCells", () => {
     expect(text).toContain("hello-world");
   });
 });
+
+// --- Palette-indexed color preservation (fgIndex / bgIndex) ---
+//
+// Regression guard for pty-layout: readCells used to flatten palette
+// cells to a hardcoded VGA RGB via paletteToRgb(), which meant
+// consumers that re-emit cells to a real terminal lost the outer
+// terminal's theme (SGR 34 became [0,0,204] always, even in kitty
+// with a blue theme). Cells now also carry `fgIndex` / `bgIndex`
+// so re-emitters can produce SGR 30-37 / 38;5;N and let the outer
+// terminal's palette win.
+
+// Find the first cell whose char matches `ch` and return it. Used
+// because the cursor trails the emitted output and the SGR attrs
+// only live on the printed chars, not the cursor row.
+function findCellByChar(
+  cells: ReturnType<PtyHandle["readCells"]>,
+  ch: string,
+): ReturnType<PtyHandle["readCells"]>[0][0] | null {
+  for (const row of cells) {
+    for (const cell of row) {
+      if (cell.char === ch) return cell;
+    }
+  }
+  return null;
+}
+
+describe("readCells — palette-indexed colors", () => {
+  it("preserves low-palette fg (SGR 34 → fgIndex=4)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[34mB\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "B") !== null);
+    const cell = findCellByChar(h.readCells(), "B")!;
+    expect(cell.fgIndex).toBe(4);
+    // `fg` is still populated for back-compat — consumers that don't
+    // know about fgIndex fall back to the flattened RGB.
+    expect(cell.fg).not.toBeNull();
+  });
+
+  it("preserves bright-palette fg (SGR 94 → fgIndex=12)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[94mX\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "X") !== null);
+    const cell = findCellByChar(h.readCells(), "X")!;
+    expect(cell.fgIndex).toBe(12);
+  });
+
+  it("preserves 256-palette fg (SGR 38;5;17 → fgIndex=17)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[38;5;17mY\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "Y") !== null);
+    const cell = findCellByChar(h.readCells(), "Y")!;
+    expect(cell.fgIndex).toBe(17);
+  });
+
+  it("preserves 256-palette bg (SGR 48;5;124 → bgIndex=124)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[48;5;124mZ\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "Z") !== null);
+    const cell = findCellByChar(h.readCells(), "Z")!;
+    expect(cell.bgIndex).toBe(124);
+  });
+
+  it("truecolor RGB leaves fgIndex null (cell is not indexed)", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[38;2;10;20;30mT\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "T") !== null);
+    const cell = findCellByChar(h.readCells(), "T")!;
+    expect(cell.fgIndex).toBeNull();
+    expect(cell.fg).toEqual([10, 20, 30]);
+  });
+
+  it("default-color cells have both fg=null and fgIndex=null", async () => {
+    const h = spawn("bash", ["-c", "printf 'D'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "D") !== null);
+    const cell = findCellByChar(h.readCells(), "D")!;
+    expect(cell.fg).toBeNull();
+    expect(cell.fgIndex).toBeNull();
+    expect(cell.bg).toBeNull();
+    expect(cell.bgIndex).toBeNull();
+  });
+
+  it("fg and bg indices are tracked independently", async () => {
+    const h = spawn("bash", ["-c", "printf '\\x1b[31;42mM\\x1b[0m'; sleep 10"]);
+    await waitFor(h, () => findCellByChar(h.readCells(), "M") !== null);
+    const cell = findCellByChar(h.readCells(), "M")!;
+    expect(cell.fgIndex).toBe(1); // SGR 31
+    expect(cell.bgIndex).toBe(2); // SGR 42
+  });
+});

@@ -241,6 +241,32 @@ export interface CanvasNode {
   _rect?: Rect;
 }
 
+/** One grid cell as read by `PtyHandle.readCells`. Keeps both the
+ *  resolved RGB and — when the source was palette-indexed — the raw
+ *  0-255 index. Re-emitters that want the outer terminal's theme
+ *  (kitty, wezterm, iterm2 with a user palette) should prefer the
+ *  index; consumers that need a concrete RGB fall back to `fg`/`bg`. */
+export interface PtyCell {
+  char: string;
+  /** RGB foreground. `null` when the cell used the terminal's default
+   *  fg and no explicit color was ever set. For palette cells this is
+   *  populated with a flattened VGA/xterm-cube approximation — check
+   *  `fgIndex` first if you want the outer terminal's theme. */
+  fg: [number, number, number] | null;
+  bg: [number, number, number] | null;
+  /** 0-255 palette index when the cell was written with an indexed
+   *  SGR color (30-37, 90-97, 38;5;N, 48;5;N). `null` for default-
+   *  color cells and for true-color cells. Added so pty-layout and
+   *  similar re-emitters can round-trip indexed colors and let the
+   *  outer terminal resolve them against its own theme. */
+  fgIndex: number | null;
+  bgIndex: number | null;
+  bold: boolean;
+  dim: boolean;
+  italic: boolean;
+  underline: boolean;
+}
+
 /** Handle returned by createPty(). Holds the spawned process + xterm terminal. */
 export interface PtyHandle {
   /** Write raw input to the child process. */
@@ -252,7 +278,7 @@ export interface PtyHandle {
    * xterm parsed is preserved. No serialize round-trip.
    * @param scrollOffset Lines to scroll back into history (0 = live viewport).
    */
-  readCells(scrollOffset?: number): { char: string; fg: [number, number, number] | null; bg: [number, number, number] | null; bold: boolean; dim: boolean; italic: boolean; underline: boolean }[][];
+  readCells(scrollOffset?: number): PtyCell[][];
   /**
    * Read per-row "wrapped" flags aligned with the rows returned by
    * `readCells(scrollOffset)`. A `true` at index `r` means row `r`

@@ -6,7 +6,7 @@ import type {
   IconNode, RowNode, ColumnNode, HStackNode, PanelNode,
   ScrollableNode, SelectableNode, StatusBarNode, FooterNode,
   AskBarNode, TextInputNode, FPSCounterNode, CanvasNode,
-  DrawContext, PtyHandle, PtyViewNode,
+  DrawContext, PtyHandle, PtyViewNode, PtyCell,
 } from "./nodes.ts";
 import type { BoxStyle, Theme } from "./colors.ts";
 import type { ScrollRegion } from "./scrollable.ts";
@@ -325,45 +325,53 @@ function readXtermCells(
   const startLine = Math.max(0, baseY - scrollOffset);
   const grid: ReturnType<PtyHandle["readCells"]> = [];
 
+  const EMPTY: PtyCell = {
+    char: " ", fg: null, bg: null, fgIndex: null, bgIndex: null,
+    bold: false, dim: false, italic: false, underline: false,
+  };
+
   for (let r = 0; r < rows; r++) {
     const lineIdx = startLine + r;
     const line = lineIdx < buf.length ? buf.getLine(lineIdx) : null;
     const row: typeof grid[0] = [];
     for (let c = 0; c < cols; c++) {
-      if (!line) {
-        row.push({ char: " ", fg: null, bg: null, bold: false, dim: false, italic: false, underline: false });
-        continue;
-      }
+      if (!line) { row.push({ ...EMPTY }); continue; }
       const cell = line.getCell(c);
-      if (!cell) {
-        row.push({ char: " ", fg: null, bg: null, bold: false, dim: false, italic: false, underline: false });
-        continue;
-      }
+      if (!cell) { row.push({ ...EMPTY }); continue; }
 
-      // Extract foreground color
+      // Foreground. Preserve the palette index when the source was
+      // indexed so consumers that re-emit to a real terminal can keep
+      // the outer theme (kitty/wezterm/iterm2 user palette).
       let fg: [number, number, number] | null = null;
+      let fgIndex: number | null = null;
       if (cell.isFgRGB()) {
         const v = cell.getFgColor();
         fg = [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
       } else if (cell.isFgPalette()) {
-        fg = paletteToRgb(cell.getFgColor());
+        const n = cell.getFgColor();
+        fg = paletteToRgb(n);
+        fgIndex = n;
       }
-      // isFgDefault() → null (use theme default)
+      // isFgDefault() → both null (use theme default)
 
-      // Extract background color
       let bg: [number, number, number] | null = null;
+      let bgIndex: number | null = null;
       if (cell.isBgRGB()) {
         const v = cell.getBgColor();
         bg = [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
       } else if (cell.isBgPalette()) {
-        bg = paletteToRgb(cell.getBgColor());
+        const n = cell.getBgColor();
+        bg = paletteToRgb(n);
+        bgIndex = n;
       }
-      // isBgDefault() → null (use theme default)
+      // isBgDefault() → both null
 
       row.push({
         char: cell.getChars() || " ",
         fg,
         bg,
+        fgIndex,
+        bgIndex,
         bold: !!cell.isBold(),
         dim: !!cell.isDim(),
         italic: !!cell.isItalic(),
