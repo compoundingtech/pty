@@ -48,6 +48,10 @@ export class CellBuffer {
     let curCol = 0;
     let fgColor: [number, number, number] | null = null;
     let bgColor: [number, number, number] | null = null;
+    // Palette index tracking — populated on indexed SGR (30-37 / 90-97 /
+    // 38;5;N / 48;5;N), nulled on truecolor SGR (38;2) and resets (0, 39, 49).
+    let fgIndex: number | null = null;
+    let bgIndex: number | null = null;
     let isBold = false;
     let isDim = false;
     let isItalic = false;
@@ -75,6 +79,7 @@ export class CellBuffer {
               const p = parts[j]!;
               if (p === 0) {
                 fgColor = null; bgColor = null;
+                fgIndex = null; bgIndex = null;
                 isBold = false; isDim = false; isItalic = false; isUnderline = false;
               } else if (p === 1) isBold = true;
               else if (p === 2) isDim = true;
@@ -84,24 +89,30 @@ export class CellBuffer {
               else if (p === 23) isItalic = false;
               else if (p === 24) isUnderline = false;
               else if (p === 27) { /* reset inverse - ignore */ }
-              else if (p === 39) fgColor = null;
-              else if (p === 49) bgColor = null;
+              else if (p === 39) { fgColor = null; fgIndex = null; }
+              else if (p === 49) { bgColor = null; bgIndex = null; }
               else if (p === 38 && parts[j + 1] === 2) {
                 fgColor = [parts[j + 2] ?? 0, parts[j + 3] ?? 0, parts[j + 4] ?? 0];
+                fgIndex = null; // truecolor has no palette index
                 j += 4;
               } else if (p === 48 && parts[j + 1] === 2) {
                 bgColor = [parts[j + 2] ?? 0, parts[j + 3] ?? 0, parts[j + 4] ?? 0];
+                bgIndex = null;
                 j += 4;
               } else if (p === 38 && parts[j + 1] === 5) {
-                fgColor = ansi256ToRgb(parts[j + 2] ?? 0);
+                const n = parts[j + 2] ?? 0;
+                fgColor = ansi256ToRgb(n);
+                fgIndex = n;
                 j += 2;
               } else if (p === 48 && parts[j + 1] === 5) {
-                bgColor = ansi256ToRgb(parts[j + 2] ?? 0);
+                const n = parts[j + 2] ?? 0;
+                bgColor = ansi256ToRgb(n);
+                bgIndex = n;
                 j += 2;
-              } else if (p >= 30 && p <= 37) fgColor = ansi16ToRgb(p - 30);
-              else if (p >= 40 && p <= 47) bgColor = ansi16ToRgb(p - 40);
-              else if (p >= 90 && p <= 97) fgColor = ansi16ToRgb(p - 90 + 8);
-              else if (p >= 100 && p <= 107) bgColor = ansi16ToRgb(p - 100 + 8);
+              } else if (p >= 30 && p <= 37) { fgColor = ansi16ToRgb(p - 30); fgIndex = p - 30; }
+              else if (p >= 40 && p <= 47) { bgColor = ansi16ToRgb(p - 40); bgIndex = p - 40; }
+              else if (p >= 90 && p <= 97) { fgColor = ansi16ToRgb(p - 90 + 8); fgIndex = p - 90 + 8; }
+              else if (p >= 100 && p <= 107) { bgColor = ansi16ToRgb(p - 100 + 8); bgIndex = p - 100 + 8; }
               j++;
             }
           } else if (cmd === "H") {
@@ -151,6 +162,8 @@ export class CellBuffer {
             char: ch,
             fg: fgColor ? [...fgColor] : null,
             bg: bgColor ? [...bgColor] : null,
+            fgIndex,
+            bgIndex,
             bold: isBold,
             dim: isDim,
             italic: isItalic,
@@ -162,6 +175,8 @@ export class CellBuffer {
               char: "",
               fg: fgColor ? [...fgColor] : null,
               bg: bgColor ? [...bgColor] : null,
+              fgIndex,
+              bgIndex,
               bold: isBold,
               dim: isDim,
               italic: isItalic,
@@ -187,14 +202,88 @@ export class CellBuffer {
   }
 }
 
+/** SGR emitter state used by diff and fullRender.
+ *  `fgIdx` / `bgIdx` track the palette index when the last-emitted color
+ *  was indexed; `fgRgb` / `bgRgb` track truecolor. They're always in sync
+ *  — an index-based emit leaves `fgIdx` set AND `fgRgb` populated with
+ *  the flattened value, so re-checking equality against a later cell
+ *  that happens to carry the same RGB but a different index (or no
+ *  index at all) still fires a re-emit through the index check. */
+interface EmitState {
+  fgIdx: number | null;
+  fgRgb: [number, number, number] | null;
+  bgIdx: number | null;
+  bgRgb: [number, number, number] | null;
+}
+
+function indexedFgSgr(idx: number): string {
+  if (idx < 8) return `\x1b[${30 + idx}m`;
+  if (idx < 16) return `\x1b[${90 + idx - 8}m`;
+  return `\x1b[38;5;${idx}m`;
+}
+
+function indexedBgSgr(idx: number): string {
+  if (idx < 8) return `\x1b[${40 + idx}m`;
+  if (idx < 16) return `\x1b[${100 + idx - 8}m`;
+  return `\x1b[48;5;${idx}m`;
+}
+
+/** Emit an SGR for the foreground of `cell`, if different from `state`.
+ *  Mutates `state`. Index-first: palette cells round-trip as SGR 30-37 /
+ *  90-97 / 38;5;N so the outer terminal's theme wins. Truecolor cells
+ *  emit SGR 38;2. Default cells emit SGR 39 only when transitioning
+ *  away from a non-default color. */
+function emitFg(cell: Cell, state: EmitState): string {
+  if (cell.fgIndex !== null) {
+    if (state.fgIdx === cell.fgIndex) return "";
+    state.fgIdx = cell.fgIndex;
+    state.fgRgb = cell.fg;
+    return indexedFgSgr(cell.fgIndex);
+  }
+  if (cell.fg !== null) {
+    if (state.fgIdx === null && colorEq(state.fgRgb, cell.fg)) return "";
+    state.fgIdx = null;
+    state.fgRgb = cell.fg;
+    return `\x1b[38;2;${cell.fg[0]};${cell.fg[1]};${cell.fg[2]}m`;
+  }
+  // Default
+  if (state.fgIdx === null && state.fgRgb === null) return "";
+  state.fgIdx = null;
+  state.fgRgb = null;
+  return "\x1b[39m";
+}
+
+function emitBg(cell: Cell, state: EmitState): string {
+  if (cell.bgIndex !== null) {
+    if (state.bgIdx === cell.bgIndex) return "";
+    state.bgIdx = cell.bgIndex;
+    state.bgRgb = cell.bg;
+    return indexedBgSgr(cell.bgIndex);
+  }
+  if (cell.bg !== null) {
+    if (state.bgIdx === null && colorEq(state.bgRgb, cell.bg)) return "";
+    state.bgIdx = null;
+    state.bgRgb = cell.bg;
+    return `\x1b[48;2;${cell.bg[0]};${cell.bg[1]};${cell.bg[2]}m`;
+  }
+  if (state.bgIdx === null && state.bgRgb === null) return "";
+  state.bgIdx = null;
+  state.bgRgb = null;
+  return "\x1b[49m";
+}
+
+function resetState(state: EmitState): void {
+  state.fgIdx = null; state.fgRgb = null;
+  state.bgIdx = null; state.bgRgb = null;
+}
+
 /** Diff two buffers and emit minimal ANSI to update from prev to next.
  *  Uses DEC synchronized output (mode 2026) to prevent tearing. */
 export function diff(prev: CellBuffer, next: CellBuffer): string {
   let out = "\x1b[?2026h"; // Begin synchronized update
   let lastRow = -1;
   let lastCol = -1;
-  let lastFg: [number, number, number] | null = null;
-  let lastBg: [number, number, number] | null = null;
+  const state: EmitState = { fgIdx: null, fgRgb: null, bgIdx: null, bgRgb: null };
   let lastBold = false;
   let lastDim = false;
   let lastItalic = false;
@@ -227,8 +316,7 @@ export function diff(prev: CellBuffer, next: CellBuffer): string {
 
       if (needReset) {
         out += "\x1b[0m";
-        lastFg = null;
-        lastBg = null;
+        resetState(state);
         lastBold = false;
         lastDim = false;
         lastItalic = false;
@@ -241,24 +329,13 @@ export function diff(prev: CellBuffer, next: CellBuffer): string {
       if (nc.italic && !lastItalic) out += "\x1b[3m";
       if (nc.underline && !lastUnderline) out += "\x1b[4m";
 
-      if (nc.fg && !colorEq(nc.fg, lastFg)) {
-        out += `\x1b[38;2;${nc.fg[0]};${nc.fg[1]};${nc.fg[2]}m`;
-      } else if (!nc.fg && lastFg) {
-        out += "\x1b[39m";
-      }
-
-      if (nc.bg && !colorEq(nc.bg, lastBg)) {
-        out += `\x1b[48;2;${nc.bg[0]};${nc.bg[1]};${nc.bg[2]}m`;
-      } else if (!nc.bg && lastBg) {
-        out += "\x1b[49m";
-      }
+      out += emitFg(nc, state);
+      out += emitBg(nc, state);
 
       out += nc.char;
 
       lastRow = r;
       lastCol = c + 1;
-      lastFg = nc.fg;
-      lastBg = nc.bg;
       lastBold = nc.bold;
       lastDim = nc.dim;
       lastItalic = nc.italic;
@@ -274,8 +351,7 @@ export function diff(prev: CellBuffer, next: CellBuffer): string {
 /** Render the full buffer to ANSI (for initial draw). */
 export function fullRender(buf: CellBuffer): string {
   let out = "\x1b[?2026h\x1b[H\x1b[0m";
-  let lastFg: [number, number, number] | null = null;
-  let lastBg: [number, number, number] | null = null;
+  const state: EmitState = { fgIdx: null, fgRgb: null, bgIdx: null, bgRgb: null };
   let lastBold = false;
   let lastDim = false;
   let lastItalic = false;
@@ -297,8 +373,7 @@ export function fullRender(buf: CellBuffer): string {
 
       if (needReset) {
         out += "\x1b[0m";
-        lastFg = null;
-        lastBg = null;
+        resetState(state);
         lastBold = false;
         lastDim = false;
         lastItalic = false;
@@ -310,21 +385,10 @@ export function fullRender(buf: CellBuffer): string {
       if (cell.italic && !lastItalic) out += "\x1b[3m";
       if (cell.underline && !lastUnderline) out += "\x1b[4m";
 
-      if (cell.fg && !colorEq(cell.fg, lastFg)) {
-        out += `\x1b[38;2;${cell.fg[0]};${cell.fg[1]};${cell.fg[2]}m`;
-      } else if (!cell.fg && lastFg) {
-        out += "\x1b[39m";
-      }
-
-      if (cell.bg && !colorEq(cell.bg, lastBg)) {
-        out += `\x1b[48;2;${cell.bg[0]};${cell.bg[1]};${cell.bg[2]}m`;
-      } else if (!cell.bg && lastBg) {
-        out += "\x1b[49m";
-      }
+      out += emitFg(cell, state);
+      out += emitBg(cell, state);
 
       out += cell.char;
-      lastFg = cell.fg;
-      lastBg = cell.bg;
       lastBold = cell.bold;
       lastDim = cell.dim;
       lastItalic = cell.italic;

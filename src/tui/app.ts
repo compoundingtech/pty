@@ -162,6 +162,7 @@ export function app(config: AppConfig): App {
         if (col + i >= 0 && col + i < buf.cols) {
           buf.cells[0][col + i] = {
             char: label[i], fg: theme.bg1 ? [...theme.bg1] : null, bg: theme.fgAc ? [...theme.fgAc] : null,
+            fgIndex: null, bgIndex: null,
             bold: false, dim: false, italic: false, underline: false,
           };
         }

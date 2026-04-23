@@ -6,8 +6,17 @@ import type { KeyEvent } from "./input.ts";
 // --- Cell buffer types ---
 export interface Cell {
   char: string;
+  /** Flattened RGB foreground. Populated for both truecolor and palette
+   *  cells (palette flattened via the 16/256 tables). `null` means "use
+   *  the terminal default." */
   fg: [number, number, number] | null;
   bg: [number, number, number] | null;
+  /** 0-255 palette index when the source was an indexed SGR color
+   *  (30-37 / 90-97 / 38;5;N). `null` for truecolor (38;2;r;g;b) and
+   *  default-color cells. Re-emitters prefer this over the flattened
+   *  RGB so the outer terminal's theme wins for indexed colors. */
+  fgIndex: number | null;
+  bgIndex: number | null;
   bold: boolean;
   dim: boolean;
   italic: boolean;
@@ -15,7 +24,10 @@ export interface Cell {
 }
 
 export function emptyCell(): Cell {
-  return { char: " ", fg: null, bg: null, bold: false, dim: false, italic: false, underline: false };
+  return {
+    char: " ", fg: null, bg: null, fgIndex: null, bgIndex: null,
+    bold: false, dim: false, italic: false, underline: false,
+  };
 }
 
 export function cellsEqual(a: Cell, b: Cell): boolean {
@@ -25,6 +37,8 @@ export function cellsEqual(a: Cell, b: Cell): boolean {
     a.dim === b.dim &&
     a.italic === b.italic &&
     a.underline === b.underline &&
+    a.fgIndex === b.fgIndex &&
+    a.bgIndex === b.bgIndex &&
     colorEqual(a.fg, b.fg) &&
     colorEqual(a.bg, b.bg)
   );

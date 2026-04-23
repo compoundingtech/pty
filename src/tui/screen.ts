@@ -285,8 +285,18 @@ function makeCell(
   bold: boolean = false,
   dim: boolean = false,
   italic: boolean = false,
+  fgIndex: number | null = null,
+  bgIndex: number | null = null,
 ): Cell {
-  return { char: ch, fg: fgc ? [...fgc] : null, bg: bgc ? [...bgc] : null, bold, dim, italic, underline: false };
+  return {
+    char: ch,
+    fg: fgc ? [...fgc] : null,
+    bg: bgc ? [...bgc] : null,
+    fgIndex,
+    bgIndex,
+    bold, dim, italic,
+    underline: false,
+  };
 }
 
 /** Write a plain string into the buffer at (row, col). Clips to buffer bounds. */
@@ -721,6 +731,7 @@ function renderNodeToBuffer(
             cell.fg ?? (theme.fg1 ? [...theme.fg1] : null),
             cell.bg ?? (theme.bg1 ? [...theme.bg1] : null),
             cell.bold, cell.dim, cell.italic,
+            cell.fgIndex, cell.bgIndex,
           );
         }
       }
