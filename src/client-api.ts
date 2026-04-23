@@ -40,6 +40,7 @@ export {
   type SessionRestartEvent, type SessionFailedEvent,
   type SupervisorStartEvent, type SupervisorStopEvent,
   type UserEvent, type StateSetEvent, type StateDeleteEvent,
+  type DisplayNameChangeEvent, type TagsChangeEvent,
   type FollowerOptions,
 } from "./events.ts";
 

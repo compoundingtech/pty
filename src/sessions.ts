@@ -2,6 +2,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
+// Circular import: events.ts imports getEventsPath/ensureSessionDir from
+// this file. Cycle is safe — `appendEventSync` is only called at runtime
+// from inside functions, never at module-init time.
+import { appendEventSync } from "./events.ts";
 
 const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
 
@@ -125,21 +129,37 @@ export function writeMetadata(name: string, metadata: SessionMetadata): void {
 }
 
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.
- *  Pass `null` to remove the alias. Throws if `name` doesn't exist. */
+ *  Pass `null` to remove the alias. Throws if `name` doesn't exist. Emits a
+ *  `display_name_change` event when (and only when) the value actually
+ *  changed — no-op renames don't ping downstream watchers. */
 export function setDisplayName(name: string, displayName: string | null): void {
   const metadata = readMetadata(name);
   if (!metadata) {
     throw new Error(`Session "${name}" not found.`);
   }
-  if (displayName === null || displayName === "") {
+  const previous = metadata.displayName ?? null;
+  const next = displayName === null || displayName === "" ? null : displayName;
+  if (previous === next) return; // no-op write + no-op event
+
+  if (next === null) {
     delete metadata.displayName;
   } else {
-    metadata.displayName = displayName;
+    metadata.displayName = next;
   }
   writeMetadata(name, metadata);
+  appendEventSync(name, {
+    session: name,
+    type: "display_name_change",
+    ts: new Date().toISOString(),
+    previous,
+    value: next,
+  });
 }
 
-/** Update tags on an existing session. Performs an atomic read-modify-write. */
+/** Update tags on an existing session. Performs an atomic read-modify-write.
+ *  Emits a `tags_change` event carrying snapshots of the full previous and
+ *  new tag maps when the effective tags change. No-op updates (e.g. setting
+ *  a key to the same value, removing a key that isn't there) don't emit. */
 export function updateTags(
   name: string,
   updates: Record<string, string>,
@@ -149,19 +169,39 @@ export function updateTags(
   if (!metadata) {
     throw new Error(`Session "${name}" not found.`);
   }
-  const tags = { ...(metadata.tags ?? {}) };
+  const previous = { ...(metadata.tags ?? {}) };
+  const tags = { ...previous };
   for (const [k, v] of Object.entries(updates)) {
     tags[k] = v;
   }
   for (const k of removals) {
     delete tags[k];
   }
+  if (tagsEqual(previous, tags)) return; // no-op write + no-op event
+
   if (Object.keys(tags).length > 0) {
     metadata.tags = tags;
   } else {
     delete metadata.tags;
   }
   writeMetadata(name, metadata);
+  appendEventSync(name, {
+    session: name,
+    type: "tags_change",
+    ts: new Date().toISOString(),
+    previous,
+    value: tags,
+  });
+}
+
+function tagsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, k) || a[k] !== b[k]) return false;
+  }
+  return true;
 }
 
 /** Read a session's state bag. Returns an empty object when the session
@@ -185,11 +225,9 @@ export function getStateKey(name: string, key: string): unknown {
 }
 
 /** Set a key on the state bag. Atomic read-modify-write of the metadata
- *  file. Caller is responsible for calling `appendEvent` with the
- *  matching `state.set` record if event emission is desired — the CLI
- *  wrapper (`pty state set`) does this. Keeping the event-emit decoupled
- *  from the write keeps this function usable from contexts that don't
- *  want to emit (e.g. tests, bulk imports). */
+ *  file. Emits a `state.set` event on every successful write — callers
+ *  that want the full reactive signal (pty-layout, activity viewers,
+ *  etc.) get it whether they use the CLI or the programmatic API. */
 export function setState(name: string, key: string, value: unknown): void {
   const metadata = readMetadata(name);
   if (!metadata) throw new Error(`Session "${name}" not found.`);
@@ -197,13 +235,20 @@ export function setState(name: string, key: string, value: unknown): void {
   state[key] = value;
   metadata.state = state;
   writeMetadata(name, metadata);
+  appendEventSync(name, {
+    session: name,
+    type: "state.set",
+    ts: new Date().toISOString(),
+    key,
+    value,
+  });
 }
 
 /** Delete a key from the state bag. Returns `true` when the key existed and
  *  was removed, `false` when the key wasn't set (no write performed).
- *  Callers that emit a `state.delete` event should gate on the return value
- *  so a delete on a missing key doesn't produce a ghost event. Uses
- *  own-property lookup — inherited names like `toString` never match. */
+ *  Emits a `state.delete` event only when something was actually removed,
+ *  so a delete on a missing key is a true no-op (no ghost event).
+ *  Uses own-property lookup — inherited names like `toString` never match. */
 export function deleteState(name: string, key: string): boolean {
   const metadata = readMetadata(name);
   if (!metadata) throw new Error(`Session "${name}" not found.`);
@@ -216,6 +261,12 @@ export function deleteState(name: string, key: string): boolean {
     delete metadata.state;
   }
   writeMetadata(name, metadata);
+  appendEventSync(name, {
+    session: name,
+    type: "state.delete",
+    ts: new Date().toISOString(),
+    key,
+  });
   return true;
 }
 

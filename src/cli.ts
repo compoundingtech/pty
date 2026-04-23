@@ -30,7 +30,7 @@ import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
   EventFollower, EventWriter, EventType,
   readRecentEvents, formatEvent,
-  emitUserEvent, appendEvent,
+  emitUserEvent,
 } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
@@ -2060,10 +2060,7 @@ async function cmdState(argv: string[]): Promise<void> {
           process.exit(1);
         }
         setState(name, key, value);
-        await appendEvent(name, {
-          session: name, type: "state.set", ts: new Date().toISOString(),
-          key, value,
-        });
+        // state.set event is emitted by setState itself.
         return;
       }
       case "delete":
@@ -2074,13 +2071,9 @@ async function cmdState(argv: string[]): Promise<void> {
           process.exit(1);
         }
         const key = r[0];
-        const removed = deleteState(name, key);
-        if (removed) {
-          await appendEvent(name, {
-            session: name, type: "state.delete", ts: new Date().toISOString(),
-            key,
-          });
-        }
+        deleteState(name, key);
+        // state.delete event is emitted by deleteState when a key was
+        // actually removed; a delete on a missing key is a silent no-op.
         return;
       }
       case "keys": {

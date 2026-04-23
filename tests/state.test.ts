@@ -398,6 +398,52 @@ describe("pty state CLI", () => {
   }, 15000);
 });
 
+describe("state helpers emit events from the programmatic API", () => {
+  // Regression: pty-layout et al. use setState/deleteState via the client
+  // API, not via the CLI. Prior to this fix, events only fired from the
+  // CLI wrapper — programmatic callers got silent writes.
+  it("setState emits state.set even when called directly (no CLI involved)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+
+    setState(name, "port", 9000);
+
+    const events = readEvents(dir, name);
+    const set = events.find(e => e.type === "state.set" && e.key === "port");
+    expect(set).toBeTruthy();
+    expect(set.value).toBe(9000);
+  }, 15000);
+
+  it("deleteState emits state.delete when something was removed", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+
+    setState(name, "x", 1);
+    const before = readEvents(dir, name).filter(e => e.type === "state.delete").length;
+    const removed = deleteState(name, "x");
+    expect(removed).toBe(true);
+    const after = readEvents(dir, name).filter(e => e.type === "state.delete").length;
+    expect(after).toBe(before + 1);
+  }, 15000);
+
+  it("deleteState on a missing key writes no event and returns false", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+
+    const before = readEvents(dir, name).filter(e => e.type === "state.delete").length;
+    const removed = deleteState(name, "never-existed");
+    expect(removed).toBe(false);
+    const after = readEvents(dir, name).filter(e => e.type === "state.delete").length;
+    expect(after).toBe(before);
+  }, 15000);
+});
+
 describe("EventFollower — state.* streaming", () => {
   it("delivers state.set and state.delete events live", async () => {
     const dir = makeSessionDir();

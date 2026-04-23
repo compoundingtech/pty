@@ -160,7 +160,7 @@ Use `pty run -d` to explicitly create a background session from inside another s
 
 ### Events
 
-Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — to per-session JSONL files.
+Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — plus metadata mutations: `display_name_change` on rename, `tags_change` on tag updates, `state.set` / `state.delete` on state bag writes, and any `user.*` events published via `pty emit`. Everything goes into per-session JSONL files.
 
 ```sh
 pty events myserver              # follow events live (like tail -f)

@@ -112,6 +112,24 @@ export interface StateDeleteEvent extends EventBase {
   key: string;
 }
 
+/** Emitted whenever `setDisplayName` actually changes the stored value.
+ *  `previous` / `value` are `null` when absent. Skipped on no-op writes
+ *  so consumers don't get spurious refresh pings. */
+export interface DisplayNameChangeEvent extends EventBase {
+  type: "display_name_change";
+  previous: string | null;
+  value: string | null;
+}
+
+/** Emitted whenever `updateTags` effectively changes the tags map.
+ *  Snapshots both the previous and new full tag maps so consumers
+ *  can diff without having to reason about `updates` vs `removals`. */
+export interface TagsChangeEvent extends EventBase {
+  type: "tags_change";
+  previous: Record<string, string>;
+  value: Record<string, string>;
+}
+
 export type EventRecord =
   | BellEvent
   | TitleChangeEvent
@@ -127,7 +145,9 @@ export type EventRecord =
   | SupervisorStopEvent
   | UserEvent
   | StateSetEvent
-  | StateDeleteEvent;
+  | StateDeleteEvent
+  | DisplayNameChangeEvent
+  | TagsChangeEvent;
 
 /** Type guard: narrows an EventRecord to a UserEvent. */
 export function isUserEvent(e: EventRecord): e is UserEvent {
@@ -171,6 +191,32 @@ export async function appendEvent(name: string, event: EventRecord): Promise<voi
   const line = JSON.stringify(event) + "\n";
   await fsp.appendFile(filePath, line);
   await maybeTruncate(filePath);
+}
+
+/** Synchronous twin of `appendEvent` — lets synchronous metadata-mutation
+ *  helpers (setDisplayName, updateTags, setState, deleteState) emit their
+ *  change events inline without forcing their signatures to go async.
+ *  Uses the same retention path with a sync stat fast-path. */
+export function appendEventSync(name: string, event: EventRecord): void {
+  ensureSessionDir();
+  const filePath = getEventsPath(name);
+  const line = JSON.stringify(event) + "\n";
+  fs.appendFileSync(filePath, line);
+  maybeTruncateSync(filePath);
+}
+
+function maybeTruncateSync(filePath: string): void {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size < MAX_LINES * 40) return;
+    const content = fs.readFileSync(filePath, "utf-8");
+    const lines = content.trimEnd().split("\n");
+    if (lines.length >= MAX_LINES) {
+      fs.writeFileSync(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
+    }
+  } catch {
+    // File might have been concurrently removed — ignore.
+  }
 }
 
 /** Cheap retention check. Only reads + rewrites when the file's byte size
@@ -439,6 +485,13 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} state.set ${event.key} = ${JSON.stringify(event.value)}`;
     case "state.delete":
       return `${prefix} state.delete ${event.key}`;
+    case "display_name_change":
+      return `${prefix} display_name -> ${JSON.stringify(event.value)} (was ${JSON.stringify(event.previous)})`;
+    case "tags_change": {
+      const fmt = (t: Record<string, string>) =>
+        Object.keys(t).length === 0 ? "{}" : Object.entries(t).map(([k, v]) => `${k}=${v}`).join(" ");
+      return `${prefix} tags -> ${fmt(event.value)} (was ${fmt(event.previous)})`;
+    }
     default: {
       // user.* events + anything else unknown-at-compile-time.
       const e = event as EventBase & { data?: unknown; text?: string };
