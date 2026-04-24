@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 (2026-04-24)
+
 ### Nesting prevention (client-inside-a-client refusal)
 - **`pty attach`, `pty a`, and `pty attach -r`** now refuse to run when `$PTY_SESSION` is set. Attaching inside an existing client nested two clients and sent detach keybindings to the outer one, leaving users tangled. The guard fires before ref resolution, so even a mistyped name yields the nesting hint instead of "Session not found." Error text points at `Ctrl+\\` to detach and at pty-layout's `^]n` for users inside a tiled layout. `--force` restores the old behavior.
 - **`pty restart <ref>`** still restarts the session when nested (that operation is independent of attach), but skips the trailing `doAttach` and prints `(not attached: already inside pty session "X")`. `--force` restores the old restart-then-attach behavior. `-y` / `--yes` (which skips the kill-confirm prompt) is unchanged and independent.
