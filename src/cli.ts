@@ -1282,6 +1282,16 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
     });
   }
 
+  // Stable display order: ASCII sort on the user-visible label (displayName
+  // when set, otherwise the stable id). Without this, `fs.readdirSync` on
+  // APFS returns sessions in roughly insertion order, which drifts as
+  // sessions come and go and reads like accidental chaos to the eye.
+  const sortKey = (s: SessionInfo): string => s.metadata?.displayName ?? s.name;
+  sessions = [...sessions].sort((a, b) => {
+    const ka = sortKey(a), kb = sortKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+
   // Fetch relay hosts if --remote
   let remoteHosts: {
     label: string;
@@ -1485,7 +1495,12 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
       continue;
     }
     console.log(`\x1b[1m${host.label}\x1b[0m (${host.sessions.length} sessions):`);
-    for (const s of host.sessions) {
+    const sortedRemote = [...host.sessions].sort((a, b) => {
+      const ka = a.displayName ?? a.name;
+      const kb = b.displayName ?? b.name;
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    for (const s of sortedRemote) {
       const icon = s.status === "running" ? "\u25cf" : "\u25cb";
       const cwd = s.cwd ? shortPath(s.cwd) : "";
       const cmd = s.command ?? "";

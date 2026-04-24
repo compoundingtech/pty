@@ -306,3 +306,78 @@ describe("pty list --summary", () => {
     expect(r.stdout).toContain("No matching sessions.");
   }, 10000);
 });
+
+// Adding metadata files in a specific order and checking that `pty list`
+// sorts its output regardless of on-disk insertion order. Without an
+// explicit sort the output reflects readdir order (APFS insertion-ish),
+// which is near-meaningless when sessions come and go.
+function writeFakeMetadataWithDn(
+  dir: string,
+  name: string,
+  opts: { createdAt: string; displayName?: string },
+) {
+  const meta = {
+    command: "cat",
+    args: [],
+    displayCommand: "cat",
+    cwd: os.tmpdir(),
+    createdAt: opts.createdAt,
+    ...(opts.displayName ? { displayName: opts.displayName } : {}),
+  };
+  fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify(meta));
+}
+
+describe("pty list — sort order", () => {
+  it("JSON output is sorted ASCII by displayName, falling back to name", () => {
+    const dir = makeSessionDir();
+    const now = new Date().toISOString();
+
+    // Intentionally create in non-alphabetical order to confirm the sort
+    // isn't just insertion-order by accident.
+    writeFakeMetadataWithDn(dir, "zzz-raw", { createdAt: now });
+    writeFakeMetadataWithDn(dir, "aaa-raw", { createdAt: now, displayName: "mmm-friendly" });
+    writeFakeMetadataWithDn(dir, "mmm-raw", { createdAt: now, displayName: "bbb-friendly" });
+    writeFakeMetadataWithDn(dir, "bbb-raw", { createdAt: now });
+
+    const r = runCli(dir, "list", "--json");
+    expect(r.status).toBe(0);
+    const sessions = JSON.parse(r.stdout);
+    // Expected sort keys: bbb-friendly, bbb-raw, mmm-friendly, zzz-raw
+    const keys = sessions.map((s: any) => s.displayName ?? s.name);
+    expect(keys).toEqual(["bbb-friendly", "bbb-raw", "mmm-friendly", "zzz-raw"]);
+  }, 10000);
+
+  it("text output renders grouped buckets in sorted order", () => {
+    const dir = makeSessionDir();
+    const now = new Date().toISOString();
+
+    // All vanished (missing exitedAt/exitCode), so they land in a single
+    // bucket and we can just scan for line order within it.
+    writeFakeMetadataWithDn(dir, "z1", { createdAt: now });
+    writeFakeMetadataWithDn(dir, "a1", { createdAt: now });
+    writeFakeMetadataWithDn(dir, "m1", { createdAt: now });
+
+    const r = runCli(dir, "list");
+    expect(r.status).toBe(0);
+    const ia = r.stdout.indexOf("a1");
+    const im = r.stdout.indexOf("m1");
+    const iz = r.stdout.indexOf("z1");
+    expect(ia).toBeGreaterThan(-1);
+    expect(im).toBeGreaterThan(ia);
+    expect(iz).toBeGreaterThan(im);
+  }, 10000);
+
+  it("displayName beats the stable id when sorting", () => {
+    const dir = makeSessionDir();
+    const now = new Date().toISOString();
+    // id "aaa" but displayName "zebra" should sort AFTER id "mmm" with no
+    // displayName — the displayName wins.
+    writeFakeMetadataWithDn(dir, "aaa", { createdAt: now, displayName: "zebra" });
+    writeFakeMetadataWithDn(dir, "mmm", { createdAt: now });
+
+    const r = runCli(dir, "list", "--json");
+    const sessions = JSON.parse(r.stdout);
+    const keys = sessions.map((s: any) => s.displayName ?? s.name);
+    expect(keys).toEqual(["mmm", "zebra"]);
+  }, 10000);
+});
