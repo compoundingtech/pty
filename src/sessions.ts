@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
@@ -120,12 +121,50 @@ export function isGone(status: SessionInfo["status"]): boolean {
   return status === "exited" || status === "vanished";
 }
 
+/** Atomic file publish: write to a unique per-writer tmp file in the
+ *  same directory, then rename over the target. Readers see either
+ *  the old file or the new one, never a half-written intermediate.
+ *  Concurrent writers do NOT coordinate — the last rename wins — but
+ *  they can't corrupt each other's tmp files because each writer uses
+ *  its own unique path. Same-filesystem rename on POSIX is atomic. */
+export function atomicWriteFileSync(target: string, content: string): void {
+  const tmp = `${target}.tmp.${process.pid}.${randomHex(8)}`;
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    // If writeFileSync or renameSync fails, try to clean up the tmp.
+    // Silent — the original target is still intact either way.
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
+/** Async twin of `atomicWriteFileSync` for code paths that are already
+ *  async (EventWriter, etc). Same semantics, same guarantees. */
+export async function atomicWriteFile(target: string, content: string): Promise<void> {
+  const tmp = `${target}.tmp.${process.pid}.${randomHex(8)}`;
+  try {
+    await fsp.writeFile(tmp, content);
+    await fsp.rename(tmp, target);
+  } catch (e) {
+    try { await fsp.unlink(tmp); } catch {}
+    throw e;
+  }
+}
+
+function randomHex(bytes: number): string {
+  // Small inline hex generator — keeping sessions.ts free of a `node:crypto`
+  // import for this tiny helper. Not cryptographic; just needs low
+  // collision probability across concurrent writers in the same dir.
+  let out = "";
+  for (let i = 0; i < bytes; i++) out += Math.floor(Math.random() * 256).toString(16).padStart(2, "0");
+  return out;
+}
+
 export function writeMetadata(name: string, metadata: SessionMetadata): void {
   ensureSessionDir();
-  const target = getMetadataPath(name);
-  const tmp = target + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(metadata, null, 2));
-  fs.renameSync(tmp, target);
+  atomicWriteFileSync(getMetadataPath(name), JSON.stringify(metadata, null, 2));
 }
 
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.

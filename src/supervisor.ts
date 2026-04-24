@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
   getSessionDir, ensureSessionDir, readMetadata, cleanupAll,
   acquireLock, releaseLock, updateTags,
+  atomicWriteFileSync,
   type SessionMetadata,
 } from "./sessions.ts";
 import { spawnDaemon } from "./spawn.ts";
@@ -449,10 +450,8 @@ export class Supervisor {
       };
     }
     const filePath = path.join(getSupervisorDir(), "state.json");
-    const tmp = filePath + ".tmp";
     try {
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-      fs.renameSync(tmp, filePath);
+      atomicWriteFileSync(filePath, JSON.stringify(state, null, 2));
     } catch {
       // Non-fatal
     }

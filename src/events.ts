@@ -1,6 +1,9 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import { getEventsPath, getSessionDir, ensureSessionDir } from "./sessions.ts";
+import {
+  getEventsPath, getSessionDir, ensureSessionDir,
+  atomicWriteFileSync, atomicWriteFile,
+} from "./sessions.ts";
 
 export const EventType = {
   BELL: "bell",
@@ -196,7 +199,14 @@ export async function appendEvent(name: string, event: EventRecord): Promise<voi
 /** Synchronous twin of `appendEvent` — lets synchronous metadata-mutation
  *  helpers (setDisplayName, updateTags, setState, deleteState) emit their
  *  change events inline without forcing their signatures to go async.
- *  Uses the same retention path with a sync stat fast-path. */
+ *  Uses the same retention path with a sync stat fast-path.
+ *
+ *  Concurrency note: `fs.appendFileSync` issues a single `write()` with
+ *  `O_APPEND`, which POSIX guarantees is atomic for payloads up to
+ *  `PIPE_BUF` bytes (typically 4096 on Linux/macOS). All built-in events
+ *  are well under that. If a caller passes a `user.*` event or
+ *  `state.set` with a > 4KB payload, concurrent appends could interleave
+ *  — keep large payloads out of the event stream and in state. */
 export function appendEventSync(name: string, event: EventRecord): void {
   ensureSessionDir();
   const filePath = getEventsPath(name);
@@ -212,7 +222,12 @@ function maybeTruncateSync(filePath: string): void {
     const content = fs.readFileSync(filePath, "utf-8");
     const lines = content.trimEnd().split("\n");
     if (lines.length >= MAX_LINES) {
-      fs.writeFileSync(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
+      // Tmp+rename so readers never see a half-written rewrite. Concurrent
+      // appenders after our read but before our rename will have their
+      // lines lost (their append goes to the old inode that we unlink
+      // via rename); that's a "concurrent writes overwrite each other"
+      // case, not corruption — readers always see a valid JSONL file.
+      atomicWriteFileSync(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
     }
   } catch {
     // File might have been concurrently removed — ignore.
@@ -294,7 +309,9 @@ async function truncate(filePath: string): Promise<void> {
   const content = await fsp.readFile(filePath, "utf-8");
   const lines = content.trimEnd().split("\n");
   if (lines.length >= MAX_LINES) {
-    await fsp.writeFile(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
+    // Tmp+rename so readers never see a half-written rewrite — same
+    // reasoning as `maybeTruncateSync`.
+    await atomicWriteFile(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
   }
 }
 

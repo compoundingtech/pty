@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixes
+- **Concurrent writers can no longer corrupt the session metadata file.** Reported against `pty tag` but the flaw spanned four write sites: `writeMetadata` (sessions.ts), supervisor state save, `pty supervisor reset`, and the event-log retention/truncation path. All four shared the same bug — `target + ".tmp"` is a single fixed path per target, so two concurrent writers truncate-and-overwrite each other's tmp file, and whichever `rename` runs second (or first, depending on timing) can land a half-written JSON blob into the target. Fix: new `atomicWriteFileSync` / `atomicWriteFile` helpers in `sessions.ts` that use a unique tmp path per writer (`<target>.tmp.<pid>.<rand>`), `writeFileSync` into that, then `rename` into place. POSIX same-filesystem `rename` is atomic; readers always see either the old file or the new one, never an intermediate. All four call sites now route through the helper. Event-log truncation (previously `writeFile` in place over a 1000-line rollover) also goes through tmp+rename, so `pty events` readers never see a mid-rewrite file. Contract: last-write-wins under concurrent writers — lost updates are possible, corruption is not. Large (> 4KB) `user.*` / `state.set` event payloads can still interleave at the POSIX `O_APPEND` level; the module documents this and recommends keeping large blobs in state rather than events.
+
 ## 0.10.0 (2026-04-24)
 
 ### Nesting prevention (client-inside-a-client refusal)

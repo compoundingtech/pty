@@ -22,6 +22,7 @@ import {
   allRefs,
   readMetadata,
   writeMetadata,
+  atomicWriteFileSync,
   getSessionDir,
   getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo,
@@ -2379,9 +2380,7 @@ async function cmdSupervisorReset(name: string): Promise<void> {
       state.sessions[name].restartWindowStart = 0;
       state.sessions[name].nextBackoffMs = 1000;
       state.sessions[name].failed = false;
-      const tmp = statePath + ".tmp";
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-      fs.renameSync(tmp, statePath);
+      atomicWriteFileSync(statePath, JSON.stringify(state, null, 2));
     }
   } catch {}
 
