@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Nesting prevention (client-inside-a-client refusal)
+- **`pty attach`, `pty a`, and `pty attach -r`** now refuse to run when `$PTY_SESSION` is set. Attaching inside an existing client nested two clients and sent detach keybindings to the outer one, leaving users tangled. The guard fires before ref resolution, so even a mistyped name yields the nesting hint instead of "Session not found." Error text points at `Ctrl+\\` to detach and at pty-layout's `^]n` for users inside a tiled layout. `--force` restores the old behavior.
+- **`pty restart <ref>`** still restarts the session when nested (that operation is independent of attach), but skips the trailing `doAttach` and prints `(not attached: already inside pty session "X")`. `--force` restores the old restart-then-attach behavior. `-y` / `--yes` (which skips the kill-confirm prompt) is unchanged and independent.
+- **`pty` / `pty i` / `pty interactive`** refuse to open the TUI picker when nested — the picker rendering inside a session with broken detach was a worse footgun than any other vector. `--force` opens it anyway (useful for debugging the TUI itself).
+- **`pty run -a`** narrows the existing "already inside pty session, running directly" behavior: if `-a` was given and the target session is already running, refuse rather than silently dropping `-a` and running the command in-place. The target-not-running case keeps the run-directly behavior (there's no session to attach to). `--force` skips the new check.
+- **Shared helper `ensureNotNested(cmd, { force?, hint? })`** in `src/cli.ts` — early exit with a consistent message and per-command hint text.
+- **`Session.spawn` (the `@myobie/pty/testing` harness) now scrubs `PTY_SESSION` from the child env** in addition to the existing `PTY_SERVER_CONFIG` scrubbing, so tests running inside a pty session don't leak that context into the CLI they're exercising. Without this, every interactive-TUI test would trip the new guard.
+
 ### Events & state
 - **`pty emit` — publish user events.** `pty emit <type> [--json <payload>] [--text <string>]` appends an event of type `user.<name>` to a session's `.events.jsonl` file. `<type>` must start with `user.` (the `user.*` namespace is reserved for arbitrary app events and will never collide with built-in types). Inside a pty session the ref is omitted — `$PTY_SESSION` resolves it — so scripts inside a session can just run `pty emit user.deploy.started --json '{"commit":"abc123"}'`. Consumers tail via the existing `EventFollower` API. Programmatic access: `emitUserEvent(sessionName, type, { data?, text? })` on `@myobie/pty/client`.
 - **`pty state` — per-session JSON key/value bag.** Each session's metadata file now carries an optional `state: Record<string, unknown>` field with four CLI subcommands:

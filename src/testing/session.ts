@@ -81,7 +81,12 @@ export class Session {
       ...(process.env as Record<string, string>),
       ...opts.env,
     };
+    // Scrub pty-internal env vars so the spawned CLI sees a clean user
+    // environment, not the test harness's own pty context. Without this,
+    // any test that runs `pty` inside a Session inherits the harness's
+    // PTY_SESSION and trips the nesting-prevention guard.
     delete env.PTY_SERVER_CONFIG;
+    delete env.PTY_SESSION;
 
     const proc = pty.spawn(command, args, {
       name: "xterm-256color",

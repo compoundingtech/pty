@@ -39,7 +39,13 @@ import { parseDuration, formatDuration } from "./duration.ts";
 
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
-async function runInteractive(options?: { preselectNew?: boolean; filterTags?: Record<string, string> }): Promise<void> {
+async function runInteractive(options?: { preselectNew?: boolean; filterTags?: Record<string, string>; force?: boolean }): Promise<void> {
+  ensureNotNested("interactive", {
+    force: options?.force,
+    hint:
+      "  The interactive picker would render inside your current session and detach would route to the outer client.\n" +
+      "  Detach first (Ctrl+\\) and run `pty` from outside, or pass --force to open the picker anyway.",
+  });
   const mod = await import("./tui/interactive.ts");
   await mod.runInteractive(options);
 }
@@ -72,6 +78,7 @@ function usage(): void {
   pty rename --show <ref>                 Show current displayName for <ref>
   pty rename --clear [ref]                Remove displayName (ref required outside a session)
   pty attach <name>                        Attach to an existing session
+  pty attach --force <name>                Attach even when already inside a pty session (nested)
   pty exec -- <command> [args...]          Replace the current session's command
   pty attach -r <name>                     Attach, auto-restart if exited
   pty peek <name>                          Print current screen and exit
@@ -140,6 +147,26 @@ async function resolveRef(ref: string): Promise<string> {
   return session.name;
 }
 
+/** Refuse a command that would start a nested client inside an existing
+ *  pty session. Several commands (attach, restart-then-attach, the
+ *  interactive picker, run -a when the target is running) silently created
+ *  a client-inside-a-client, routing detach keybindings to the outer
+ *  client and tangling the user up. `--force` opts back into the old
+ *  behavior for the rare cases where nesting is intentional (debugging,
+ *  screen-sharing demos). Prints + exits; does not return on refusal. */
+function ensureNotNested(
+  cmd: string,
+  opts: { force?: boolean; hint?: string } = {},
+): void {
+  if (opts.force) return;
+  const nested = process.env.PTY_SESSION;
+  if (!nested) return;
+  console.error(`pty ${cmd}: already inside pty session "${nested}".`);
+  if (opts.hint) console.error(opts.hint);
+  else console.error("  Pass --force to override.");
+  process.exit(1);
+}
+
 /** Generate a short random session id. Base32 (Crockford-ish, no 0/O/1/I
  *  confusion). 8 chars = 40 bits — plenty of headroom against collisions
  *  even with thousands of sessions per machine. */
@@ -192,14 +219,16 @@ async function main(): Promise<void> {
 
   let preselectNew = false;
   let interactiveFilterTags: Record<string, string> = {};
+  let interactiveForce = false;
   if (!subcommand || subcommand === "i" || subcommand === "interactive") {
     preselectNew = args.includes("--preselect-new");
+    interactiveForce = args.includes("--force");
     interactiveFilterTags = extractFilterTags(args);
   }
-  const dispatchArgs = args.filter((a) => a !== "--preselect-new");
+  const dispatchArgs = args.filter((a) => a !== "--preselect-new" && a !== "--force");
 
   if (dispatchArgs.length === 0) {
-    await runInteractive({ preselectNew, filterTags: interactiveFilterTags });
+    await runInteractive({ preselectNew, filterTags: interactiveFilterTags, force: interactiveForce });
     return;
   }
 
@@ -208,7 +237,7 @@ async function main(): Promise<void> {
   switch (command) {
     case "interactive":
     case "i": {
-      await runInteractive({ preselectNew, filterTags: interactiveFilterTags });
+      await runInteractive({ preselectNew, filterTags: interactiveFilterTags, force: interactiveForce });
       break;
     }
 
@@ -219,6 +248,7 @@ async function main(): Promise<void> {
       let ephemeral = false;
       let isolateEnv = false;
       let noDisplayName = false;
+      let force = false;
       let name: string | null = null;
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
@@ -229,6 +259,7 @@ async function main(): Promise<void> {
         else if (args[i] === "-e" || args[i] === "--ephemeral") { ephemeral = true; i++; }
         else if (args[i] === "--isolate-env") { isolateEnv = true; i++; }
         else if (args[i] === "--no-display-name") { noDisplayName = true; i++; }
+        else if (args[i] === "--force") { force = true; i++; }
         else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
         else if (args[i] === "--tag" && i + 1 < args.length) {
@@ -288,8 +319,24 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      // Nesting prevention: if inside a pty session and not detaching, exec directly
+      // Nesting prevention: if inside a pty session and not detaching, exec
+      // directly. The -a branch is narrower: if the caller asked to attach-
+      // if-running and the target IS running, attaching would nest a client —
+      // error with a clear message unless --force. If the target isn't
+      // running, the original "exec directly" behavior still makes sense
+      // (there's no session to attach to anyway).
       if (process.env.PTY_SESSION && !detach) {
+        if (attachExisting && name && !force) {
+          const existing = await getSession(name);
+          if (existing && existing.status === "running") {
+            ensureNotNested("run -a", {
+              force: false,
+              hint:
+                `  Target session "${name}" is already running; attaching would nest a client inside the current session.\n` +
+                "  Pass --force to attach anyway, or detach first (Ctrl+\\) and re-run from outside.",
+            });
+          }
+        }
         console.error(
           `Already inside pty session "${process.env.PTY_SESSION}", running directly.`
         );
@@ -345,13 +392,34 @@ async function main(): Promise<void> {
 
     case "attach":
     case "a": {
-      const autoRestart =
-        args[1] === "--auto-restart" || args[1] === "-r";
-      const attachName = autoRestart ? args[2] : args[1];
+      let autoRestart = false;
+      let force = false;
+      let attachName: string | null = null;
+      for (let ai = 1; ai < args.length; ai++) {
+        const a = args[ai];
+        if (a === "--auto-restart" || a === "-r") autoRestart = true;
+        else if (a === "--force") force = true;
+        else if (!attachName) attachName = a;
+        else {
+          console.error(`pty attach: unexpected argument "${a}"`);
+          process.exit(1);
+        }
+      }
       if (!attachName) {
-        console.error("Usage: pty attach [-r|--auto-restart] <name>");
+        console.error("Usage: pty attach [-r|--auto-restart] [--force] <name>");
         process.exit(1);
       }
+      // Nesting guard runs BEFORE name validation / ref resolution. A nested
+      // caller gets the informative nesting message even if they mistyped
+      // the session name — otherwise they'd fix the typo, try again, and
+      // only then discover they shouldn't attach at all.
+      ensureNotNested("attach", {
+        force,
+        hint:
+          "  Attaching now would nest a client inside the current session — detach keys route to the outer client and get tangled.\n" +
+          "  Detach first (Ctrl+\\) or, from inside pty-layout, use ^]n to pick a session.\n" +
+          "  Pass --force to attach anyway (nested clients are usually a mistake).",
+      });
       try {
         validateName(attachName);
       } catch (e: any) {
@@ -359,7 +427,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       const resolvedAttachName = await resolveRef(attachName);
-      await cmdAttach(resolvedAttachName, autoRestart);
+      await cmdAttach(resolvedAttachName, autoRestart, force);
       break;
     }
 
@@ -607,14 +675,28 @@ async function main(): Promise<void> {
     }
 
     case "restart": {
-      const forceRestart = args[1] === "-y" || args[1] === "--yes";
-      const restartName = forceRestart ? args[2] : args[1];
+      // -y / --yes: skip the "kill and restart?" prompt when already running
+      // --force: also skip the nesting guard (restart + attach even when
+      //          already inside a pty session — nested client, caveat emptor)
+      let yes = false;
+      let force = false;
+      let restartName: string | null = null;
+      for (let ai = 1; ai < args.length; ai++) {
+        const a = args[ai];
+        if (a === "-y" || a === "--yes") yes = true;
+        else if (a === "--force") force = true;
+        else if (!restartName) restartName = a;
+        else {
+          console.error(`pty restart: unexpected argument "${a}"`);
+          process.exit(1);
+        }
+      }
       if (!restartName) {
-        console.error("Usage: pty restart [-y] <name>");
+        console.error("Usage: pty restart [-y] [--force] <name>");
         process.exit(1);
       }
       const resolvedRestartName = await resolveRef(restartName);
-      await cmdRestart(resolvedRestartName, forceRestart);
+      await cmdRestart(resolvedRestartName, yes, force);
       break;
     }
 
@@ -1037,8 +1119,14 @@ async function cmdRun(
 
 async function cmdAttach(
   name: string,
-  autoRestart = false
+  autoRestart = false,
+  _force = false,
 ): Promise<void> {
+  // Nesting guard runs in the dispatcher (before name resolution) so the
+  // user gets the nesting hint even for typo'd refs. cmdAttach itself is
+  // only reached once that check has passed; _force is retained in the
+  // signature for clarity and potential future use.
+  void _force;
   const session = await getSession(name);
 
   if (!session) {
@@ -2903,7 +2991,11 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
   }
 }
 
-async function cmdRestart(name: string, force = false): Promise<void> {
+async function cmdRestart(
+  name: string,
+  yes = false,
+  forceNested = false,
+): Promise<void> {
   try {
     validateName(name);
   } catch (e: any) {
@@ -2926,7 +3018,7 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   }
 
   if (session.status === "running" && session.pid) {
-    if (!force) {
+    if (!yes) {
       const answer = await ask(`Session "${name}" is running. Kill and restart? [Y/n] `);
       if (answer.toLowerCase() === "n") {
         process.exit(0);
@@ -2943,6 +3035,15 @@ async function cmdRestart(name: string, force = false): Promise<void> {
   cleanupAll(name);
   await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
   console.log(`Session "${name}" restarted.`);
+
+  // Nesting guard: restart itself is fine, but attaching would nest a client
+  // inside the current session. Print a note and bail unless --force.
+  const nested = process.env.PTY_SESSION;
+  if (nested && !forceNested) {
+    console.log(`  (not attached: already inside pty session "${nested}". Pass --force to attach anyway.)`);
+    return;
+  }
+
   doAttach(name);
 }
 
