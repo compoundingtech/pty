@@ -13,9 +13,10 @@ import { spawnDaemon } from "../spawn.ts";
 import { matchesAllTags, isReservedTagKey } from "../tags.ts";
 import {
   app, screen, signal, computed, batch,
-  text, panel, footer,
+  text, panel, footer, row,
   groupedSelectable, type SelectableGroup,
   updateScrollRegion, themes,
+  applyTextKey, renderFieldNodes, type TextFieldState,
   type KeyEvent, type ScreenContext, type UINode,
 } from "./index.ts";
 // Reuse utility functions from the existing screen modules
@@ -50,7 +51,9 @@ function defaultShell(): string {
 // ============================================================
 
 const sessions = signal<SessionInfo[]>([]);
-const filterText = signal("");
+// TextFieldState carries a cursor so ctrl+a/e/w/u/k + arrow keys + word
+// motion all work readline-style. The filter string itself is `.text`.
+const filterField = signal<TextFieldState>({ text: "", cursor: 0 });
 const selectedIndex = signal(0);
 
 /** Tag filter from `--filter-tag key=value`. Filters the list AND auto-applies
@@ -252,7 +255,7 @@ const filteredGroups = computed<SelectableGroup<ListItem>[]>(() => {
       }))
     : relayHosts.get();
   return buildFilteredGroups(
-    filterText.get(),
+    filterField.get().text,
     sortedSessions.get(),
     hosts,
   );
@@ -352,14 +355,31 @@ const listScreen = screen({
       viewport,
     );
 
-    const filter = filterText.get();
+    const field = filterField.get();
     const tagFilter = filterTags.get();
     const tagFilterStr = Object.entries(tagFilter).map(([k, v]) => `#${k}=${v}`).join(" ");
-    const filterLine = filter
-      ? text("  Filter: " + filter + (tagFilterStr ? "  " + tagFilterStr : ""), "primary")
+    // renderFieldNodes returns [before, cursor, after] text nodes so the
+    // cursor paints on top of the char under it rather than shoving
+    // neighbors sideways. Always render with active=true; the input is
+    // always focused in this screen.
+    const [before, cursor, after] = renderFieldNodes(field.text, field.cursor, true);
+    const filterLine = field.text
+      ? row(
+          text("  Filter: ", "primary"),
+          before, cursor, after,
+          ...(tagFilterStr ? [text("  " + tagFilterStr, "primary")] : []),
+        )
       : tagFilterStr
-        ? text("  Filter: " + tagFilterStr, "primary")
-        : text("  Filter: (type to filter)", "muted", { dim: true });
+        ? row(
+            text("  Filter: ", "primary"),
+            before, cursor, after,
+            text("  " + tagFilterStr, "primary"),
+          )
+        : row(
+            text("  Filter: ", "muted", { dim: true }),
+            before, cursor, after,
+            text(" (type to filter)", "muted", { dim: true }),
+          );
 
     const hasRelay = relayHosts.get().length > 0;
 
@@ -433,14 +453,14 @@ const listScreen = screen({
       }
     }
     if (key.name === "escape") {
-      if (filterText.peek()) {
-        batch(() => { filterText.set(""); selectedIndex.set(0); });
+      if (filterField.peek().text) {
+        batch(() => { filterField.set({ text: "", cursor: 0 }); selectedIndex.set(0); });
         return true;
       }
       ctx.quit();
       return true;
     }
-    if (key.char === "q" && !key.ctrl && !key.alt && !filterText.peek()) {
+    if (key.char === "q" && !key.ctrl && !key.alt && !filterField.peek().text) {
       ctx.quit();
       return true;
     }
@@ -448,14 +468,22 @@ const listScreen = screen({
     // here so the global default fires. If someone binds it in a context
     // that should NOT quit (e.g. a composer with double-ctrl-c semantics),
     // they intercept via AppConfig.onKey.
-    if (key.name === "backspace") {
-      if (filterText.peek().length > 0) {
-        batch(() => { filterText.set(filterText.peek().slice(0, -1)); selectedIndex.set(0); });
-      }
-      return true;
-    }
-    if (key.char && !key.ctrl && !key.alt) {
-      batch(() => { filterText.set(filterText.peek() + key.char); selectedIndex.set(0); });
+
+    // Delegate edit keys to applyTextKey — gives us readline-style editing
+    // (backspace, delete, left/right, home/end, alt+b/f for word motion,
+    // ctrl+a/e for start/end, ctrl+u to clear-to-start, ctrl+w to delete-
+    // prev-word, ctrl+k to kill-to-end, plus printable char insertion).
+    // applyTextKey returns null when the key isn't a text-editing key, in
+    // which case we fall through and swallow it (nothing else to handle).
+    const prev = filterField.peek();
+    const updated = applyTextKey(prev, key);
+    if (updated !== null) {
+      batch(() => {
+        filterField.set(updated);
+        // Reset the selection whenever the filter TEXT changes. Pure cursor
+        // movement (home, end, arrows) keeps the current selection.
+        if (updated.text !== prev.text) selectedIndex.set(0);
+      });
       return true;
     }
     return true;
@@ -504,7 +532,7 @@ function doAttachRemote(host: RelayHost, session: RemoteSession): void {
     refreshRelayHosts();
     batch(() => {
       sessions.set(updated);
-      filterText.set("");
+      filterField.set({ text: "", cursor: 0 });
       const maxIdx = Math.max(0, totalItems.get() - 1);
       if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
     });
@@ -538,7 +566,7 @@ function doSpawnRemote(host: RelayHost, name: string): void {
     refreshRelayHosts();
     batch(() => {
       sessions.set(updated);
-      filterText.set("");
+      filterField.set({ text: "", cursor: 0 });
       const maxIdx = Math.max(0, totalItems.get() - 1);
       if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
     });
@@ -554,7 +582,7 @@ function doAttach(name: string): void {
       const updated = await listSessions();
       batch(() => {
         sessions.set(updated);
-        filterText.set("");
+        filterField.set({ text: "", cursor: 0 });
         const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });
@@ -566,7 +594,7 @@ function doAttach(name: string): void {
       const updated = await listSessions();
       batch(() => {
         sessions.set(updated);
-        filterText.set("");
+        filterField.set({ text: "", cursor: 0 });
         const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });

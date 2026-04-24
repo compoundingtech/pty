@@ -47,6 +47,55 @@ describe("applyTextKey", () => {
     expect(applyTextKey(mid, k("u", { ctrl: true }))).toEqual({ text: "lo", cursor: 0 });
   });
 
+  it("ctrl+a moves the cursor to the start (same as home)", () => {
+    expect(applyTextKey(hello, k("a", { char: "a", ctrl: true })))
+      .toEqual({ text: "hello", cursor: 0 });
+  });
+
+  it("ctrl+e moves the cursor to the end (same as end)", () => {
+    expect(applyTextKey({ text: "hello", cursor: 1 }, k("e", { char: "e", ctrl: true })))
+      .toEqual({ text: "hello", cursor: 5 });
+  });
+
+  it("ctrl+w deletes the word immediately behind the cursor", () => {
+    // "git status|" → "git |"
+    const s: TextFieldState = { text: "git status", cursor: 10 };
+    expect(applyTextKey(s, k("w", { char: "w", ctrl: true })))
+      .toEqual({ text: "git ", cursor: 4 });
+  });
+
+  it("ctrl+w mid-string keeps everything after the cursor", () => {
+    // "hello world|xxx" with cursor at 11 (end of 'world') → "hello |xxx"
+    const s: TextFieldState = { text: "hello worldxxx", cursor: 11 };
+    const r = applyTextKey(s, k("w", { char: "w", ctrl: true }));
+    expect(r).toEqual({ text: "hello xxx", cursor: 6 });
+  });
+
+  it("ctrl+w on whitespace immediately behind cursor: skips space then eats word", () => {
+    // "foo   bar|" (cursor at end, run of spaces behind bar) → "foo   |"
+    // prevWordBoundary skips non-word then word; here behind cursor is 'bar',
+    // so it just eats 'bar'.
+    const s: TextFieldState = { text: "foo   bar", cursor: 9 };
+    const r = applyTextKey(s, k("w", { char: "w", ctrl: true }));
+    expect(r).toEqual({ text: "foo   ", cursor: 6 });
+  });
+
+  it("ctrl+w on empty field is a no-op", () => {
+    expect(applyTextKey(empty, k("w", { char: "w", ctrl: true })))
+      .toEqual({ text: "", cursor: 0 });
+  });
+
+  it("ctrl+k kills to end of line from the cursor", () => {
+    const mid: TextFieldState = { text: "hello world", cursor: 5 };
+    expect(applyTextKey(mid, k("k", { char: "k", ctrl: true })))
+      .toEqual({ text: "hello", cursor: 5 });
+  });
+
+  it("ctrl+k at end is a no-op", () => {
+    expect(applyTextKey(hello, k("k", { char: "k", ctrl: true })))
+      .toEqual({ text: "hello", cursor: 5 });
+  });
+
   it("ignores ctrl/alt-modified printable keys so shortcuts don't leak", () => {
     expect(applyTextKey(hello, k("s", { char: "s", ctrl: true }))).toBeNull();
     expect(applyTextKey(hello, k("q", { char: "q", alt: true }))).toBeNull();

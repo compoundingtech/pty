@@ -451,6 +451,69 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "ctrl+u clears the filter in one keystroke",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name1 = uniqueName();
+      const name2 = uniqueName();
+
+      const bg1 = await createBackgroundSession(sessionDir, name1, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg1.pid);
+      const bg2 = await createBackgroundSession(sessionDir, name2, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg2.pid);
+
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText(name1, 10000);
+      await tui.waitForText(name2, 10000);
+
+      // Type part of name1 to filter. Wait for name2 to disappear so we're
+      // sure the filter has rendered before we measure the clear.
+      tui.type(name1.slice(-4));
+      await tui.waitForAbsent(name2, 5000);
+
+      // ctrl+u clears the whole filter.
+      tui.press("ctrl+u");
+      await tui.waitForText(name2, 5000);
+
+      const ss = tui.screenshot();
+      expect(ss.text).toContain(name1);
+      expect(ss.text).toContain(name2);
+    },
+    20000,
+  );
+
+  it(
+    "ctrl+w deletes the previous word from the filter",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name1 = uniqueName();
+
+      const bg1 = await createBackgroundSession(sessionDir, name1, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg1.pid);
+
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText(name1, 10000);
+
+      // Type "foo bar" — two words. ctrl+w should remove "bar" and leave
+      // "foo " in the filter line. The underlying fuzzy matcher probably
+      // won't match a session name, so we check the rendered filter line
+      // directly.
+      tui.type("foo bar");
+      // Wait for both words to appear in the "Filter: ..." line.
+      await tui.waitForText("foo bar", 5000);
+
+      tui.press("ctrl+w");
+      // After ctrl+w, "bar" should be gone from the filter line; the filter
+      // should still contain "foo ".
+      await tui.waitForAbsent("foo bar", 5000);
+      const ss = tui.screenshot();
+      expect(ss.text).toContain("Filter: foo");
+      expect(ss.text).not.toContain("foo bar");
+    },
+    20000,
+  );
+
+  it(
     "typing filters the list, backspace unfilters",
     async () => {
       const sessionDir = makeSessionDir();

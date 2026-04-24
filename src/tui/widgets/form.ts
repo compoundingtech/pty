@@ -88,6 +88,24 @@ export function applyTextKey(state: TextFieldState, key: KeyEvent): TextFieldSta
   if (key.name === "u" && key.ctrl) {
     return { text: state.text.slice(state.cursor), cursor: 0 };
   }
+  // ctrl+w: delete the word immediately behind the cursor. Matches
+  // readline / shell behavior — users expect this to shrink the line
+  // word-by-word from the left.
+  if (key.name === "w" && key.ctrl) {
+    const start = prevWordBoundary(state.text, state.cursor);
+    return {
+      text: state.text.slice(0, start) + state.text.slice(state.cursor),
+      cursor: start,
+    };
+  }
+  // ctrl+k: kill to end of line from the cursor. In a single-line field
+  // that's everything after the cursor.
+  if (key.name === "k" && key.ctrl) {
+    return {
+      text: state.text.slice(0, state.cursor),
+      cursor: state.cursor,
+    };
+  }
   // Printable character — ignore ctrl/alt-modified keys so shortcuts don't
   // leak as text into the field.
   if (key.char && !key.ctrl && !key.alt) {
