@@ -9,6 +9,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
 const cliPath = path.join(__dirname, "..", "dist", "cli.js");
 
+// Platform gates. Both installers are Linux-only — macOS has no systemd or
+// runit. Rather than fail the whole suite on the wrong platform, skip the
+// individual tests so developers on Mac see a clean "skipped" rather than
+// red "runsvdir is not installed" errors. CI runs on Linux and exercises
+// the real code path.
+function hasCommand(cmd: string): boolean {
+  return spawnSync("sh", ["-lc", `command -v ${cmd} >/dev/null 2>&1`]).status === 0;
+}
+const hasSystemdUser = process.platform === "linux" && hasCommand("systemctl");
+const hasRunit = process.platform === "linux" && hasCommand("runsvdir");
+
 const bgPids: number[] = [];
 const cleanupUnits: string[] = [];
 const cleanupPaths: string[] = [];
@@ -39,16 +50,18 @@ function killPid(pid: number | undefined) {
 }
 
 afterEach(() => {
-  for (const unit of cleanupUnits.splice(0)) {
-    spawnSync("systemctl", ["--user", "disable", "--now", unit], { encoding: "utf-8" });
-    spawnSync("systemctl", ["--user", "reset-failed", unit], { encoding: "utf-8" });
-    const unitPath = path.join(os.homedir(), ".config", "systemd", "user", unit);
-    try { fs.unlinkSync(unitPath); } catch {}
-  }
-  if (cleanupUnits.length > 0) {
+  // systemctl cleanup is a no-op on macOS where the cmd doesn't exist.
+  // Guarding saves noisy spawn errors in the test log.
+  if (hasSystemdUser) {
+    for (const unit of cleanupUnits.splice(0)) {
+      spawnSync("systemctl", ["--user", "disable", "--now", unit], { encoding: "utf-8" });
+      spawnSync("systemctl", ["--user", "reset-failed", unit], { encoding: "utf-8" });
+      const unitPath = path.join(os.homedir(), ".config", "systemd", "user", unit);
+      try { fs.unlinkSync(unitPath); } catch {}
+    }
     spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf-8" });
   } else {
-    spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf-8" });
+    cleanupUnits.length = 0;
   }
 
   for (const pid of bgPids.splice(0)) killPid(pid);
@@ -58,7 +71,7 @@ afterEach(() => {
 });
 
 describe("supervisor service installers", () => {
-  it("installs and uninstalls a user systemd service", async () => {
+  it.skipIf(!hasSystemdUser)("installs and uninstalls a user systemd service", async () => {
     const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-systemd-"));
     cleanupPaths.push(sessionDir);
 
@@ -90,11 +103,7 @@ describe("supervisor service installers", () => {
     expect(activeAfter.status).not.toBe(0);
   }, 30000);
 
-  it("installs a runit service that can be started by a private runsvdir", async () => {
-    if (spawnSync("sh", ["-lc", "command -v runsvdir >/dev/null 2>&1"]).status !== 0) {
-      throw new Error("runsvdir is not installed");
-    }
-
+  it.skipIf(!hasRunit)("installs a runit service that can be started by a private runsvdir", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pty-runit-"));
     const sessionDir = path.join(root, "sessions");
     const svDir = path.join(root, "sv");
