@@ -171,6 +171,10 @@ pty events --json myserver       # raw JSONL output
 
 Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
 
+### On-disk format
+
+Session metadata, events, and supporting files all live under `$PTY_SESSION_DIR` (default `~/.local/state/pty`). The full layout — file naming, JSON shape, atomic-write contract, event types, stability tiers — is documented in [docs/disk-layout.md](docs/disk-layout.md). Third parties can read these files directly to skip the Node CLI's startup cost; `git`-style command forwarding (`pty <subcommand>` resolves to a `pty-<subcommand>` binary on `$PATH`) lets you ship native fast-path readers as `pty` subcommands.
+
 ### Project Files
 
 A project can include a `pty.toml` to declare its sessions:

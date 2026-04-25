@@ -22,6 +22,12 @@ export const EventType = {
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
 
+// PUBLIC FORMAT — `<name>.events.jsonl` is line-delimited JSON of these
+// records. Adding a new event type, renaming an existing one, or changing
+// a payload field MUST be reflected in `docs/disk-layout.md` and called
+// out under `### Storage format` in the next CHANGELOG entry. A smoke
+// test (`tests/disk-layout-docs.test.ts`) asserts every event-type literal
+// appears in the docs.
 export interface EventBase {
   session: string;
   /** Type string. Known system types live in the `EventType` enum; user

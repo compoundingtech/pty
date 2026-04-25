@@ -70,6 +70,11 @@ export function getEventsPath(name: string): string {
   return path.join(getSessionDir(), `${name}.events.jsonl`);
 }
 
+// PUBLIC FORMAT — this is the on-disk shape of `<name>.json`. Any change
+// to fields here (add / rename / remove / type change) MUST be reflected in
+// `docs/disk-layout.md` and called out under `### Storage format` in the
+// next CHANGELOG entry. A smoke test (`tests/disk-layout-docs.test.ts`)
+// asserts every field name on this interface appears in the docs.
 export interface SessionMetadata {
   command: string;
   args: string[];
