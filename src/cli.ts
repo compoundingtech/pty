@@ -113,6 +113,7 @@ function usage(): void {
   pty tag <name>                           Show tags on a session
   pty tag <name> key=value [key=value...]  Set tags
   pty tag <name> --rm key [--rm key...]    Remove tags
+  pty tag-multi <selector> [ops...]        Read/write tags across multiple sessions (--all / --filter-tag k=v / <name>...)
   pty supervisor start                     Start the session supervisor
   pty supervisor stop                      Stop the supervisor
   pty supervisor status                    Show supervised sessions
