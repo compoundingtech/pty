@@ -110,8 +110,11 @@ pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # remove all exited sessions
-pty tag myserver role=web                 # set tags on a session
-pty tag myserver --rm role                # remove a tag
+pty tag myserver role=web env=prod        # set one or more tags on a session
+pty tag myserver --rm role --rm env       # remove one or more tags
+pty tag-multi --filter-tag role=web env=prod    # bulk write across matching sessions
+pty tag-multi --all --json                # bulk read tags across every session
+pty tag-multi --all --yes audit=today     # write to every session (--yes required)
 
 pty supervisor start                      # start the session supervisor
 pty supervisor stop                       # stop the supervisor

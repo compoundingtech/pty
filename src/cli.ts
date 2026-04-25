@@ -737,20 +737,37 @@ async function main(): Promise<void> {
       }
       const resolvedTagName = await resolveRef(tagName);
 
+      // Bulk-friendly parsing. Multiple `key=value` and `--rm <key>` may
+      // appear in any order; updates apply before removals (see updateTags
+      // in sessions.ts), so `pty tag X k=v --rm k` ends with k removed.
       const updates: Record<string, string> = {};
       const removals: string[] = [];
       for (let i = 2; i < args.length; i++) {
-        if (args[i] === "--rm" && i + 1 < args.length) {
-          removals.push(args[i + 1]);
-          i++;
-        } else {
-          const eq = args[i].indexOf("=");
-          if (eq === -1) {
-            console.error(`Invalid tag format: "${args[i]}". Use key=value or --rm key`);
+        if (args[i] === "--rm") {
+          if (i + 1 >= args.length) {
+            console.error("pty tag: --rm requires a key (e.g. --rm role)");
             process.exit(1);
           }
-          updates[args[i].slice(0, eq)] = args[i].slice(eq + 1);
+          const rmKey = args[i + 1];
+          if (rmKey === "") {
+            console.error("pty tag: --rm requires a non-empty key");
+            process.exit(1);
+          }
+          removals.push(rmKey);
+          i++;
+          continue;
         }
+        const eq = args[i].indexOf("=");
+        if (eq === -1) {
+          console.error(`pty tag: invalid argument "${args[i]}". Use key=value or --rm key.`);
+          process.exit(1);
+        }
+        const key = args[i].slice(0, eq);
+        if (key === "") {
+          console.error(`pty tag: empty key in "${args[i]}". Tag keys must be non-empty.`);
+          process.exit(1);
+        }
+        updates[key] = args[i].slice(eq + 1);
       }
 
       // No updates or removals — show current tags
@@ -795,6 +812,11 @@ async function main(): Promise<void> {
         console.error(e.message);
         process.exit(1);
       }
+      break;
+    }
+
+    case "tag-multi": {
+      await cmdTagMulti(args.slice(1));
       break;
     }
 
@@ -1996,6 +2018,247 @@ async function cmdGc(dryRun: boolean): Promise<void> {
       ? `Would clean up ${parts.join(" and ")}. (Dry run — no changes made.)`
       : `Cleaned up ${parts.join(" and ")}.`,
   );
+}
+
+// --- tag-multi: read/write tags across multiple sessions in one call ---
+//
+// Three selectors (mutually exclusive):
+//   <name>...               explicit list (resolved up-front; any unresolvable
+//                           name aborts before any write)
+//   --filter-tag k=v ...    sessions whose tags match all listed pairs
+//   --all                   every session
+//
+// No ops = read mode (per-session tag dump, text or --json). Any ops
+// (`k=v` / `--rm k`) = write mode; --all + write mode requires --yes
+// because it operates on every session in the dir.
+
+interface TagMultiParsed {
+  selector:
+    | { kind: "names"; names: string[] }
+    | { kind: "filter"; filterTags: Record<string, string> }
+    | { kind: "all" };
+  ops: { updates: Record<string, string>; removals: string[] };
+  json: boolean;
+  yes: boolean;
+}
+
+function parseTagMultiArgs(argv: string[]): TagMultiParsed {
+  let all = false;
+  const filterTags: Record<string, string> = {};
+  const names: string[] = [];
+  const updates: Record<string, string> = {};
+  const removals: string[] = [];
+  let json = false;
+  let yes = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--all") { all = true; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a === "--yes" || a === "-y") { yes = true; continue; }
+    if (a === "-h" || a === "--help") {
+      printTagMultiHelp();
+      process.exit(0);
+    }
+    if (a === "--filter-tag") {
+      if (i + 1 >= argv.length) {
+        console.error("pty tag-multi: --filter-tag requires k=v");
+        process.exit(1);
+      }
+      const next = argv[++i];
+      const eq = next.indexOf("=");
+      if (eq === -1) {
+        console.error(`pty tag-multi: --filter-tag value "${next}" must be k=v`);
+        process.exit(1);
+      }
+      const k = next.slice(0, eq);
+      if (k === "") {
+        console.error("pty tag-multi: --filter-tag key must be non-empty");
+        process.exit(1);
+      }
+      filterTags[k] = next.slice(eq + 1);
+      continue;
+    }
+    if (a === "--rm") {
+      if (i + 1 >= argv.length) {
+        console.error("pty tag-multi: --rm requires a key (e.g. --rm role)");
+        process.exit(1);
+      }
+      const k = argv[++i];
+      if (k === "") {
+        console.error("pty tag-multi: --rm requires a non-empty key");
+        process.exit(1);
+      }
+      removals.push(k);
+      continue;
+    }
+    const eq = a.indexOf("=");
+    if (eq !== -1) {
+      const k = a.slice(0, eq);
+      if (k === "") {
+        console.error(`pty tag-multi: empty key in "${a}". Tag keys must be non-empty.`);
+        process.exit(1);
+      }
+      updates[k] = a.slice(eq + 1);
+      continue;
+    }
+    // Anything else is a positional session name. validateName will catch
+    // illegal characters at resolution time.
+    names.push(a);
+  }
+
+  // Selector mutex check.
+  const selectorCount =
+    (all ? 1 : 0) +
+    (Object.keys(filterTags).length > 0 ? 1 : 0) +
+    (names.length > 0 ? 1 : 0);
+  if (selectorCount === 0) {
+    console.error(
+      "pty tag-multi: no selector — pass session names, --filter-tag k=v, or --all",
+    );
+    process.exit(1);
+  }
+  if (selectorCount > 1) {
+    console.error(
+      "pty tag-multi: selectors are mutually exclusive — pick one of <names>, --filter-tag, --all",
+    );
+    process.exit(1);
+  }
+
+  let selector: TagMultiParsed["selector"];
+  if (all) selector = { kind: "all" };
+  else if (Object.keys(filterTags).length > 0) selector = { kind: "filter", filterTags };
+  else selector = { kind: "names", names };
+
+  return { selector, ops: { updates, removals }, json, yes };
+}
+
+async function cmdTagMulti(argv: string[]): Promise<void> {
+  const parsed = parseTagMultiArgs(argv);
+  const isWrite =
+    Object.keys(parsed.ops.updates).length > 0 || parsed.ops.removals.length > 0;
+
+  // Resolve selector → list of stable session ids. Explicit names are
+  // resolved up-front so an unresolvable name aborts before any writes.
+  let targets: string[];
+  if (parsed.selector.kind === "names") {
+    targets = [];
+    for (const ref of parsed.selector.names) {
+      try {
+        validateName(ref);
+      } catch (e: any) {
+        console.error(`pty tag-multi: ${e.message}`);
+        process.exit(1);
+      }
+      const sess = await getSession(ref);
+      if (!sess) {
+        console.error(`pty tag-multi: session "${ref}" not found.`);
+        process.exit(1);
+      }
+      targets.push(sess.name);
+    }
+  } else if (parsed.selector.kind === "filter") {
+    const all = await listSessions();
+    targets = all
+      .filter((s) => matchesAllTags(s.metadata?.tags, parsed.selector.kind === "filter" ? parsed.selector.filterTags : {}))
+      .map((s) => s.name);
+  } else {
+    // --all
+    if (isWrite && !parsed.yes) {
+      const all = await listSessions();
+      console.error(
+        `pty tag-multi: --all writes are destructive across ${all.length} session(s). Re-run with --yes to apply.`,
+      );
+      process.exit(1);
+    }
+    const all = await listSessions();
+    targets = all.map((s) => s.name);
+  }
+
+  // Read mode: collect per-session tags into an object.
+  if (!isWrite) {
+    const out: Record<string, Record<string, string>> = {};
+    for (const name of targets) {
+      const meta = readMetadata(name);
+      out[name] = meta?.tags ?? {};
+    }
+    if (parsed.json) {
+      console.log(JSON.stringify(out));
+      return;
+    }
+    if (targets.length === 0) {
+      console.log("0 sessions matched.");
+      return;
+    }
+    for (const name of targets) {
+      const tags = out[name];
+      const keys = Object.keys(tags);
+      if (keys.length === 0) {
+        console.log(`${name}: (no tags)`);
+        continue;
+      }
+      console.log(`${name}:`);
+      for (const k of keys) console.log(`  ${k}=${tags[k]}`);
+    }
+    return;
+  }
+
+  // Write mode: apply per-session, continue on error, exit 1 if any failed.
+  if (targets.length === 0) {
+    if (parsed.json) {
+      console.log(JSON.stringify({}));
+    } else {
+      console.log("0 sessions matched. No writes performed.");
+    }
+    return;
+  }
+  const results: Record<string, Record<string, string>> = {};
+  const errors: { name: string; message: string }[] = [];
+  for (const name of targets) {
+    try {
+      updateTags(name, parsed.ops.updates, parsed.ops.removals);
+      const meta = readMetadata(name);
+      results[name] = meta?.tags ?? {};
+    } catch (e: any) {
+      errors.push({ name, message: e.message ?? String(e) });
+    }
+  }
+  if (parsed.json) {
+    console.log(JSON.stringify(results));
+  } else {
+    const changed = Object.keys(results).length;
+    console.log(`${changed} session(s) processed.`);
+  }
+  if (errors.length > 0) {
+    for (const e of errors) {
+      console.error(`pty tag-multi: ${e.name}: ${e.message}`);
+    }
+    process.exit(1);
+  }
+}
+
+function printTagMultiHelp(): void {
+  console.log(`Usage:
+  pty tag-multi <selector> [--json] [--yes] [<ops>...]
+
+Selectors (pick one):
+  <name>...                explicit list of session names or displayNames
+  --filter-tag k=v         sessions matching tag (repeatable for AND)
+  --all                    every session
+
+Operations (presence flips command into write mode):
+  k=v                      set tag k to v
+  --rm k                   remove tag k
+
+Flags:
+  --json                   structured output (object: name → tags)
+  --yes / -y               required with --all when ops are present
+
+Examples:
+  pty tag-multi --all --json
+  pty tag-multi --filter-tag role=web env=prod
+  pty tag-multi sess-a sess-b --rm temp-flag
+  pty tag-multi --all --yes audit=2026-04-25`);
 }
 
 // --- emit: publish a user.* event to a session's events log ---
