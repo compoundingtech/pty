@@ -746,6 +746,81 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "auto-refreshes the home list when a session is created externally (closes #26)",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const a = uniqueName();
+      const bg1 = await createBackgroundSession(sessionDir, a, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg1.pid);
+
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText(a, 10000);
+
+      // While the TUI sits idle on the home screen, create a new session
+      // out of band. The dir-watch + EventFollower wiring should pick up
+      // session_start (or the new .json file) and refresh sessions.
+      const b = uniqueName();
+      const bg2 = await createBackgroundSession(sessionDir, b, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg2.pid);
+
+      // Should appear without any keystroke from the TUI.
+      await tui.waitForText(b, 5000);
+    },
+    20000,
+  );
+
+  it(
+    "auto-refreshes the home list when a session exits externally (closes #26)",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+      const { pid } = await createBackgroundSession(sessionDir, name, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(pid);
+
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText(name, 10000);
+
+      // The "running" indicator (●) is on; force the daemon to exit and
+      // wait for the list to reflect the change.
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      // Filter out the killed pid from cleanup since we just killed it.
+      bgPids = bgPids.filter((p) => p !== pid);
+
+      // The session moves to the exited group — wait for the marker text
+      // that only renders for exited sessions ("(exited ...").
+      await tui.waitForText("exited", 8000);
+    },
+    20000,
+  );
+
+  it(
+    "auto-refreshes the home list when tags change externally (closes #26)",
+    async () => {
+      const sessionDir = makeSessionDir();
+      const name = uniqueName();
+      const { pid } = await createBackgroundSession(sessionDir, name, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(pid);
+
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText(name, 10000);
+      // No tags rendered yet.
+      const before = tui.screenshot();
+      expect(before.text).not.toContain("#role=web");
+
+      // Out-of-band tag change. EventFollower should pick up `tags_change`
+      // and the home list should re-render with the inline tag.
+      const r = spawn(nodeBin, [cliPath, "tag", name, "role=web"], {
+        env: { ...process.env, PTY_SESSION_DIR: sessionDir },
+        stdio: "ignore",
+      });
+      await new Promise<void>((resolve) => r.on("exit", () => resolve()));
+
+      await tui.waitForText("#role=web", 5000);
+    },
+    20000,
+  );
+
+  it(
     "preserves the filter and selection across attach/detach (closes #27)",
     async () => {
       const sessionDir = makeSessionDir();
