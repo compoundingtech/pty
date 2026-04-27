@@ -526,13 +526,13 @@ function doAttachRemote(host: RelayHost, session: RemoteSession): void {
     stdio: "inherit",
   });
 
-  // Refresh and resume
+  // Refresh and resume. Preserve the filter and (when in-bounds) the
+  // selection so the user lands back where they were — closes #27.
   (async () => {
     const updated = await listSessions();
     refreshRelayHosts();
     batch(() => {
       sessions.set(updated);
-      filterField.set({ text: "", cursor: 0 });
       const maxIdx = Math.max(0, totalItems.get() - 1);
       if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
     });
@@ -566,7 +566,6 @@ function doSpawnRemote(host: RelayHost, name: string): void {
     refreshRelayHosts();
     batch(() => {
       sessions.set(updated);
-      filterField.set({ text: "", cursor: 0 });
       const maxIdx = Math.max(0, totalItems.get() - 1);
       if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
     });
@@ -579,10 +578,13 @@ function doAttach(name: string): void {
   attach({
     name,
     onDetach: async () => {
+      // Preserve filter + in-bounds selection so the user returns to the
+      // overview where they were. Closes #27. The selection clamps when
+      // the list shrunk (the attached session might have exited and been
+      // gc'd while we were attached).
       const updated = await listSessions();
       batch(() => {
         sessions.set(updated);
-        filterField.set({ text: "", cursor: 0 });
         const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });
@@ -594,7 +596,6 @@ function doAttach(name: string): void {
       const updated = await listSessions();
       batch(() => {
         sessions.set(updated);
-        filterField.set({ text: "", cursor: 0 });
         const maxIdx = Math.max(0, totalItems.get() - 1);
         if (selectedIndex.peek() > maxIdx) selectedIndex.set(maxIdx);
       });

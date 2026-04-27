@@ -746,6 +746,69 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "preserves the filter and selection across attach/detach (closes #27)",
+    async () => {
+      const sessionDir = makeSessionDir();
+      // Three sessions whose names share enough characters that a partial
+      // filter narrows but doesn't empty the list.
+      const a = uniqueName();
+      const b = uniqueName();
+      const c = uniqueName();
+      const bg1 = await createBackgroundSession(sessionDir, a, "sh", ["-c", "echo A_MARK; sleep 300"], os.tmpdir());
+      bgPids.push(bg1.pid);
+      const bg2 = await createBackgroundSession(sessionDir, b, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg2.pid);
+      const bg3 = await createBackgroundSession(sessionDir, c, "sh", ["-c", "sleep 300"], os.tmpdir());
+      bgPids.push(bg3.pid);
+
+      const tui = createTuiSession(sessionDir);
+
+      // Wait for all three to appear so the filter has something to filter.
+      await tui.waitForText(a, 10000);
+      await tui.waitForText(b, 10000);
+      await tui.waitForText(c, 10000);
+
+      // Type a filter that matches `a` only — shared name prefix `s` plus a
+      // chunk of `a`'s random suffix.
+      const filter = a.slice(-4);
+      tui.type(filter);
+      // Wait for the OTHER sessions to disappear so we're confident the
+      // filter rendered before we attach.
+      await tui.waitForAbsent(b, 5000);
+
+      // The filter line should show the typed value.
+      const beforeAttach = tui.screenshot();
+      expect(beforeAttach.text).toContain(`Filter: ${filter}`);
+
+      // Attach to `a` (which is still selected since the filter matched it).
+      tui.press("return");
+      await tui.waitForText("A_MARK", 10000);
+
+      // Detach back to the overview.
+      tui.sendKeys("\x1c");
+
+      // After returning, the filter must still be present and `b` / `c`
+      // must still be hidden by it. This is the regression — previously
+      // the overview cleared the filter on detach.
+      const after = await tui.waitForText(a, 10000);
+      expect(after.text).toContain(`Filter: ${filter}`);
+      expect(after.text).toContain(a);
+      expect(after.text).not.toContain(b);
+      expect(after.text).not.toContain(c);
+
+      // The user can still edit the filter (cursor preserved). One more
+      // keystroke continues from the current cursor position; ctrl+u
+      // should clear back to nothing.
+      tui.press("ctrl+u");
+      await tui.waitForText(b, 5000);
+      const cleared = tui.screenshot();
+      expect(cleared.text).toContain(b);
+      expect(cleared.text).toContain(c);
+    },
+    30000,
+  );
+
+  it(
     "session list reloads after returning from attach",
     async () => {
       const sessionDir = makeSessionDir();

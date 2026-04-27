@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Interactive TUI
+- **Filter and selection persist across attach/detach** (closes #27). Previously, the overview's filter input and selection were cleared every time the user attached to a session and came back — `doAttach` (and the remote-spawn / remote-attach paths) explicitly reset `filterField` to empty on `onDetach` / `onExit`. That made jumping in and out of sessions feel disorienting. Now the four return paths preserve both. The selection still clamps when the underlying list shrinks (a session that exited and got reaped while the user was attached), so it never points off the end. The clear-filter-on-spawn behavior was the same code path; it's also gone, which means `+ Create new session...` followed by detach lands you back on your filtered view too.
+
 ### Tags
 - **`pty tag-multi` — multi-session tag operations.** New sibling command for read and write across many sessions in one CLI invocation. Three mutually-exclusive selectors:
   - `<name>...` — explicit list (resolved up-front; if any name is unresolvable the command aborts before any write so partial application doesn't happen)
