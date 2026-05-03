@@ -361,8 +361,16 @@ export async function listSessions(): Promise<SessionInfo[]> {
       // reachable socket can briefly coexist with exitedAt being set.
       const status = metadata?.exitedAt ? "exited" : "running";
       sessions.push({ name, socketPath, pid, status, metadata });
+    } else if (pid !== null && isProcessAlive(pid)) {
+      // Pid is still alive but the socket isn't reachable right now (busy
+      // daemon, transient EAGAIN, race with a service restart). Keep the
+      // socket on disk and report the session as running — deleting the
+      // socket would render the still-alive daemon permanently invisible.
+      const metadata = readMetadata(name);
+      const status = metadata?.exitedAt ? "exited" : "running";
+      sessions.push({ name, socketPath, pid, status, metadata });
     } else {
-      // Process died — clean up socket/pid but keep metadata
+      // Process really died — clean up socket/pid but keep metadata
       cleanupSocket(name);
     }
   }
@@ -383,13 +391,18 @@ export async function listSessions(): Promise<SessionInfo[]> {
     // this keys off exitedAt; for vanished sessions (no exit record written)
     // fall back to createdAt so they don't accumulate indefinitely. A session
     // with a missing daemon and a metadata file older than 24h is not coming
-    // back regardless of why it died.
+    // back regardless of why it died — *unless* the recorded pid is still
+    // alive, in which case the daemon outlived its socket and we must keep
+    // metadata around so the session stays addressable.
     const ageAnchor = metadata.exitedAt ?? metadata.createdAt;
     if (ageAnchor) {
       const anchoredAt = new Date(ageAnchor).getTime();
       if (Date.now() - anchoredAt > DEAD_SESSION_TTL_MS) {
-        cleanupAll(name);
-        continue;
+        const pid = readPid(name);
+        if (pid === null || !isProcessAlive(pid)) {
+          cleanupAll(name);
+          continue;
+        }
       }
     }
 
