@@ -155,6 +155,58 @@ describe("vanished status", () => {
   }, 15000);
 });
 
+describe("listSessions guards against deleting state for live daemons", () => {
+  // Refs https://github.com/myobie/pty/issues/34. listSessions used to
+  // unconditionally `cleanupSocket` whenever the socket-reachable probe
+  // failed and `cleanupAll` whenever metadata was older than 24h. Both
+  // ran even if the recorded pid was still alive — once the .sock or
+  // .json was gone, the still-running daemon became invisible to every
+  // future scan. These tests pin the new behaviour: live pid wins.
+  it("keeps a session whose socket file is missing but recorded pid is still alive", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    // Use the test runner's own pid as a stand-in for an alive daemon.
+    fs.writeFileSync(path.join(dir, `${name}.pid`), String(process.pid));
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      command: "cat", args: [], displayCommand: "cat", cwd: os.tmpdir(),
+      createdAt: new Date().toISOString(),
+    }));
+    // Note: no .sock file written. Without the guard, scan-and-cleanup paths
+    // would fall into the .json branch and delete metadata-on-age.
+
+    // Force the .json into the >24h bucket so the second guard is exercised.
+    const old = new Date(Date.now() - 48 * 3600_000).toISOString();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      command: "cat", args: [], displayCommand: "cat", cwd: os.tmpdir(),
+      createdAt: old,
+    }));
+
+    const r = runCli(dir, "list", "--json");
+    expect(r.status).toBe(0);
+    const found = JSON.parse(r.stdout).find((s: any) => s.name === name);
+    expect(found, "session should still be listed because its pid is alive").toBeDefined();
+    // Metadata file must survive the call so the next scan also sees it.
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+  }, 10000);
+
+  it("does delete metadata older than 24h when the pid is dead", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    // Pid 0x7fffffff is "guaranteed dead" on Linux/macOS in practice.
+    fs.writeFileSync(path.join(dir, `${name}.pid`), "2147483647");
+    const old = new Date(Date.now() - 48 * 3600_000).toISOString();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      command: "cat", args: [], displayCommand: "cat", cwd: os.tmpdir(),
+      createdAt: old,
+    }));
+
+    const r = runCli(dir, "list", "--json");
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).find((s: any) => s.name === name)).toBeUndefined();
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(false);
+  }, 10000);
+});
+
 describe("pty list --status", () => {
   it("filters to a single status", async () => {
     const dir = makeSessionDir();
