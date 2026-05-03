@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { constants as osConstants } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cli = join(__dirname, '..', 'dist', 'cli.js');
@@ -12,9 +13,38 @@ if (!existsSync(cli)) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, [cli, ...process.argv.slice(2)], {
+// `spawn` (not `spawnSync`) so the wrapper stays event-loop-live and can
+// react to signals it receives. Without this, signals delivered to the
+// wrapper (e.g. systemd's SIGTERM under KillMode=process) terminated the
+// wrapper without ever reaching the child supervisor, leaving an orphaned
+// supervisor that kept holding `supervisor.lock` and made every subsequent
+// service restart fail with "another supervisor is already running".
+const child = spawn(process.execPath, [cli, ...process.argv.slice(2)], {
   stdio: 'inherit',
   env: process.env,
 });
 
-process.exit(result.status ?? 1);
+const FORWARDED_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT', 'SIGUSR1', 'SIGUSR2'];
+for (const sig of FORWARDED_SIGNALS) {
+  process.on(sig, () => {
+    // Forward and let the child decide when to exit. The wrapper's own
+    // exit is driven by the child's 'exit' event so the child has time
+    // to flush before we propagate its status.
+    try { child.kill(sig); } catch {}
+  });
+}
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    // Mirror shell convention (128 + signum) so callers can distinguish
+    // signal death from a nonzero exit code.
+    const signum = osConstants.signals[signal] ?? 0;
+    process.exit(128 + signum);
+  }
+  process.exit(code ?? 1);
+});
+
+child.on('error', (err) => {
+  console.error(`pty: failed to spawn cli: ${err.message}`);
+  process.exit(1);
+});
