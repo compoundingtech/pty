@@ -326,6 +326,11 @@ export interface PtyHandle {
    *  pushes, CSI < u pops). Empty array means the protocol is not active.
    *  Returned as a defensive copy — mutating it has no effect on the PTY. */
   readonly kittyKeyboardFlags: number[];
+  /** Whether the child has enabled bracketed paste mode (CSI ? 2004 h).
+   *  When true, the child wraps pasted input in `\x1b[200~ ... \x1b[201~`
+   *  markers and expects them on stdin; consumers proxying paste should
+   *  forward the markers verbatim only to children that have it on. */
+  readonly bracketedPasteMode: boolean;
   /** Configured scrollback line count. */
   readonly scrollback: number;
   /** Total lines in the buffer (viewport + scrollback history). */
