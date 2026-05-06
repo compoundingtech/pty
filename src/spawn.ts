@@ -58,7 +58,19 @@ export interface SpawnDaemonOptions {
    *  ```
    */
   launcher?: { command: string; args?: string[] };
+  /** Time in ms to wait for the daemon's Unix socket to appear before
+   *  giving up. Defaults to 30000 (30s) — generous enough for heavy
+   *  startups like `claude --resume` of a large session, while still
+   *  bounded so a hung child doesn't block forever. The earlyExit
+   *  handler still surfaces immediate failures within milliseconds, so
+   *  this only governs the "alive but slow" case. */
+  startTimeoutMs?: number;
 }
+
+/** Default time we wait for a daemon's Unix socket to appear after
+ *  spawn before declaring the start a failure. See SpawnDaemonOptions
+ *  for rationale. */
+export const DEFAULT_START_TIMEOUT_MS = 30_000;
 
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   const stdout = process.stdout as tty.WriteStream;
@@ -108,7 +120,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   child.unref();
 
   try {
-    await waitForSocket(options.name, 3000, () => {
+    await waitForSocket(options.name, options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, () => {
       if (earlyExit) {
         const details = stderrOutput.trim();
         const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;

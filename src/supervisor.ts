@@ -25,6 +25,18 @@ const BACKOFF_MULTIPLIER = 2;
 const SCAN_INTERVAL_MS = 10_000;
 const TEMPORARY_CLEANUP_DELAY_MS = 1_000;
 
+/** Spawn parameters cached on each SupervisedSession so a restart can
+ *  retry even after `cleanupAll` has removed the on-disk metadata.
+ *  Without this, the second restart attempt of a slow-starting session
+ *  hits "no metadata" and the supervisor silently gives up. */
+interface CachedSpawnConfig {
+  command: string;
+  args: string[];
+  displayCommand: string;
+  cwd: string;
+  tags?: Record<string, string>;
+}
+
 interface SupervisedSession {
   name: string;
   strategy: "permanent" | "temporary";
@@ -34,6 +46,11 @@ interface SupervisedSession {
   nextBackoffMs: number;
   failed: boolean;
   pendingTimer: ReturnType<typeof setTimeout> | null;
+  /** Last-known spawn parameters. Cached so a restart attempt can
+   *  succeed even if `cleanupAll` has already removed the on-disk
+   *  metadata file. Populated whenever `evaluateSession` reads fresh
+   *  metadata. */
+  spawnConfig?: CachedSpawnConfig;
 }
 
 interface PersistedState {
@@ -200,6 +217,13 @@ export class Supervisor {
 
       const tracked = this.sessions.get(name)!;
       tracked.strategy = "permanent";
+      tracked.spawnConfig = {
+        command: metadata.command,
+        args: metadata.args,
+        displayCommand: metadata.displayCommand,
+        cwd: metadata.cwd,
+        tags: metadata.tags,
+      };
 
       if (isExited && !tracked.failed && !tracked.pendingTimer) {
         this.scheduleRestart(name);
@@ -305,8 +329,22 @@ export class Supervisor {
     }
 
     const metadata = readMetadata(name);
+    const tracked = this.sessions.get(name);
+
+    // Recovery for the "metadata file already removed" case:
+    // cleanupAll runs before spawnDaemon during a restart, so if the
+    // first attempt's spawn times out the metadata is gone for the
+    // second attempt's readMetadata. Fall back to the cached
+    // spawnConfig on the in-memory SupervisedSession when that
+    // happens — without this, a single slow start permanently drops
+    // a permanent session.
     if (!metadata) {
-      console.log(`[supervisor] skipping restart for ${name} (no metadata)`);
+      if (tracked?.strategy === "permanent" && tracked.spawnConfig && !tracked.failed) {
+        console.log(`[supervisor] no on-disk metadata for ${name}; recovering from cached spawnConfig`);
+        await this.respawnFromCachedConfig(name, tracked);
+      } else {
+        console.log(`[supervisor] skipping restart for ${name} (no metadata)`);
+      }
       return;
     }
     if (metadata.tags?.strategy !== "permanent") {
@@ -327,7 +365,6 @@ export class Supervisor {
       }
     }
 
-    const tracked = this.sessions.get(name);
     if (!tracked) {
       console.log(`[supervisor] skipping restart for ${name} (not tracked)`);
       return;
@@ -360,6 +397,10 @@ export class Supervisor {
       }
     }
 
+    // Cache the spawn config before cleanup so a slow start that
+    // wipes the metadata file can still recover on the next attempt.
+    tracked.spawnConfig = { command, args, displayCommand, cwd, tags };
+
     // Clean up the dead session
     cleanupAll(name);
 
@@ -371,6 +412,39 @@ export class Supervisor {
     tracked.nextBackoffMs = Math.min(tracked.nextBackoffMs * BACKOFF_MULTIPLIER, MAX_BACKOFF_MS);
 
     console.log(`[supervisor] restarted ${name} (attempt ${tracked.restartCount}/${MAX_RESTARTS})`);
+
+    this.emitEvent(EventType.SESSION_RESTART, {
+      session: name,
+      restartCount: tracked.restartCount,
+      backoffMs: tracked.nextBackoffMs,
+    });
+
+    this.persistState();
+  }
+
+  /** Restart path used when the on-disk metadata is missing. The
+   *  cached spawnConfig on the SupervisedSession was populated last
+   *  time evaluateSession saw fresh metadata, so it's still valid as
+   *  a recovery source. */
+  private async respawnFromCachedConfig(name: string, tracked: SupervisedSession): Promise<void> {
+    const cfg = tracked.spawnConfig;
+    if (!cfg) return; // caller checked already, but be defensive
+
+    cleanupAll(name);
+    await spawnDaemon({
+      name,
+      command: cfg.command,
+      args: cfg.args,
+      displayCommand: cfg.displayCommand,
+      cwd: cfg.cwd,
+      tags: cfg.tags,
+    });
+
+    tracked.restartCount++;
+    tracked.lastRestartAt = Date.now();
+    tracked.nextBackoffMs = Math.min(tracked.nextBackoffMs * BACKOFF_MULTIPLIER, MAX_BACKOFF_MS);
+
+    console.log(`[supervisor] restarted ${name} from cached config (attempt ${tracked.restartCount}/${MAX_RESTARTS})`);
 
     this.emitEvent(EventType.SESSION_RESTART, {
       session: name,
