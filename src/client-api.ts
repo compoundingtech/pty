@@ -12,7 +12,7 @@ export {
 } from "./sessions.ts";
 
 // Session creation
-export { spawnDaemon, resolveCommand, waitForSocket, type SpawnDaemonOptions } from "./spawn.ts";
+export { spawnDaemon, resolveCommand, waitForSocket, setServerModulePath, type SpawnDaemonOptions } from "./spawn.ts";
 
 // Session interaction (programmatic — no process.exit, no stdin/stdout)
 export {
