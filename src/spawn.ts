@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as tty from "node:tty";
@@ -7,9 +7,13 @@ import { getSocketPath } from "./sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** Allow overriding the server module path (used by the bundled supervisor). */
+/** Allow overriding the server module path (used by the bundled supervisor
+ *  and test harnesses). When set, takes precedence over both the on-disk
+ *  fast path and the CLI delegation fallback. Pass null/empty to clear. */
 let _serverModulePath: string | null = null;
-export function setServerModulePath(p: string): void { _serverModulePath = p; }
+export function setServerModulePath(p: string | null): void {
+  _serverModulePath = p && p.length > 0 ? p : null;
+}
 
 export interface SpawnDaemonOptions {
   name: string;
@@ -56,16 +60,51 @@ export interface SpawnDaemonOptions {
    *    launcher: { command: "/usr/local/bin/node" },
    *  });
    *  ```
+   *
+   *  Ignored when this lib delegates the spawn to the `pty` CLI (the
+   *  bundled-context fallback) — the CLI handles its own runtime selection.
    */
   launcher?: { command: string; args?: string[] };
 }
 
+/**
+ * Resolve which strategy to use for spawning a daemon.
+ *
+ *   1. If `setServerModulePath` was called, run `node <override>` with the
+ *      explicit path. Used by test harnesses that want a custom server.
+ *   2. If our sibling `dist/server.js` is a real file on disk, run
+ *      `node <sibling>` directly — fast path for ordinary npm installs.
+ *   3. Otherwise (consumer bundled this package into a single binary;
+ *      `import.meta.url` is virtualised; sibling lookup fails), delegate
+ *      to the `pty` CLI on PATH. The CLI is always a real on-disk binary
+ *      with intact module resolution, so it sidesteps every bundling
+ *      failure mode at once: spawning, embedded source materialisation,
+ *      child-process module resolution, native-binding loading.
+ */
+type SpawnStrategy =
+  | { kind: "node"; serverModule: string }
+  | { kind: "cli" };
+
+function resolveSpawnStrategy(): SpawnStrategy {
+  if (_serverModulePath !== null) return { kind: "node", serverModule: _serverModulePath };
+  const sibling = path.join(__dirname, "server.js");
+  try {
+    if (fs.statSync(sibling).isFile()) return { kind: "node", serverModule: sibling };
+  } catch {}
+  return { kind: "cli" };
+}
+
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
+  const strategy = resolveSpawnStrategy();
+  if (strategy.kind === "cli") return spawnViaCli(options);
+  return spawnViaNode(options, strategy.serverModule);
+}
+
+async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): Promise<void> {
   const stdout = process.stdout as tty.WriteStream;
   const rows = options.rows ?? stdout.rows ?? 24;
   const cols = options.cols ?? stdout.columns ?? 80;
 
-  const serverModule = _serverModulePath ?? path.join(__dirname, "server.js");
   const config = JSON.stringify({
     name: options.name,
     command: options.command,
@@ -90,21 +129,14 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
     env: { ...process.env, PTY_SERVER_CONFIG: config },
   });
 
-  // Capture stderr for better error reporting
   let stderrOutput = "";
-  child.stderr?.on("data", (data: Buffer) => {
-    stderrOutput += data.toString();
-  });
+  child.stderr?.on("data", (data: Buffer) => { stderrOutput += data.toString(); });
 
-  // Detect early daemon crash before the socket appears
   let earlyExit = false;
   let earlyExitCode: number | null = null;
-  child.on("exit", (code) => {
-    earlyExit = true;
-    earlyExitCode = code;
-  });
+  child.on("exit", (code) => { earlyExit = true; earlyExitCode = code; });
 
-  (child.stderr as any)?.unref?.();
+  (child.stderr as { unref?: () => void } | null)?.unref?.();
   child.unref();
 
   try {
@@ -116,12 +148,61 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
       }
     });
   } catch (err) {
-    // Kill the orphaned daemon process so it doesn't leak
     if (!earlyExit && child.pid) {
       try { process.kill(child.pid, "SIGTERM"); } catch {}
     }
     throw err;
   }
+}
+
+/**
+ * Bundled-context fallback: shell out to `pty run -d ...` on PATH.
+ *
+ * Only the inputs that the CLI surface today supports are passed through.
+ * Options without a CLI-level equivalent (`rows`, `cols`, `displayCommand`,
+ * `displayName`, `ephemeral`, `extraEnv`, `env`, `launcher`) are silently
+ * ignored on this path — they're either non-load-bearing for typical
+ * consumers (initial size; clients resize after attach) or rarely used
+ * (`launcher`, advanced env shaping). Add CLI flags upstream as concrete
+ * needs surface.
+ *
+ * `isolateEnv` maps to `--isolate-env`. `cwd` to `--cwd`. `tags` to
+ * repeated `--tag k=v`. `name` to `--name`. The session command is
+ * positional after `--`.
+ */
+function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
+  const cliArgs: string[] = ["run", "-d", "--name", options.name];
+  if (options.cwd) cliArgs.push("--cwd", options.cwd);
+  if (options.isolateEnv) cliArgs.push("--isolate-env");
+  if (options.tags) {
+    for (const [k, v] of Object.entries(options.tags)) {
+      cliArgs.push("--tag", `${k}=${v}`);
+    }
+  }
+  cliArgs.push("--", options.command, ...options.args);
+
+  const result = spawnSync("pty", cliArgs, {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf-8",
+  });
+  if (result.error !== undefined) {
+    const err = result.error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error(
+        `@myobie/pty: bundled-context spawn requires the \`pty\` CLI on PATH. ` +
+          `Install @myobie/pty so its \`bin/pty\` is available, or call ` +
+          `setServerModulePath() with a real on-disk server.js before spawnDaemon.`,
+      );
+    }
+    throw err;
+  }
+  if (result.status !== 0) {
+    const stderr = (result.stderr ?? "").trim();
+    const stdout = (result.stdout ?? "").trim();
+    const detail = stderr || stdout || `exit ${result.status}`;
+    throw new Error(`pty CLI failed: ${detail}`);
+  }
+  return waitForSocket(options.name, 3000);
 }
 
 export function waitForSocket(
@@ -134,7 +215,6 @@ export function waitForSocket(
 
   return new Promise((resolve, reject) => {
     function check(): void {
-      // Check for early daemon failure
       try {
         earlyCheck?.();
       } catch (e) {
@@ -162,7 +242,6 @@ export function waitForSocket(
 }
 
 export function resolveCommand(cmd: string): string {
-  // Already absolute — just verify it exists
   if (path.isAbsolute(cmd)) {
     if (!fs.existsSync(cmd)) {
       throw new Error(`Command not found: ${cmd}`);
@@ -170,7 +249,6 @@ export function resolveCommand(cmd: string): string {
     return cmd;
   }
 
-  // Relative path (contains /) — resolve against cwd
   if (cmd.includes("/")) {
     const resolved = path.resolve(cmd);
     if (!fs.existsSync(resolved)) {
@@ -179,7 +257,6 @@ export function resolveCommand(cmd: string): string {
     return resolved;
   }
 
-  // Bare command name — look up in PATH
   try {
     return execFileSync("which", [cmd], { encoding: "utf8" }).trim();
   } catch {
