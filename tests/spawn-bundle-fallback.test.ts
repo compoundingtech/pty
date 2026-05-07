@@ -29,7 +29,11 @@ afterEach(() => {
 
 let nameCounter = 0;
 function uniqueName(): string {
-  return `bundle-fb${++nameCounter}-${Math.random().toString(36).slice(2, 6)}`;
+  // Short to fit in the 104-byte Unix-socket path limit on macOS,
+  // where os.tmpdir() lives under /var/folders/.../T/ (~52 chars) plus
+  // the test root prefix (~29) plus a per-test "d-XXXXXX/" (~10) burns
+  // the budget fast. Keep this under ~7 chars.
+  return `b${++nameCounter}${Math.random().toString(36).slice(2, 5)}`;
 }
 
 function makeSessionDir(): string {
