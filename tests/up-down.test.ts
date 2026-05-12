@@ -121,6 +121,32 @@ command = "cat"
     expect(running.map((s: any) => s.name).sort()).toEqual(["db", "web"]);
   }, 15000);
 
+  it("propagates env from pty.toml into the spawned session", async () => {
+    const projDir = makeProjectDir();
+    const sessDir = makeSessionDir();
+    const outFile = path.join(projDir, "envcheck.out");
+    writePtyToml(projDir, `
+[sessions.envprobe]
+command = "echo \\"$MY_VAR|$ANOTHER\\" > '${outFile}'; cat"
+
+[sessions.envprobe.env]
+MY_VAR = "hello"
+ANOTHER = "world"
+`);
+
+    const result = runCli(sessDir, "up", projDir);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("envprobe (started)");
+
+    // `cat` keeps the session alive after the redirect; wait for the file.
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && !fs.existsSync(outFile)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(fs.existsSync(outFile)).toBe(true);
+    expect(fs.readFileSync(outFile, "utf-8").trim()).toBe("hello|world");
+  }, 15000);
+
   it("skips already running sessions", () => {
     const projDir = makeProjectDir();
     const sessDir = makeSessionDir();

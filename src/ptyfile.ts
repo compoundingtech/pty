@@ -9,6 +9,7 @@ export interface PtySessionDef {
   shortName: string;  // name as written in the toml (for filtering)
   command: string;
   tags?: Record<string, string>;
+  env?: Record<string, string>;
 }
 
 export interface PtyFile {
@@ -61,7 +62,21 @@ export function readPtyFile(dir?: string): PtyFile {
         }
       }
 
-      sessions.push({ name, shortName: rawName, command: d.command, tags });
+      let env: Record<string, string> | undefined;
+      if (d.env !== undefined) {
+        if (!d.env || typeof d.env !== "object" || Array.isArray(d.env)) {
+          throw new Error(`Session "${name}" in ${filePath}: "env" must be a table of string values`);
+        }
+        env = {};
+        for (const [k, v] of Object.entries(d.env as Record<string, unknown>)) {
+          if (typeof v !== "string") {
+            throw new Error(`Session "${name}" in ${filePath}: env.${k} must be a string`);
+          }
+          env[k] = v;
+        }
+      }
+
+      sessions.push({ name, shortName: rawName, command: d.command, tags, env });
     }
   }
 
@@ -70,4 +85,15 @@ export function readPtyFile(dir?: string): PtyFile {
   }
 
   return { dir: resolvedDir, prefix, sessions };
+}
+
+/** Build the `/bin/sh -c` payload for a session: an optional `export K='V'; ...`
+ *  prefix derived from `sess.env`, followed by the session's own command. */
+export function commandWithEnvExports(sess: PtySessionDef): string {
+  const entries = sess.env ? Object.entries(sess.env) : [];
+  if (entries.length === 0) return sess.command;
+  const prefix = entries
+    .map(([k, v]) => `export ${k}='${v.replace(/'/g, `'\\''`)}'`)
+    .join("; ");
+  return `${prefix}; ${sess.command}`;
 }

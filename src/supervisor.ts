@@ -7,7 +7,7 @@ import {
   type SessionMetadata,
 } from "./sessions.ts";
 import { spawnDaemon } from "./spawn.ts";
-import { readPtyFile } from "./ptyfile.ts";
+import { readPtyFile, commandWithEnvExports } from "./ptyfile.ts";
 import { EventWriter, EventType, type EventRecord } from "./events.ts";
 
 /** Supervisor state lives in its own subdirectory to avoid polluting the session dir. */
@@ -386,7 +386,7 @@ export class Supervisor {
         const sessDef = ptyFile.sessions.find((s) => s.shortName === ptyfileSession);
         if (sessDef) {
           command = "/bin/sh";
-          args = ["-c", sessDef.command];
+          args = ["-c", commandWithEnvExports(sessDef)];
           displayCommand = sessDef.command;
           cwd = ptyFile.dir;
           tags = { ...sessDef.tags, ptyfile: ptyfilePath, "ptyfile.session": ptyfileSession };

@@ -33,7 +33,7 @@ import {
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
-import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
+import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
 import { getSupervisorDir } from "./supervisor.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
@@ -3171,7 +3171,7 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       await spawnDaemon({
         name: sess.name,
         command: "/bin/sh",
-        args: ["-c", sess.command],
+        args: ["-c", commandWithEnvExports(sess)],
         displayCommand: sess.command,
         cwd: ptyFile.dir,
         tags: tomlTags,
