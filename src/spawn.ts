@@ -65,6 +65,18 @@ export interface SpawnDaemonOptions {
    *  bundled-context fallback) — the CLI handles its own runtime selection.
    */
   launcher?: { command: string; args?: string[] };
+  /** Bind the daemon's lifetime to this process. When true, the daemon polls
+   *  for the spawner's PID every few seconds and shuts down cleanly once the
+   *  spawner is gone — preventing orphaned daemons reparented to init when
+   *  the spawner exits without calling `disconnect()` / `kill()`.
+   *
+   *  Off by default to preserve the historical "daemon outlives spawner"
+   *  semantics relied on by long-lived supervisors. Opt in when the caller
+   *  is the sole owner of the daemon (e.g., short-lived scripts, test
+   *  harnesses, `@overeng/pty-effect` scopes).
+   *
+   *  Implemented via the `PTY_SPAWNER_PID` env var read by the daemon. */
+  bindToSpawnerLifetime?: boolean;
   /** Time in ms to wait for the daemon's Unix socket to appear before
    *  giving up. Defaults to 30000 (30s) — generous enough for heavy
    *  startups like `claude --resume` of a large session, while still
@@ -135,10 +147,15 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
 
   const launcherCmd = options.launcher?.command ?? process.execPath;
   const launcherArgs = options.launcher?.args ?? [];
+  // PTY_SPAWNER_PID lets the daemon poll for spawner liveness and shut down
+  // when its spawner is gone. Off by default — opt in via
+  // `bindToSpawnerLifetime` when the caller owns the daemon's lifetime.
+  const env: Record<string, string> = { ...process.env, PTY_SERVER_CONFIG: config };
+  if (options.bindToSpawnerLifetime) env.PTY_SPAWNER_PID = String(process.pid);
   const child = spawn(launcherCmd, [...launcherArgs, serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, PTY_SERVER_CONFIG: config },
+    env,
   });
 
   let stderrOutput = "";

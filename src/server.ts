@@ -896,6 +896,43 @@ export class PtyServer {
   }
 }
 
+/** How often the spawner-PID watchdog checks for liveness. 5s is fast enough
+ *  that a leaked daemon is reclaimed promptly without producing meaningful
+ *  CPU load. */
+const SPAWNER_POLL_INTERVAL_MS = 5000;
+
+/** Returns true if `pid` refers to a live process this user can signal.
+ *  `kill(pid, 0)` is the standard POSIX liveness probe — sends no signal,
+ *  only validates the target. ESRCH means dead; EPERM means alive but
+ *  unsignalable (still "alive" for our purposes). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function installSpawnerWatchdog(cleanShutdown: (code: number) => Promise<never>): void {
+  const raw = process.env.PTY_SPAWNER_PID;
+  if (!raw) return;
+  const pid = Number(raw);
+  if (!Number.isInteger(pid) || pid <= 1) return;
+  if (!isProcessAlive(pid)) {
+    // Already dead by the time we boot — exit before clients can connect.
+    void cleanShutdown(0);
+    return;
+  }
+  const interval = setInterval(() => {
+    if (isProcessAlive(pid)) return;
+    clearInterval(interval);
+    void cleanShutdown(0);
+  }, SPAWNER_POLL_INTERVAL_MS);
+  // Don't keep the event loop alive just for this poll.
+  interval.unref?.();
+}
+
 /** Entry point when this file is run as the daemon process. */
 if (process.argv[1]?.endsWith("/server.js")) {
   const config = JSON.parse(process.env.PTY_SERVER_CONFIG ?? "{}");
@@ -934,4 +971,13 @@ if (process.argv[1]?.endsWith("/server.js")) {
 
   process.on("SIGTERM", () => cleanShutdown(0));
   process.on("SIGINT", () => cleanShutdown(0));
+
+  // Spawner-PID watchdog (opt-in via PTY_SPAWNER_PID).
+  //
+  // `detached: true` puts the daemon in its own session, so the kernel sends
+  // no signal when the spawner exits — and the daemon ends up reparented to
+  // init, surviving forever. When the spawner sets PTY_SPAWNER_PID, we poll
+  // for its liveness and call cleanShutdown() once it's gone. Off when the
+  // env var is absent, so existing callers see no behaviour change.
+  installSpawnerWatchdog(cleanShutdown);
 }
