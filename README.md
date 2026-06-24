@@ -198,6 +198,19 @@ tags = { role = "server" }
 
 Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
 
+Sessions can also declare per-session environment variables:
+
+```toml
+[sessions.api]
+command = "bin/api"
+
+[sessions.api.env]
+PORT = "8080"
+LOG_LEVEL = "debug"
+```
+
+The values are exported into the session's shell before the command runs (the supervisor wraps every session command in `/bin/sh -c`). They take effect on the next `pty up` after the session has stopped — restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` followed by `pty up` is the way to pick up a changed env block on an already-running session.
+
 ### Supervisor
 
 The supervisor keeps sessions alive by watching for the `strategy` tag:
