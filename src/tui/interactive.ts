@@ -319,9 +319,8 @@ function renderListItem(item: ListItem, _index: number, selected: boolean): UINo
     ? cwdStr
     : [cwdStr, exitStr].filter(Boolean).join("  ");
 
-  const supStatus = s.metadata?.tags?.["supervisor.status"];
   const strategy = s.metadata?.tags?.strategy;
-  const marker = supStatus === "failed" ? " [failed]" : strategy === "permanent" ? " [permanent]" : strategy === "temporary" ? " [temporary]" : "";
+  const marker = strategy === "permanent" ? " [permanent]" : "";
   const tagStr = renderTagsInline(s.metadata?.tags);
 
   // Prefer displayName for the primary label; show the stable id secondarily

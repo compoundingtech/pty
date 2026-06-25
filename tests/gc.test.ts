@@ -263,4 +263,30 @@ describe("pty gc", () => {
     expect(result.stdout).toContain(`Removed: ${name}`);
     expect(fs.existsSync(metaPath)).toBe(false);
   }, 10000);
+
+  it("--print-launchd-plist emits a valid-looking plist", () => {
+    const dir = makeSessionDir();
+    const result = runCli(dir, "gc", "--print-launchd-plist");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("<!DOCTYPE plist");
+    expect(result.stdout).toContain("<string>com.myobie.pty.gc</string>");
+    expect(result.stdout).toContain("<key>StartInterval</key>");
+    expect(result.stdout).toContain("<integer>30</integer>");
+    expect(result.stdout).toContain("<key>PTY_SESSION_DIR</key>");
+  });
+
+  it("--print-launchd-plist --interval=N sets the interval", () => {
+    const dir = makeSessionDir();
+    const result = runCli(dir, "gc", "--print-launchd-plist", "--interval=15");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("<integer>15</integer>");
+  });
+
+  it("rejects --interval=0 and non-numeric intervals", () => {
+    const dir = makeSessionDir();
+    const r1 = runCli(dir, "gc", "--print-launchd-plist", "--interval=0");
+    expect(r1.status).not.toBe(0);
+    const r2 = runCli(dir, "gc", "--print-launchd-plist", "--interval=abc");
+    expect(r2.status).not.toBe(0);
+  });
 });

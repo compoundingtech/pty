@@ -16,7 +16,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
 | `theme` | last-selected TUI theme | 2 |
-| `supervisor/state.json` | supervisor state | 2 (internal) |
+| `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |
 | `<name>.events.jsonl.tmp.<pid>.<rand>` | same | n/a |
 
@@ -48,7 +48,10 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 ```
 
 - Status (`running` / `exited` / `vanished`) is *derived* from socket + pid, not stored.
-- Reserved tag keys (`ptyfile*`, `strategy`, `supervisor.status`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
+- Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
+- User-facing tags that drive pty behavior but are visible by default:
+  - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).
+  - `parent=<name>` — `pty gc` orphan-kills this session (SIGTERM + cleanup) when the referenced session's daemon is no longer alive. Combinator with `strategy=permanent` is well-defined: orphan-kill wins.
 - Concurrent writers: last-write-wins; readers never see torn files. Cross-process writers can lose updates to the read-modify-write window.
 
 ## `<name>.events.jsonl` (tier 1)
@@ -67,10 +70,7 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_start` | `tags?` |
 | `session_exit` | `exitCode` |
 | `session_exec` | `previousCommand, command` |
-| `session_restart` | `restartCount, backoffMs` |
-| `session_failed` | `restartCount, reason` |
-| `supervisor_start` | — |
-| `supervisor_stop` | — |
+| `session_respawn` | — (`pty gc` respawned a `strategy=permanent` session) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
 | `state.set` | `key, value` |
