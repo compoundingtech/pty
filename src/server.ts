@@ -2,12 +2,12 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import * as pty from "node-pty";
-// @xterm packages are CJS-only. Named imports fail under Node's native ESM
-// loader (Node v24+), so we use default imports + separate type imports.
+// @xterm/headless is CJS-only, so keep its default import. The serialize addon
+// ships native ESM with named exports, so import its runtime namespace.
 import type { Terminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
 import xterm from "@xterm/headless";
-import xtermSerialize from "@xterm/addon-serialize";
+import * as xtermSerialize from "@xterm/addon-serialize";
 import {
   MessageType,
   PacketReader,

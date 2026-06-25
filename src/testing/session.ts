@@ -2,7 +2,7 @@ import * as net from "node:net";
 import type { Terminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
 import xterm from "@xterm/headless";
-import xtermSerialize from "@xterm/addon-serialize";
+import * as xtermSerialize from "@xterm/addon-serialize";
 import * as pty from "node-pty";
 import { PtyServer, type ServerOptions as PtyServerOptions } from "../server.ts";
 import {
