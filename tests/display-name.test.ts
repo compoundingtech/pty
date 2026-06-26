@@ -295,3 +295,68 @@ describe("lookup by displayName", () => {
     collectPid(dir, "raw1");
   });
 });
+
+describe("commands resolve a long displayName even when it would fail validateName", () => {
+  // Regression test for schickling-assistant's PR #45 finding:
+  // long displayNames could be CREATED but not OPERATED on, because the
+  // command handlers ran `validateName(ref)` before `resolveRef(ref)`.
+  // `validateName` is the strict, sock-path-bounded validator; a long
+  // displayName legitimately fails it. Resolution paths must NOT run
+  // strict validation — that's reserved for id creation.
+  const LONG_LABEL = "org.cos.orc-payments-platform.orc-checkout-api.worker-authz-service.subworker-db-migrations.verifier-contracts";
+
+  it("creates a 110-char displayName cleanly", () => {
+    const dir = makeSessionDir();
+    expect(LONG_LABEL.length).toBe(110);
+    const r = runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    expect(r.status).toBe(0);
+    const sessions = listJson(dir);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].displayName).toBe(LONG_LABEL);
+    collectPid(dir, sessions[0].name);
+  });
+
+  it("pty peek <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "peek", "--plain", LONG_LABEL);
+    expect(r.status).toBe(0);
+    // Don't assert on screen content — just that the command resolves and exits 0.
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty send <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "send", LONG_LABEL, "hi");
+    expect(r.status).toBe(0);
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty tag <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "tag", LONG_LABEL, "role=worker");
+    expect(r.status).toBe(0);
+    const s = listJson(dir).find((s: any) => s.displayName === LONG_LABEL)!;
+    expect(s.tags.role).toBe("worker");
+    collectPid(dir, s.name);
+  });
+
+  it("pty events <longDisplayName> --recent works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "events", "--recent", LONG_LABEL);
+    expect(r.status).toBe(0);
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty kill <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "kill", LONG_LABEL);
+    expect(r.status).toBe(0);
+    const running = listJson(dir).filter((s: any) => s.status === "running");
+    expect(running).toHaveLength(0);
+  });
+});

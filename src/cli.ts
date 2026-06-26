@@ -470,12 +470,6 @@ async function main(): Promise<void> {
           "  Detach first (Ctrl+\\) or, from inside pty-layout, use ^]n to pick a session.\n" +
           "  Pass --force to attach anyway (nested clients are usually a mistake).",
       });
-      try {
-        validateName(attachName);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedAttachName = await resolveRef(attachName);
       await cmdAttach(resolvedAttachName, autoRestart, force);
       break;
@@ -514,12 +508,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty peek [-f] [--plain] [--full] [--wait <pattern>] [-t <seconds>] <name>");
         process.exit(1);
       }
-      try {
-        validateName(peekName);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedPeekName = await resolveRef(peekName);
       if (waitPatterns.length > 0) {
         await cmdPeekWait(resolvedPeekName, waitPatterns, timeoutSec, plain);
@@ -533,12 +521,6 @@ async function main(): Promise<void> {
       const sendName = args[1];
       if (!sendName) {
         console.error('Usage: pty send <name> "text"  or  pty send <name> --seq "text" --seq key:return');
-        process.exit(1);
-      }
-      try {
-        validateName(sendName);
-      } catch (e: any) {
-        console.error(e.message);
         process.exit(1);
       }
 
@@ -644,12 +626,6 @@ async function main(): Promise<void> {
 
       let resolvedEventsName: string | null = null;
       if (eventsName) {
-        try {
-          validateName(eventsName);
-        } catch (e: any) {
-          console.error(e.message);
-          process.exit(1);
-        }
         resolvedEventsName = await resolveRef(eventsName);
       }
 
@@ -755,12 +731,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty kill <name>");
         process.exit(1);
       }
-      try {
-        validateName(args[1]);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedKillName = await resolveRef(args[1]);
       await cmdKill(resolvedKillName);
       break;
@@ -776,12 +746,6 @@ async function main(): Promise<void> {
       const tagName = args[1];
       if (!tagName) {
         console.error("Usage: pty tag <name> [key=value...] [--rm key...]");
-        process.exit(1);
-      }
-      try {
-        validateName(tagName);
-      } catch (e: any) {
-        console.error(e.message);
         process.exit(1);
       }
       const resolvedTagName = await resolveRef(tagName);
@@ -936,12 +900,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty rm <name>");
         process.exit(1);
       }
-      try {
-        validateName(args[1]);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedRmName = await resolveRef(args[1]);
       await cmdRm(resolvedRmName);
       break;
@@ -980,7 +938,8 @@ async function main(): Promise<void> {
             console.error("Usage: pty supervisor forget <name>");
             process.exit(1);
           }
-          await cmdSupervisorForget(forgetName);
+          const resolvedForgetName = await resolveRef(forgetName);
+          await cmdSupervisorForget(resolvedForgetName);
           break;
         }
         case "reset": {
@@ -989,7 +948,8 @@ async function main(): Promise<void> {
             console.error("Usage: pty supervisor reset <name>");
             process.exit(1);
           }
-          await cmdSupervisorReset(resetName);
+          const resolvedResetName = await resolveRef(resetName);
+          await cmdSupervisorReset(resolvedResetName);
           break;
         }
         case "launchd": {
@@ -2194,12 +2154,6 @@ async function cmdTagMulti(argv: string[]): Promise<void> {
   if (parsed.selector.kind === "names") {
     targets = [];
     for (const ref of parsed.selector.names) {
-      try {
-        validateName(ref);
-      } catch (e: any) {
-        console.error(`pty tag-multi: ${e.message}`);
-        process.exit(1);
-      }
       const sess = await getSession(ref);
       if (!sess) {
         console.error(`pty tag-multi: session "${ref}" not found.`);
@@ -2349,12 +2303,6 @@ async function cmdEmit(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  try {
-    validateName(ref);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
   const resolvedName = await resolveRef(ref);
 
   let data: unknown;
@@ -2629,13 +2577,6 @@ async function cmdSupervisorStatus(): Promise<void> {
 }
 
 async function cmdSupervisorForget(name: string): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const meta = readMetadata(name);
   if (!meta) {
     console.error(`Session "${name}" not found.`);
@@ -2662,13 +2603,6 @@ async function cmdSupervisorForget(name: string): Promise<void> {
 }
 
 async function cmdSupervisorReset(name: string): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const meta = readMetadata(name);
   if (!meta) {
     console.error(`Session "${name}" not found.`);
@@ -3360,13 +3294,6 @@ async function cmdRestart(
   yes = false,
   forceNested = false,
 ): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const session = await getSession(name);
 
   if (!session) {
