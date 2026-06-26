@@ -5,8 +5,18 @@ import { parse as parseToml } from "smol-toml";
 const PTY_TOML = "pty.toml";
 
 export interface PtySessionDef {
-  name: string;       // full session name (with prefix if set)
-  shortName: string;  // name as written in the toml (for filtering)
+  /** Human-friendly label rendered by `pty ls` / events. By default:
+   *  `<prefix>-<shortName>` if `prefix` is set, else `<shortName>`. The
+   *  toml's optional `display_name = "..."` field overrides this. NOT the
+   *  on-disk identifier — that's a separate short random id (or the toml's
+   *  optional `id` field) generated at spawn time, so long display labels
+   *  don't blow past the macOS `sockaddr_un.sun_path` limit. */
+  displayName: string;
+  /** Name as written in the toml (for `pty up <name>` filtering). */
+  shortName: string;
+  /** Explicit on-disk id from `id = "..."` in the toml. When null, `pty up`
+   *  generates a random short id at spawn time. */
+  id: string | null;
   command: string;
   tags?: Record<string, string>;
   env?: Record<string, string>;
@@ -45,13 +55,31 @@ export function readPtyFile(dir?: string): PtyFile {
 
   if (parsed.sessions && typeof parsed.sessions === "object") {
     for (const [rawName, def] of Object.entries(parsed.sessions)) {
-      const name = prefix ? `${prefix}-${rawName}` : rawName;
+      const defaultDisplayName = prefix ? `${prefix}-${rawName}` : rawName;
       if (!def || typeof def !== "object") {
-        throw new Error(`Invalid session "${name}" in ${filePath}: expected a table`);
+        throw new Error(`Invalid session "${defaultDisplayName}" in ${filePath}: expected a table`);
       }
       const d = def as Record<string, unknown>;
       if (typeof d.command !== "string" || d.command.length === 0) {
-        throw new Error(`Session "${name}" in ${filePath} is missing a "command" field`);
+        throw new Error(`Session "${defaultDisplayName}" in ${filePath} is missing a "command" field`);
+      }
+
+      // Optional `display_name` override.
+      let displayName = defaultDisplayName;
+      if (d.display_name !== undefined) {
+        if (typeof d.display_name !== "string" || d.display_name.length === 0) {
+          throw new Error(`Session "${defaultDisplayName}" in ${filePath}: "display_name" must be a non-empty string`);
+        }
+        displayName = d.display_name;
+      }
+
+      // Optional `id` override (pinned on-disk identifier).
+      let id: string | null = null;
+      if (d.id !== undefined) {
+        if (typeof d.id !== "string" || d.id.length === 0) {
+          throw new Error(`Session "${defaultDisplayName}" in ${filePath}: "id" must be a non-empty string`);
+        }
+        id = d.id;
       }
 
       let tags: Record<string, string> | undefined;
@@ -65,18 +93,18 @@ export function readPtyFile(dir?: string): PtyFile {
       let env: Record<string, string> | undefined;
       if (d.env !== undefined) {
         if (!d.env || typeof d.env !== "object" || Array.isArray(d.env)) {
-          throw new Error(`Session "${name}" in ${filePath}: "env" must be a table of string values`);
+          throw new Error(`Session "${defaultDisplayName}" in ${filePath}: "env" must be a table of string values`);
         }
         env = {};
         for (const [k, v] of Object.entries(d.env as Record<string, unknown>)) {
           if (typeof v !== "string") {
-            throw new Error(`Session "${name}" in ${filePath}: env.${k} must be a string`);
+            throw new Error(`Session "${defaultDisplayName}" in ${filePath}: env.${k} must be a string`);
           }
           env[k] = v;
         }
       }
 
-      sessions.push({ name, shortName: rawName, command: d.command, tags, env });
+      sessions.push({ displayName, shortName: rawName, id, command: d.command, tags, env });
     }
   }
 

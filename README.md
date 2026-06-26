@@ -50,14 +50,16 @@ When you detach from a session entered via the interactive list (`Ctrl+\`), you 
 pty                                       # interactive session manager
 pty --preselect-new                       # open the TUI with "Create new session..." selected
 pty --filter-tag layout=work              # TUI filtered by tag; new sessions inherit the tag
-pty run -- node server.js                 # start a session (random name + auto displayName)
-pty run --name myserver -- node server.js # start with an explicit name (still gets a displayName)
-pty run --no-display-name -- bash         # random name, no friendly label (good for throwaway shells)
-pty run -d -- node server.js              # start in the background
-pty run -a -- node server.js              # create or attach if already running
-pty run -e -- npm test                    # ephemeral: auto-remove on exit
-pty run --tag owner=forge -- node srv.js  # tag a session with metadata
-pty run --cwd /path -- node server.js    # run in a specific directory
+pty run -- node server.js                          # random id + auto display label
+pty run --id myserver -- node server.js            # pin an explicit on-disk id
+pty run --name "My API Server" -- node server.js   # set an explicit display label (any length)
+pty run --id api --name "My API" -- node server.js # pin both id and display label
+pty run --no-display-name -- bash                  # random id, no friendly label
+pty run -d -- node server.js                       # start in the background
+pty run -a -- node server.js                       # create or attach if already running
+pty run -e -- npm test                             # ephemeral: auto-remove on exit
+pty run --tag owner=forge -- node srv.js           # tag a session with metadata
+pty run --cwd /path -- node server.js              # run in a specific directory
 
 pty rename my-label                       # inside a session: add/change its displayName
 pty rename <ref> my-label                 # outside: set displayName on <ref>
@@ -197,6 +199,17 @@ tags = { role = "server" }
 ```
 
 Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
+
+Each session also supports two optional fields:
+
+```toml
+[sessions.serve]
+command = "bin/serve"
+id = "srv"                       # pin the on-disk id (sock + json filename)
+display_name = "My Web Server"   # override the default `<prefix>-<sessionKey>` label
+```
+
+`id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` is permissive (≤ 500 chars, any printable text); omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
 
 Sessions can also declare per-session environment variables:
 

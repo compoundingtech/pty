@@ -155,7 +155,7 @@ describe("pty nesting prevention", () => {
   it("-d flag bypasses nesting check", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--name", name, "--", "cat"], {
+    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--id", name, "--", "cat"], {
       env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: "outer-session" },
       encoding: "utf-8",
       timeout: 10000,
@@ -194,7 +194,7 @@ describe("pty nesting prevention", () => {
     const env = { ...process.env, PTY_SESSION_DIR: dir };
     delete env.PTY_SESSION;
 
-    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--name", name, "--", "cat"], {
+    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--id", name, "--", "cat"], {
       env,
       encoding: "utf-8",
       timeout: 10000,

@@ -246,7 +246,7 @@ describe("pty run -a", () => {
     const target = uniqueName();
     await startDaemon(dir, target);
 
-    const r = runCliNested(dir, "outer-session", "run", "-a", "--name", target, "--", "cat");
+    const r = runCliNested(dir, "outer-session", "run", "-a", "--id", target, "--", "cat");
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain('already inside pty session "outer-session"');
     expect(r.stderr).toContain(target);
@@ -257,7 +257,7 @@ describe("pty run -a", () => {
     const target = uniqueName();
     // No daemon started — target doesn't exist.
 
-    const r = runCliNested(dir, "outer-session", "run", "-a", "--name", target, "--", "true");
+    const r = runCliNested(dir, "outer-session", "run", "-a", "--id", target, "--", "true");
     // Should hit the exec-directly path: exec `true` which exits 0.
     expect(r.stderr).toContain("Already inside pty session");
     expect(r.stderr).toContain("running directly");
@@ -268,7 +268,7 @@ describe("pty run -a", () => {
     const target = uniqueName();
     await startDaemon(dir, target);
 
-    const r = runCliNested(dir, "outer-session", "run", "-a", "--force", "--name", target, "--", "cat");
+    const r = runCliNested(dir, "outer-session", "run", "-a", "--force", "--id", target, "--", "cat");
     // With --force we fall through past the nesting guard. The child run
     // command will likely fail for a different reason (no daemon spawn in
     // the nested-exec path) — just confirm the nesting error didn't fire.

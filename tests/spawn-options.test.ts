@@ -150,7 +150,7 @@ describe("spawnDaemon options", () => {
     const name = uniqueName();
 
     // Use CLI to spawn (exercises spawnDaemon with options object internally)
-    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--name", name, "--", "cat"], {
+    const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--id", name, "--", "cat"], {
       env: { ...process.env, PTY_SESSION_DIR: dir },
       encoding: "utf-8",
       timeout: 10000,
@@ -232,7 +232,7 @@ describe("spawnDaemon options", () => {
     const secret = "pty_isolated_test_secret_must_not_leak";
 
     const runResult = spawnSync(nodeBin, [
-      cliPath, "run", "-d", "--name", name, "--isolate-env",
+      cliPath, "run", "-d", "--id", name, "--isolate-env",
       "--", "sh", "-c", "env > /tmp/pty-iso-env.txt; sleep 30",
     ], {
       env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SECRET_TEST: secret },
@@ -264,7 +264,7 @@ describe("spawnDaemon options", () => {
 
     const marker = "pty_legacy_env_test_marker";
     const runResult = spawnSync(nodeBin, [
-      cliPath, "run", "-d", "--name", name,
+      cliPath, "run", "-d", "--id", name,
       "--", "sh", "-c", "env > /tmp/pty-legacy-env.txt; sleep 30",
     ], {
       env: { ...process.env, PTY_SESSION_DIR: dir, PTY_LEGACY_MARKER: marker },
@@ -484,7 +484,7 @@ describe("spawnDaemon options", () => {
     delete callerEnv.TERM;
 
     const runResult = spawnSync(nodeBin, [
-      cliPath, "run", "-d", "--name", name, "--isolate-env",
+      cliPath, "run", "-d", "--id", name, "--isolate-env",
       "--", "sh", "-c", `env > ${JSON.stringify(dumpFile)}; sleep 30`,
     ], {
       env: callerEnv,

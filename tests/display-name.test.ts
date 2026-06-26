@@ -94,10 +94,10 @@ describe("--no-display-name: random name, no displayName", () => {
   });
 });
 
-describe("--name: explicit name + auto displayName (unless --no-display-name)", () => {
-  it("honors --name and generates a displayName", () => {
+describe("--id: explicit on-disk id", () => {
+  it("honors --id (pinned on-disk id) and auto-generates a displayName", () => {
     const dir = makeSessionDir();
-    const r = runCli(dir, {}, "run", "-d", "--name", "mysvc", "--", "cat");
+    const r = runCli(dir, {}, "run", "-d", "--id", "mysvc", "--", "cat");
     expect(r.status).toBe(0);
 
     const sessions = listJson(dir);
@@ -107,9 +107,9 @@ describe("--name: explicit name + auto displayName (unless --no-display-name)", 
     collectPid(dir, "mysvc");
   });
 
-  it("--name combined with --no-display-name skips displayName", () => {
+  it("--id combined with --no-display-name skips displayName", () => {
     const dir = makeSessionDir();
-    const r = runCli(dir, {}, "run", "-d", "--name", "raw", "--no-display-name", "--", "cat");
+    const r = runCli(dir, {}, "run", "-d", "--id", "raw", "--no-display-name", "--", "cat");
     expect(r.status).toBe(0);
 
     const sessions = listJson(dir);
@@ -117,12 +117,74 @@ describe("--name: explicit name + auto displayName (unless --no-display-name)", 
     expect(s.displayName).toBeUndefined();
     collectPid(dir, "raw");
   });
+
+  it("--id combined with explicit --name pins both id and display label", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--id", "svc", "--name", "My Pretty Service", "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    const s = sessions.find((s: any) => s.name === "svc")!;
+    expect(s).toBeDefined();
+    expect(s.displayName).toBe("My Pretty Service");
+    collectPid(dir, "svc");
+  });
+
+  it("rejects an --id whose sock path would exceed the kernel limit", () => {
+    const dir = makeSessionDir();
+    const longId = "x".repeat(120);
+    const r = runCli(dir, {}, "run", "-d", "--id", longId, "--", "cat");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/exceeds the.*byte kernel limit|too long/i);
+  });
+
+  it("rejects an --id that collides with an existing session", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--id", "dup", "--", "cat");
+    const r = runCli(dir, {}, "run", "-d", "--id", "dup", "--", "cat");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("already in use");
+    collectPid(dir, "dup");
+  });
+});
+
+describe("--name: explicit display label (any length / chars)", () => {
+  it("accepts a long display label that would not be a valid id", () => {
+    const dir = makeSessionDir();
+    const longLabel = "My Very Long Display Label With Spaces and Punctuation";
+    const r = runCli(dir, {}, "run", "-d", "--name", longLabel, "--", "cat");
+    expect(r.status).toBe(0);
+
+    const sessions = listJson(dir);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].displayName).toBe(longLabel);
+    // The on-disk name is a random short id, not the display label.
+    expect(sessions[0].name).toMatch(/^[a-z0-9]{6,12}$/);
+    expect(sessions[0].name).not.toBe(longLabel);
+    collectPid(dir, sessions[0].name);
+  });
+
+  it("rejects an --id equal to the explicit --name", () => {
+    const dir = makeSessionDir();
+    const r = runCli(dir, {}, "run", "-d", "--id", "same", "--name", "same", "--", "cat");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/cannot equal/i);
+  });
+
+  it("rejects an --name that collides with another session", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--id", "a1", "--name", "shared", "--", "cat");
+    const r = runCli(dir, {}, "run", "-d", "--id", "a2", "--name", "shared", "--", "cat");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("already in use");
+    collectPid(dir, "a1");
+  });
 });
 
 describe("pty rename (outside a session)", () => {
   it("pty rename <ref> <new> sets displayName", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "webapp", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "webapp", "--no-display-name", "--", "cat");
 
     const r = runCli(dir, {}, "rename", "webapp", "my-label");
     expect(r.status).toBe(0);
@@ -135,7 +197,7 @@ describe("pty rename (outside a session)", () => {
 
   it("pty rename --show <ref> prints current displayName", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "api", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "api", "--no-display-name", "--", "cat");
     runCli(dir, {}, "rename", "api", "friendly-api");
 
     const r = runCli(dir, {}, "rename", "--show", "api");
@@ -146,7 +208,7 @@ describe("pty rename (outside a session)", () => {
 
   it("pty rename --show <ref> without displayName prints a hint", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "bare", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "bare", "--no-display-name", "--", "cat");
 
     const r = runCli(dir, {}, "rename", "--show", "bare");
     expect(r.status).toBe(0);
@@ -156,7 +218,7 @@ describe("pty rename (outside a session)", () => {
 
   it("pty rename --clear <ref> removes displayName", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "svc", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "svc", "--no-display-name", "--", "cat");
     runCli(dir, {}, "rename", "svc", "pretty");
     expect(listJson(dir).find((s: any) => s.name === "svc")!.displayName).toBe("pretty");
 
@@ -175,8 +237,8 @@ describe("pty rename (outside a session)", () => {
 
   it("rejects displayName that collides with another session's name", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "aaa", "--no-display-name", "--", "cat");
-    runCli(dir, {}, "run", "-d", "--name", "bbb", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "aaa", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "bbb", "--no-display-name", "--", "cat");
 
     const r = runCli(dir, {}, "rename", "aaa", "bbb");
     expect(r.status).not.toBe(0);
@@ -187,7 +249,7 @@ describe("pty rename (outside a session)", () => {
 
   it("rejects displayName equal to the session's own name", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "same", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "same", "--no-display-name", "--", "cat");
     const r = runCli(dir, {}, "rename", "same", "same");
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("cannot equal");
@@ -198,7 +260,7 @@ describe("pty rename (outside a session)", () => {
 describe("pty rename (inside a session)", () => {
   it("pty rename <new> with PTY_SESSION set renames the current session", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "insider", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "insider", "--no-display-name", "--", "cat");
 
     const r = runCli(dir, { PTY_SESSION: "insider" }, "rename", "from-inside");
     expect(r.status).toBe(0);
@@ -209,7 +271,7 @@ describe("pty rename (inside a session)", () => {
 
   it("pty rename --clear with PTY_SESSION clears the current session's displayName", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "i2", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "i2", "--no-display-name", "--", "cat");
     runCli(dir, { PTY_SESSION: "i2" }, "rename", "has-a-display");
 
     const r = runCli(dir, { PTY_SESSION: "i2" }, "rename", "--clear");
@@ -222,7 +284,7 @@ describe("pty rename (inside a session)", () => {
 describe("lookup by displayName", () => {
   it("pty list references a session by its displayName for peek/stats/etc", () => {
     const dir = makeSessionDir();
-    runCli(dir, {}, "run", "-d", "--name", "raw1", "--no-display-name", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "raw1", "--no-display-name", "--", "cat");
     runCli(dir, {}, "rename", "raw1", "friendly");
 
     // stats by displayName should resolve the same session as by name
@@ -231,5 +293,70 @@ describe("lookup by displayName", () => {
     const stats = JSON.parse(r.stdout);
     expect(stats.name).toBe("raw1");
     collectPid(dir, "raw1");
+  });
+});
+
+describe("commands resolve a long displayName even when it would fail validateName", () => {
+  // Regression test for schickling-assistant's PR #45 finding:
+  // long displayNames could be CREATED but not OPERATED on, because the
+  // command handlers ran `validateName(ref)` before `resolveRef(ref)`.
+  // `validateName` is the strict, sock-path-bounded validator; a long
+  // displayName legitimately fails it. Resolution paths must NOT run
+  // strict validation — that's reserved for id creation.
+  const LONG_LABEL = "org.cos.orc-payments-platform.orc-checkout-api.worker-authz-service.subworker-db-migrations.verifier-contracts";
+
+  it("creates a 110-char displayName cleanly", () => {
+    const dir = makeSessionDir();
+    expect(LONG_LABEL.length).toBe(110);
+    const r = runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    expect(r.status).toBe(0);
+    const sessions = listJson(dir);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].displayName).toBe(LONG_LABEL);
+    collectPid(dir, sessions[0].name);
+  });
+
+  it("pty peek <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "peek", "--plain", LONG_LABEL);
+    expect(r.status).toBe(0);
+    // Don't assert on screen content — just that the command resolves and exits 0.
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty send <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "send", LONG_LABEL, "hi");
+    expect(r.status).toBe(0);
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty tag <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "tag", LONG_LABEL, "role=worker");
+    expect(r.status).toBe(0);
+    const s = listJson(dir).find((s: any) => s.displayName === LONG_LABEL)!;
+    expect(s.tags.role).toBe("worker");
+    collectPid(dir, s.name);
+  });
+
+  it("pty events <longDisplayName> --recent works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "events", "--recent", LONG_LABEL);
+    expect(r.status).toBe(0);
+    collectPid(dir, listJson(dir)[0].name);
+  });
+
+  it("pty kill <longDisplayName> works", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--name", LONG_LABEL, "--", "cat");
+    const r = runCli(dir, {}, "kill", LONG_LABEL);
+    expect(r.status).toBe(0);
+    const running = listJson(dir).filter((s: any) => s.status === "running");
+    expect(running).toHaveLength(0);
   });
 });

@@ -15,6 +15,7 @@ import {
   cleanupAll,
   cleanupSocket,
   validateName,
+  validateDisplayName,
   acquireLock,
   releaseLock,
   updateTags,
@@ -66,14 +67,16 @@ function usage(): void {
   pty                                       Interactive session manager
   pty --preselect-new                       Open the TUI with "Create new session..." pre-selected
   pty --filter-tag key=value                Filter TUI to sessions with a tag; auto-applied to new sessions
-  pty run -- <command> [args...]            Create a session and attach (auto-named)
-  pty run --name <n> -- <command> [args...] Create a named session and attach
-  pty run -d -- <command> [args...]        Create in the background
-  pty run -a -- <command> [args...]        Create or attach if already running
-  pty run --tag key=value -- <command>    Tag a session with metadata
-  pty run --cwd /path -- <command>        Run in a specific directory
-  pty run --isolate-env -- <command>       Scrub env down to a safe allow-list (for remote-reachable sessions)
-  pty run --no-display-name -- <command>   Skip the friendly cwd+command label (just a random id)
+  pty run -- <command> [args...]            Create a session and attach (random id + auto label)
+  pty run --id <id> -- <command>            Pin the on-disk id (sock + json filename)
+  pty run --name <dn> -- <command>          Set the display label (arbitrary length / chars)
+  pty run --id <id> --name <dn> -- <cmd>    Pin both id and display label
+  pty run -d -- <command> [args...]         Create in the background
+  pty run -a -- <command> [args...]         Create or attach if already running
+  pty run --tag key=value -- <command>      Tag a session with metadata
+  pty run --cwd /path -- <command>          Run in a specific directory
+  pty run --isolate-env -- <command>        Scrub env down to a safe allow-list (for remote-reachable sessions)
+  pty run --no-display-name -- <command>    Skip the friendly cwd+command label (just an id)
   pty rename <new>                        Inside a session, set its displayName
   pty rename <ref> <new>                  Outside, set displayName on <ref>
   pty rename --show <ref>                 Show current displayName for <ref>
@@ -244,14 +247,22 @@ async function main(): Promise<void> {
     }
 
     case "run": {
-      // Parse flags before the -- separator
+      // Parse flags before the -- separator. The flag model:
+      //   --id <id>     explicit on-disk id (sock/json filename). Validated:
+      //                 charset, sock-path length, no existing-ref collision.
+      //   --name <dn>   explicit display label (arbitrary length / chars,
+      //                 within the permissive validateDisplayName rules).
+      //                 Replaces the auto-generated cwd+cmd label.
+      //   --no-display-name  skip displayName entirely.
+      //   Both omitted → random short id + auto-generated displayName.
       let detach = false;
       let attachExisting = false;
       let ephemeral = false;
       let isolateEnv = false;
       let noDisplayName = false;
       let force = false;
-      let name: string | null = null;
+      let explicitId: string | null = null;
+      let explicitDisplayName: string | null = null;
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
       let i = 1;
@@ -262,7 +273,8 @@ async function main(): Promise<void> {
         else if (args[i] === "--isolate-env") { isolateEnv = true; i++; }
         else if (args[i] === "--no-display-name") { noDisplayName = true; i++; }
         else if (args[i] === "--force") { force = true; i++; }
-        else if (args[i] === "--name" && i + 1 < args.length) { name = args[i + 1]; i += 2; }
+        else if (args[i] === "--id" && i + 1 < args.length) { explicitId = args[i + 1]; i += 2; }
+        else if (args[i] === "--name" && i + 1 < args.length) { explicitDisplayName = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
         else if (args[i] === "--tag" && i + 1 < args.length) {
           const eq = args[i + 1].indexOf("=");
@@ -283,24 +295,25 @@ async function main(): Promise<void> {
       let cmdArgs: string[];
 
       if (dashDash !== -1) {
-        // Anything between flags and -- that isn't a flag is a legacy positional name
+        // Anything between flags and -- that isn't a flag is a legacy
+        // positional that's now interpreted as the display name. The
+        // previous semantics (positional = on-disk id) is gone — use --id.
         const between = args.slice(i, dashDash);
-        if (between.length > 0 && !name) {
-          // Backward compat: pty run myserver -- node server.js
-          name = between[0];
-          console.error(`Hint: use --name instead: pty run --name ${name} -- ...`);
+        if (between.length > 0 && !explicitDisplayName) {
+          explicitDisplayName = between[0];
+          console.error(`Hint: use --name instead: pty run --name ${between[0]} -- ...`);
         }
         cmd = args[dashDash + 1];
         cmdArgs = args.slice(dashDash + 2);
       } else {
         // No -- separator: legacy positional format
-        // pty run myserver node server.js
+        // pty run mydisplayname node server.js
         const rest = args.slice(i);
-        if (!name && rest.length >= 2) {
-          name = rest[0];
+        if (!explicitDisplayName && rest.length >= 2) {
+          explicitDisplayName = rest[0];
           cmd = rest[1];
           cmdArgs = rest.slice(2);
-          console.error(`Hint: use --name instead: pty run --name ${name} -- ${cmd} ${cmdArgs.join(" ")}`.trimEnd());
+          console.error(`Hint: use --name instead: pty run --name ${rest[0]} -- ${cmd} ${cmdArgs.join(" ")}`.trimEnd());
         } else {
           cmd = rest[0];
           cmdArgs = rest.slice(1);
@@ -308,7 +321,7 @@ async function main(): Promise<void> {
       }
 
       if (!cmd) {
-        console.error("Usage: pty run [--name <name>] [-d] [-a] -- <command> [args...]");
+        console.error("Usage: pty run [--id <id>] [--name <displayName>] [-d] [-a] -- <command> [args...]");
         process.exit(1);
       }
 
@@ -328,13 +341,15 @@ async function main(): Promise<void> {
       // running, the original "exec directly" behavior still makes sense
       // (there's no session to attach to anyway).
       if (process.env.PTY_SESSION && !detach) {
-        if (attachExisting && name && !force) {
-          const existing = await getSession(name);
+        // Nested-attach check: target by either the explicit id or display name
+        const lookupRef = explicitId ?? explicitDisplayName;
+        if (attachExisting && lookupRef && !force) {
+          const existing = await getSession(lookupRef);
           if (existing && existing.status === "running") {
             ensureNotNested("run -a", {
               force: false,
               hint:
-                `  Target session "${name}" is already running; attaching would nest a client inside the current session.\n` +
+                `  Target session "${lookupRef}" is already running; attaching would nest a client inside the current session.\n` +
                 "  Pass --force to attach anyway, or detach first (Ctrl+\\) and re-run from outside.",
             });
           }
@@ -351,41 +366,74 @@ async function main(): Promise<void> {
 
       const existingRefs = await allRefs();
 
-      // Resolve `name` (stable id). If the user didn't pass --name, generate
-      // a short random id (6 chars of Crockford-ish base32). Collisions are
-      // astronomically unlikely but we retry if one shows up.
-      if (!name) {
-        for (let attempt = 0; attempt < 8; attempt++) {
-          const candidate = randomSessionName();
-          if (!existingRefs.has(candidate)) { name = candidate; break; }
+      // Resolve `name` (the on-disk id). If --id was passed, validate and use
+      // it verbatim; otherwise generate a short random id. Charset, length,
+      // and uniqueness checks are all done up front so automation fails
+      // loudly rather than hitting EINVAL/ENAMETOOLONG deep in spawn.
+      //
+      // Uniqueness exception: under `-a` (attach-or-create), a collision
+      // with an existing session is the *expected* path — cmdRun attaches
+      // a running session or recreates an exited one. Defer to cmdRun.
+      let name: string;
+      if (explicitId) {
+        try {
+          validateName(explicitId);
+        } catch (e: any) {
+          console.error(e.message);
+          process.exit(1);
         }
-        if (!name) {
+        if (existingRefs.has(explicitId) && !attachExisting) {
+          console.error(`Session id "${explicitId}" is already in use (as a name or displayName).`);
+          process.exit(1);
+        }
+        name = explicitId;
+      } else {
+        let candidate: string | null = null;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const c = randomSessionName();
+          if (!existingRefs.has(c)) { candidate = c; break; }
+        }
+        if (!candidate) {
           console.error("Could not generate a unique session id after 8 attempts.");
           process.exit(1);
         }
+        name = candidate;
       }
 
-      try {
-        validateName(name);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
-
-      // Resolve `displayName`. Skip if --no-display-name. Otherwise
-      // auto-generate the old human-friendly cwd+command label and dedup
-      // against existing names/displayNames.
+      // Resolve `displayName`. Precedence:
+      //   1. --no-display-name → null
+      //   2. --name <x>         → x (validated permissively, deduped only
+      //                            against existing refs)
+      //   3. otherwise          → auto cwd+cmd label (sanitized + deduped)
       let displayName: string | null = null;
       if (!noDisplayName) {
-        let candidate = autoName(autoNameCmd, cmdArgs);
-        candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-        if (existingRefs.has(candidate)) {
-          for (let n = 2; ; n++) {
-            const c = `${candidate}-${n}`;
-            if (!existingRefs.has(c)) { candidate = c; break; }
+        if (explicitDisplayName) {
+          try {
+            validateDisplayName(explicitDisplayName);
+          } catch (e: any) {
+            console.error(`Invalid displayName: ${e.message}`);
+            process.exit(1);
           }
+          if (explicitDisplayName === name) {
+            console.error(`displayName cannot equal the session's id ("${name}").`);
+            process.exit(1);
+          }
+          if (existingRefs.has(explicitDisplayName)) {
+            console.error(`"${explicitDisplayName}" is already in use by another session (as a name or displayName).`);
+            process.exit(1);
+          }
+          displayName = explicitDisplayName;
+        } else {
+          let candidate = autoName(autoNameCmd, cmdArgs);
+          candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+          if (existingRefs.has(candidate) || candidate === name) {
+            for (let n = 2; ; n++) {
+              const c = `${candidate}-${n}`;
+              if (!existingRefs.has(c) && c !== name) { candidate = c; break; }
+            }
+          }
+          displayName = candidate;
         }
-        displayName = candidate;
       }
 
       await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName);
@@ -422,12 +470,6 @@ async function main(): Promise<void> {
           "  Detach first (Ctrl+\\) or, from inside pty-layout, use ^]n to pick a session.\n" +
           "  Pass --force to attach anyway (nested clients are usually a mistake).",
       });
-      try {
-        validateName(attachName);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedAttachName = await resolveRef(attachName);
       await cmdAttach(resolvedAttachName, autoRestart, force);
       break;
@@ -466,12 +508,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty peek [-f] [--plain] [--full] [--wait <pattern>] [-t <seconds>] <name>");
         process.exit(1);
       }
-      try {
-        validateName(peekName);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedPeekName = await resolveRef(peekName);
       if (waitPatterns.length > 0) {
         await cmdPeekWait(resolvedPeekName, waitPatterns, timeoutSec, plain);
@@ -485,12 +521,6 @@ async function main(): Promise<void> {
       const sendName = args[1];
       if (!sendName) {
         console.error('Usage: pty send <name> "text"  or  pty send <name> --seq "text" --seq key:return');
-        process.exit(1);
-      }
-      try {
-        validateName(sendName);
-      } catch (e: any) {
-        console.error(e.message);
         process.exit(1);
       }
 
@@ -596,12 +626,6 @@ async function main(): Promise<void> {
 
       let resolvedEventsName: string | null = null;
       if (eventsName) {
-        try {
-          validateName(eventsName);
-        } catch (e: any) {
-          console.error(e.message);
-          process.exit(1);
-        }
         resolvedEventsName = await resolveRef(eventsName);
       }
 
@@ -707,12 +731,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty kill <name>");
         process.exit(1);
       }
-      try {
-        validateName(args[1]);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedKillName = await resolveRef(args[1]);
       await cmdKill(resolvedKillName);
       break;
@@ -728,12 +746,6 @@ async function main(): Promise<void> {
       const tagName = args[1];
       if (!tagName) {
         console.error("Usage: pty tag <name> [key=value...] [--rm key...]");
-        process.exit(1);
-      }
-      try {
-        validateName(tagName);
-      } catch (e: any) {
-        console.error(e.message);
         process.exit(1);
       }
       const resolvedTagName = await resolveRef(tagName);
@@ -888,12 +900,6 @@ async function main(): Promise<void> {
         console.error("Usage: pty rm <name>");
         process.exit(1);
       }
-      try {
-        validateName(args[1]);
-      } catch (e: any) {
-        console.error(e.message);
-        process.exit(1);
-      }
       const resolvedRmName = await resolveRef(args[1]);
       await cmdRm(resolvedRmName);
       break;
@@ -932,7 +938,8 @@ async function main(): Promise<void> {
             console.error("Usage: pty supervisor forget <name>");
             process.exit(1);
           }
-          await cmdSupervisorForget(forgetName);
+          const resolvedForgetName = await resolveRef(forgetName);
+          await cmdSupervisorForget(resolvedForgetName);
           break;
         }
         case "reset": {
@@ -941,7 +948,8 @@ async function main(): Promise<void> {
             console.error("Usage: pty supervisor reset <name>");
             process.exit(1);
           }
-          await cmdSupervisorReset(resetName);
+          const resolvedResetName = await resolveRef(resetName);
+          await cmdSupervisorReset(resolvedResetName);
           break;
         }
         case "launchd": {
@@ -1938,10 +1946,11 @@ async function cmdRename(rawArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Validate the new display like a name — same charset rules keep things
-  // predictable in URLs, file names, and CLI args.
+  // Display names can be arbitrary printable text (spaces, punctuation, any
+  // length up to 500 chars). The on-disk id (`name`) carries the strict
+  // charset and the sock-path-length constraint; display names don't.
   try {
-    validateName(newDisplay);
+    validateDisplayName(newDisplay);
   } catch (e: any) {
     console.error(`Invalid displayName: ${e.message}`);
     process.exit(1);
@@ -2145,12 +2154,6 @@ async function cmdTagMulti(argv: string[]): Promise<void> {
   if (parsed.selector.kind === "names") {
     targets = [];
     for (const ref of parsed.selector.names) {
-      try {
-        validateName(ref);
-      } catch (e: any) {
-        console.error(`pty tag-multi: ${e.message}`);
-        process.exit(1);
-      }
       const sess = await getSession(ref);
       if (!sess) {
         console.error(`pty tag-multi: session "${ref}" not found.`);
@@ -2300,12 +2303,6 @@ async function cmdEmit(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  try {
-    validateName(ref);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
   const resolvedName = await resolveRef(ref);
 
   let data: unknown;
@@ -2580,13 +2577,6 @@ async function cmdSupervisorStatus(): Promise<void> {
 }
 
 async function cmdSupervisorForget(name: string): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const meta = readMetadata(name);
   if (!meta) {
     console.error(`Session "${name}" not found.`);
@@ -2613,13 +2603,6 @@ async function cmdSupervisorForget(name: string): Promise<void> {
 }
 
 async function cmdSupervisorReset(name: string): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const meta = readMetadata(name);
   if (!meta) {
     console.error(`Session "${name}" not found.`);
@@ -3090,8 +3073,8 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
   let sessions = ptyFile.sessions;
   if (names.length > 0) {
     const nameSet = new Set(names);
-    const matchesName = (s: PtySessionDef) => nameSet.has(s.name) || nameSet.has(s.shortName);
-    const unknown = names.filter((n) => !sessions.some((s) => s.name === n || s.shortName === n));
+    const matchesName = (s: PtySessionDef) => nameSet.has(s.displayName) || nameSet.has(s.shortName);
+    const unknown = names.filter((n) => !sessions.some((s) => s.displayName === n || s.shortName === n));
     if (unknown.length > 0) {
       console.error(`Unknown session${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`);
       console.error(`Available: ${sessions.map((s) => s.shortName).join(", ")}`);
@@ -3100,14 +3083,22 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
     sessions = sessions.filter(matchesName);
   }
 
+  const tomlPath = path.join(ptyFile.dir, "pty.toml");
   const existing = await listSessions();
-  const runningNames = new Set(existing.filter((s) => s.status === "running").map((s) => s.name));
+  /** Find an existing session that came from this same (ptyfile, ptyfile.session)
+   *  pair. The toml-derived displayName is just a label; identity is the tag
+   *  pair, so renaming a session or hitting a long-name collision doesn't lose
+   *  the binding. */
+  const findByTags = (shortName: string) => existing.find((s) =>
+    s.metadata?.tags?.ptyfile === tomlPath &&
+    s.metadata?.tags?.["ptyfile.session"] === shortName
+  );
+  const allRefSet = await allRefs();
 
   let started = 0;
   let skipped = 0;
 
   for (const sess of sessions) {
-    const tomlPath = path.join(ptyFile.dir, "pty.toml");
     const userTomlKeys = Object.keys(sess.tags ?? {}).sort();
     const ptyfileTagsValue = userTomlKeys.join(",");
     const tomlTags: Record<string, string> = {
@@ -3117,13 +3108,14 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       "ptyfile.tags": ptyfileTagsValue,
     };
 
-    if (runningNames.has(sess.name)) {
+    const bound = findByTags(sess.shortName);
+
+    if (bound && bound.status === "running") {
       // Sync tags from toml to the running session (including ptyfile metadata).
       // Track which tag keys came from the toml via "ptyfile.tags" so that
       // removing a tag from the toml causes it to be removed here (but
       // manually-added tags — those not in "ptyfile.tags" — are preserved).
-      const currentMeta = readMetadata(sess.name);
-      const currentTags = currentMeta?.tags ?? {};
+      const currentTags = bound.metadata?.tags ?? {};
 
       const updates: Record<string, string> = {};
       for (const [k, v] of Object.entries(tomlTags)) {
@@ -3137,49 +3129,88 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       const newKeySet = new Set(userTomlKeys);
       const removals = prevTomlKeys.filter((k) => !newKeySet.has(k));
 
+      const label = bound.metadata?.displayName ?? bound.name;
       if (Object.keys(updates).length > 0 || removals.length > 0) {
         try {
-          updateTags(sess.name, updates, removals);
+          updateTags(bound.name, updates, removals);
           const changedTagUpdates = Object.entries(updates)
             .filter(([k]) => k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags")
             .map(([k, v]) => `${k}=${v}`);
           const changedRemovals = removals.map((k) => `-${k}`);
           const changed = [...changedTagUpdates, ...changedRemovals].join(", ");
           if (changed) {
-            console.log(`  ● ${sess.name} (already running, updated tags: ${changed})`);
+            console.log(`  ● ${label} (already running, updated tags: ${changed})`);
           } else {
-            console.log(`  ● ${sess.name} (already running)`);
+            console.log(`  ● ${label} (already running)`);
           }
         } catch {
-          console.log(`  ● ${sess.name} (already running)`);
+          console.log(`  ● ${label} (already running)`);
         }
       } else {
-        console.log(`  ● ${sess.name} (already running)`);
+        console.log(`  ● ${label} (already running)`);
       }
       skipped++;
       continue;
     }
 
-    // Clean up any stale session (exited or vanished) with the same name
-    // so the respawn can reuse the slot.
-    const existingSession = existing.find((s) => s.name === sess.name);
-    if (existingSession && isGone(existingSession.status)) {
-      cleanupAll(sess.name);
+    // Clean up an exited bound session so its slot can be reused.
+    if (bound && isGone(bound.status)) {
+      cleanupAll(bound.name);
+    }
+
+    // Pick the on-disk id: honor the pty.toml's `id = "..."` if set,
+    // otherwise generate a random one. Either way validate before spawn so
+    // long pinned ids fail with a clear up-front error.
+    let name: string;
+    if (sess.id) {
+      try {
+        validateName(sess.id);
+      } catch (e: any) {
+        console.error(`  ✗ ${sess.displayName}: ${e.message}`);
+        continue;
+      }
+      if (allRefSet.has(sess.id)) {
+        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use (as a name or displayName).`);
+        continue;
+      }
+      name = sess.id;
+      allRefSet.add(sess.id);
+    } else {
+      let candidate: string | null = null;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const c = randomSessionName();
+        if (!allRefSet.has(c)) { candidate = c; allRefSet.add(c); break; }
+      }
+      if (!candidate) {
+        console.error(`  ✗ ${sess.displayName}: could not generate a unique session id after 8 attempts.`);
+        continue;
+      }
+      name = candidate;
+    }
+
+    // Validate the toml-derived displayName once. Default `<prefix>-<short>`
+    // is always safe; an explicit `display_name` field could be anything.
+    try {
+      validateDisplayName(sess.displayName);
+    } catch (e: any) {
+      console.error(`  ✗ ${sess.displayName}: ${e.message}`);
+      continue;
     }
 
     try {
       await spawnDaemon({
-        name: sess.name,
+        name,
         command: "/bin/sh",
         args: ["-c", commandWithEnvExports(sess)],
         displayCommand: sess.command,
         cwd: ptyFile.dir,
         tags: tomlTags,
+        displayName: sess.displayName,
       });
-      console.log(`  ● ${sess.name} (started)`);
+      console.log(`  ● ${sess.displayName} (started)`);
       started++;
     } catch (e: any) {
-      console.error(`  ✗ ${sess.name}: ${e.message}`);
+      console.error(`  ✗ ${sess.displayName}: ${e.message}`);
     }
   }
 
@@ -3202,15 +3233,22 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
   let sessions = ptyFile.sessions;
   if (names.length > 0) {
     const nameSet = new Set(names);
-    sessions = sessions.filter((s) => nameSet.has(s.name) || nameSet.has(s.shortName));
+    sessions = sessions.filter((s) => nameSet.has(s.displayName) || nameSet.has(s.shortName));
   }
 
+  const tomlPath = path.join(ptyFile.dir, "pty.toml");
   const existing = await listSessions();
+  const findByTags = (shortName: string) => existing.find((s) =>
+    s.metadata?.tags?.ptyfile === tomlPath &&
+    s.metadata?.tags?.["ptyfile.session"] === shortName
+  );
   let stopped = 0;
 
   for (const sess of sessions) {
-    const existingSession = existing.find((s) => s.name === sess.name);
+    const existingSession = findByTags(sess.shortName);
     if (!existingSession) continue;
+
+    const label = existingSession.metadata?.displayName ?? existingSession.name;
 
     // Remove supervision tags so the supervisor doesn't restart it
     const wasSupervised = existingSession.metadata?.tags?.strategy === "permanent" || existingSession.metadata?.tags?.strategy === "temporary";
@@ -3218,22 +3256,22 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
       try {
         const removals = ["strategy"];
         if (existingSession.metadata?.tags?.["supervisor.status"]) removals.push("supervisor.status");
-        updateTags(sess.name, {}, removals);
+        updateTags(existingSession.name, {}, removals);
       } catch {}
     }
 
     if (existingSession.status === "running" && existingSession.pid) {
       try {
         process.kill(existingSession.pid, "SIGTERM");
-        console.log(`  ○ ${sess.name} (stopped${wasSupervised ? ", removed from supervision" : ""})`);
+        console.log(`  ○ ${label} (stopped${wasSupervised ? ", removed from supervision" : ""})`);
         stopped++;
       } catch {
-        console.error(`  ✗ ${sess.name}: failed to stop`);
+        console.error(`  ✗ ${label}: failed to stop`);
       }
-      cleanupSocket(sess.name);
+      cleanupSocket(existingSession.name);
     } else if (isGone(existingSession.status)) {
-      cleanupAll(sess.name);
-      console.log(`  ○ ${sess.name} (cleaned up)`);
+      cleanupAll(existingSession.name);
+      console.log(`  ○ ${label} (cleaned up)`);
       stopped++;
     }
   }
@@ -3245,10 +3283,7 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
   }
 
   // Warn if any stopped sessions are toml-managed
-  const anyTomlManaged = sessions.some((sess) => {
-    const existingSession = existing.find((s) => s.name === sess.name);
-    return existingSession?.metadata?.tags?.ptyfile;
-  });
+  const anyTomlManaged = sessions.some((sess) => findByTags(sess.shortName)?.metadata?.tags?.ptyfile);
   if (anyTomlManaged && stopped > 0) {
     console.error("\nNote: strategy tags will be restored on the next 'pty up'.");
   }
@@ -3259,13 +3294,6 @@ async function cmdRestart(
   yes = false,
   forceNested = false,
 ): Promise<void> {
-  try {
-    validateName(name);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
   const session = await getSession(name);
 
   if (!session) {
