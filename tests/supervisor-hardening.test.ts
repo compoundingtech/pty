@@ -95,17 +95,17 @@ afterEach(() => {
 describe("displayCommand formatting", () => {
   it("pty run shows command with args in list", () => {
     const dir = makeSessionDir();
-    const name = uniqueName();
+    const id = uniqueName();
 
-    runCli(dir, "run", "-d", "--name", name, "--", "echo", "hello", "world");
+    runCli(dir, "run", "-d", "--id", id, "--", "echo", "hello", "world");
     // Wait for session to start
     const start = Date.now();
     while (Date.now() - start < 3000) {
-      const meta = readMeta(dir, name);
+      const meta = readMeta(dir, id);
       if (meta) break;
     }
 
-    const meta = readMeta(dir, name);
+    const meta = readMeta(dir, id);
     expect(meta).not.toBeNull();
     expect(meta.displayCommand).toBe("echo hello world");
   }, 15000);
@@ -120,7 +120,18 @@ command = "echo server running"
 
     runCli(dir, "up", projDir);
 
-    const meta = readMeta(dir, "serve");
+    // pty up gives the session a random short id as the on-disk name and
+    // sets `serve` as the displayName. Wait for the session to register, then
+    // look up the on-disk name by displayName.
+    const start = Date.now();
+    let sess: any = undefined;
+    while (Date.now() - start < 3000) {
+      const listResult = JSON.parse(runCli(dir, "list", "--json").stdout) as any[];
+      sess = listResult.find((s: any) => s.displayName === "serve");
+      if (sess) break;
+    }
+    expect(sess).toBeDefined();
+    const meta = readMeta(dir, sess.name);
     expect(meta).not.toBeNull();
     expect(meta.displayCommand).toBe("echo server running");
     // command should be /bin/sh, args should be ["-c", "echo server running"]
@@ -247,7 +258,7 @@ describe("spawnDaemon process leak", () => {
     const dir = makeSessionDir();
 
     // Try to spawn with a nonexistent command — daemon will crash
-    const result = runCli(dir, "run", "-d", "--name", "leak-test", "--", "/nonexistent/command");
+    const result = runCli(dir, "run", "-d", "--id", "leak-test", "--", "/nonexistent/command");
 
     // The command should have failed
     expect(result.status).not.toBe(0);

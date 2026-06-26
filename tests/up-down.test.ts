@@ -118,7 +118,7 @@ command = "cat"
     const sessions = listJson(sessDir);
     const running = sessions.filter((s: any) => s.status === "running");
     expect(running).toHaveLength(2);
-    expect(running.map((s: any) => s.name).sort()).toEqual(["db", "web"]);
+    expect(running.map((s: any) => s.displayName).sort()).toEqual(["db", "web"]);
   }, 15000);
 
   it("propagates env from pty.toml into the spawned session", async () => {
@@ -187,7 +187,7 @@ tags = { strategy = "permanent", role = "server" }
 
     // Verify tags were applied
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "syncme");
+    const session = sessions.find((s: any) => s.displayName === "syncme");
     expect(session.tags.strategy).toBe("permanent");
     expect(session.tags.role).toBe("server");
     expect(session.tags.ptyfile).toBeDefined();
@@ -211,7 +211,7 @@ tags = { role = "server" }
     runCli(sessDir, "up", projDir);
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "manual");
+    const session = sessions.find((s: any) => s.displayName === "manual");
     expect(session.tags.role).toBe("server");
     expect(session.tags.custom).toBe("yes");
   }, 15000);
@@ -228,7 +228,7 @@ tags = { role = "server", env = "dev" }
     runCli(sessDir, "up", projDir);
 
     let sessions = listJson(sessDir);
-    let session = sessions.find((s: any) => s.name === "remover");
+    let session = sessions.find((s: any) => s.displayName === "remover");
     expect(session.tags.role).toBe("server");
     expect(session.tags.env).toBe("dev");
 
@@ -242,7 +242,7 @@ tags = { role = "server" }
     expect(result.stdout).toContain("-env");
 
     sessions = listJson(sessDir);
-    session = sessions.find((s: any) => s.name === "remover");
+    session = sessions.find((s: any) => s.displayName === "remover");
     expect(session.tags.role).toBe("server");
     expect(session.tags.env).toBeUndefined();
     // Metadata tags should still be present
@@ -271,7 +271,7 @@ command = "cat"
     expect(result.stdout).toContain("-role");
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "cleared");
+    const session = sessions.find((s: any) => s.displayName === "cleared");
     expect(session.tags.role).toBeUndefined();
     expect(session.tags.env).toBeUndefined();
     expect(session.tags.ptyfile).toBeDefined();
@@ -299,7 +299,7 @@ command = "cat"
     runCli(sessDir, "up", projDir);
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "mixer");
+    const session = sessions.find((s: any) => s.displayName === "mixer");
     expect(session.tags.role).toBeUndefined();
     expect(session.tags.custom).toBe("yes");
   }, 20000);
@@ -325,7 +325,7 @@ tags = { env = "prod" }
     expect(result.stdout).not.toContain("-env");
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "mover");
+    const session = sessions.find((s: any) => s.displayName === "mover");
     expect(session.tags.env).toBe("prod");
   }, 20000);
 
@@ -358,7 +358,7 @@ tags = { role = "server", env = "dev" }
     runCli(sessDir, "up", projDir);
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "tagged");
+    const session = sessions.find((s: any) => s.displayName === "tagged");
     expect(session).toBeDefined();
     expect(session.tags.role).toBe("server");
     expect(session.tags.env).toBe("dev");
@@ -376,7 +376,7 @@ command = "cat"
     runCli(sessDir, "up", projDir);
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "checkdir");
+    const session = sessions.find((s: any) => s.displayName === "checkdir");
     expect(session).toBeDefined();
     expect(session.cwd).toBe(projDir);
   }, 15000);
@@ -401,7 +401,7 @@ command = "cat"
     expect(result.stdout).toContain("myapp-worker (started)");
 
     const sessions = listJson(sessDir);
-    const names = sessions.filter((s: any) => s.status === "running").map((s: any) => s.name);
+    const names = sessions.filter((s: any) => s.status === "running").map((s: any) => s.displayName);
     expect(names.sort()).toEqual(["myapp-web", "myapp-worker"]);
   }, 15000);
 
@@ -427,7 +427,7 @@ command = "cat"
     const sessions = listJson(sessDir);
     const running = sessions.filter((s: any) => s.status === "running");
     expect(running).toHaveLength(1);
-    expect(running[0].name).toBe("myapp-web");
+    expect(running[0].displayName).toBe("myapp-web");
   }, 15000);
 
   it("sets ptyfile tags on created sessions", () => {
@@ -441,7 +441,7 @@ command = "cat"
     runCli(sessDir, "up", projDir);
 
     const sessions = listJson(sessDir);
-    const session = sessions.find((s: any) => s.name === "tracked");
+    const session = sessions.find((s: any) => s.displayName === "tracked");
     expect(session).toBeDefined();
     expect(session.tags.ptyfile).toBe(projDir + "/pty.toml");
     expect(session.tags["ptyfile.session"]).toBe("tracked");
@@ -540,7 +540,7 @@ command = "cat"
     const sessions = listJson(sessDir);
     const running = sessions.filter((s: any) => s.status === "running");
     expect(running).toHaveLength(1);
-    expect(running[0].name).toBe("keep");
+    expect(running[0].displayName).toBe("keep");
   }, 15000);
 
   it("reports when nothing to stop", () => {

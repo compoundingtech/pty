@@ -401,11 +401,16 @@ export class Supervisor {
     // wipes the metadata file can still recover on the next attempt.
     tracked.spawnConfig = { command, args, displayCommand, cwd, tags };
 
+    // Preserve the existing displayName across the respawn so the user-visible
+    // label survives. (`name` is the immutable on-disk id; displayName is the
+    // pretty label that pty.toml sets.)
+    const displayName = metadata.displayName;
+
     // Clean up the dead session
     cleanupAll(name);
 
     // Respawn
-    await spawnDaemon({ name, command, args, displayCommand, cwd, tags });
+    await spawnDaemon({ name, command, args, displayCommand, cwd, tags, ...(displayName ? { displayName } : {}) });
 
     tracked.restartCount++;
     tracked.lastRestartAt = Date.now();

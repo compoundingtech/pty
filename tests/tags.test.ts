@@ -257,7 +257,7 @@ describe("session tags", () => {
     const name = uniqueName();
 
     const result = spawnSync(nodeBin, [
-      cliPath, "run", "-d", "--name", name,
+      cliPath, "run", "-d", "--id", name,
       "--tag", "owner=forge", "--tag", "env=staging",
       "--", "cat",
     ], {
@@ -318,7 +318,7 @@ describe("session tags", () => {
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit
 
     // Recreate with run -a (no new --tag flags)
-    const result = spawnSync(nodeBin, [cliPath, "run", "-a", "-d", "--name", name, "--", "cat"], {
+    const result = spawnSync(nodeBin, [cliPath, "run", "-a", "-d", "--id", name, "--", "cat"], {
       env: { ...process.env, PTY_SESSION_DIR: dir },
       encoding: "utf-8",
       timeout: 10000,
@@ -347,7 +347,7 @@ describe("session tags", () => {
 
     // Recreate with run -a with NEW tags
     const result = spawnSync(nodeBin, [
-      cliPath, "run", "-a", "-d", "--name", name,
+      cliPath, "run", "-a", "-d", "--id", name,
       "--tag", "owner=new",
       "--", "cat",
     ], {
@@ -373,7 +373,7 @@ describe("session tags", () => {
     const dir = makeSessionDir();
 
     const result = spawnSync(nodeBin, [
-      cliPath, "run", "-d", "--name", "bad-tag",
+      cliPath, "run", "-d", "--id", "bad-tag",
       "--tag", "no-equals-sign",
       "--", "cat",
     ], {

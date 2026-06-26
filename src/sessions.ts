@@ -46,6 +46,25 @@ export function validateName(name: string): void {
   }
 }
 
+/** Permissive validator for display labels. Allowed: anything printable
+ *  including spaces and punctuation, ≤ 500 chars. Rejected: empty, NUL,
+ *  slashes (would confuse path-shaped UIs), backslashes, newlines, other
+ *  control characters. Length cap is a sanity limit, not a kernel limit —
+ *  display labels live in metadata.json, not in the socket path. */
+export function validateDisplayName(name: string): void {
+  if (!name || name.length === 0) {
+    throw new Error("Display name cannot be empty.");
+  }
+  if (name.length > 500) {
+    throw new Error("Display name too long (max 500 characters).");
+  }
+  if (/[\0\/\\\n\r\t\x00-\x1f\x7f]/.test(name)) {
+    throw new Error(
+      `Invalid display name. Slashes, backslashes, newlines, and control characters are not allowed.`
+    );
+  }
+}
+
 export function getSessionDir(): string {
   return process.env.PTY_SESSION_DIR ?? DEFAULT_SESSION_DIR;
 }

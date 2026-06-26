@@ -859,6 +859,7 @@ export class PtyServer {
       exitedAt: new Date().toISOString(),
       lastLines: this.getLastLines(),
       ...(existing?.tags ? { tags: existing.tags } : {}),
+      ...(existing?.displayName ? { displayName: existing.displayName } : {}),
     });
   }
 

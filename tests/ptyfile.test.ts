@@ -65,26 +65,26 @@ NOT_A_STRING = 42
 describe("commandWithEnvExports", () => {
   it("returns the bare command when env is absent", () => {
     expect(commandWithEnvExports({
-      name: "x", shortName: "x", command: "echo hi",
+      displayName: "x", shortName: "x", id: null, command: "echo hi",
     })).toBe("echo hi");
   });
 
   it("returns the bare command when env is empty", () => {
     expect(commandWithEnvExports({
-      name: "x", shortName: "x", command: "echo hi", env: {},
+      displayName: "x", shortName: "x", id: null, command: "echo hi", env: {},
     })).toBe("echo hi");
   });
 
   it("prepends export statements", () => {
     expect(commandWithEnvExports({
-      name: "x", shortName: "x", command: "echo $FOO",
+      displayName: "x", shortName: "x", id: null, command: "echo $FOO",
       env: { FOO: "bar" },
     })).toBe("export FOO='bar'; echo $FOO");
   });
 
   it("emits one export per env entry", () => {
     const out = commandWithEnvExports({
-      name: "x", shortName: "x", command: "do-thing",
+      displayName: "x", shortName: "x", id: null, command: "do-thing",
       env: { A: "1", B: "two" },
     });
     expect(out).toContain("export A='1'");
@@ -94,14 +94,14 @@ describe("commandWithEnvExports", () => {
 
   it("escapes single quotes in values", () => {
     expect(commandWithEnvExports({
-      name: "x", shortName: "x", command: "echo $MSG",
+      displayName: "x", shortName: "x", id: null, command: "echo $MSG",
       env: { MSG: "it's a value" },
     })).toBe(`export MSG='it'\\''s a value'; echo $MSG`);
   });
 
   it("handles values with shell metacharacters safely", () => {
     expect(commandWithEnvExports({
-      name: "x", shortName: "x", command: "go",
+      displayName: "x", shortName: "x", id: null, command: "go",
       env: { PATH_LIKE: "$HOME/bin:/usr/bin; echo pwned" },
     })).toBe(`export PATH_LIKE='$HOME/bin:/usr/bin; echo pwned'; go`);
   });

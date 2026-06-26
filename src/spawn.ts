@@ -196,11 +196,19 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
  * needs surface.
  *
  * `isolateEnv` maps to `--isolate-env`. `cwd` to `--cwd`. `tags` to
- * repeated `--tag k=v`. `name` to `--name`. The session command is
- * positional after `--`.
+ * repeated `--tag k=v`. `name` to `--id` (the on-disk identifier under the
+ * decoupled name/displayName model). `displayName` to `--name` if present.
+ * The session command is positional after `--`.
  */
 function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
-  const cliArgs: string[] = ["run", "-d", "--name", options.name];
+  const cliArgs: string[] = ["run", "-d", "--id", options.name];
+  if (options.displayName) {
+    cliArgs.push("--name", options.displayName);
+  } else {
+    // No display label requested — match spawnDaemon's behavior of leaving
+    // displayName unset (rather than CLI's default of auto-generating one).
+    cliArgs.push("--no-display-name");
+  }
   if (options.cwd) cliArgs.push("--cwd", options.cwd);
   if (options.isolateEnv) cliArgs.push("--isolate-env");
   if (options.tags) {
