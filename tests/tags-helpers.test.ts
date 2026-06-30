@@ -64,8 +64,15 @@ describe("isReservedTagKey", () => {
     expect(isReservedTagKey("ptyfile")).toBe(true);
     expect(isReservedTagKey("ptyfile.session")).toBe(true);
     expect(isReservedTagKey("ptyfile.tags")).toBe(true);
-    expect(isReservedTagKey("supervisor.status")).toBe(true);
     expect(isReservedTagKey("strategy")).toBe(true);
+  });
+
+  it("does NOT reserve removed/user-facing keys", () => {
+    // supervisor.status is gone with the supervisor — must not still be
+    // reserved. parent= is a user-facing tag (drives orphan-kill in
+    // `pty gc`) so it stays visible in `pty list` by default.
+    expect(isReservedTagKey("supervisor.status")).toBe(false);
+    expect(isReservedTagKey("parent")).toBe(false);
   });
 
   it("flags any key starting with `:` (tool-owned convention)", () => {

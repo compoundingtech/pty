@@ -15,6 +15,8 @@ readable output, and the ability to wait for results.
 
 ## Session lifecycle
 
+`strategy=permanent` sessions are restarted by `pty gc` (typically a launchd `StartInterval=30` task — `pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist`). Restarts are stateless — no backoff tracking, no retry budget. Expect up to one interval of latency before a session comes back.
+
 ### 1. Create a detached session
 
 ```bash

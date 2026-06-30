@@ -111,21 +111,14 @@ pty state delete myserver port            # remove a key
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
-pty gc                                    # remove all exited sessions
+pty gc                                    # reconcile sessions: kill orphan children, respawn permanents, sweep exited
+pty gc --dry-run                          # preview what gc would do without changing anything
+pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist   # install macOS auto-gc
 pty tag myserver role=web env=prod        # set one or more tags on a session
 pty tag myserver --rm role --rm env       # remove one or more tags
 pty tag-multi --filter-tag role=web env=prod    # bulk write across matching sessions
 pty tag-multi --all --json                # bulk read tags across every session
 pty tag-multi --all --yes audit=today     # write to every session (--yes required)
-
-pty supervisor start                      # start the session supervisor
-pty supervisor stop                       # stop the supervisor
-pty supervisor status                     # show supervised sessions
-pty supervisor forget myserver            # stop supervising a session
-pty supervisor reset myserver             # reset a failed session for retry
-pty supervisor launchd install            # install launchd auto-start (macOS)
-pty supervisor systemd install            # install user-level systemd auto-start (Linux)
-pty supervisor runit install              # install runit service files
 
 pty up                                    # start all sessions from ./pty.toml
 pty up ./backend                          # start sessions from ./backend/pty.toml
@@ -222,28 +215,23 @@ PORT = "8080"
 LOG_LEVEL = "debug"
 ```
 
-The values are exported into the session's shell before the command runs (the supervisor wraps every session command in `/bin/sh -c`). They take effect on the next `pty up` after the session has stopped — restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` followed by `pty up` is the way to pick up a changed env block on an already-running session.
+The values are exported into the session's shell before the command runs — `pty up` wraps every toml-managed session in `/bin/sh -c` so the `export K='V'; …` prefix is honored. They take effect on the next `pty up` after the session has stopped — restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` followed by `pty up` is the way to pick up a changed env block on an already-running session.
 
-### Supervisor
+### Permanent sessions
 
-The supervisor keeps sessions alive by watching for the `strategy` tag:
+Tag a session with `strategy=permanent` and `pty gc` will respawn it whenever its daemon exits or vanishes:
 
 ```sh
-# Tag a session as permanent
 pty tag myserver strategy=permanent
 
-# Start the supervisor
-pty supervisor start
-
-# If myserver exits, the supervisor restarts it with exponential backoff
-# Max 5 restarts in 60 seconds before marking as [failed]
-
-pty supervisor status            # show supervised sessions
-pty supervisor forget myserver   # stop supervising
-pty supervisor stop              # stop the supervisor
+# After myserver exits — manually or by crash — the next `pty gc` run
+# brings it back. No backoff, no retry budget; the cron interval below
+# is the rate limit. Sessions managed by pty.toml re-read the toml on
+# respawn so command/env edits take effect immediately.
+pty gc
 ```
 
-Sessions can be supervised from `pty.toml` by setting the `strategy` tag:
+From `pty.toml`:
 
 ```toml
 [sessions.serve]
@@ -251,11 +239,42 @@ command = "bin/serve"
 tags = { strategy = "permanent" }
 ```
 
-For auto-start:
+Restart is stateless — every `pty gc` invocation re-derives intent from on-disk metadata. There's no in-memory restart counter, no `[failed]` state, no persisted bookkeeping. If a session's binary isn't reachable (volume not mounted, broken symlink), `pty gc` reports `Respawn failed:` and the next tick tries again.
 
-- macOS: `pty supervisor launchd install` — compiles a small wrapper binary and prompts for Full Disk Access (required for sessions on external/removable volumes)
-- Linux/systemd: `pty supervisor systemd install` — installs a user service in `~/.config/systemd/user/` and enables it immediately. If you want it to start at boot before login, enable linger with `sudo loginctl enable-linger $USER`.
-- runit: `pty supervisor runit install` — writes a `run` script and symlinkable service directory. By default it uses `~/.config/runit/{sv,service}`; on systems like Void you can point it at `/etc/sv` and `/var/service`.
+### Parent-child sessions
+
+Tag a session with `parent=<name>` and `pty gc` will SIGTERM it (and clean up its metadata) when the referenced parent's daemon is no longer alive — useful for sidecar workers that shouldn't outlive their primary:
+
+```sh
+pty run -d --name webserver -- bin/serve
+pty run -d --name webserver-tail --tag parent=webserver -- tail -f log/web.log
+# If `webserver` dies, the next `pty gc` SIGTERMs `webserver-tail`.
+```
+
+What triggers the kill: the parent's metadata file is gone OR the parent's pid file is gone OR the parent's process isn't alive. What doesn't: the parent's exit code, the parent's `exitedAt` timestamp. Combinator with `strategy=permanent` is well-defined — orphan-kill wins (the child is removed, not respawned).
+
+Cycles (A→B, B→A) resolve deterministically by name-sorted iteration: whichever name sorts first dies first on the tick where both parents are gone; the loser dies the same tick because its parent (the just-killed winner) is also dead. No cycle detection needed.
+
+### Auto-running gc
+
+`pty gc` is a one-shot reconciliation pass. The intended deployment is to run it on a short interval so permanent sessions come back quickly and orphans get cleaned promptly. The CLI ships an install helper for macOS:
+
+```sh
+pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist
+launchctl load ~/Library/LaunchAgents/com.myobie.pty.gc.plist
+```
+
+Default interval is 30 seconds; tune with `pty gc --print-launchd-plist --interval=15` etc. Output goes to `~/.local/state/pty/gc.log`.
+
+Statelessness is the whole point of running it on a cron rather than as a long-lived daemon. At boot, if the volume containing the `pty` binary isn't mounted yet, the invocation fails — the next tick tries again. The historic long-running supervisor would burn through its 5-retry budget in the first 10 seconds of boot and never come back; this design just shrugs and reconciles on the next tick.
+
+For other systems:
+
+- Linux + cron: `* * * * * pty gc >> ~/.local/state/pty/gc.log 2>&1` (one-minute resolution; tune to taste).
+- Linux + systemd-timer: `OnUnitActiveSec=30s` on a `pty.gc.service` that `ExecStart=pty gc`.
+- runit: a `run` script that loops `pty gc` with a `sleep 30` between iterations.
+
+The macOS `pty gc --print-launchd-plist` helper is the only one bundled today; the others are one-liners and easy enough to write yourself. File an issue if you'd like a built-in install command for systemd/runit.
 
 ### Plugins
 

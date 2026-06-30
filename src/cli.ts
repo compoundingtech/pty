@@ -35,7 +35,6 @@ import {
   emitUserEvent,
 } from "./events.ts";
 import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
-import { getSupervisorDir } from "./supervisor.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 
@@ -117,17 +116,7 @@ function usage(): void {
   pty tag <name> key=value [key=value...]  Set tags
   pty tag <name> --rm key [--rm key...]    Remove tags
   pty tag-multi <selector> [ops...]        Read/write tags across multiple sessions (--all / --filter-tag k=v / <name>...)
-  pty supervisor start                     Start the session supervisor
-  pty supervisor stop                      Stop the supervisor
-  pty supervisor status                    Show supervised sessions
-  pty supervisor forget <name>             Stop supervising a session
-  pty supervisor reset <name>              Reset a failed session for retry
-  pty supervisor launchd install [--path PATH]                     Register with macOS launchd
-  pty supervisor launchd uninstall                              Remove launchd registration
-  pty supervisor systemd install [--name NAME] [--path PATH]     Register with user systemd
-  pty supervisor systemd uninstall [--name NAME]                 Remove user systemd registration
-  pty supervisor runit install [--name NAME] [--svdir PATH] [--service-dir PATH] [--path PATH]  Register with runit
-  pty supervisor runit uninstall [--name NAME] [--svdir PATH] [--service-dir PATH]               Remove runit registration
+  pty gc --print-launchd-plist [--interval=N]   Print a launchd plist that runs 'pty gc' every N seconds (default 30)
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -737,7 +726,33 @@ async function main(): Promise<void> {
     }
 
     case "gc": {
-      const dryRun = args.slice(1).some((a) => a === "--dry-run" || a === "-n");
+      const gcArgs = args.slice(1);
+      const dryRun = gcArgs.some((a) => a === "--dry-run" || a === "-n");
+      const printPlist = gcArgs.includes("--print-launchd-plist");
+      let interval = 30;
+      for (let i = 0; i < gcArgs.length; i++) {
+        const a = gcArgs[i];
+        if (a === "--interval" && i + 1 < gcArgs.length) {
+          const v = parseInt(gcArgs[i + 1], 10);
+          if (!Number.isFinite(v) || v <= 0) {
+            console.error(`pty gc: --interval expects a positive integer (got "${gcArgs[i + 1]}")`);
+            process.exit(1);
+          }
+          interval = v;
+          i++;
+        } else if (a.startsWith("--interval=")) {
+          const v = parseInt(a.slice("--interval=".length), 10);
+          if (!Number.isFinite(v) || v <= 0) {
+            console.error(`pty gc: --interval expects a positive integer (got "${a.slice("--interval=".length)}")`);
+            process.exit(1);
+          }
+          interval = v;
+        }
+      }
+      if (printPlist) {
+        printLaunchdPlist(interval);
+        break;
+      }
       await cmdGc(dryRun);
       break;
     }
@@ -902,127 +917,6 @@ async function main(): Promise<void> {
       }
       const resolvedRmName = await resolveRef(args[1]);
       await cmdRm(resolvedRmName);
-      break;
-    }
-
-    case "supervisor": {
-      const subCmd = args[1];
-      if (!subCmd || subCmd === "-h" || subCmd === "--help") {
-        console.log(`Usage:
-  pty supervisor start            Start the supervisor
-  pty supervisor stop             Stop the supervisor
-  pty supervisor status           Show supervised sessions
-  pty supervisor forget <name>    Stop supervising a session
-  pty supervisor reset <name>     Reset a failed session for retry
-  pty supervisor launchd install [--path PATH]                     Register with macOS launchd (requires FDA)
-  pty supervisor launchd uninstall                              Remove from launchd
-  pty supervisor systemd install [--name NAME] [--path PATH]     Register with user systemd
-  pty supervisor systemd uninstall [--name NAME]                 Remove from user systemd
-  pty supervisor runit install [--name NAME] [--svdir PATH] [--service-dir PATH] [--path PATH]  Register with runit
-  pty supervisor runit uninstall [--name NAME] [--svdir PATH] [--service-dir PATH]               Remove from runit`);
-        break;
-      }
-      switch (subCmd) {
-        case "start":
-          await cmdSupervisorStart();
-          break;
-        case "stop":
-          await cmdSupervisorStop();
-          break;
-        case "status":
-          await cmdSupervisorStatus();
-          break;
-        case "forget": {
-          const forgetName = args[2];
-          if (!forgetName) {
-            console.error("Usage: pty supervisor forget <name>");
-            process.exit(1);
-          }
-          const resolvedForgetName = await resolveRef(forgetName);
-          await cmdSupervisorForget(resolvedForgetName);
-          break;
-        }
-        case "reset": {
-          const resetName = args[2];
-          if (!resetName) {
-            console.error("Usage: pty supervisor reset <name>");
-            process.exit(1);
-          }
-          const resolvedResetName = await resolveRef(resetName);
-          await cmdSupervisorReset(resolvedResetName);
-          break;
-        }
-        case "launchd": {
-          const launchdCmd = args[2];
-          if (launchdCmd === "install") {
-            let userPath: string | undefined;
-            for (let li = 3; li < args.length; li++) {
-              if (args[li] === "--path" && li + 1 < args.length) {
-                userPath = args[li + 1];
-                break;
-              }
-            }
-            await cmdSupervisorLaunchdInstall(userPath);
-          } else if (launchdCmd === "uninstall") {
-            cmdSupervisorLaunchdUninstall();
-          } else {
-            console.error("Usage: pty supervisor launchd install|uninstall");
-            process.exit(1);
-          }
-          break;
-        }
-        case "systemd": {
-          const systemdCmd = args[2];
-          let unitName: string | undefined;
-          let userPath: string | undefined;
-          for (let si = 3; si < args.length; si++) {
-            if (args[si] === "--name" && si + 1 < args.length) {
-              unitName = args[++si];
-            } else if (args[si] === "--path" && si + 1 < args.length) {
-              userPath = args[++si];
-            }
-          }
-          if (systemdCmd === "install") {
-            cmdSupervisorSystemdInstall(unitName, userPath);
-          } else if (systemdCmd === "uninstall") {
-            cmdSupervisorSystemdUninstall(unitName);
-          } else {
-            console.error("Usage: pty supervisor systemd install|uninstall");
-            process.exit(1);
-          }
-          break;
-        }
-        case "runit": {
-          const runitCmd = args[2];
-          let serviceName: string | undefined;
-          let svDir: string | undefined;
-          let serviceDir: string | undefined;
-          let userPath: string | undefined;
-          for (let ri = 3; ri < args.length; ri++) {
-            if (args[ri] === "--name" && ri + 1 < args.length) {
-              serviceName = args[++ri];
-            } else if (args[ri] === "--svdir" && ri + 1 < args.length) {
-              svDir = args[++ri];
-            } else if (args[ri] === "--service-dir" && ri + 1 < args.length) {
-              serviceDir = args[++ri];
-            } else if (args[ri] === "--path" && ri + 1 < args.length) {
-              userPath = args[++ri];
-            }
-          }
-          if (runitCmd === "install") {
-            cmdSupervisorRunitInstall(serviceName, svDir, serviceDir, userPath);
-          } else if (runitCmd === "uninstall") {
-            cmdSupervisorRunitUninstall(serviceName, svDir, serviceDir);
-          } else {
-            console.error("Usage: pty supervisor runit install|uninstall");
-            process.exit(1);
-          }
-          break;
-        }
-        default:
-          console.error(`Unknown supervisor command: ${subCmd}`);
-          process.exit(1);
-      }
       break;
     }
 
@@ -1817,13 +1711,12 @@ async function cmdKill(name: string): Promise<void> {
     process.exit(1);
   }
 
-  // Remove supervision tags so the supervisor doesn't restart it
-  const wasSupervised = session.metadata?.tags?.strategy === "permanent" || session.metadata?.tags?.strategy === "temporary";
-  if (wasSupervised) {
+  // Strip the `strategy` tag so `pty gc` doesn't respawn the session on
+  // its next tick. The `supervisor.status` tag is no longer a thing.
+  const wasPermanent = session.metadata?.tags?.strategy === "permanent";
+  if (wasPermanent) {
     try {
-      const removals = ["strategy"];
-      if (session.metadata?.tags?.["supervisor.status"]) removals.push("supervisor.status");
-      updateTags(name, {}, removals);
+      updateTags(name, {}, ["strategy"]);
     } catch {}
   }
 
@@ -1835,7 +1728,7 @@ async function cmdKill(name: string): Promise<void> {
   }
   cleanupSocket(name);
 
-  if (wasSupervised && session.metadata?.tags?.ptyfile) {
+  if (wasPermanent && session.metadata?.tags?.ptyfile) {
     console.error(`Note: this session is managed by ${session.metadata.tags.ptyfile}`);
     console.error("The strategy tag will be restored on the next 'pty up'.");
   }
@@ -1995,14 +1888,26 @@ async function cmdRm(name: string): Promise<void> {
 }
 
 async function cmdGc(dryRun: boolean): Promise<void> {
-  const removed = await gc({ dryRun });
+  const result = await gc({ dryRun });
   const prunedTags = await pruneOrphanLayoutTags({ dryRun });
 
-  const verb = dryRun ? "Would remove" : "Removed";
+  const killedVerb = dryRun ? "Would kill orphan child" : "Killed orphan child";
+  const respawnVerb = dryRun ? "Would respawn" : "Respawned";
+  const removeVerb = dryRun ? "Would remove" : "Removed";
   const prunedVerb = dryRun ? "Would prune" : "Pruned";
 
-  for (const name of removed) {
-    console.log(`${verb}: ${name}`);
+  for (const k of result.killedOrphanChildren) {
+    console.log(`${killedVerb}: ${k.name} (parent ${k.parent} ${k.reason})`);
+  }
+  for (const r of result.respawned) {
+    const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
+    console.log(`${respawnVerb}: ${r.name}${note}`);
+  }
+  for (const f of result.respawnFailed) {
+    console.log(`Respawn failed: ${f.name} — ${f.error}`);
+  }
+  for (const name of result.removed) {
+    console.log(`${removeVerb}: ${name}`);
   }
   for (const { name, removedKeys } of prunedTags) {
     console.log(
@@ -2011,23 +1916,92 @@ async function cmdGc(dryRun: boolean): Promise<void> {
   }
 
   const totalTags = prunedTags.reduce((sum, r) => sum + r.removedKeys.length, 0);
-  if (removed.length === 0 && totalTags === 0) {
+  const totalActions =
+    result.killedOrphanChildren.length +
+    result.respawned.length +
+    result.respawnFailed.length +
+    result.removed.length +
+    totalTags;
+
+  if (totalActions === 0) {
     console.log(dryRun ? "Nothing would be cleaned up." : "Nothing to clean up.");
     return;
   }
 
   const parts: string[] = [];
-  if (removed.length > 0) {
-    parts.push(`${removed.length} stale session${removed.length === 1 ? "" : "s"}`);
+  if (result.killedOrphanChildren.length > 0) {
+    parts.push(`${result.killedOrphanChildren.length} orphan child${result.killedOrphanChildren.length === 1 ? "" : "ren"}`);
+  }
+  if (result.respawned.length > 0) {
+    parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);
+  }
+  if (result.respawnFailed.length > 0) {
+    parts.push(`${result.respawnFailed.length} respawn failure${result.respawnFailed.length === 1 ? "" : "s"}`);
+  }
+  if (result.removed.length > 0) {
+    parts.push(`${result.removed.length} stale session${result.removed.length === 1 ? "" : "s"}`);
   }
   if (totalTags > 0) {
     parts.push(`${totalTags} orphan tag${totalTags === 1 ? "" : "s"}`);
   }
   console.log(
     dryRun
-      ? `Would clean up ${parts.join(" and ")}. (Dry run — no changes made.)`
-      : `Cleaned up ${parts.join(" and ")}.`,
+      ? `Would clean up ${parts.join(", ")}. (Dry run — no changes made.)`
+      : `Cleaned up ${parts.join(", ")}.`,
   );
+}
+
+/** Print a minimal launchd plist that runs `pty gc` every `interval`
+ *  seconds. Pure stdout — the caller redirects to
+ *  `~/Library/LaunchAgents/com.myobie.pty.gc.plist` and `launchctl load`s
+ *  it themselves. No FDA dance, no bundled binary; just node + the gc
+ *  command, inheriting PATH and PTY_SESSION_DIR. If the SSD where node
+ *  lives isn't mounted at boot, the invocation fails — the next tick
+ *  tries again. That's the whole point. */
+function printLaunchdPlist(interval: number): void {
+  const logPath = path.join(os.homedir(), ".local", "state", "pty", "gc.log");
+  const ptyBin = process.argv[1];
+  const envPath = process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  const sessionDir = getSessionDir();
+  const escape = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  // We point ProgramArguments at node + the resolved CLI script so the
+  // plist doesn't depend on the `pty` shim staying on PATH at launchd's
+  // (minimal) shell. EnvironmentVariables still carries PATH so the
+  // spawned children (and any `which` inside pty itself) find the user's
+  // tools.
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.myobie.pty.gc</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escape(process.execPath)}</string>
+    <string>${escape(ptyBin)}</string>
+    <string>gc</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${interval}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${escape(logPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${escape(logPath)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${escape(envPath)}</string>
+    <key>PTY_SESSION_DIR</key>
+    <string>${escape(sessionDir)}</string>
+  </dict>
+</dict>
+</plist>
+`;
+  process.stdout.write(plist);
 }
 
 // --- tag-multi: read/write tags across multiple sessions in one call ---
@@ -2489,569 +2463,6 @@ async function readAllStdin(): Promise<string> {
   });
 }
 
-async function cmdSupervisorStart(): Promise<void> {
-  // Run the supervisor in the foreground (not in a pty session).
-  // This makes it work with launchd KeepAlive since launchd owns the process.
-  // Use `pty events supervisor` to follow activity, `pty supervisor status` for state.
-  const { Supervisor } = await import("./supervisor.ts");
-
-  const sup = new Supervisor("supervisor");
-  sup.start();
-
-  console.log(`[supervisor] started (pid ${process.pid})`);
-  console.log(`[supervisor] watching ${getSessionDir()}`);
-
-  process.on("SIGTERM", () => {
-    console.log("[supervisor] stopping...");
-    sup.stop();
-    process.exit(0);
-  });
-  process.on("SIGINT", () => {
-    console.log("[supervisor] stopping...");
-    sup.stop();
-    process.exit(0);
-  });
-
-  // Keep the process alive
-  await new Promise(() => {});
-}
-
-async function cmdSupervisorStop(): Promise<void> {
-  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
-  let pid: number;
-  try {
-    pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
-  } catch {
-    console.error("Supervisor is not running.");
-    process.exit(1);
-  }
-  try {
-    process.kill(pid, 0); // check if alive
-    process.kill(pid, "SIGTERM");
-    console.log("Supervisor stopped.");
-  } catch {
-    console.error("Supervisor is not running (stale pid file).");
-    try { fs.unlinkSync(pidPath); } catch {}
-    process.exit(1);
-  }
-}
-
-async function cmdSupervisorStatus(): Promise<void> {
-  const sessions = await listSessions();
-  const supervised = sessions.filter((s) =>
-    s.metadata?.tags?.strategy === "permanent" || s.metadata?.tags?.strategy === "temporary"
-  );
-
-  if (supervised.length === 0) {
-    console.log("No supervised sessions.");
-    return;
-  }
-
-  // Try to read supervisor state for restart counts
-  let state: Record<string, any> = {};
-  try {
-    const content = fs.readFileSync(path.join(getSupervisorDir(), "state.json"), "utf-8");
-    state = JSON.parse(content).sessions ?? {};
-  } catch {}
-
-  let supervisorRunning = false;
-  try {
-    const pid = parseInt(fs.readFileSync(path.join(getSupervisorDir(), "supervisor.pid"), "utf-8").trim(), 10);
-    process.kill(pid, 0);
-    supervisorRunning = true;
-  } catch {}
-  console.log(`Supervisor: ${supervisorRunning ? "\x1b[32mrunning\x1b[0m" : "\x1b[31mnot running\x1b[0m"}`);
-  console.log("");
-
-  for (const s of supervised) {
-    const strategy = s.metadata!.tags!.strategy;
-    const supStatus = s.metadata?.tags?.["supervisor.status"];
-    const stateInfo = state[s.name];
-    const restarts = stateInfo?.restartCount ?? 0;
-
-    let status = s.status === "running" ? "\x1b[32mrunning\x1b[0m" : "\x1b[33mexited\x1b[0m";
-    if (supStatus === "failed") status = "\x1b[31mfailed\x1b[0m";
-
-    console.log(`  \x1b[1m${s.name}\x1b[0m [${strategy}] — ${status}${restarts > 0 ? ` (${restarts} restarts)` : ""}`);
-  }
-}
-
-async function cmdSupervisorForget(name: string): Promise<void> {
-  const meta = readMetadata(name);
-  if (!meta) {
-    console.error(`Session "${name}" not found.`);
-    process.exit(1);
-  }
-
-  const removals: string[] = [];
-  if (meta.tags?.strategy) removals.push("strategy");
-  if (meta.tags?.["supervisor.status"]) removals.push("supervisor.status");
-
-  if (removals.length === 0) {
-    console.log(`Session "${name}" is not supervised.`);
-    return;
-  }
-
-  updateTags(name, {}, removals);
-  console.log(`Removed supervision from "${name}".`);
-
-  if (meta.tags?.ptyfile) {
-    console.error(`\nWarning: this session is managed by ${meta.tags.ptyfile}`);
-    console.error("The strategy tag will be restored on the next 'pty up'.");
-    console.error("Edit the pty.toml to make this permanent.");
-  }
-}
-
-async function cmdSupervisorReset(name: string): Promise<void> {
-  const meta = readMetadata(name);
-  if (!meta) {
-    console.error(`Session "${name}" not found.`);
-    process.exit(1);
-  }
-
-  if (meta.tags?.["supervisor.status"] !== "failed") {
-    console.log(`Session "${name}" is not in failed state.`);
-    return;
-  }
-
-  // Remove the failed tag
-  updateTags(name, {}, ["supervisor.status"]);
-
-  // Reset restart counter in supervisor state
-  const statePath = path.join(getSupervisorDir(), "state.json");
-  try {
-    const content = fs.readFileSync(statePath, "utf-8");
-    const state = JSON.parse(content);
-    if (state.sessions?.[name]) {
-      state.sessions[name].restartCount = 0;
-      state.sessions[name].restartWindowStart = 0;
-      state.sessions[name].nextBackoffMs = 1000;
-      state.sessions[name].failed = false;
-      atomicWriteFileSync(statePath, JSON.stringify(state, null, 2));
-    }
-  } catch {}
-
-  console.log(`Reset "${name}". The supervisor will try restarting it.`);
-}
-
-function stopExistingSupervisorIfRunning(): void {
-  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
-  try {
-    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    try { fs.unlinkSync(pidPath); } catch {}
-    console.log("Stopped existing supervisor.");
-  } catch {}
-}
-
-function getSourceRoot(): string {
-  return path.join(
-    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
-    "..",
-  );
-}
-
-function getSupervisorEntryPoint(): string {
-  return path.join(getSourceRoot(), "dist", "supervisor-entry.js");
-}
-
-function ensureSupervisorBuildExists(): void {
-  const entryPoint = getSupervisorEntryPoint();
-  if (!fs.existsSync(entryPoint)) {
-    console.error(`Missing ${entryPoint}. Run: npm run build`);
-    process.exit(1);
-  }
-}
-
-function getConfigHome(): string {
-  return process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function systemdQuote(value: string): string {
-  return `"${value.replace(/["\\$`]/g, "\\$&")}"`;
-}
-
-function normalizeServiceName(name: string | undefined, suffix: string): string {
-  const raw = (name && name.trim()) ? name.trim() : `pty-supervisor${suffix}`;
-  return raw.endsWith(suffix) ? raw : `${raw}${suffix}`;
-}
-
-function runChecked(command: string, args: string[], options: Parameters<typeof spawnSync>[2] = {}): ReturnType<typeof spawnSync> {
-  const result = spawnSync(command, args, { encoding: "utf-8", ...options });
-  if (result.status !== 0) {
-    const stderr = String(result.stderr ?? "").trim();
-    const stdout = String(result.stdout ?? "").trim();
-    console.error(`Failed: ${command} ${args.join(" ")}`);
-    if (stderr) console.error(stderr);
-    else if (stdout) console.error(stdout);
-    process.exit(result.status ?? 1);
-  }
-  return result;
-}
-
-function maybePrintSystemdLingerHint(): void {
-  const user = os.userInfo().username;
-  const result = spawnSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], {
-    encoding: "utf-8",
-  });
-  if (result.status === 0 && result.stdout.trim().toLowerCase() !== "yes") {
-    console.log("");
-    console.log(`Note: loginctl linger is disabled for ${user}.`);
-    console.log("This user service will start while you're logged in, but not at boot.");
-    console.log(`To keep it running across reboots, run: sudo loginctl enable-linger ${user}`);
-  }
-}
-
-function cmdSupervisorSystemdInstall(unitName?: string, userPath?: string): void {
-  ensureSupervisorBuildExists();
-  stopExistingSupervisorIfRunning();
-
-  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  const entryPoint = getSupervisorEntryPoint();
-  const resolvedUnit = normalizeServiceName(unitName, ".service");
-  const unitDir = path.join(getConfigHome(), "systemd", "user");
-  const unitPath = path.join(unitDir, resolvedUnit);
-  const sessionDir = getSessionDir();
-
-  fs.mkdirSync(unitDir, { recursive: true });
-  fs.writeFileSync(unitPath, `[Unit]
-Description=pty supervisor
-
-[Service]
-Type=simple
-Environment=${systemdQuote(`PATH=${envPath}`)}
-Environment=${systemdQuote(`TERM=xterm-256color`)}
-Environment=${systemdQuote(`COLORTERM=truecolor`)}
-Environment=${systemdQuote(`PTY_SESSION_DIR=${sessionDir}`)}
-WorkingDirectory=${os.homedir()}
-ExecStart=${process.execPath} ${entryPoint}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-`);
-
-  runChecked("systemctl", ["--user", "daemon-reload"]);
-  runChecked("systemctl", ["--user", "enable", "--now", resolvedUnit]);
-
-  console.log(`Installed systemd user unit: ${unitPath}`);
-  console.log(`Manage it with: systemctl --user status ${resolvedUnit}`);
-  maybePrintSystemdLingerHint();
-}
-
-function cmdSupervisorSystemdUninstall(unitName?: string): void {
-  const resolvedUnit = normalizeServiceName(unitName, ".service");
-  const unitPath = path.join(getConfigHome(), "systemd", "user", resolvedUnit);
-
-  spawnSync("systemctl", ["--user", "disable", "--now", resolvedUnit], { encoding: "utf-8" });
-  try { fs.unlinkSync(unitPath); } catch {}
-  runChecked("systemctl", ["--user", "daemon-reload"]);
-  spawnSync("systemctl", ["--user", "reset-failed", resolvedUnit], { encoding: "utf-8" });
-  stopExistingSupervisorIfRunning();
-
-  console.log(`Removed systemd user unit: ${unitPath}`);
-}
-
-function cmdSupervisorRunitInstall(
-  serviceName?: string,
-  svDir?: string,
-  serviceDir?: string,
-  userPath?: string,
-): void {
-  ensureSupervisorBuildExists();
-  stopExistingSupervisorIfRunning();
-
-  const resolvedName = normalizeServiceName(serviceName, "");
-  const resolvedSvDir = path.resolve(svDir ?? path.join(getConfigHome(), "runit", "sv"));
-  const resolvedServiceDir = path.resolve(serviceDir ?? path.join(getConfigHome(), "runit", "service"));
-  const servicePath = path.join(resolvedSvDir, resolvedName);
-  const runPath = path.join(servicePath, "run");
-  const linkPath = path.join(resolvedServiceDir, resolvedName);
-  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  const sessionDir = getSessionDir();
-  const entryPoint = getSupervisorEntryPoint();
-
-  fs.mkdirSync(resolvedSvDir, { recursive: true });
-  fs.mkdirSync(resolvedServiceDir, { recursive: true });
-  fs.rmSync(servicePath, { recursive: true, force: true });
-  fs.mkdirSync(servicePath, { recursive: true, mode: 0o755 });
-
-  fs.writeFileSync(runPath, `#!/bin/sh
-export PATH=${shellQuote(envPath)}
-export TERM=${shellQuote("xterm-256color")}
-export COLORTERM=${shellQuote("truecolor")}
-export PTY_SESSION_DIR=${shellQuote(sessionDir)}
-exec ${shellQuote(process.execPath)} ${shellQuote(entryPoint)}
-`);
-  fs.chmodSync(runPath, 0o755);
-
-  try {
-    const stat = fs.lstatSync(linkPath);
-    if (stat.isSymbolicLink() || stat.isFile()) fs.unlinkSync(linkPath);
-    else {
-      console.error(`Refusing to replace non-symlink path: ${linkPath}`);
-      process.exit(1);
-    }
-  } catch {}
-  fs.symlinkSync(servicePath, linkPath);
-
-  console.log(`Installed runit service: ${servicePath}`);
-  console.log(`Enabled via symlink: ${linkPath}`);
-  console.log(`Start it with: runsvdir ${shellQuote(resolvedServiceDir)}`);
-}
-
-function cmdSupervisorRunitUninstall(serviceName?: string, svDir?: string, serviceDir?: string): void {
-  const resolvedName = normalizeServiceName(serviceName, "");
-  const resolvedSvDir = path.resolve(svDir ?? path.join(getConfigHome(), "runit", "sv"));
-  const resolvedServiceDir = path.resolve(serviceDir ?? path.join(getConfigHome(), "runit", "service"));
-  const servicePath = path.join(resolvedSvDir, resolvedName);
-  const linkPath = path.join(resolvedServiceDir, resolvedName);
-
-  try { fs.unlinkSync(linkPath); } catch {}
-  try { fs.rmSync(servicePath, { recursive: true, force: true }); } catch {}
-  stopExistingSupervisorIfRunning();
-
-  console.log(`Removed runit service: ${servicePath}`);
-  console.log(`Removed symlink: ${linkPath}`);
-}
-
-async function cmdSupervisorLaunchdInstall(userPath?: string): Promise<void> {
-  const launchdDir = path.join(os.homedir(), ".local", "pty", "launchd");
-  const wrapperPath = path.join(launchdDir, "pty-supervisor");
-  const bundlePath = path.join(launchdDir, "supervisor.bundle.js");
-  const logPath = path.join(os.homedir(), ".local", "state", "pty", "supervisor.log");
-  const plistDir = path.join(os.homedir(), "Library", "LaunchAgents");
-  const plistPath = path.join(plistDir, "com.myobie.pty.supervisor.plist");
-
-  // Stop existing supervisor if running
-  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
-  try {
-    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    try { fs.unlinkSync(pidPath); } catch {}
-    console.log("Stopped existing supervisor.");
-  } catch {}
-
-  // Unload existing plist if present
-  if (fs.existsSync(plistPath)) {
-    spawnSync("launchctl", ["unload", plistPath], { encoding: "utf-8" });
-  }
-
-  const srcRoot = path.join(
-    import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
-    ".."
-  );
-  const distDir = path.join(srcRoot, "dist");
-  const nodeBin = process.execPath;
-  const wrapperSrc = path.join(srcRoot, "scripts", "supervisor-wrapper.c");
-
-  // Clean and create launchd directory
-  fs.rmSync(launchdDir, { recursive: true, force: true });
-  fs.mkdirSync(launchdDir, { recursive: true });
-
-  // Bundle the supervisor
-  const entryPoint = path.join(distDir, "supervisor-entry.js");
-  const serverModule = path.join(distDir, "server.js");
-
-  console.log("Bundling supervisor...");
-  const esbuildResult = spawnSync("npx", ["esbuild", entryPoint, "--bundle", "--platform=node", "--format=esm", `--outfile=${bundlePath}`, `--define:SERVER_MODULE_PATH="${serverModule.replace(/\\/g, "\\\\")}"`], {
-    encoding: "utf-8",
-    cwd: distDir,
-  });
-  if (esbuildResult.status !== 0) {
-    console.error(`Failed to bundle supervisor: ${esbuildResult.stderr}`);
-    process.exit(1);
-  }
-
-  // Compile the FDA wrapper binary with PATH baked in
-  const envPath = userPath ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  console.log("Compiling FDA wrapper...");
-  const ccResult = spawnSync("cc", [
-    "-O2", "-o", wrapperPath,
-    `-DNODE_PATH="${nodeBin}"`,
-    `-DBUNDLE_PATH="${bundlePath}"`,
-    `-DUSER_PATH="${envPath}"`,
-    wrapperSrc,
-  ], { encoding: "utf-8" });
-  if (ccResult.status !== 0) {
-    console.error(`Failed to compile wrapper: ${ccResult.stderr}`);
-    process.exit(1);
-  }
-
-  // Run --check via a one-shot launchd job to test under launchd's actual
-  // permission scope (not the terminal's). This is the only reliable way to
-  // know if the wrapper binary has FDA.
-  function checkFDAViaLaunchd(): boolean {
-    const checkLabel = "com.myobie.pty.fda-check";
-    const checkOutput = path.join(launchdDir, "fda-check.log");
-    const checkPlist = path.join(launchdDir, "fda-check.plist");
-
-    try { fs.unlinkSync(checkOutput); } catch {}
-
-    fs.writeFileSync(checkPlist, `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${checkLabel}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${wrapperPath}</string>
-    <string>--check</string>
-  </array>
-  <key>StandardOutPath</key>
-  <string>${checkOutput}</string>
-  <key>StandardErrorPath</key>
-  <string>${checkOutput}</string>
-  <key>RunAtLoad</key>
-  <true/>
-</dict>
-</plist>
-`);
-
-    // Unload any previous check job
-    spawnSync("launchctl", ["unload", checkPlist], { encoding: "utf-8" });
-
-    // Load — runs immediately due to RunAtLoad
-    spawnSync("launchctl", ["load", checkPlist], { encoding: "utf-8" });
-
-    // Wait for the job to finish (it's a one-shot, exits quickly)
-    const start = Date.now();
-    while (Date.now() - start < 5000) {
-      const list = spawnSync("launchctl", ["list"], { encoding: "utf-8" });
-      const line = list.stdout.split("\n").find((l: string) => l.includes(checkLabel));
-      // Format: "PID\tExitCode\tLabel" — if PID is "-", the job has exited
-      if (line && line.startsWith("-")) break;
-      spawnSync("sleep", ["0.2"]);
-    }
-
-    // Unload the check job
-    spawnSync("launchctl", ["unload", checkPlist], { encoding: "utf-8" });
-    try { fs.unlinkSync(checkPlist); } catch {}
-
-    // Read the output
-    try {
-      const output = fs.readFileSync(checkOutput, "utf-8");
-      try { fs.unlinkSync(checkOutput); } catch {}
-      return output.includes("All checks passed");
-    } catch {
-      return false;
-    }
-  }
-
-  console.log("Checking Full Disk Access via launchd...");
-  let hasFDA = checkFDAViaLaunchd();
-
-  if (!hasFDA) {
-    console.log("");
-    console.log("The supervisor wrapper needs Full Disk Access to manage");
-    console.log("sessions on external/removable volumes.");
-    console.log("");
-    console.log("1. Open System Settings > Privacy & Security > Full Disk Access");
-    console.log(`2. Click + and add: ${wrapperPath}`);
-    console.log("");
-
-    // Open the folder in Finder so they can find the binary
-    spawnSync("open", [launchdDir]);
-
-    const rl = await import("node:readline/promises");
-    const prompt = rl.createInterface({ input: process.stdin, output: process.stdout });
-    const answer = await prompt.question("Have you granted Full Disk Access? [y/N] ");
-    prompt.close();
-
-    if (answer.trim().toLowerCase() !== "y") {
-      console.error("Aborted. Full Disk Access is required for launchd.");
-      process.exit(1);
-    }
-
-    // Re-check via launchd
-    console.log("Verifying...");
-    hasFDA = checkFDAViaLaunchd();
-    if (!hasFDA) {
-      console.error("");
-      console.error("Full Disk Access check failed under launchd.");
-      console.error("The plist was NOT loaded. Grant FDA and try again:");
-      console.error(`  ${wrapperPath}`);
-      process.exit(1);
-    }
-    console.log("Full Disk Access verified.");
-  } else {
-    console.log("Full Disk Access: granted.");
-  }
-
-  // Write and load the plist — FDA is confirmed
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.myobie.pty.supervisor</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${wrapperPath}</string>
-  </array>
-  <key>StandardOutPath</key>
-  <string>${logPath}</string>
-  <key>StandardErrorPath</key>
-  <string>${logPath}</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>5</integer>
-</dict>
-</plist>
-`;
-
-  fs.mkdirSync(plistDir, { recursive: true });
-  fs.writeFileSync(plistPath, plist);
-
-  const result = spawnSync("launchctl", ["load", plistPath], { encoding: "utf-8" });
-  if (result.status !== 0) {
-    console.error(`Failed to load plist: ${result.stderr}`);
-    process.exit(1);
-  }
-
-  console.log("");
-  console.log(`Wrapper: ${wrapperPath}`);
-  console.log(`Bundle:  ${bundlePath}`);
-  console.log(`Plist:   ${plistPath}`);
-  console.log(`Log:     ${logPath}`);
-  console.log("Supervisor will start on login and restart if it exits.");
-}
-
-function cmdSupervisorLaunchdUninstall(): void {
-  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", "com.myobie.pty.supervisor.plist");
-  const launchdDir = path.join(os.homedir(), ".local", "pty", "launchd");
-
-  if (!fs.existsSync(plistPath)) {
-    console.error("Supervisor is not registered with launchd.");
-    process.exit(1);
-  }
-
-  spawnSync("launchctl", ["unload", plistPath], { encoding: "utf-8" });
-  try { fs.unlinkSync(plistPath); } catch {}
-
-  // Clean up bundled files
-  try { fs.rmSync(launchdDir, { recursive: true, force: true }); } catch {}
-
-  // Stop supervisor if running
-  const pidPath = path.join(getSupervisorDir(), "supervisor.pid");
-  try {
-    const pid = parseInt(fs.readFileSync(pidPath, "utf-8").trim(), 10);
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    try { fs.unlinkSync(pidPath); } catch {}
-  } catch {}
-
-  console.log("Supervisor removed from launchd.");
-  console.log(`Cleaned up ${launchdDir}`);
-}
 
 function hasPtyFile(dir: string): boolean {
   try {
@@ -3250,20 +2661,19 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
 
     const label = existingSession.metadata?.displayName ?? existingSession.name;
 
-    // Remove supervision tags so the supervisor doesn't restart it
-    const wasSupervised = existingSession.metadata?.tags?.strategy === "permanent" || existingSession.metadata?.tags?.strategy === "temporary";
-    if (wasSupervised) {
+    // Strip the `strategy` tag so `pty gc` doesn't respawn the session
+    // on its next tick. The `supervisor.status` tag is no longer a thing.
+    const wasPermanent = existingSession.metadata?.tags?.strategy === "permanent";
+    if (wasPermanent) {
       try {
-        const removals = ["strategy"];
-        if (existingSession.metadata?.tags?.["supervisor.status"]) removals.push("supervisor.status");
-        updateTags(existingSession.name, {}, removals);
+        updateTags(existingSession.name, {}, ["strategy"]);
       } catch {}
     }
 
     if (existingSession.status === "running" && existingSession.pid) {
       try {
         process.kill(existingSession.pid, "SIGTERM");
-        console.log(`  ○ ${label} (stopped${wasSupervised ? ", removed from supervision" : ""})`);
+        console.log(`  ○ ${label} (stopped${wasPermanent ? ", removed from supervision" : ""})`);
         stopped++;
       } catch {
         console.error(`  ✗ ${label}: failed to stop`);
@@ -3455,10 +2865,7 @@ function ask(prompt: string): Promise<string> {
 
 function strategyMarker(tags?: Record<string, string>): string {
   if (!tags) return "";
-  const supStatus = tags["supervisor.status"];
-  if (supStatus === "failed") return " \x1b[31m[failed]\x1b[0m";
   if (tags.strategy === "permanent") return " \x1b[33m[permanent]\x1b[0m";
-  if (tags.strategy === "temporary") return " \x1b[2m[temporary]\x1b[0m";
   return "";
 }
 

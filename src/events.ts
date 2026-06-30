@@ -14,10 +14,7 @@ export const EventType = {
   SESSION_START: "session_start",
   SESSION_EXIT: "session_exit",
   SESSION_EXEC: "session_exec",
-  SESSION_RESTART: "session_restart",
-  SESSION_FAILED: "session_failed",
-  SUPERVISOR_START: "supervisor_start",
-  SUPERVISOR_STOP: "supervisor_stop",
+  SESSION_RESPAWN: "session_respawn",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -78,24 +75,12 @@ export interface SessionExecEvent extends EventBase {
   command: string;
 }
 
-export interface SessionRestartEvent extends EventBase {
-  type: "session_restart";
-  restartCount: number;
-  backoffMs: number;
-}
-
-export interface SessionFailedEvent extends EventBase {
-  type: "session_failed";
-  restartCount: number;
-  reason: string;
-}
-
-export interface SupervisorStartEvent extends EventBase {
-  type: "supervisor_start";
-}
-
-export interface SupervisorStopEvent extends EventBase {
-  type: "supervisor_stop";
+/** Emitted by `pty gc` whenever it respawns a `strategy=permanent`
+ *  session that's exited/vanished. Carries no payload beyond the
+ *  envelope — the restart is stateless, there is no attempt counter,
+ *  and the cron interval is the rate limit. */
+export interface SessionRespawnEvent extends EventBase {
+  type: "session_respawn";
 }
 
 /** User-published event. `type` must begin with `user.` — the CLI
@@ -148,10 +133,7 @@ export type EventRecord =
   | SessionStartEvent
   | SessionExitEvent
   | SessionExecEvent
-  | SessionRestartEvent
-  | SessionFailedEvent
-  | SupervisorStartEvent
-  | SupervisorStopEvent
+  | SessionRespawnEvent
   | UserEvent
   | StateSetEvent
   | StateDeleteEvent
@@ -496,14 +478,8 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} exited (code ${event.exitCode})`;
     case "session_exec":
       return `${prefix} exec ${event.command} (was ${event.previousCommand})`;
-    case "session_restart":
-      return `${prefix} restarted (attempt ${event.restartCount}, backoff ${event.backoffMs}ms)`;
-    case "session_failed":
-      return `${prefix} failed — ${event.reason}`;
-    case "supervisor_start":
-      return `${prefix} supervisor started`;
-    case "supervisor_stop":
-      return `${prefix} supervisor stopped`;
+    case "session_respawn":
+      return `${prefix} respawned`;
     case "state.set":
       return `${prefix} state.set ${event.key} = ${JSON.stringify(event.value)}`;
     case "state.delete":

@@ -8,7 +8,7 @@ export {
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
   getState, getStateKey, setState, deleteState, listStateKeys,
-  type SessionInfo, type SessionMetadata, type PrunedTagResult,
+  type SessionInfo, type SessionMetadata, type PrunedTagResult, type GcResult,
 } from "./sessions.ts";
 
 // Session creation
@@ -37,8 +37,7 @@ export {
   type BellEvent, type TitleChangeEvent, type NotificationEvent,
   type FocusRequestEvent, type CursorVisibleEvent,
   type SessionStartEvent, type SessionExitEvent, type SessionExecEvent,
-  type SessionRestartEvent, type SessionFailedEvent,
-  type SupervisorStartEvent, type SupervisorStopEvent,
+  type SessionRespawnEvent,
   type UserEvent, type StateSetEvent, type StateDeleteEvent,
   type DisplayNameChangeEvent, type TagsChangeEvent,
   type FollowerOptions,

@@ -58,9 +58,8 @@ complete -c pty -n __pty_needs_command -a restart -d 'Restart an exited session'
 complete -c pty -n __pty_needs_command -a kill -d 'Kill a running session'
 complete -c pty -n __pty_needs_command -a rm -d 'Remove an exited session'
 complete -c pty -n __pty_needs_command -a remove -d 'Remove an exited session'
-complete -c pty -n __pty_needs_command -a gc -d 'Remove all exited sessions'
+complete -c pty -n __pty_needs_command -a gc -d 'Reconcile sessions (kill orphan children, respawn permanents, sweep exited)'
 complete -c pty -n __pty_needs_command -a tag -d 'Show or modify session tags'
-complete -c pty -n __pty_needs_command -a supervisor -d 'Manage the session supervisor'
 complete -c pty -n __pty_needs_command -a up -d 'Start sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a down -d 'Stop sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a wrap -d 'Auto-wrap a command in pty sessions'
@@ -137,6 +136,8 @@ complete -c pty -n '__pty_using_command unwrap' -a '(__pty_wrapped)' -d 'Wrapped
 complete -c pty -n '__pty_using_command tag' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command tag' -l rm -d 'Remove a tag'
 
-# supervisor: subcommands
-complete -c pty -n '__pty_using_command supervisor' -a 'start stop status forget reset launchd' -d 'Subcommand'
+# gc: flags
+complete -c pty -n '__pty_using_command gc' -s n -l dry-run -d 'Preview without changing anything'
+complete -c pty -n '__pty_using_command gc' -l print-launchd-plist -d 'Print a macOS launchd plist that runs pty gc'
+complete -c pty -n '__pty_using_command gc' -l interval -x -d 'Plist StartInterval in seconds (default 30)'
 

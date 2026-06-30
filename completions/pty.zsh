@@ -38,9 +38,8 @@ _pty() {
     'kill:Kill a running session'
     'rm:Remove an exited session'
     'remove:Remove an exited session'
-    'gc:Remove all exited sessions'
+    'gc:Reconcile sessions (kill orphan children, respawn permanents, sweep exited)'
     'tag:Show or modify session tags'
-    'supervisor:Manage the session supervisor'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'wrap:Auto-wrap a command in pty sessions'
@@ -108,30 +107,13 @@ _pty() {
             '--tags[Show tags as #key=value]'
           ;;
         gc)
-          # No arguments
+          _arguments \
+            '(-n --dry-run)'{-n,--dry-run}'[Preview without changing anything]' \
+            '--print-launchd-plist[Print a macOS launchd plist that runs pty gc]' \
+            '--interval[Plist StartInterval in seconds (default 30)]:seconds:'
           ;;
         tag)
           _arguments '1:session:_pty_sessions'
-          ;;
-        supervisor)
-          local -a subcmds
-          subcmds=(
-            'start:Start the supervisor'
-            'stop:Stop the supervisor'
-            'status:Show supervised sessions'
-            'forget:Stop supervising a session'
-            'reset:Reset a failed session for retry'
-            'launchd:Register/unregister with macOS launchd'
-          )
-          _arguments '1:subcommand:->subcmd' '*::arg:->subargs'
-          case $state in
-            subcmd) _describe 'subcommand' subcmds ;;
-            subargs)
-              case ${words[1]} in
-                forget|reset) _arguments '1:session:_pty_sessions' ;;
-                launchd) _arguments '1:action:(install uninstall)' ;;
-              esac ;;
-          esac
           ;;
         wrap)
           _arguments \

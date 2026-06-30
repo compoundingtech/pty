@@ -464,16 +464,190 @@ export async function allRefs(): Promise<Set<string>> {
   return refs;
 }
 
-/** Remove all exited **and** vanished sessions. Returns the names of removed
- *  sessions. `dryRun: true` performs the same walk but doesn't delete — useful
- *  for preview UIs. */
-export async function gc(opts: { dryRun?: boolean } = {}): Promise<string[]> {
-  const sessions = await listSessions();
-  const gone = sessions.filter((s) => isGone(s.status));
-  if (!opts.dryRun) {
-    for (const s of gone) cleanupAll(s.name);
+/** Result of a `gc()` reconciliation pass. The four buckets correspond
+ *  to the three reconciliation steps: orphan-kill (step 1), permanent
+ *  respawn success / failure (step 2), and the sweep of exited
+ *  non-permanent sessions (step 3 — the historic `gc()` behavior). */
+export interface GcResult {
+  /** Names of exited/vanished non-permanent sessions whose metadata was
+   *  removed. Empty under `dryRun: true` callers should treat the same
+   *  list as the preview. */
+  removed: string[];
+  /** Children killed because their `parent=` referent is dead or missing. */
+  killedOrphanChildren: { name: string; parent: string; reason: "missing" | "dead" }[];
+  /** Permanent sessions respawned this pass. `ptyfileReread` indicates
+   *  whether the spawn used a fresh `pty.toml` read (when the session
+   *  carries `ptyfile` + `ptyfile.session` tags) or its stored metadata. */
+  respawned: { name: string; ptyfileReread: boolean }[];
+  /** Permanent sessions where respawn was attempted but failed (e.g. the
+   *  binary is on an unmounted volume). Cron interval is the rate limit;
+   *  next tick tries again. */
+  respawnFailed: { name: string; error: string }[];
+}
+
+/** Reconciliation pass driven by `pty gc`. Stateless: every invocation
+ *  re-derives intent from on-disk metadata. Three steps run in order:
+ *
+ *    1. Orphan-kill: children with a `parent=<name>` tag whose parent's
+ *       metadata is gone OR whose parent's pid isn't alive get SIGTERM'd
+ *       and `cleanupAll`'d. Runs first so a permanent child whose parent
+ *       has died isn't immediately respawned by step 2.
+ *    2. Permanent respawn: every `strategy=permanent` session that's
+ *       exited/vanished is respawned via `spawnDaemon` (lazy-imported to
+ *       avoid the `sessions ↔ spawn` cycle). Sessions with `ptyfile` +
+ *       `ptyfile.session` tags re-read the toml to pick up any edits.
+ *    3. Existing sweep: the historic behavior — exited/vanished sessions
+ *       that aren't permanent get `cleanupAll`'d. */
+export async function gc(opts: { dryRun?: boolean } = {}): Promise<GcResult> {
+  const dryRun = !!opts.dryRun;
+  // First call to `listSessions` is intentionally throwaway — it has a
+  // side effect (`cleanupSocket`) on sessions whose daemon SIGKILL'd
+  // without writing an exit record, and those sessions are then *missing*
+  // from the returned array (their entry is dropped because `seen` set
+  // contained the name but the alive checks failed). A second call sees
+  // them via the `.json` files loop as `status=vanished`. Without this
+  // priming pass, step 1's orphan-kill misses vanished sessions whose
+  // sockets were still on disk when gc started.
+  await listSessions();
+  const initial = await listSessions();
+
+  // STEP 1: orphan-children. Sort by name so cycles (A→B, B→A) resolve
+  // deterministically — whichever name sorts first wins this tick; the
+  // loser dies; on the next tick the winner has no live parent either
+  // and dies too. No cycle detection needed.
+  const killedOrphanChildren: GcResult["killedOrphanChildren"] = [];
+  const withParent = initial
+    .filter((s) => s.metadata?.tags?.parent)
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const s of withParent) {
+    const parentRef = s.metadata!.tags!.parent;
+    const parentMeta = readMetadata(parentRef);
+    const parentPid = parentMeta ? readPid(parentRef) : null;
+    const parentAlive = parentMeta != null && parentPid !== null && isProcessAlive(parentPid);
+    if (parentAlive) continue;
+    const reason: "missing" | "dead" = parentMeta ? "dead" : "missing";
+    if (!dryRun) {
+      if (s.status === "running" && s.pid != null) {
+        // SIGTERM the live daemon, then wait briefly for it to exit so
+        // its shutdown handler doesn't race our cleanupAll by writing
+        // metadata back to disk after we've removed it. We poll the
+        // pid (up to ~1s) and fall through whether or not the daemon
+        // shut down in time — cleanupAll wipes whatever remains.
+        try { process.kill(s.pid, "SIGTERM"); } catch {}
+        const deadline = Date.now() + 1000;
+        while (Date.now() < deadline) {
+          if (!isProcessAlive(s.pid)) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      }
+      cleanupAll(s.name);
+    }
+    killedOrphanChildren.push({ name: s.name, parent: parentRef, reason });
   }
-  return gone.map((s) => s.name);
+
+  // STEP 2: permanent respawn. Re-list since step 1 may have removed
+  // some metadata (an orphan-killed permanent child should not also
+  // appear here). In dryRun mode the initial list is fine — step 1
+  // didn't mutate anything.
+  const afterStep1 = dryRun ? initial : await listSessions();
+  const respawned: GcResult["respawned"] = [];
+  const respawnFailed: GcResult["respawnFailed"] = [];
+  for (const s of afterStep1) {
+    if (s.metadata?.tags?.strategy !== "permanent") continue;
+    if (!isGone(s.status)) continue;
+    const ptyfileReread = !!s.metadata?.tags?.ptyfile;
+    if (dryRun) {
+      respawned.push({ name: s.name, ptyfileReread });
+      continue;
+    }
+    try {
+      await respawnPermanent(s.name, s.metadata!);
+      respawned.push({ name: s.name, ptyfileReread });
+    } catch (err: any) {
+      respawnFailed.push({ name: s.name, error: err?.message ?? String(err) });
+    }
+  }
+
+  // STEP 3: historic sweep. Exited/vanished non-permanent sessions get
+  // their metadata removed. Permanent sessions are handled by step 2 —
+  // if their respawn succeeded they're back to `running` and skipped;
+  // if it failed we leave the metadata around so the next tick can try
+  // again.
+  const finalList = dryRun ? initial : await listSessions();
+  const removed: string[] = [];
+  for (const s of finalList) {
+    if (!isGone(s.status)) continue;
+    if (s.metadata?.tags?.strategy === "permanent") continue;
+    if (!dryRun) cleanupAll(s.name);
+    removed.push(s.name);
+  }
+
+  return { removed, killedOrphanChildren, respawned, respawnFailed };
+}
+
+/** Restart a `strategy=permanent` session whose daemon is gone. If the
+ *  session was toml-managed (`ptyfile` + `ptyfile.session` tags), re-read
+ *  the pty.toml so the new daemon picks up command/env edits since the
+ *  last spawn. On any read error fall back to the stored metadata
+ *  verbatim (last-known-good) so a temporarily-missing toml doesn't
+ *  prevent restart.
+ *
+ *  Lazy-imports `spawn.ts` so the `sessions.ts ↔ spawn.ts` cycle doesn't
+ *  bite at module-init time. After spawn, appends a `session_respawn`
+ *  event to the session's event log so consumers see the restart. */
+async function respawnPermanent(name: string, metadata: SessionMetadata): Promise<void> {
+  let command = metadata.command;
+  let args = metadata.args;
+  let displayCommand = metadata.displayCommand;
+  let cwd = metadata.cwd;
+  let tags: Record<string, string> | undefined = metadata.tags;
+  const displayName = metadata.displayName;
+
+  const ptyfilePath = metadata.tags?.ptyfile;
+  const ptyfileSession = metadata.tags?.["ptyfile.session"];
+  if (ptyfilePath && ptyfileSession) {
+    try {
+      const { readPtyFile, commandWithEnvExports } = await import("./ptyfile.ts");
+      const dir = path.dirname(ptyfilePath);
+      const ptyFile = readPtyFile(dir);
+      const sessDef = ptyFile.sessions.find((s) => s.shortName === ptyfileSession);
+      if (sessDef) {
+        command = "/bin/sh";
+        args = ["-c", commandWithEnvExports(sessDef)];
+        displayCommand = sessDef.command;
+        cwd = ptyFile.dir;
+        tags = {
+          ...sessDef.tags,
+          ptyfile: ptyfilePath,
+          "ptyfile.session": ptyfileSession,
+        };
+      }
+    } catch {
+      // pty.toml unreadable (volume not mounted yet, file deleted, parse
+      // error). Fall back to stored metadata — better to respawn with
+      // last-known-good than to give up.
+    }
+  }
+
+  // Wipe stale socket/pid/events before respawn so spawnDaemon doesn't
+  // trip over leftovers from the dead daemon. Metadata is recreated by
+  // spawnDaemon.
+  cleanupAll(name);
+
+  const { spawnDaemon } = await import("./spawn.ts");
+  await spawnDaemon({
+    name, command, args, displayCommand, cwd, tags,
+    ...(displayName ? { displayName } : {}),
+  });
+
+  // Best-effort event; respawn already succeeded if we got here.
+  try {
+    appendEventSync(name, {
+      session: name,
+      type: "session_respawn",
+      ts: new Date().toISOString(),
+    });
+  } catch {}
 }
 
 /**

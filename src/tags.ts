@@ -46,16 +46,17 @@ export function matchesAllTags(
 }
 
 /**
- * Keys that pty itself treats as internal bookkeeping. These drive
- * dedicated markers (`[permanent]`, `[failed]`) or wire up the
- * supervisor / ptyfile plumbing — they're visible in `pty list --tags`
- * but hidden from the default listing.
+ * Keys that pty itself treats as internal bookkeeping. `strategy` drives
+ * the `[permanent]` marker and tells `pty gc` to respawn the session on
+ * exit; `ptyfile*` keys wire up the toml-managed-session plumbing. The
+ * user-facing `parent=<name>` orphan-kill tag is intentionally NOT
+ * reserved — it's a regular tag visible in `pty list`. Reserved keys
+ * are visible in `pty list --tags` but hidden from the default listing.
  */
 const EXACT_RESERVED = new Set([
   "ptyfile",
   "ptyfile.session",
   "ptyfile.tags",
-  "supervisor.status",
   "strategy",
 ]);
 

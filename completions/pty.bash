@@ -6,7 +6,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag supervisor up down wrap unwrap test help"
+  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag up down wrap unwrap test help"
 
   # Complete subcommand
   if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -41,7 +41,9 @@ _pty() {
       fi
       ;;
     gc)
-      # No arguments
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--dry-run -n --print-launchd-plist --interval" -- "${cur}"))
+      fi
       ;;
     wrap)
       if [[ "${cur}" == -* ]]; then
@@ -71,15 +73,6 @@ _pty() {
       # Before --, complete flags
       if [[ "${cur}" == -* ]]; then
         COMPREPLY=($(compgen -W "--detach -d --attach -a --ephemeral -e --name --cwd --tag" -- "${cur}"))
-      fi
-      ;;
-    supervisor)
-      if [[ ${COMP_CWORD} -eq 2 ]]; then
-        COMPREPLY=($(compgen -W "start stop status forget reset launchd" -- "${cur}"))
-      elif [[ "${COMP_WORDS[2]}" == "forget" || "${COMP_WORDS[2]}" == "reset" ]]; then
-        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
-      elif [[ "${COMP_WORDS[2]}" == "launchd" ]]; then
-        COMPREPLY=($(compgen -W "install uninstall" -- "${cur}"))
       fi
       ;;
   esac
