@@ -117,6 +117,7 @@ function usage(): void {
   pty tag <name> --rm key [--rm key...]    Remove tags
   pty tag-multi <selector> [ops...]        Read/write tags across multiple sessions (--all / --filter-tag k=v / <name>...)
   pty gc --print-launchd-plist [--interval=N]   Print a launchd plist that runs 'pty gc' every N seconds (default 30)
+  pty gc [--dry-run] [--idle-days N]       Reconciliation pass; --idle-days N reaps permanent sessions with no attach in N days
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -730,6 +731,7 @@ async function main(): Promise<void> {
       const dryRun = gcArgs.some((a) => a === "--dry-run" || a === "-n");
       const printPlist = gcArgs.includes("--print-launchd-plist");
       let interval = 30;
+      let idleDays: number | undefined;
       for (let i = 0; i < gcArgs.length; i++) {
         const a = gcArgs[i];
         if (a === "--interval" && i + 1 < gcArgs.length) {
@@ -747,13 +749,28 @@ async function main(): Promise<void> {
             process.exit(1);
           }
           interval = v;
+        } else if (a === "--idle-days" && i + 1 < gcArgs.length) {
+          const v = parseInt(gcArgs[i + 1], 10);
+          if (!Number.isFinite(v) || v <= 0) {
+            console.error(`pty gc: --idle-days expects a positive integer (got "${gcArgs[i + 1]}")`);
+            process.exit(1);
+          }
+          idleDays = v;
+          i++;
+        } else if (a.startsWith("--idle-days=")) {
+          const v = parseInt(a.slice("--idle-days=".length), 10);
+          if (!Number.isFinite(v) || v <= 0) {
+            console.error(`pty gc: --idle-days expects a positive integer (got "${a.slice("--idle-days=".length)}")`);
+            process.exit(1);
+          }
+          idleDays = v;
         }
       }
       if (printPlist) {
         printLaunchdPlist(interval);
         break;
       }
-      await cmdGc(dryRun);
+      await cmdGc(dryRun, idleDays);
       break;
     }
 
@@ -1887,17 +1904,24 @@ async function cmdRm(name: string): Promise<void> {
   console.log(`Session "${name}" removed.`);
 }
 
-async function cmdGc(dryRun: boolean): Promise<void> {
-  const result = await gc({ dryRun });
+async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
+  const result = await gc({ dryRun, idleDays });
   const prunedTags = await pruneOrphanLayoutTags({ dryRun });
 
   const killedVerb = dryRun ? "Would kill orphan child" : "Killed orphan child";
+  const abandonVerb = dryRun ? "Would abandon" : "Abandoned";
   const respawnVerb = dryRun ? "Would respawn" : "Respawned";
   const removeVerb = dryRun ? "Would remove" : "Removed";
   const prunedVerb = dryRun ? "Would prune" : "Pruned";
 
   for (const k of result.killedOrphanChildren) {
     console.log(`${killedVerb}: ${k.name} (parent ${k.parent} ${k.reason})`);
+  }
+  for (const a of result.abandoned) {
+    const detail = a.reason === "idle" && a.idleDays !== undefined
+      ? `idle ${a.idleDays}d`
+      : a.reason;
+    console.log(`${abandonVerb}: ${a.name} (${detail})`);
   }
   for (const r of result.respawned) {
     const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
@@ -1918,6 +1942,7 @@ async function cmdGc(dryRun: boolean): Promise<void> {
   const totalTags = prunedTags.reduce((sum, r) => sum + r.removedKeys.length, 0);
   const totalActions =
     result.killedOrphanChildren.length +
+    result.abandoned.length +
     result.respawned.length +
     result.respawnFailed.length +
     result.removed.length +
@@ -1931,6 +1956,9 @@ async function cmdGc(dryRun: boolean): Promise<void> {
   const parts: string[] = [];
   if (result.killedOrphanChildren.length > 0) {
     parts.push(`${result.killedOrphanChildren.length} orphan child${result.killedOrphanChildren.length === 1 ? "" : "ren"}`);
+  }
+  if (result.abandoned.length > 0) {
+    parts.push(`${result.abandoned.length} abandoned`);
   }
   if (result.respawned.length > 0) {
     parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);

@@ -2,8 +2,19 @@
 
 ## Unreleased
 
-### Fixes
-- **Alt-screen buffer mode is now restored on SCREEN replay.** The daemon tracks whether the child has entered the alternate screen buffer (DEC private modes `?1049`, `?1047`, `?47`) and prepends `\x1b[?1049h` to the SCREEN packet payload sent on ATTACH when the child is currently in alt-screen. Fixes #41 — before this, a full-screen TUI (vim/htop/codex) attached through `pty` would paint into the host's main-screen buffer, which under tmux meant every frame entered scrollback: an observed 8.7 GB scrollback / 9.1 GB tmux server RSS over 9.5h on a long-lived codex pane. The client-side detach path already resets `?1049l` via `TERMINAL_SANITIZE`, so the round-trip is symmetric. PEEK does not get the prefix — a non-follow peek prints its snapshot into the caller's shell and immediately exits, so entering alt-screen would hide the output when TERMINAL_SANITIZE fires on close.
+### `pty gc` — abandoned-reap for permanent sessions
+- **New `pty gc` step 1.5: abandoned-reap.** Runs between orphan-kill (step 1) and permanent-respawn (step 2). Reaps live `strategy=permanent` sessions detected as abandoned — SIGTERM the daemon (if alive), append a `session_abandoned` event, then `cleanupAll`. Two shapes today:
+  - **cwd-gone (on-by-default)** — the session's recorded `cwd` no longer resolves on disk (`fs.statSync` throws `ENOENT`). Strong low-false-positive signal. Escape hatch: `strategy.abandon-if-cwd-gone=false` tag opts a session out.
+  - **idle (opt-in)** — the session's `lastAttachAt` is older than a configured threshold. Enabled via `pty gc --idle-days N` (global) OR a per-session `strategy.idle-days=N` tag (which takes precedence over the global flag). Sessions with no `lastAttachAt` (never attached) are excluded — a session that was just spawned but hasn't been used yet isn't "idle."
+  - Precedence: `cwd-gone` wins over `idle` when both conditions hold — the session is abandoned regardless of attach recency once the cwd is gone.
+  - Fixes #47. Together with the process.title patch in #48 (schickling), stops orphaned `pty-daemon` processes from accumulating on long-lived hosts.
+- **New event `session_abandoned`.** `{ session, type: "session_abandoned", ts, reason: "cwd-gone" | "idle", idleDays? }`. Appended to `<name>.events.jsonl` before `cleanupAll` unlinks the file, so `pty events` watchers still see the reap even though the session file is gone by the time gc returns.
+- **New tag `strategy.abandon-if-cwd-gone=false`** — opts a permanent session out of the on-by-default cwd-gone reap. Only meaningful with `strategy=permanent`.
+- **New tag `strategy.idle-days=<N>`** — opts a permanent session into idle-reap even without a CLI flag. Value is a positive integer number of days. Overrides `--idle-days N` when both are set.
+- **New session-metadata field `lastAttachAt: string`** (ISO 8601). Written by the daemon on every non-readonly `ATTACH` message. Best-effort — a torn read during a concurrent `pty tag`/`pty rename` mutation doesn't crash the daemon, just loses one attach stamp until the next reconnect.
+- **New `pty gc --idle-days N`** — sets the global idle threshold for the run. Positive integer required; zero and negative values are rejected. Combines with per-session `strategy.idle-days` tag (per-session wins).
+- **New `pty gc` output row: `Abandoned: <name> (<reason>)`.** `--dry-run` mirrors with `Would abandon:`. Summary line adds "N abandoned" when the bucket is non-empty.
+- **`GcResult` gains a fifth field: `abandoned: { name; reason: "cwd-gone" | "idle"; idleDays? }[]`.** Public `@myobie/pty/client` API surface change.
 
 ### Breaking changes — supervisor replaced by `pty gc`
 - **Removed the long-running `pty supervisor` command and the launchd FDA wrapper.** All `pty supervisor *` subcommands are gone (`start`, `stop`, `status`, `forget`, `reset`, `launchd install/uninstall`, `systemd install/uninstall`, `runit install/uninstall`). The bundled `src/supervisor.ts`, `src/supervisor-entry.ts`, and `scripts/supervisor-wrapper.c` are deleted. So are the three supervisor test files (`tests/supervisor.test.ts`, `tests/supervisor-hardening.test.ts`, `tests/supervisor-service-install.test.ts`). Net: about 600 lines of code and a separate long-lived process removed.
