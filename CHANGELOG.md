@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixes
+- **`@myobie/pty/tui` `CellBuffer` — wide-char (2-cell) glyph rendering fixed.** Two root causes, both in `src/tui/buffer.ts`:
+  1. `writeAnsi` iterated the input string by UTF-16 code unit, splitting astral-plane codepoints (emoji like `📬`, `📭`, `📫` — U+1F4XX) into two lone surrogate halves stored as separate width-1 cells. Downstream `diff()` and `fullRender()` emitted the halves independently; a modern host terminal (kitty, iTerm2, Ghostty) recombined them as one wide glyph, but the CellBuffer's cell-index → terminal-column mapping was off by one on every emoji. Fixed by detecting surrogate pairs and combining them into one Cell whose `char` holds the full 2-code-unit string.
+  2. `diff()`'s `lastCol = c + 1` cursor-position tracker didn't account for the wide char's 2-column advance. After a wide-char emit the terminal cursor lands at `c+2`, but `lastCol` said `c+1`, mispredicting adjacency for the next emit. Fixed by `lastCol = c + charWidth(nc.char)`.
+  - Fixes the tui-sup `📬📬2 99` fossilization observed on the agent-viz cards grid when navigation shifted an emoji to a different column.
+  - Regression coverage in `tests/buffer-wide-char-diff.test.ts` — 10 cases using xterm-headless + `@xterm/addon-unicode11` as the strong oracle (real-terminal semantics for astral-plane codepoints), verifying that `fullRender(prev) + diff(prev, next)` produces a terminal state equivalent to `fullRender(next)` across shift/replace/toggle/mixed-content scenarios.
+
 ### `pty gc` — abandoned-reap for permanent sessions
 - **New `pty gc` step 1.5: abandoned-reap.** Runs between orphan-kill (step 1) and permanent-respawn (step 2). Reaps live `strategy=permanent` sessions detected as abandoned — SIGTERM the daemon (if alive), append a `session_abandoned` event, then `cleanupAll`. Two shapes today:
   - **cwd-gone (on-by-default)** — the session's recorded `cwd` no longer resolves on disk (`fs.statSync` throws `ENOENT`). Strong low-false-positive signal. Escape hatch: `strategy.abandon-if-cwd-gone=false` tag opts a session out.
