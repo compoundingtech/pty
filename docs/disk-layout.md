@@ -44,6 +44,7 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   tags?: { [k: string]: string };
   state?: { [k: string]: unknown };
   displayName?: string;
+  lastAttachAt?: string;      // ISO 8601 — set by the daemon on every non-readonly ATTACH
 }
 ```
 
@@ -51,6 +52,8 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).
+  - `strategy.abandon-if-cwd-gone=false` — opts a permanent session OUT of the on-by-default cwd-gone reap in `pty gc` step 1.5. Only meaningful with `strategy=permanent`.
+  - `strategy.idle-days=<N>` — opts a permanent session INTO idle-reap: `pty gc` reaps it when `lastAttachAt` is older than N days. Takes precedence over the global `--idle-days` flag.
   - `parent=<name>` — `pty gc` orphan-kills this session (SIGTERM + cleanup) when the referenced session's daemon is no longer alive. Combinator with `strategy=permanent` is well-defined: orphan-kill wins.
 - Concurrent writers: last-write-wins; readers never see torn files. Cross-process writers can lose updates to the read-modify-write window.
 
@@ -71,6 +74,7 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_exit` | `exitCode` |
 | `session_exec` | `previousCommand, command` |
 | `session_respawn` | — (`pty gc` respawned a `strategy=permanent` session) |
+| `session_abandoned` | `reason: "cwd-gone" \| "idle", idleDays?` — (`pty gc` reaped a live permanent session detected as abandoned) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
 | `state.set` | `key, value` |

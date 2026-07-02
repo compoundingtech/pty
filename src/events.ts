@@ -15,6 +15,7 @@ export const EventType = {
   SESSION_EXIT: "session_exit",
   SESSION_EXEC: "session_exec",
   SESSION_RESPAWN: "session_respawn",
+  SESSION_ABANDONED: "session_abandoned",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -83,6 +84,29 @@ export interface SessionRespawnEvent extends EventBase {
   type: "session_respawn";
 }
 
+/** Emitted by `pty gc` when it reaps a live `strategy=permanent` session
+ *  that's been detected as abandoned. Two shapes today:
+ *
+ *  - `cwd-gone`: the session's recorded `cwd` no longer resolves on disk
+ *    (`fs.statSync` throws `ENOENT`). Reaped by default — cwd deletion
+ *    is a strong low-false-positive signal.
+ *  - `idle`: the session's `lastAttachAt` is older than `idleDays`. Only
+ *    triggered when `pty gc --idle-days N` was passed OR the session
+ *    carries a `strategy.idle-days=N` tag; there's no on-by-default
+ *    idle threshold.
+ *
+ *  Abandonment reaps SIGTERM the daemon (if alive), `cleanupAll` the
+ *  session files, and emit this event as the final record. The event is
+ *  best-effort — if the events log has already been unlinked by
+ *  `cleanupAll` on the previous tick, the append silently no-ops. */
+export interface SessionAbandonedEvent extends EventBase {
+  type: "session_abandoned";
+  reason: "cwd-gone" | "idle";
+  /** For `idle`: the number of days since `lastAttachAt` (rounded down).
+   *  For `cwd-gone`: absent. */
+  idleDays?: number;
+}
+
 /** User-published event. `type` must begin with `user.` — the CLI
  *  (`pty emit`) rejects anything else, and the client-API `emitEvent`
  *  helper throws on bad types. Payload is free-form JSON. */
@@ -134,6 +158,7 @@ export type EventRecord =
   | SessionExitEvent
   | SessionExecEvent
   | SessionRespawnEvent
+  | SessionAbandonedEvent
   | UserEvent
   | StateSetEvent
   | StateDeleteEvent
@@ -480,6 +505,10 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} exec ${event.command} (was ${event.previousCommand})`;
     case "session_respawn":
       return `${prefix} respawned`;
+    case "session_abandoned":
+      return event.reason === "idle" && event.idleDays !== undefined
+        ? `${prefix} abandoned (idle ${event.idleDays}d)`
+        : `${prefix} abandoned (${event.reason})`;
     case "state.set":
       return `${prefix} state.set ${event.key} = ${JSON.stringify(event.value)}`;
     case "state.delete":

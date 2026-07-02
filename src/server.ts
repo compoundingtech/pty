@@ -595,6 +595,21 @@ export class PtyServer {
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
             const resized = this.negotiateSize();
+            // Stamp the last-attach timestamp so `pty gc --idle-days N`
+            // (and per-session `strategy.idle-days=N` tags) can detect
+            // abandonment. Best-effort — if the metadata file was
+            // concurrently mutated by another writer (`pty tag`,
+            // `pty rename`), our read-modify-write may lose a field, but
+            // that's the same last-write-wins semantic every other
+            // metadata mutation carries. Wrapped in try so a torn read
+            // never crashes the daemon on attach.
+            try {
+              const meta = readMetadata(this.name);
+              if (meta) {
+                meta.lastAttachAt = new Date().toISOString();
+                writeMetadata(this.name, meta);
+              }
+            } catch {}
 
             const sendScreen = () => {
               if (socket.destroyed) return;

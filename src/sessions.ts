@@ -117,6 +117,13 @@ export interface SessionMetadata {
    *  keep using `name`; `displayName` is purely for presentation and as an
    *  additional lookup key alongside `name`. */
   displayName?: string;
+  /** ISO 8601 timestamp of the last non-readonly client ATTACH. Written by
+   *  the daemon on every attach. Used by `pty gc --idle-days N` (and the
+   *  per-session `strategy.idle-days=N` tag) to decide whether a permanent
+   *  session has been abandoned. Absent on sessions that have never had a
+   *  client attach — those are excluded from idle-reap (a session that
+   *  was just spawned but not yet attached to isn't "idle"). */
+  lastAttachAt?: string;
 }
 
 export interface SessionInfo {
@@ -464,9 +471,9 @@ export async function allRefs(): Promise<Set<string>> {
   return refs;
 }
 
-/** Result of a `gc()` reconciliation pass. The four buckets correspond
- *  to the three reconciliation steps: orphan-kill (step 1), permanent
- *  respawn success / failure (step 2), and the sweep of exited
+/** Result of a `gc()` reconciliation pass. Five buckets correspond to the
+ *  reconciliation steps: orphan-kill (step 1), abandoned-reap (step 1.5),
+ *  permanent respawn success / failure (step 2), and the sweep of exited
  *  non-permanent sessions (step 3 — the historic `gc()` behavior). */
 export interface GcResult {
   /** Names of exited/vanished non-permanent sessions whose metadata was
@@ -475,6 +482,12 @@ export interface GcResult {
   removed: string[];
   /** Children killed because their `parent=` referent is dead or missing. */
   killedOrphanChildren: { name: string; parent: string; reason: "missing" | "dead" }[];
+  /** Live `strategy=permanent` sessions reaped because they've been
+   *  detected as abandoned. `cwd-gone` fires on-by-default when the
+   *  session's cwd no longer resolves; `idle` fires only when an
+   *  `idleDays` threshold is set (via CLI flag or per-session tag)
+   *  and `lastAttachAt` is older than that threshold. */
+  abandoned: { name: string; reason: "cwd-gone" | "idle"; idleDays?: number }[];
   /** Permanent sessions respawned this pass. `ptyfileReread` indicates
    *  whether the spawn used a fresh `pty.toml` read (when the session
    *  carries `ptyfile` + `ptyfile.session` tags) or its stored metadata. */
@@ -486,20 +499,28 @@ export interface GcResult {
 }
 
 /** Reconciliation pass driven by `pty gc`. Stateless: every invocation
- *  re-derives intent from on-disk metadata. Three steps run in order:
+ *  re-derives intent from on-disk metadata. Four steps run in order:
  *
- *    1. Orphan-kill: children with a `parent=<name>` tag whose parent's
- *       metadata is gone OR whose parent's pid isn't alive get SIGTERM'd
- *       and `cleanupAll`'d. Runs first so a permanent child whose parent
- *       has died isn't immediately respawned by step 2.
- *    2. Permanent respawn: every `strategy=permanent` session that's
- *       exited/vanished is respawned via `spawnDaemon` (lazy-imported to
- *       avoid the `sessions ↔ spawn` cycle). Sessions with `ptyfile` +
- *       `ptyfile.session` tags re-read the toml to pick up any edits.
- *    3. Existing sweep: the historic behavior — exited/vanished sessions
- *       that aren't permanent get `cleanupAll`'d. */
-export async function gc(opts: { dryRun?: boolean } = {}): Promise<GcResult> {
+ *    1.   Orphan-kill: children with a `parent=<name>` tag whose parent's
+ *         metadata is gone OR whose parent's pid isn't alive get SIGTERM'd
+ *         and `cleanupAll`'d. Runs first so a permanent child whose parent
+ *         has died isn't immediately respawned by step 2.
+ *    1.5. Abandoned-reap: live `strategy=permanent` sessions whose recorded
+ *         cwd is gone from disk are SIGTERM'd + `cleanupAll`'d + get a
+ *         `session_abandoned` event. When `opts.idleDays` is set OR the
+ *         session carries a `strategy.idle-days=N` tag, sessions whose
+ *         `lastAttachAt` is older than that threshold are also reaped
+ *         with reason `idle`. Runs before step 2 so a session reaped for
+ *         abandonment isn't immediately respawned by permanent-restart.
+ *    2.   Permanent respawn: every `strategy=permanent` session that's
+ *         exited/vanished is respawned via `spawnDaemon` (lazy-imported to
+ *         avoid the `sessions ↔ spawn` cycle). Sessions with `ptyfile` +
+ *         `ptyfile.session` tags re-read the toml to pick up any edits.
+ *    3.   Existing sweep: the historic behavior — exited/vanished sessions
+ *         that aren't permanent get `cleanupAll`'d. */
+export async function gc(opts: { dryRun?: boolean; idleDays?: number } = {}): Promise<GcResult> {
   const dryRun = !!opts.dryRun;
+  const globalIdleDays = opts.idleDays;
   // First call to `listSessions` is intentionally throwaway — it has a
   // side effect (`cleanupSocket`) on sessions whose daemon SIGKILL'd
   // without writing an exit record, and those sessions are then *missing*
@@ -545,14 +566,57 @@ export async function gc(opts: { dryRun?: boolean } = {}): Promise<GcResult> {
     killedOrphanChildren.push({ name: s.name, parent: parentRef, reason });
   }
 
-  // STEP 2: permanent respawn. Re-list since step 1 may have removed
-  // some metadata (an orphan-killed permanent child should not also
-  // appear here). In dryRun mode the initial list is fine — step 1
-  // didn't mutate anything.
+  // STEP 1.5: abandoned-reap. Live permanent sessions whose cwd is gone,
+  // or (opt-in) whose lastAttachAt is older than the idle threshold, get
+  // SIGTERM'd + cleaned up + emit `session_abandoned`. Runs before step 2
+  // so the reap isn't racing an immediate respawn on the same tick.
   const afterStep1 = dryRun ? initial : await listSessions();
+  const abandoned: GcResult["abandoned"] = [];
+  for (const s of afterStep1) {
+    if (s.metadata?.tags?.strategy !== "permanent") continue;
+    const decision = classifyAbandoned(s, globalIdleDays);
+    if (!decision) continue;
+
+    if (!dryRun) {
+      if (s.status === "running" && s.pid != null) {
+        try { process.kill(s.pid, "SIGTERM"); } catch {}
+        const deadline = Date.now() + 1000;
+        while (Date.now() < deadline) {
+          if (!isProcessAlive(s.pid)) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      }
+      // Emit the abandoned event BEFORE cleanupAll — cleanupAll unlinks
+      // the events file, and appendEventSync into a nonexistent file
+      // would just create a stub with a single event and leave orphaned
+      // JSONL on disk. Ordering: event → cleanup → gone.
+      try {
+        appendEventSync(s.name, {
+          session: s.name,
+          type: "session_abandoned",
+          ts: new Date().toISOString(),
+          reason: decision.reason,
+          ...(decision.idleDays !== undefined ? { idleDays: decision.idleDays } : {}),
+        });
+      } catch {}
+      cleanupAll(s.name);
+    }
+    abandoned.push({
+      name: s.name,
+      reason: decision.reason,
+      ...(decision.idleDays !== undefined ? { idleDays: decision.idleDays } : {}),
+    });
+  }
+
+  // STEP 2: permanent respawn. Re-list since steps 1 and 1.5 may have
+  // removed some metadata. In dryRun mode we filter out anything step
+  // 1.5 would have reaped so the preview reflects the same intent.
+  const afterStep15 = dryRun
+    ? initial.filter((s) => !abandoned.some((a) => a.name === s.name))
+    : await listSessions();
   const respawned: GcResult["respawned"] = [];
   const respawnFailed: GcResult["respawnFailed"] = [];
-  for (const s of afterStep1) {
+  for (const s of afterStep15) {
     if (s.metadata?.tags?.strategy !== "permanent") continue;
     if (!isGone(s.status)) continue;
     const ptyfileReread = !!s.metadata?.tags?.ptyfile;
@@ -582,7 +646,52 @@ export async function gc(opts: { dryRun?: boolean } = {}): Promise<GcResult> {
     removed.push(s.name);
   }
 
-  return { removed, killedOrphanChildren, respawned, respawnFailed };
+  return { removed, killedOrphanChildren, abandoned, respawned, respawnFailed };
+}
+
+/** Decide whether a permanent session is abandoned. Order:
+ *
+ *    1. cwd-gone (`fs.statSync` throws `ENOENT` on `metadata.cwd`) —
+ *       strong low-false-positive signal, on-by-default. Escape hatch:
+ *       `strategy.abandon-if-cwd-gone=false` tag opts a session out.
+ *    2. idle (only if `idleDays` is resolved from CLI or per-session
+ *       `strategy.idle-days=N` tag) — requires `lastAttachAt` to be set
+ *       AND to be older than the threshold.
+ *
+ *  Returns `null` when the session is NOT abandoned. A cwd-gone verdict
+ *  always wins over an idle verdict — the session is abandoned regardless
+ *  of attach recency once the cwd is gone. */
+function classifyAbandoned(
+  s: SessionInfo,
+  globalIdleDays?: number,
+): { reason: "cwd-gone" | "idle"; idleDays?: number } | null {
+  const cwd = s.metadata?.cwd;
+  const optOutCwd = s.metadata?.tags?.["strategy.abandon-if-cwd-gone"] === "false";
+  if (cwd && !optOutCwd) {
+    let cwdGone = false;
+    try {
+      fs.statSync(cwd);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") cwdGone = true;
+    }
+    if (cwdGone) return { reason: "cwd-gone" };
+  }
+
+  const tagIdle = s.metadata?.tags?.["strategy.idle-days"];
+  const perSessionIdleDays = tagIdle !== undefined ? parseInt(tagIdle, 10) : NaN;
+  const effectiveIdleDays = Number.isFinite(perSessionIdleDays) && perSessionIdleDays > 0
+    ? perSessionIdleDays
+    : (globalIdleDays !== undefined && globalIdleDays > 0 ? globalIdleDays : undefined);
+  if (effectiveIdleDays === undefined) return null;
+
+  const lastAttach = s.metadata?.lastAttachAt;
+  if (!lastAttach) return null;
+
+  const lastAttachMs = Date.parse(lastAttach);
+  if (!Number.isFinite(lastAttachMs)) return null;
+  const ageDays = Math.floor((Date.now() - lastAttachMs) / (1000 * 60 * 60 * 24));
+  if (ageDays < effectiveIdleDays) return null;
+  return { reason: "idle", idleDays: ageDays };
 }
 
 /** Restart a `strategy=permanent` session whose daemon is gone. If the
