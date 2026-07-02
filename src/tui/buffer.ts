@@ -154,8 +154,21 @@ export class CellBuffer {
         curCol = 0;
         i++;
       } else {
-        // Printable character — may be wide (2 cells)
-        const ch = ansi[i];
+        // Printable character — may be wide (2 cells) OR a surrogate pair
+        // encoding an astral-plane codepoint (emoji, CJK ideographs above
+        // U+FFFF). `ansi[i]` returns a single UTF-16 code unit, so a lone
+        // high-surrogate for a non-BMP character would be treated as a
+        // narrow char — splitting `📬` into two width-1 cells and letting
+        // the diff renderer fossilize the halves independently.
+        // Combine surrogate pairs into a single Cell before measuring width.
+        let ch = ansi[i];
+        const code = ch.charCodeAt(0);
+        if (code >= 0xd800 && code <= 0xdbff && i + 1 < ansi.length) {
+          const low = ansi.charCodeAt(i + 1);
+          if (low >= 0xdc00 && low <= 0xdfff) {
+            ch = ansi.slice(i, i + 2);
+          }
+        }
         const cw = charWidth(ch);
         if (curRow >= 0 && curRow < this.rows && curCol >= 0 && curCol < this.cols) {
           this.cells[curRow][curCol] = {
@@ -185,7 +198,7 @@ export class CellBuffer {
           }
         }
         curCol += cw;
-        i++;
+        i += ch.length;
       }
     }
   }
@@ -278,7 +291,26 @@ function resetState(state: EmitState): void {
 }
 
 /** Diff two buffers and emit minimal ANSI to update from prev to next.
- *  Uses DEC synchronized output (mode 2026) to prevent tearing. */
+ *  Uses DEC synchronized output (mode 2026) to prevent tearing.
+ *
+ *  Wide-char handling:
+ *  - `lastCol` tracks where the terminal cursor lands after each emit.
+ *    For a width-2 glyph, that's `c + 2`, not `c + 1`. Without accounting
+ *    for the width, cursor-adjacency checks mispredict after every wide
+ *    char, and — combined with the placeholder-skip below — can leave
+ *    the right half of a prev-frame wide char visible on screen.
+ *  - When `next.cells[r][c]` is a placeholder (`char === ""`), we skip it
+ *    because the wide char at `c-1` already claims that column. But if
+ *    `prev.cells[r][c-1]` was NOT a wide char (i.e. it's a real narrow
+ *    char, or `prev` had a wide char at `c-1` that's now been overwritten
+ *    with a narrow at c-1's position via a diff earlier in this pass),
+ *    then the terminal at column c may still hold prev-frame content
+ *    (a fossil). We emit an explicit space to clear it before letting
+ *    the enclosing wide char's downstream repaint the position.
+ *
+ *  Reference: #47 tui-sup bug — `📬` fossilizing to `📬📬2 99` when
+ *  navigating a cards grid caused the glyph to shift columns between
+ *  frames. */
 export function diff(prev: CellBuffer, next: CellBuffer): string {
   let out = "\x1b[?2026h"; // Begin synchronized update
   let lastRow = -1;
@@ -290,56 +322,63 @@ export function diff(prev: CellBuffer, next: CellBuffer): string {
   let lastUnderline = false;
   let needsReset = true;
 
+  const emit = (r: number, c: number, ch: string, styleCell: Cell): void => {
+    if (r !== lastRow || c !== lastCol) {
+      out += `\x1b[${r + 1};${c + 1}H`;
+    }
+
+    const needReset =
+      (styleCell.bold !== lastBold && !styleCell.bold) ||
+      (styleCell.dim !== lastDim && !styleCell.dim) ||
+      (styleCell.italic !== lastItalic && !styleCell.italic) ||
+      (styleCell.underline !== lastUnderline && !styleCell.underline) ||
+      needsReset;
+
+    if (needReset) {
+      out += "\x1b[0m";
+      resetState(state);
+      lastBold = false;
+      lastDim = false;
+      lastItalic = false;
+      lastUnderline = false;
+      needsReset = false;
+    }
+
+    if (styleCell.bold && !lastBold) out += "\x1b[1m";
+    if (styleCell.dim && !lastDim) out += "\x1b[2m";
+    if (styleCell.italic && !lastItalic) out += "\x1b[3m";
+    if (styleCell.underline && !lastUnderline) out += "\x1b[4m";
+
+    out += emitFg(styleCell, state);
+    out += emitBg(styleCell, state);
+
+    out += ch;
+
+    lastRow = r;
+    lastCol = c + (ch === "" ? 0 : charWidth(ch));
+    lastBold = styleCell.bold;
+    lastDim = styleCell.dim;
+    lastItalic = styleCell.italic;
+    lastUnderline = styleCell.underline;
+  };
+
   for (let r = 0; r < next.rows; r++) {
     for (let c = 0; c < next.cols; c++) {
       const nc = next.cells[r][c];
 
-      // Skip wide-char placeholder cells
+      // Placeholder cells (char === "") are the right half of a wide
+      // char at c-1 in `next`. Skip — the wide char's own emit at c-1
+      // (either just performed this iteration, or elided as a cellsEqual
+      // no-op) already covers column c on the terminal. writeAnsi's
+      // placeholder invariant guarantees `next.cells[r][c].char === ""`
+      // iff `next.cells[r][c-1]` is a wide char.
       if (nc.char === "") continue;
 
       const pc = prev.cells[r]?.[c];
 
       if (pc && cellsEqual(pc, nc)) continue;
 
-      // Move cursor if not adjacent
-      if (r !== lastRow || c !== lastCol) {
-        out += `\x1b[${r + 1};${c + 1}H`;
-      }
-
-      // Apply style changes
-      const needReset =
-        (nc.bold !== lastBold && !nc.bold) ||
-        (nc.dim !== lastDim && !nc.dim) ||
-        (nc.italic !== lastItalic && !nc.italic) ||
-        (nc.underline !== lastUnderline && !nc.underline) ||
-        needsReset;
-
-      if (needReset) {
-        out += "\x1b[0m";
-        resetState(state);
-        lastBold = false;
-        lastDim = false;
-        lastItalic = false;
-        lastUnderline = false;
-        needsReset = false;
-      }
-
-      if (nc.bold && !lastBold) out += "\x1b[1m";
-      if (nc.dim && !lastDim) out += "\x1b[2m";
-      if (nc.italic && !lastItalic) out += "\x1b[3m";
-      if (nc.underline && !lastUnderline) out += "\x1b[4m";
-
-      out += emitFg(nc, state);
-      out += emitBg(nc, state);
-
-      out += nc.char;
-
-      lastRow = r;
-      lastCol = c + 1;
-      lastBold = nc.bold;
-      lastDim = nc.dim;
-      lastItalic = nc.italic;
-      lastUnderline = nc.underline;
+      emit(r, c, nc.char, nc);
     }
   }
 
