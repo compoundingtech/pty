@@ -223,6 +223,13 @@ export class PtyServer {
   private sgrMouseMode = false;
   private cursorHidden = false;
   private kittyKeyboardStack: number[] = [];
+  // Alt-screen buffer state (DEC private modes ?1049 / ?1047 / ?47). Set when
+  // the child process enters the alternate screen buffer; cleared when it
+  // leaves. Replayed to attaching clients so the SCREEN snapshot lands in the
+  // right host-terminal buffer — without this, a TUI's alt-screen frames get
+  // painted into the host's main buffer, which under tmux means every frame
+  // enters scrollback (see #41).
+  private altScreenActive = false;
   // Mouse tracking modes — these are separate DEC private modes (set/cleared
   // independently by the child process) that control WHICH events the
   // terminal should report. SGR mode (1006) only controls the ENCODING of
@@ -270,6 +277,7 @@ export class PtyServer {
           if (v === 1000) this.mouseTracking1000 = true;
           if (v === 1002) this.mouseTracking1002 = true;
           if (v === 1003) this.mouseTracking1003 = true;
+          if (v === 1049 || v === 1047 || v === 47) this.altScreenActive = true;
           if (v === 25) {
             if (this.cursorHidden) this.emitEvent(EventType.CURSOR_VISIBLE);
             this.cursorHidden = false;
@@ -288,6 +296,7 @@ export class PtyServer {
           if (v === 1000) this.mouseTracking1000 = false;
           if (v === 1002) this.mouseTracking1002 = false;
           if (v === 1003) this.mouseTracking1003 = false;
+          if (v === 1049 || v === 1047 || v === 47) this.altScreenActive = false;
           if (v === 25) this.cursorHidden = true;
         }
         return false;
@@ -589,7 +598,7 @@ export class PtyServer {
 
             const sendScreen = () => {
               if (socket.destroyed) return;
-              const screen = this.getModePrefix() + this.serialize.serialize();
+              const screen = this.getModePrefix(true) + this.serialize.serialize();
               socket.write(encodeScreen(screen));
               if (this.exited) {
                 socket.write(encodeExit(this.exitCode));
@@ -686,8 +695,14 @@ export class PtyServer {
     });
   }
 
-  private getModePrefix(): string {
+  private getModePrefix(includeAltScreen = false): string {
     let prefix = "";
+    // Alt-screen mode is only prefixed for the ATTACH path, not PEEK. A
+    // non-follow `pty peek` prints the snapshot to the caller's shell and
+    // exits, so entering ?1049h would hide the output when the client-side
+    // TERMINAL_SANITIZE exits alt-screen on close. Attaching clients want
+    // the alt buffer to persist for the duration of the attach.
+    if (includeAltScreen && this.altScreenActive) prefix += "\x1b[?1049h";
     if (this.mouseTracking1000) prefix += "\x1b[?1000h";
     if (this.mouseTracking1002) prefix += "\x1b[?1002h";
     if (this.mouseTracking1003) prefix += "\x1b[?1003h";
