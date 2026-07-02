@@ -966,6 +966,14 @@ function installSpawnerWatchdog(cleanShutdown: (code: number) => Promise<never>)
 
 /** Entry point when this file is run as the daemon process. */
 if (process.argv[1]?.endsWith("/server.js")) {
+  // Name the daemon process so it shows up as "pty-daemon" in ps/top/htop/btm
+  // rather than "MainThread" (V8's default main-thread name under Node 24+).
+  // This is set only inside the daemon-entry guard — server.ts is also imported
+  // as a library (PtyServer), and we must not rename those host processes.
+  // `process.title` is the only override for /proc/<pid>/comm and Linux caps it
+  // at 15 chars (TASK_COMM_LEN), so "pty-daemon" (10 chars) stays well under.
+  try { process.title = "pty-daemon"; } catch {}
+
   const config = JSON.parse(process.env.PTY_SERVER_CONFIG ?? "{}");
   if (!config.name || !config.command) {
     console.error("PTY_SERVER_CONFIG env var required");

@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+// Give this signal-forwarding wrapper a meaningful process name. Under Node 24+
+// V8 names the main thread "MainThread", so without this every pty process shows
+// up as `MainThread` in ps/top/htop/btm. `process.title` is the only thing that
+// overrides /proc/<pid>/comm, and only when set from within the running process
+// after V8 init. Linux caps comm at 15 chars (TASK_COMM_LEN), so keep it short.
+try { process.title = 'pty'; } catch {}
+
 import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';

@@ -38,6 +38,15 @@ import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfil
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 
+// Name this process so it shows up meaningfully in ps/top/htop/btm instead of
+// "MainThread" (V8's default main-thread name under Node 24+). `process.title`
+// is the only thing that overrides /proc/<pid>/comm, and only when set from
+// within the running process after V8 init — launch flags like `node --title`
+// or `exec -a` do not work. Linux truncates comm at 15 chars (TASK_COMM_LEN).
+// This module is only ever an entrypoint (it calls main() on load), so setting
+// the title at module scope is safe.
+try { process.title = "pty"; } catch {}
+
 // Lazy-load the interactive TUI so non-interactive commands don't crash when
 // the caller's cwd was deleted (the TUI module evaluates process.cwd() at load).
 async function runInteractive(options?: { preselectNew?: boolean; filterTags?: Record<string, string>; force?: boolean }): Promise<void> {
