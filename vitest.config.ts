@@ -5,5 +5,6 @@ export default defineConfig({
     exclude: [
       "node_modules/**",
     ],
+    globalSetup: ["./tests/setup/vitest-global.ts"],
   },
 });
