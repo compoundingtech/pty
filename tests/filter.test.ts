@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildFilteredGroups, buildSpawnRemoteArgs, type ListItem, type RelayHost } from "../src/tui/interactive.ts";
+import { buildAttachRemoteArgs, buildFilteredGroups, buildSpawnRemoteArgs, type ListItem, type RelayHost, type RemoteSession } from "../src/tui/interactive.ts";
 import type { SessionInfo } from "../src/sessions.ts";
 
 function makeSession(name: string, status: "running" | "exited" = "running", opts?: { command?: string; cwd?: string; tags?: Record<string, string> }): SessionInfo {
@@ -252,6 +252,37 @@ describe("buildSpawnRemoteArgs", () => {
   it("preserves = in values", () => {
     expect(buildSpawnRemoteArgs("u", "n", { note: "k=v" })).toEqual([
       "connect", "u", "--spawn", "n", "--tag", "note=k=v",
+    ]);
+  });
+});
+
+describe("buildAttachRemoteArgs", () => {
+  const sess = (name: string): RemoteSession => ({ name, status: "running" });
+  const host = (label: string, url: string): RelayHost => ({
+    label, url, sessions: [], spawn_enabled: true, error: null,
+  });
+
+  it("appends session name to token URL path (no fragment)", () => {
+    expect(buildAttachRemoteArgs(host("h", "https://x.example"), sess("s1"))).toEqual([
+      "connect", "https://x.example/s1",
+    ]);
+  });
+
+  it("appends session name before the URL fragment (with token hash)", () => {
+    expect(buildAttachRemoteArgs(host("h", "https://x.example#tok"), sess("s2"))).toEqual([
+      "connect", "https://x.example/s2#tok",
+    ]);
+  });
+
+  it("uses label + --session for ssh:// peers, ignoring URL-path convention", () => {
+    expect(buildAttachRemoteArgs(host("home", "ssh://me@home"), sess("chat"))).toEqual([
+      "connect", "home", "--session", "chat",
+    ]);
+  });
+
+  it("ssh peers with port keep label routing", () => {
+    expect(buildAttachRemoteArgs(host("box", "ssh://user@box:2222"), sess("s"))).toEqual([
+      "connect", "box", "--session", "s",
     ]);
   });
 });

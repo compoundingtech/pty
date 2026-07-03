@@ -513,15 +513,24 @@ async function doRestart(session: SessionInfo): Promise<void> {
   doAttach(session.name);
 }
 
+/** Build the argv for attaching to a remote session. ssh:// peers have no
+ *  path-in-URL convention — pty-relay's connect looks them up by label +
+ *  a `--session <name>` flag. Token URLs still take the session name as
+ *  a path segment (parseToken handles that). Exported for unit testing. */
+export function buildAttachRemoteArgs(host: RelayHost, session: RemoteSession): string[] {
+  if (host.url.startsWith("ssh://")) {
+    return ["connect", host.label, "--session", session.name];
+  }
+  const url = host.url.replace(/#.*$/, "") + "/" + session.name +
+    (host.url.includes("#") ? "#" + host.url.split("#").slice(1).join("#") : "");
+  return ["connect", url];
+}
+
 function doAttachRemote(host: RelayHost, session: RemoteSession): void {
   if (!relayBin) return;
   pauseApp();
 
-  // Build the connect URL: base URL + /session-name
-  const url = host.url.replace(/#.*$/, "") + "/" + session.name +
-    (host.url.includes("#") ? "#" + host.url.split("#").slice(1).join("#") : "");
-
-  const result = spawnSync(relayBin, ["connect", url], {
+  const result = spawnSync(relayBin, buildAttachRemoteArgs(host, session), {
     stdio: "inherit",
   });
 
