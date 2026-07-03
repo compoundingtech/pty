@@ -16,27 +16,62 @@ export async function setup(): Promise<void> {
   process.stderr.write(`[vitest-global] runRoot=${runRoot}\n`);
 }
 
-export async function teardown(): Promise<void> {
-  if (!runRoot) return;
-  const root = runRoot;
+function collectPidsHoldingUnder(root: string): Set<number> {
+  const pids = new Set<number>();
+  // macOS symlinks /tmp -> /private/tmp; a socket bound to /tmp/pv-X/sock
+  // reports as /private/tmp/pv-X/sock in `lsof -U`.
+  const prefixes = [root + "/", "/private" + root + "/"];
 
-  let pidLines = "";
+  // Sweep 1: files or directories under root (cwd, open files, mmaps).
+  // Misses processes whose ONLY tie to root is a bound listen socket.
+  let dTree = "";
   try {
-    pidLines = execSync(`lsof -Fpn +D "${root}" 2>/dev/null || true`, {
+    dTree = execSync(`lsof -Fpn +D "${root}" 2>/dev/null || true`, {
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
     });
   } catch {
-    // lsof may exit non-zero when no matches — treat as empty.
+    /* lsof exits non-zero on no matches */
   }
-
-  const pids = new Set<number>();
-  for (const line of pidLines.split("\n")) {
+  for (const line of dTree.split("\n")) {
     if (line.startsWith("p")) {
       const n = Number(line.slice(1));
       if (Number.isFinite(n) && n !== process.pid && n > 1) pids.add(n);
     }
   }
+
+  // Sweep 2: unix-domain sockets. `+D` does not index socket-name entries,
+  // so a daemon holding only its listen socket inside root is invisible to
+  // sweep 1. Walk `lsof -U` and match sockets by name prefix.
+  let uSockets = "";
+  try {
+    uSockets = execSync(`lsof -Fpn -U 2>/dev/null || true`, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    /* same */
+  }
+  let curPid: number | undefined;
+  for (const line of uSockets.split("\n")) {
+    if (line.startsWith("p")) {
+      const n = Number(line.slice(1));
+      curPid = Number.isFinite(n) ? n : undefined;
+    } else if (line.startsWith("n") && curPid !== undefined) {
+      const name = line.slice(1);
+      if (prefixes.some((p) => name.startsWith(p))) {
+        if (curPid !== process.pid && curPid > 1) pids.add(curPid);
+      }
+    }
+  }
+  return pids;
+}
+
+export async function teardown(): Promise<void> {
+  if (!runRoot) return;
+  const root = runRoot;
+
+  const pids = collectPidsHoldingUnder(root);
 
   const pidArr = Array.from(pids);
   if (pidArr.length > 0) {
