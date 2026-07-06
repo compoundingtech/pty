@@ -16,6 +16,7 @@ export const EventType = {
   SESSION_EXEC: "session_exec",
   SESSION_RESPAWN: "session_respawn",
   SESSION_ABANDONED: "session_abandoned",
+  SESSION_FLAPPING: "session_flapping",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -107,6 +108,23 @@ export interface SessionAbandonedEvent extends EventBase {
   idleDays?: number;
 }
 
+/** Emitted by `pty gc` when a `strategy=permanent` session has fast-failed
+ *  its respawn `limit` consecutive times within `window` seconds. Marks the
+ *  session `strategy.status=flapping` and stops respawning until the operator
+ *  removes the tag (or the stored command changes — auto-reset on hash
+ *  divergence). Emitted at the moment the threshold is crossed; subsequent
+ *  gc ticks silently skip the flapping session. */
+export interface SessionFlappingEvent extends EventBase {
+  type: "session_flapping";
+  /** Fast-fails counted, at or above `limit` when this event fired. */
+  counter: number;
+  /** Threshold that was crossed. */
+  limit: number;
+  /** Fast-fail window in seconds. A respawn that exits within this many
+   *  seconds of its `strategy.last-respawn-at` stamp counts as fast. */
+  window: number;
+}
+
 /** User-published event. `type` must begin with `user.` — the CLI
  *  (`pty emit`) rejects anything else, and the client-API `emitEvent`
  *  helper throws on bad types. Payload is free-form JSON. */
@@ -159,6 +177,7 @@ export type EventRecord =
   | SessionExecEvent
   | SessionRespawnEvent
   | SessionAbandonedEvent
+  | SessionFlappingEvent
   | UserEvent
   | StateSetEvent
   | StateDeleteEvent

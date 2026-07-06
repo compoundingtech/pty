@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### `pty gc` fast-fail respawn cap (fixes #54)
+
+- **New:** `pty gc` STEP-2 now detects a crash-looping permanent session and stops respawning it before it churns forever. A respawn whose leaf exits within `strategy.fast-fail-window` seconds (default 60) of the previous respawn counts as a fast fail; after `strategy.fast-fail-limit` consecutive fast fails (default 3) the session gets `strategy.status=flapping` written to its tags and a `session_flapping` event, and subsequent gc ticks silently skip it. This is the crash-loop-with-live-cwd case that the earlier `cwd-gone`/`idle` reap (#47, #50) didn't cover.
+- **New event `session_flapping`.** Payload `{ session, type: "session_flapping", ts, counter, limit, window }`. `counter` is the fast-fail streak at the moment of flip (>= `limit`); `window` is the resolved window in seconds. Documented in `docs/disk-layout.md`.
+- **New bookkeeping tags on permanent sessions.** Written by `pty gc` on every respawn: `strategy.last-respawn-at` (ISO timestamp), `strategy.consecutive-fast-fails` (running counter), `strategy.command-hash` (16-char SHA-256 prefix of the respawn command line — used to auto-reset the counter and clear a stale flapping mark when the operator edits the stored command). At the flip: `strategy.status=flapping` is added.
+- **Manual reset:** `pty tag <name> --rm strategy.status` (or `pty tag ... --rm strategy.consecutive-fast-fails --rm strategy.last-respawn-at` for a full clean-slate). The next gc tick retries.
+- **Auto-reset on command change:** the classifier compares the new command's fingerprint against `strategy.command-hash`. If they differ, the counter resets to zero and `strategy.status=flapping` clears — the operator has already reshaped the problem, no manual step needed.
+- **Per-session overrides** — `strategy.fast-fail-window=<sec>` and `strategy.fast-fail-limit=<int>` tags override the defaults for one session; higher precedence than the CLI globals.
+- **New CLI globals** — `pty gc --fast-fail-window=<sec>` and `pty gc --fast-fail-limit=<int>` mirror the per-session tags for anyone who wants to override the defaults for a whole gc run.
+- **`GcResult` gains two fields.** `flapped: { name, counter, limit, window }[]` — sessions the classifier flipped this tick. `flappingSkipped: string[]` — sessions the classifier silently skipped because they were already flagged. Both are surfaced in `cmdGc` output. Additive; existing consumers keep working.
+- **CLI output** — new lines: `Flapping: <name> (<N> fast-fails in <W>s, limit <L>)` on the flip tick and `Skipped (flapping): <name> — remove strategy.status tag to retry` on subsequent ticks. Summary bar adds `N flapping` / `N skipped-flapping` when non-empty. `--dry-run` mirrors with `Would flap: ...`.
+- Tests in `tests/gc-flapping.test.ts` (10 new) cover: dry-run previews, at-limit persistence + event emission, already-flapping silent skip, slow-fail counter reset, command-hash auto-reset (clears flapping mark), per-session and CLI-global window/limit overrides, and the first-respawn (no prior last-respawn-at) case.
+
 ### Per-namespace isolation — `PTY_ROOT` + `pty --root <path>`
 
 - **New canonical env var `PTY_ROOT`** for the state registry directory (default `~/.local/state/pty`). The pre-existing `PTY_SESSION_DIR` still works and continues to point at the same registry; when only the legacy name is set, `pty` emits a one-time deprecation notice to stderr per process. Precedence: `PTY_ROOT > PTY_SESSION_DIR > default`.

@@ -75,6 +75,7 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_exec` | `previousCommand, command` |
 | `session_respawn` | — (`pty gc` respawned a `strategy=permanent` session) |
 | `session_abandoned` | `reason: "cwd-gone" \| "idle", idleDays?` — (`pty gc` reaped a live permanent session detected as abandoned) |
+| `session_flapping` | `counter, limit, window` — (`pty gc` flipped a permanent session to `strategy.status=flapping` after N consecutive fast-fail respawns; subsequent ticks skip it) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
 | `state.set` | `key, value` |
