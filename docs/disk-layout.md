@@ -6,7 +6,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 
 ## Directory
 
-`$PTY_SESSION_DIR` (default `~/.local/state/pty`, mode `0700`, single-user). Every CLI command honors the env var.
+`$PTY_ROOT` (default `~/.local/state/pty`, mode `0700`, single-user). Every CLI command honors the env var. The pre-Phase-2 name `$PTY_SESSION_DIR` still works with a one-time deprecation notice; set `PTY_ROOT_LEGACY_SILENT=1` to suppress it.
 
 | file | purpose | tier |
 |---|---|---|
@@ -86,7 +86,7 @@ A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins a
 ## Reading from outside pty
 
 ```sh
-jq -r '.tags["role"] // empty' "$PTY_SESSION_DIR/myserver.json"
+jq -r '.tags["role"] // empty' "$PTY_ROOT/myserver.json"
 ```
 
 For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `state.set` / `tags_change` / `display_name_change` fire on every mutation.

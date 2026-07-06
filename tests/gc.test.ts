@@ -269,10 +269,14 @@ describe("pty gc", () => {
     const result = runCli(dir, "gc", "--print-launchd-plist");
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("<!DOCTYPE plist");
-    expect(result.stdout).toContain("<string>com.myobie.pty.gc</string>");
+    // Non-default root (tests use a tmp registry) — Label carries the
+    // basename suffix. Match either the default or the non-default shape.
+    expect(result.stdout).toMatch(/<string>com\.myobie\.pty\.gc(?:\.[A-Za-z0-9._-]+)?<\/string>/);
     expect(result.stdout).toContain("<key>StartInterval</key>");
     expect(result.stdout).toContain("<integer>30</integer>");
-    expect(result.stdout).toContain("<key>PTY_SESSION_DIR</key>");
+    // Phase-2: emitted env var is PTY_ROOT (canonical). Legacy
+    // PTY_SESSION_DIR readers migrate via the alias in getSessionDir().
+    expect(result.stdout).toContain("<key>PTY_ROOT</key>");
   });
 
   it("--print-launchd-plist --interval=N sets the interval", () => {
