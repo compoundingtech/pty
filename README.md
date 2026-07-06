@@ -171,7 +171,32 @@ Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dea
 
 ### On-disk format
 
-Session metadata, events, and supporting files all live under `$PTY_SESSION_DIR` (default `~/.local/state/pty`). The full layout — file naming, JSON shape, atomic-write contract, event types, stability tiers — is documented in [docs/disk-layout.md](docs/disk-layout.md). Third parties can read these files directly to skip the Node CLI's startup cost; `git`-style command forwarding (`pty <subcommand>` resolves to a `pty-<subcommand>` binary on `$PATH`) lets you ship native fast-path readers as `pty` subcommands.
+Session metadata, events, and supporting files all live under `$PTY_ROOT` (default `~/.local/state/pty`). The full layout — file naming, JSON shape, atomic-write contract, event types, stability tiers — is documented in [docs/disk-layout.md](docs/disk-layout.md). Third parties can read these files directly to skip the Node CLI's startup cost; `git`-style command forwarding (`pty <subcommand>` resolves to a `pty-<subcommand>` binary on `$PATH`) lets you ship native fast-path readers as `pty` subcommands.
+
+### Namespaces
+
+`pty` is single-registry by default — every `list`, `gc`, `kill`, `tag`, and `attach` operates on the same directory tree. Two tools sharing a machine can compose two levels of isolation on top of that: **filter by tag** (soft: everyone still sees each other but scoped views are cheap) and **switch registry** (hard: the underlying state directory is different, sessions are invisible across).
+
+**Soft isolation via tags** — any tool can stamp a namespace tag at spawn and filter on it:
+
+```sh
+pty run --tag app=payments -- ./bin/worker
+pty list --filter-tag app=payments          # only payments sessions
+pty list --filter-tag app=payments --filter-tag role=worker  # combine, ALL must match
+```
+
+The primitive is `--filter-tag k=v` (repeatable, matches ALL). Any tool layering on top — smalltalk uses `st.network=<root>` to distinguish agents in its network from an operator's ad-hoc pty use — reads and writes tags through the same primitive; no pty semantics for the outer tool's key.
+
+**Hard isolation via `--root`** — pin the state registry per call, or per environment:
+
+```sh
+pty --root /var/lib/pty-eval list           # one-off scope for this invocation
+PTY_ROOT=/var/lib/pty-eval pty list         # scope for a whole shell / process tree
+```
+
+Distinct roots share no sockets, no metadata, no events, no gc. A launchd cron (`pty gc --print-launchd-plist`) inherits the current `$PTY_ROOT` and bakes a per-root Label (`com.myobie.pty.gc.<basename>`) plus per-root log path, so N isolated registries can each install their own gc plist without collision. On the default root the Label stays `com.myobie.pty.gc` — existing installs survive an upgrade unchanged.
+
+`PTY_SESSION_DIR` (the pre-Phase-2 name for the same env var) still works and emits a one-time deprecation notice. Set `PTY_ROOT_LEGACY_SILENT=1` to suppress the notice while migrating.
 
 ### Project Files
 

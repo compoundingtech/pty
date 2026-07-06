@@ -78,6 +78,7 @@ const ISOLATED_ENV_ALLOWLIST = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL",
   "TERM", "COLORTERM", "LANG", "TZ", "PWD", "TMPDIR",
   // pty-internal
+  "PTY_ROOT",
   "PTY_SESSION_DIR",
 ]);
 

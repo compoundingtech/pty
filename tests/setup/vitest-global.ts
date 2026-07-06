@@ -13,6 +13,11 @@ export async function setup(): Promise<void> {
   runRoot = fs.mkdtempSync(path.join(shortBaseTmp(), `pv-`));
   process.env.PTY_VITEST_RUN_ROOT = runRoot;
   process.env.TMPDIR = runRoot;
+  // Existing tests set the legacy PTY_SESSION_DIR env for isolation;
+  // silence its Phase-2 deprecation notice so test stderr stays clean.
+  // A single dedicated test (tests/pty-root.test.ts) opts back in
+  // by unsetting this in the spawned child's env.
+  process.env.PTY_ROOT_LEGACY_SILENT = "1";
   process.stderr.write(`[vitest-global] runRoot=${runRoot}\n`);
 }
 

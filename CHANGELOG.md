@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Per-namespace isolation — `PTY_ROOT` + `pty --root <path>`
+
+- **New canonical env var `PTY_ROOT`** for the state registry directory (default `~/.local/state/pty`). The pre-existing `PTY_SESSION_DIR` still works and continues to point at the same registry; when only the legacy name is set, `pty` emits a one-time deprecation notice to stderr per process. Precedence: `PTY_ROOT > PTY_SESSION_DIR > default`.
+- **New env var `PTY_ROOT_LEGACY_SILENT=1`** — suppresses the `PTY_SESSION_DIR` deprecation notice for callers (test suites, long-lived legacy scripts) that are on a migration schedule.
+- **New global flag `pty --root <path>`** — pins the state registry for a single invocation. Parsed before subcommand dispatch, so every subcommand (`list`, `gc`, `kill`, `tag`, `attach`, `up`, `run`, …) transparently scopes. Equivalent to `PTY_ROOT=<path> pty <cmd>`.
+- **`pty gc --print-launchd-plist` per-root parametrization.** On the default root the emitted plist retains its Label `com.myobie.pty.gc` (backwards-compatible with existing installs) and its previous log path. On a non-default root the Label becomes `com.myobie.pty.gc.<basename-of-root>` — reverse-DNS-safe (non-`[A-Za-z0-9._-]` runs collapse to a single hyphen) — and the log path is `<PTY_ROOT>/gc.log`. Two networks can each install their own gc plist without a launchd-Label collision, and each network's gc noise stays inside its own registry.
+- **`PTY_ROOT` added to the isolate-env allow-list** (`src/server.ts:ISOLATED_ENV_ALLOWLIST`) alongside `PTY_SESSION_DIR`, so `pty run --isolate-env` children still see the pinned registry.
+- **Emitted plist now uses `PTY_ROOT`** in its `EnvironmentVariables` block — the deprecation notice fires anew every launchd tick if you re-use the legacy env, so a mid-migration installer gets loud, actionable feedback in `gc.log` instead of silent drift.
+- **README** — new "Namespaces" section under "On-disk format" documenting soft (tag-filter) and hard (`--root`/`PTY_ROOT`) namespacing, with the smalltalk `st.network=<value>` tag called out as a specific application of the soft primitive.
+- **`docs/disk-layout.md`** — directory table now references `$PTY_ROOT`; legacy env name called out with the migration hint.
+- Tests in `tests/pty-root.test.ts` cover: env-var precedence, deprecation notice fires exactly once and is silenced by `PTY_ROOT_LEGACY_SILENT`, `--root` overrides both env vars, `--root` without a value errors clearly, default-root plist retains legacy Label, non-default root gets a suffixed Label + per-root logPath, and a pathological basename (spaces) sanitizes into a launchd-safe suffix.
+
 ### Fixes
 - **`@myobie/pty/tui` `CellBuffer` — wide-char (2-cell) glyph rendering fixed.** Two root causes, both in `src/tui/buffer.ts`:
   1. `writeAnsi` iterated the input string by UTF-16 code unit, splitting astral-plane codepoints (emoji like `📬`, `📭`, `📫` — U+1F4XX) into two lone surrogate halves stored as separate width-1 cells. Downstream `diff()` and `fullRender()` emitted the halves independently; a modern host terminal (kitty, iTerm2, Ghostty) recombined them as one wide glyph, but the CellBuffer's cell-index → terminal-column mapping was off by one on every emoji. Fixed by detecting surrogate pairs and combining them into one Cell whose `char` holds the full 2-code-unit string.

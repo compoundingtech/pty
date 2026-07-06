@@ -8,7 +8,9 @@ import * as net from "node:net";
 // from inside functions, never at module-init time.
 import { appendEventSync } from "./events.ts";
 
-const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
+export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
+
+let hasWarnedLegacyRootEnv = false;
 
 const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -66,7 +68,19 @@ export function validateDisplayName(name: string): void {
 }
 
 export function getSessionDir(): string {
-  return process.env.PTY_SESSION_DIR ?? DEFAULT_SESSION_DIR;
+  const root = process.env.PTY_ROOT;
+  if (root && root.length > 0) return root;
+  const legacy = process.env.PTY_SESSION_DIR;
+  if (legacy && legacy.length > 0) {
+    if (!hasWarnedLegacyRootEnv && !process.env.PTY_ROOT_LEGACY_SILENT) {
+      hasWarnedLegacyRootEnv = true;
+      process.stderr.write(
+        "pty: PTY_SESSION_DIR is deprecated; use PTY_ROOT (same shape, canonical name).\n"
+      );
+    }
+    return legacy;
+  }
+  return DEFAULT_SESSION_DIR;
 }
 
 export function ensureSessionDir(): void {

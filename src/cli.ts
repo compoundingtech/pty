@@ -25,6 +25,7 @@ import {
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  DEFAULT_SESSION_DIR,
   getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo,
 } from "./sessions.ts";
@@ -75,6 +76,7 @@ function usage(): void {
   pty                                       Interactive session manager
   pty --preselect-new                       Open the TUI with "Create new session..." pre-selected
   pty --filter-tag key=value                Filter TUI to sessions with a tag; auto-applied to new sessions
+  pty --root <path> <subcommand> [...]     Pin the state registry for this call (same as PTY_ROOT env)
   pty run -- <command> [args...]            Create a session and attach (random id + auto label)
   pty run --id <id> -- <command>            Pin the on-disk id (sock + json filename)
   pty run --name <dn> -- <command>          Set the display label (arbitrary length / chars)
@@ -204,6 +206,21 @@ function autoName(cmd: string, cmdArgs: string[]): string {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // Global --root <path>: pin the state registry for this invocation.
+  // Consumed here so every subcommand transparently scopes via
+  // getSessionDir(). Equivalent to PTY_ROOT=<path> for one call.
+  // Scanned across the full argv because no subcommand uses --root.
+  const rootIdx = args.indexOf("--root");
+  if (rootIdx !== -1) {
+    const val = args[rootIdx + 1];
+    if (!val || val.startsWith("-")) {
+      console.error("pty: --root requires a path (e.g. pty --root /var/lib/pty-eval list)");
+      process.exit(1);
+    }
+    process.env.PTY_ROOT = val;
+    args.splice(rootIdx, 2);
+  }
 
   // Interactive-mode flags (--preselect-new, --filter-tag) can appear before
   // the subcommand. Peek at the subcommand without consuming flags; if it's
@@ -1995,11 +2012,32 @@ async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
  *  command, inheriting PATH and PTY_SESSION_DIR. If the SSD where node
  *  lives isn't mounted at boot, the invocation fails — the next tick
  *  tries again. That's the whole point. */
+/** Launchd `Label` values are reverse-DNS strings; the docs require
+ *  each service to have a unique label. When emitting per-network gc
+ *  plists we suffix the label with the root's basename so N networks
+ *  install N distinct services. Non-URL-safe characters (spaces,
+ *  slashes, etc.) collapse to a single hyphen so a pathological root
+ *  name can't produce a plist launchd rejects. */
+function labelBasenameFromRoot(sessionDir: string): string {
+  return path
+    .basename(sessionDir)
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 function printLaunchdPlist(interval: number): void {
-  const logPath = path.join(os.homedir(), ".local", "state", "pty", "gc.log");
+  const sessionDir = getSessionDir();
+  const isDefault = sessionDir === DEFAULT_SESSION_DIR;
+  // Default root keeps the pre-Phase-2 label untouched so existing
+  // installs (`launchctl load ... com.myobie.pty.gc.plist`) survive
+  // an upgrade. Non-default roots get a suffixed label so two networks
+  // can each install their own plist without a `Label` collision.
+  const suffix = isDefault ? "" : `.${labelBasenameFromRoot(sessionDir)}`;
+  const label = `com.myobie.pty.gc${suffix}`;
+  // Per-root log so a network's gc noise stays inside its own registry.
+  const logPath = path.join(sessionDir, "gc.log");
   const ptyBin = process.argv[1];
   const envPath = process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  const sessionDir = getSessionDir();
   const escape = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -2007,13 +2045,13 @@ function printLaunchdPlist(interval: number): void {
   // plist doesn't depend on the `pty` shim staying on PATH at launchd's
   // (minimal) shell. EnvironmentVariables still carries PATH so the
   // spawned children (and any `which` inside pty itself) find the user's
-  // tools.
+  // tools. PTY_ROOT (canonical) pins the target registry.
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.myobie.pty.gc</string>
+  <string>${escape(label)}</string>
   <key>ProgramArguments</key>
   <array>
     <string>${escape(process.execPath)}</string>
@@ -2032,7 +2070,7 @@ function printLaunchdPlist(interval: number): void {
   <dict>
     <key>PATH</key>
     <string>${escape(envPath)}</string>
-    <key>PTY_SESSION_DIR</key>
+    <key>PTY_ROOT</key>
     <string>${escape(sessionDir)}</string>
   </dict>
 </dict>
