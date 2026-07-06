@@ -129,6 +129,8 @@ function usage(): void {
   pty tag-multi <selector> [ops...]        Read/write tags across multiple sessions (--all / --filter-tag k=v / <name>...)
   pty gc --print-launchd-plist [--interval=N]   Print a launchd plist that runs 'pty gc' every N seconds (default 30)
   pty gc [--dry-run] [--idle-days N]       Reconciliation pass; --idle-days N reaps permanent sessions with no attach in N days
+  pty gc --fast-fail-window=N              Fast-fail window (seconds) for the respawn cap (default 60; per-session tag wins)
+  pty gc --fast-fail-limit=N               Consecutive fast fails before a permanent session is flagged flapping (default 3)
   pty wrap <command>                       Auto-wrap a command in pty sessions
   pty unwrap <command>                     Remove a wrap
   pty wrap --list                          List wrapped commands
@@ -758,45 +760,41 @@ async function main(): Promise<void> {
       const printPlist = gcArgs.includes("--print-launchd-plist");
       let interval = 30;
       let idleDays: number | undefined;
+      let fastFailWindowSec: number | undefined;
+      let fastFailLimit: number | undefined;
+      const parsePositive = (flag: string, raw: string): number => {
+        const v = parseInt(raw, 10);
+        if (!Number.isFinite(v) || v <= 0) {
+          console.error(`pty gc: ${flag} expects a positive integer (got "${raw}")`);
+          process.exit(1);
+        }
+        return v;
+      };
       for (let i = 0; i < gcArgs.length; i++) {
         const a = gcArgs[i];
         if (a === "--interval" && i + 1 < gcArgs.length) {
-          const v = parseInt(gcArgs[i + 1], 10);
-          if (!Number.isFinite(v) || v <= 0) {
-            console.error(`pty gc: --interval expects a positive integer (got "${gcArgs[i + 1]}")`);
-            process.exit(1);
-          }
-          interval = v;
-          i++;
+          interval = parsePositive("--interval", gcArgs[++i]);
         } else if (a.startsWith("--interval=")) {
-          const v = parseInt(a.slice("--interval=".length), 10);
-          if (!Number.isFinite(v) || v <= 0) {
-            console.error(`pty gc: --interval expects a positive integer (got "${a.slice("--interval=".length)}")`);
-            process.exit(1);
-          }
-          interval = v;
+          interval = parsePositive("--interval", a.slice("--interval=".length));
         } else if (a === "--idle-days" && i + 1 < gcArgs.length) {
-          const v = parseInt(gcArgs[i + 1], 10);
-          if (!Number.isFinite(v) || v <= 0) {
-            console.error(`pty gc: --idle-days expects a positive integer (got "${gcArgs[i + 1]}")`);
-            process.exit(1);
-          }
-          idleDays = v;
-          i++;
+          idleDays = parsePositive("--idle-days", gcArgs[++i]);
         } else if (a.startsWith("--idle-days=")) {
-          const v = parseInt(a.slice("--idle-days=".length), 10);
-          if (!Number.isFinite(v) || v <= 0) {
-            console.error(`pty gc: --idle-days expects a positive integer (got "${a.slice("--idle-days=".length)}")`);
-            process.exit(1);
-          }
-          idleDays = v;
+          idleDays = parsePositive("--idle-days", a.slice("--idle-days=".length));
+        } else if (a === "--fast-fail-window" && i + 1 < gcArgs.length) {
+          fastFailWindowSec = parsePositive("--fast-fail-window", gcArgs[++i]);
+        } else if (a.startsWith("--fast-fail-window=")) {
+          fastFailWindowSec = parsePositive("--fast-fail-window", a.slice("--fast-fail-window=".length));
+        } else if (a === "--fast-fail-limit" && i + 1 < gcArgs.length) {
+          fastFailLimit = parsePositive("--fast-fail-limit", gcArgs[++i]);
+        } else if (a.startsWith("--fast-fail-limit=")) {
+          fastFailLimit = parsePositive("--fast-fail-limit", a.slice("--fast-fail-limit=".length));
         }
       }
       if (printPlist) {
         printLaunchdPlist(interval);
         break;
       }
-      await cmdGc(dryRun, idleDays);
+      await cmdGc(dryRun, idleDays, fastFailWindowSec, fastFailLimit);
       break;
     }
 
@@ -1930,13 +1928,19 @@ async function cmdRm(name: string): Promise<void> {
   console.log(`Session "${name}" removed.`);
 }
 
-async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
-  const result = await gc({ dryRun, idleDays });
+async function cmdGc(
+  dryRun: boolean,
+  idleDays?: number,
+  fastFailWindowSec?: number,
+  fastFailLimit?: number,
+): Promise<void> {
+  const result = await gc({ dryRun, idleDays, fastFailWindowSec, fastFailLimit });
   const prunedTags = await pruneOrphanLayoutTags({ dryRun });
 
   const killedVerb = dryRun ? "Would kill orphan child" : "Killed orphan child";
   const abandonVerb = dryRun ? "Would abandon" : "Abandoned";
   const respawnVerb = dryRun ? "Would respawn" : "Respawned";
+  const flapVerb = dryRun ? "Would flap" : "Flapping";
   const removeVerb = dryRun ? "Would remove" : "Removed";
   const prunedVerb = dryRun ? "Would prune" : "Pruned";
 
@@ -1956,6 +1960,16 @@ async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
   for (const f of result.respawnFailed) {
     console.log(`Respawn failed: ${f.name} — ${f.error}`);
   }
+  for (const fl of result.flapped) {
+    console.log(
+      `${flapVerb}: ${fl.name} (${fl.counter} fast-fails in ${fl.window}s, limit ${fl.limit})`,
+    );
+  }
+  for (const name of result.flappingSkipped) {
+    console.log(
+      `Skipped (flapping): ${name} — remove strategy.status tag to retry`,
+    );
+  }
   for (const name of result.removed) {
     console.log(`${removeVerb}: ${name}`);
   }
@@ -1971,6 +1985,8 @@ async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
     result.abandoned.length +
     result.respawned.length +
     result.respawnFailed.length +
+    result.flapped.length +
+    result.flappingSkipped.length +
     result.removed.length +
     totalTags;
 
@@ -1991,6 +2007,12 @@ async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
   }
   if (result.respawnFailed.length > 0) {
     parts.push(`${result.respawnFailed.length} respawn failure${result.respawnFailed.length === 1 ? "" : "s"}`);
+  }
+  if (result.flapped.length > 0) {
+    parts.push(`${result.flapped.length} flapping`);
+  }
+  if (result.flappingSkipped.length > 0) {
+    parts.push(`${result.flappingSkipped.length} skipped-flapping`);
   }
   if (result.removed.length > 0) {
     parts.push(`${result.removed.length} stale session${result.removed.length === 1 ? "" : "s"}`);

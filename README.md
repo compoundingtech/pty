@@ -266,6 +266,22 @@ tags = { strategy = "permanent" }
 
 Restart is stateless — every `pty gc` invocation re-derives intent from on-disk metadata. There's no in-memory restart counter, no `[failed]` state, no persisted bookkeeping. If a session's binary isn't reachable (volume not mounted, broken symlink), `pty gc` reports `Respawn failed:` and the next tick tries again.
 
+**Fast-fail cap** — a permanent session whose leaf exits within `strategy.fast-fail-window` seconds of its previous `pty gc` respawn counts as a fast fail. After `strategy.fast-fail-limit` consecutive fast fails, `pty gc` writes `strategy.status=flapping` on the session, emits a `session_flapping` event, and stops respawning it. Subsequent gc ticks print `Skipped (flapping): <name>` and take no action. Defaults: 60 s window, 3 consecutive fast fails.
+
+Reset a flagged session with one of:
+
+- `pty tag <name> --rm strategy.status` — clear the mark, `pty gc` retries on the next tick.
+- Edit the session's `pty.toml` command — the classifier notices the SHA-256 fingerprint change and auto-resets the counter and mark.
+
+Per-session overrides tune the cap without editing gc's globals:
+
+```sh
+pty tag myserver strategy.fast-fail-window=120  # allow 2min of runtime before "fast"
+pty tag myserver strategy.fast-fail-limit=5     # tolerate 5 fast fails before flapping
+```
+
+CLI globals mirror the per-session tags (`--fast-fail-window=N`, `--fast-fail-limit=N`); the per-session tag wins when both are set.
+
 ### Parent-child sessions
 
 Tag a session with `parent=<name>` and `pty gc` will SIGTERM it (and clean up its metadata) when the referenced parent's daemon is no longer alive — useful for sidecar workers that shouldn't outlive their primary:

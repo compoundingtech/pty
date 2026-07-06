@@ -3,6 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
+import { createHash } from "node:crypto";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
@@ -510,6 +511,43 @@ export interface GcResult {
    *  binary is on an unmounted volume). Cron interval is the rate limit;
    *  next tick tries again. */
   respawnFailed: { name: string; error: string }[];
+  /** Permanent sessions the fast-fail cap flipped to `flapping` on this
+   *  tick. Each entry records the counter at the moment of flip plus the
+   *  effective `limit`/`window` in play. Sessions already flagged before
+   *  this tick are silently skipped from the respawn loop and do NOT
+   *  appear here — this bucket is transitions only. */
+  flapped: { name: string; counter: number; limit: number; window: number }[];
+  /** Permanent sessions skipped this tick because they are already
+   *  `strategy.status=flapping`. Distinct from `flapped` (transitions),
+   *  `respawnFailed` (attempted + failed), and `respawned` (attempted +
+   *  succeeded). Consumers can render "N flapping" without having to
+   *  read tags themselves. */
+  flappingSkipped: string[];
+}
+
+/** Default fast-fail respawn cap window (seconds). A permanent session
+ *  that exits within `DEFAULT_FAST_FAIL_WINDOW_SEC` of its previous gc
+ *  respawn counts as a fast fail. Overridden by `opts.fastFailWindowSec`
+ *  or the per-session `strategy.fast-fail-window` tag. */
+export const DEFAULT_FAST_FAIL_WINDOW_SEC = 60;
+
+/** Default fast-fail limit. `DEFAULT_FAST_FAIL_LIMIT` consecutive fast
+ *  fails flip the session to `strategy.status=flapping` and stop future
+ *  respawns until the operator intervenes (or the stored command changes,
+ *  which auto-resets). Overridden by `opts.fastFailLimit` or the
+ *  per-session `strategy.fast-fail-limit` tag. */
+export const DEFAULT_FAST_FAIL_LIMIT = 3;
+
+/** SHA-256 of a session's respawn command line, used to auto-reset the
+ *  fast-fail counter when the operator edits the pty.toml (or otherwise
+ *  changes the stored command). Kept short — the tag surface is user-
+ *  facing, not a cryptographic identifier. */
+function commandFingerprint(command: string, args: string[]): string {
+  const h = createHash("sha256");
+  h.update(command);
+  h.update("\0");
+  h.update(args.join("\0"));
+  return h.digest("hex").slice(0, 16);
 }
 
 /** Reconciliation pass driven by `pty gc`. Stateless: every invocation
@@ -530,11 +568,26 @@ export interface GcResult {
  *         exited/vanished is respawned via `spawnDaemon` (lazy-imported to
  *         avoid the `sessions ↔ spawn` cycle). Sessions with `ptyfile` +
  *         `ptyfile.session` tags re-read the toml to pick up any edits.
+ *         A fast-fail cap prevents a crash-looping leaf from being
+ *         respawned forever: `strategy.fast-fail-limit` consecutive
+ *         respawns whose leaf exited within `strategy.fast-fail-window`
+ *         seconds flip the session to `strategy.status=flapping` and
+ *         skip it on subsequent ticks. Auto-reset when the stored command
+ *         changes; manual reset via `pty tag <name> --rm strategy.status`.
  *    3.   Existing sweep: the historic behavior — exited/vanished sessions
  *         that aren't permanent get `cleanupAll`'d. */
-export async function gc(opts: { dryRun?: boolean; idleDays?: number } = {}): Promise<GcResult> {
+export async function gc(
+  opts: {
+    dryRun?: boolean;
+    idleDays?: number;
+    fastFailWindowSec?: number;
+    fastFailLimit?: number;
+  } = {},
+): Promise<GcResult> {
   const dryRun = !!opts.dryRun;
   const globalIdleDays = opts.idleDays;
+  const globalFastFailWindow = opts.fastFailWindowSec;
+  const globalFastFailLimit = opts.fastFailLimit;
   // First call to `listSessions` is intentionally throwaway — it has a
   // side effect (`cleanupSocket`) on sessions whose daemon SIGKILL'd
   // without writing an exit record, and those sessions are then *missing*
@@ -630,16 +683,83 @@ export async function gc(opts: { dryRun?: boolean; idleDays?: number } = {}): Pr
     : await listSessions();
   const respawned: GcResult["respawned"] = [];
   const respawnFailed: GcResult["respawnFailed"] = [];
+  const flapped: GcResult["flapped"] = [];
+  const flappingSkipped: GcResult["flappingSkipped"] = [];
   for (const s of afterStep15) {
     if (s.metadata?.tags?.strategy !== "permanent") continue;
     if (!isGone(s.status)) continue;
     const ptyfileReread = !!s.metadata?.tags?.ptyfile;
+
+    // Fast-fail classifier: was the previous respawn a fast crash? What's
+    // the running counter? Should we flip to flapping? Runs before any
+    // spawn so a session at the limit boundary flaps this tick instead
+    // of respawning one more time.
+    const decision = classifyFlapping(
+      s,
+      new Date(),
+      globalFastFailWindow,
+      globalFastFailLimit,
+    );
+
+    if (decision.action === "skip-flapping") {
+      flappingSkipped.push(s.name);
+      continue;
+    }
+
     if (dryRun) {
+      if (decision.action === "flap-now") {
+        flapped.push({
+          name: s.name,
+          counter: decision.counter,
+          limit: decision.effectiveLimit,
+          window: decision.effectiveWindow,
+        });
+        continue;
+      }
       respawned.push({ name: s.name, ptyfileReread });
       continue;
     }
+
+    if (decision.action === "flap-now") {
+      // Persist the flapping mark to on-disk metadata so subsequent
+      // ticks see it. We update the metadata file directly instead of
+      // going through updateTags — the session's daemon is gone, there's
+      // no live connection to notify, and cleanupAll ordering constraints
+      // in respawnPermanent don't apply here (we're NOT respawning).
+      try {
+        const meta = readMetadata(s.name);
+        if (meta) {
+          const merged: Record<string, string> = {
+            ...(meta.tags ?? {}),
+            ...decision.newBookkeeping,
+          };
+          writeMetadata(s.name, { ...meta, tags: merged });
+        }
+      } catch {
+        // Best-effort — if we can't persist the flag now, the next tick
+        // will recompute the same decision and try again.
+      }
+      try {
+        appendEventSync(s.name, {
+          session: s.name,
+          type: "session_flapping",
+          ts: new Date().toISOString(),
+          counter: decision.counter,
+          limit: decision.effectiveLimit,
+          window: decision.effectiveWindow,
+        });
+      } catch {}
+      flapped.push({
+        name: s.name,
+        counter: decision.counter,
+        limit: decision.effectiveLimit,
+        window: decision.effectiveWindow,
+      });
+      continue;
+    }
+
     try {
-      await respawnPermanent(s.name, s.metadata!);
+      await respawnPermanent(s.name, s.metadata!, decision.newBookkeeping);
       respawned.push({ name: s.name, ptyfileReread });
     } catch (err: any) {
       respawnFailed.push({ name: s.name, error: err?.message ?? String(err) });
@@ -660,7 +780,15 @@ export async function gc(opts: { dryRun?: boolean; idleDays?: number } = {}): Pr
     removed.push(s.name);
   }
 
-  return { removed, killedOrphanChildren, abandoned, respawned, respawnFailed };
+  return {
+    removed,
+    killedOrphanChildren,
+    abandoned,
+    respawned,
+    respawnFailed,
+    flapped,
+    flappingSkipped,
+  };
 }
 
 /** Decide whether a permanent session is abandoned. Order:
@@ -708,6 +836,132 @@ function classifyAbandoned(
   return { reason: "idle", idleDays: ageDays };
 }
 
+/** Decide whether a `strategy=permanent` session that's exited/vanished
+ *  should be respawned, marked flapping, or silently skipped because
+ *  it's already flapping. Reads three bookkeeping tags from the session:
+ *    - `strategy.last-respawn-at` (ISO ts): when gc last respawned it
+ *    - `strategy.consecutive-fast-fails` (int): running fast-fail counter
+ *    - `strategy.command-hash` (16-char hex): command fingerprint at last
+ *      respawn. If the current fingerprint differs, the operator edited
+ *      the pty.toml (or otherwise changed the command); reset the
+ *      counter and clear any stale `strategy.status=flapping`.
+ *
+ *  Effective window/limit resolution:
+ *    per-session tag (strategy.fast-fail-window / -limit)
+ *    → global opt (CLI --fast-fail-window / --fast-fail-limit)
+ *    → DEFAULT_FAST_FAIL_WINDOW_SEC / DEFAULT_FAST_FAIL_LIMIT.
+ *
+ *  Returned `newBookkeeping` MUST be merged onto the session's tags map
+ *  before/instead of respawn. The `flap-now` action never respawns; the
+ *  `respawn` action does; the `skip-flapping` action skips entirely. */
+interface FlappingDecision {
+  action: "respawn" | "flap-now" | "skip-flapping";
+  effectiveWindow: number;
+  effectiveLimit: number;
+  /** Fast-fail counter after this tick's classification. Only meaningful
+   *  for `respawn` (stamped on the session) and `flap-now` (the counter
+   *  that crossed the threshold, surfaced in the event payload). */
+  counter: number;
+  /** Tag deltas to persist. Empty for `skip-flapping`. For `respawn`,
+   *  carries the fresh timestamp, counter, and command hash. For
+   *  `flap-now`, adds `strategy.status=flapping` on top. */
+  newBookkeeping: Record<string, string>;
+}
+
+function classifyFlapping(
+  s: SessionInfo,
+  now: Date,
+  globalWindowSec: number | undefined,
+  globalLimit: number | undefined,
+): FlappingDecision {
+  const tags = s.metadata?.tags ?? {};
+
+  const tagWindow = parseInt(tags["strategy.fast-fail-window"] ?? "", 10);
+  const effectiveWindow = Number.isFinite(tagWindow) && tagWindow > 0
+    ? tagWindow
+    : (globalWindowSec !== undefined && globalWindowSec > 0
+      ? globalWindowSec
+      : DEFAULT_FAST_FAIL_WINDOW_SEC);
+
+  const tagLimit = parseInt(tags["strategy.fast-fail-limit"] ?? "", 10);
+  const effectiveLimit = Number.isFinite(tagLimit) && tagLimit > 0
+    ? tagLimit
+    : (globalLimit !== undefined && globalLimit > 0
+      ? globalLimit
+      : DEFAULT_FAST_FAIL_LIMIT);
+
+  const command = s.metadata?.command ?? "";
+  const args = s.metadata?.args ?? [];
+  const currentHash = commandFingerprint(command, args);
+  const storedHash = tags["strategy.command-hash"];
+  const commandChanged = storedHash !== undefined && storedHash !== currentHash;
+
+  // Command change wins over an existing flapping mark: the operator has
+  // edited the pty.toml (or manually mutated the command), so give it a
+  // fresh chance. `strategy.status` clears; counter resets to 0.
+  if (tags["strategy.status"] === "flapping" && !commandChanged) {
+    return {
+      action: "skip-flapping",
+      effectiveWindow,
+      effectiveLimit,
+      counter: parseInt(tags["strategy.consecutive-fast-fails"] ?? "0", 10) || 0,
+      newBookkeeping: {},
+    };
+  }
+
+  // Was the previous respawn a fast fail? Compare the exit timestamp
+  // against the last-respawn stamp; anything under `window` seconds is
+  // fast. If no prior stamp exists (never respawned by gc) or the exit
+  // is missing (vanished session), treat as slow — the counter resets.
+  const lastRespawnAt = tags["strategy.last-respawn-at"];
+  const exitedAt = s.metadata?.exitedAt;
+  let liveMs: number | null = null;
+  if (lastRespawnAt && exitedAt) {
+    const lr = Date.parse(lastRespawnAt);
+    const ex = Date.parse(exitedAt);
+    if (Number.isFinite(lr) && Number.isFinite(ex)) liveMs = ex - lr;
+  }
+  const wasFastFail = liveMs !== null && liveMs >= 0 && liveMs < effectiveWindow * 1000;
+
+  const prevCounter = parseInt(tags["strategy.consecutive-fast-fails"] ?? "0", 10) || 0;
+  const nextCounter = commandChanged ? 0 : (wasFastFail ? prevCounter + 1 : 0);
+
+  if (nextCounter >= effectiveLimit) {
+    // Threshold crossed. Mark flapping, don't respawn. The counter goes
+    // into the tags at its final value so subsequent listers can see how
+    // deep the streak went.
+    const bookkeeping: Record<string, string> = {
+      "strategy.status": "flapping",
+      "strategy.consecutive-fast-fails": String(nextCounter),
+      "strategy.command-hash": currentHash,
+    };
+    if (lastRespawnAt) bookkeeping["strategy.last-respawn-at"] = lastRespawnAt;
+    return {
+      action: "flap-now",
+      effectiveWindow,
+      effectiveLimit,
+      counter: nextCounter,
+      newBookkeeping: bookkeeping,
+    };
+  }
+
+  // Respawn. Stamp fresh bookkeeping. If we're clearing a stale flap
+  // mark from a command change, drop `strategy.status` explicitly by
+  // storing an empty string — updateTags treats that as a remove.
+  const bookkeeping: Record<string, string> = {
+    "strategy.last-respawn-at": now.toISOString(),
+    "strategy.consecutive-fast-fails": String(nextCounter),
+    "strategy.command-hash": currentHash,
+  };
+  return {
+    action: "respawn",
+    effectiveWindow,
+    effectiveLimit,
+    counter: nextCounter,
+    newBookkeeping: bookkeeping,
+  };
+}
+
 /** Restart a `strategy=permanent` session whose daemon is gone. If the
  *  session was toml-managed (`ptyfile` + `ptyfile.session` tags), re-read
  *  the pty.toml so the new daemon picks up command/env edits since the
@@ -715,10 +969,19 @@ function classifyAbandoned(
  *  verbatim (last-known-good) so a temporarily-missing toml doesn't
  *  prevent restart.
  *
+ *  `bookkeepingOverlay` (optional) carries pty-internal tags that must
+ *  survive the pty.toml re-read: gc backoff state (`strategy.last-*`,
+ *  `strategy.command-hash`, `strategy.consecutive-fast-fails`). Passed
+ *  by `gc()` STEP-2; ignored by other callers.
+ *
  *  Lazy-imports `spawn.ts` so the `sessions.ts ↔ spawn.ts` cycle doesn't
  *  bite at module-init time. After spawn, appends a `session_respawn`
  *  event to the session's event log so consumers see the restart. */
-async function respawnPermanent(name: string, metadata: SessionMetadata): Promise<void> {
+async function respawnPermanent(
+  name: string,
+  metadata: SessionMetadata,
+  bookkeepingOverlay: Record<string, string> = {},
+): Promise<void> {
   let command = metadata.command;
   let args = metadata.args;
   let displayCommand = metadata.displayCommand;
@@ -750,6 +1013,17 @@ async function respawnPermanent(name: string, metadata: SessionMetadata): Promis
       // error). Fall back to stored metadata — better to respawn with
       // last-known-good than to give up.
     }
+  }
+
+  // Merge gc's backoff bookkeeping last so it survives the pty.toml
+  // overlay above. Callers pass an empty overlay when they aren't gc.
+  // If a command change is clearing a stale flap mark, the caller
+  // omits `strategy.status` from the overlay; we also clear any
+  // existing flag on the merged map so a rebuilt tags dict doesn't
+  // silently carry it forward from the previous metadata.
+  tags = { ...(tags ?? {}), ...bookkeepingOverlay };
+  if (bookkeepingOverlay["strategy.status"] === undefined) {
+    delete tags["strategy.status"];
   }
 
   // Wipe stale socket/pid/events before respawn so spawnDaemon doesn't
