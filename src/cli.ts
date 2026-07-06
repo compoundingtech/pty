@@ -224,6 +224,37 @@ async function main(): Promise<void> {
     args.splice(rootIdx, 2);
   }
 
+  // Fail-loud backstop for the sockaddr_un.sun_path 104-byte kernel limit.
+  // `validateName()` already catches a too-long root at spawn time by
+  // computing the full socket path, but its error message reads as if
+  // the name were the problem, and it fires per-invocation only when a
+  // spawn happens. This check catches the pathological deep-PTY_ROOT
+  // case at startup — before any subcommand runs — and points the
+  // finger at the root, not the name.
+  //
+  // Threshold: an 8-char random session id (the default `pty run`
+  // shape) produces a socket suffix of `/xxxxxxxx.sock` = 14 bytes.
+  // A root whose length + 14 exceeds 104 can't host a default-id
+  // session and is unusable. Callers who intentionally want tiny
+  // 1-char names on a nearly-full root can side-step by shortening
+  // the root; there's no correct behavior for a genuinely-too-long
+  // root, so we fail rather than limp.
+  const resolvedRoot = process.env.PTY_ROOT ?? process.env.PTY_SESSION_DIR;
+  if (resolvedRoot && resolvedRoot.length > 0) {
+    const SUN_PATH_MAX = 104;
+    const SOCK_SUFFIX_BYTES = "/".length + 8 + ".sock".length;
+    const rootBytes = Buffer.byteLength(resolvedRoot, "utf-8");
+    if (rootBytes + SOCK_SUFFIX_BYTES > SUN_PATH_MAX) {
+      const usable = SUN_PATH_MAX - SOCK_SUFFIX_BYTES;
+      console.error(
+        `pty: PTY_ROOT is too long — ${rootBytes} bytes; must be ≤ ${usable} bytes for the socket path to fit the ${SUN_PATH_MAX}-byte kernel limit.\n` +
+        `  root: ${resolvedRoot}\n` +
+        `  Shorten the root (or use \`pty --root <shorter-path>\` for a one-off).`
+      );
+      process.exit(1);
+    }
+  }
+
   // Interactive-mode flags (--preselect-new, --filter-tag) can appear before
   // the subcommand. Peek at the subcommand without consuming flags; if it's
   // the interactive TUI (none, "i", or "interactive"), consume those flags
@@ -2637,6 +2668,20 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       const newKeySet = new Set(userTomlKeys);
       const removals = prevTomlKeys.filter((k) => !newKeySet.has(k));
 
+      // Manual `pty up` is an operator "reset" signal, same shape as
+      // `pty restart` in cmdRestart above. Drop any `pty gc` flapping
+      // bookkeeping the session may have accumulated so a re-`pty up`
+      // gives the session a clean slate. These keys are gc-owned, never
+      // toml-declared, so they aren't in `prevTomlKeys`.
+      for (const k of [
+        "strategy.status",
+        "strategy.consecutive-fast-fails",
+        "strategy.last-respawn-at",
+        "strategy.command-hash",
+      ]) {
+        if (currentTags[k] !== undefined && !removals.includes(k)) removals.push(k);
+      }
+
       const label = bound.metadata?.displayName ?? bound.name;
       if (Object.keys(updates).length > 0 || removals.length > 0) {
         try {
@@ -2831,7 +2876,13 @@ async function cmdRestart(
   }
 
   cleanupAll(name);
-  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
+  // Manual restart is an operator "please try again" signal — drop any
+  // `strategy.status=flapping` mark and its bookkeeping so the fresh
+  // spawn isn't skipped by `pty gc` on the next tick. Auto-reset on
+  // command edit already clears these; this handles the operator-
+  // intervenes-without-edit case that gc otherwise can't infer.
+  const restartTags = clearFlappingBookkeeping(meta.tags);
+  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: restartTags });
   console.log(`Session "${name}" restarted.`);
 
   // Nesting guard: restart itself is fine, but attaching would nest a client
@@ -2960,8 +3011,36 @@ function ask(prompt: string): Promise<string> {
   });
 }
 
+/** Strip `pty gc`'s flapping bookkeeping from a tag map before a manual
+ *  restart / respawn. `strategy.status`, `strategy.consecutive-fast-fails`,
+ *  `strategy.last-respawn-at`, and `strategy.command-hash` are all
+ *  gc-owned — they exist to track auto-respawn state, and an operator
+ *  action ("please try again") is a signal to reset them. Returns
+ *  `undefined` when the input is missing/empty so downstream defaults
+ *  (spawnDaemon skips the `tags` field entirely) apply. */
+function clearFlappingBookkeeping(
+  tags: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!tags || Object.keys(tags).length === 0) return tags;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(tags)) {
+    if (k === "strategy.status") continue;
+    if (k === "strategy.consecutive-fast-fails") continue;
+    if (k === "strategy.last-respawn-at") continue;
+    if (k === "strategy.command-hash") continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function strategyMarker(tags?: Record<string, string>): string {
   if (!tags) return "";
+  // Flapping supersedes permanent visually because it's what changed the
+  // operator's expectation ("gc stopped respawning this on purpose").
+  // Rendered red so it stands out from the yellow [permanent].
+  if (tags["strategy.status"] === "flapping") {
+    return " \x1b[31m[flapping]\x1b[0m";
+  }
   if (tags.strategy === "permanent") return " \x1b[33m[permanent]\x1b[0m";
   return "";
 }

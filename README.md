@@ -268,10 +268,13 @@ Restart is stateless — every `pty gc` invocation re-derives intent from on-dis
 
 **Fast-fail cap** — a permanent session whose leaf exits within `strategy.fast-fail-window` seconds of its previous `pty gc` respawn counts as a fast fail. After `strategy.fast-fail-limit` consecutive fast fails, `pty gc` writes `strategy.status=flapping` on the session, emits a `session_flapping` event, and stops respawning it. Subsequent gc ticks print `Skipped (flapping): <name>` and take no action. Defaults: 60 s window, 3 consecutive fast fails.
 
+A flagged session shows `[flapping]` (red) in `pty list` in place of `[permanent]` — the operator's expectation has changed, so the badge reflects that.
+
 Reset a flagged session with one of:
 
-- `pty tag <name> --rm strategy.status` — clear the mark, `pty gc` retries on the next tick.
-- Edit the session's `pty.toml` command — the classifier notices the SHA-256 fingerprint change and auto-resets the counter and mark.
+- `pty restart <name>` or `pty up` — the manual respawn drops all fast-fail bookkeeping (`strategy.status`, `strategy.consecutive-fast-fails`, `strategy.last-respawn-at`, `strategy.command-hash`), treating restart as an operator "please try again" signal.
+- `pty tag <name> --rm strategy.status` — surgical reset that clears only the mark, leaving the counter intact for observability.
+- Edit the session's `pty.toml` command — the classifier notices the SHA-256 fingerprint change and auto-resets the counter and mark on the next gc tick.
 
 Per-session overrides tune the cap without editing gc's globals:
 
