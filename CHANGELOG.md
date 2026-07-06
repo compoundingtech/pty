@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Follow-ups to #56 (fast-fail cap) + PTY_ROOT length backstop
+
+- **`pty restart` and `pty up` now clear the `pty gc` flapping bookkeeping.** Manual restart is an operator "please try again" signal — dropping `strategy.status`, `strategy.consecutive-fast-fails`, `strategy.last-respawn-at`, and `strategy.command-hash` on the restarted session gives it a clean slate, so the next `pty gc` tick isn't a no-op (silent skip against a stale flapping flag). Auto-reset on command-hash divergence already handled the toml-edit case; this handles the operator-intervenes-without-edit case that gc otherwise can't infer. Applies to both `pty restart` and `pty up`'s "already running, tag-sync" path.
+- **`pty list` renders `[flapping]`** in place of `[permanent]` when a session carries `strategy.status=flapping`. Red instead of yellow — the flag stands out from ordinary permanent sessions because the operator's expectation has changed (`pty gc` has stopped respawning it on purpose).
+- **Startup-time PTY_ROOT length backstop.** When the resolved root's byte length + a default-shape `/<8-char-id>.sock` suffix (14 bytes) would exceed the `sockaddr_un.sun_path` 104-byte kernel limit, `pty` errors before any subcommand runs. The error names the root and points the finger at the root, not the session name — the previous fallthrough error at spawn time read as if a random-id name were the problem. Backstop respects `--root <shorter>` overrides.
+- Tests in `tests/gc-flap-clear-badge-root-len.test.ts` (7 new) cover: restart-clears-bookkeeping, list shows [flapping] and hides [permanent] when both would apply, list still shows [permanent] otherwise, backstop errors on `pty list` with too-deep root, backstop fires before subcommand parsing, root at the usable threshold succeeds, `--root <shorter>` overrides a too-long env.
+
 ### `pty gc` fast-fail respawn cap (fixes #54)
 
 - **New:** `pty gc` STEP-2 now detects a crash-looping permanent session and stops respawning it before it churns forever. A respawn whose leaf exits within `strategy.fast-fail-window` seconds (default 60) of the previous respawn counts as a fast fail; after `strategy.fast-fail-limit` consecutive fast fails (default 3) the session gets `strategy.status=flapping` written to its tags and a `session_flapping` event, and subsequent gc ticks silently skip it. This is the crash-loop-with-live-cwd case that the earlier `cwd-gone`/`idle` reap (#47, #50) didn't cover.
