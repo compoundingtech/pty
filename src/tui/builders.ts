@@ -60,17 +60,41 @@ export function themeToXterm(theme: Theme): Record<string, string> {
   };
 }
 
+interface TextOpts {
+  bold?: boolean; dim?: boolean; italic?: boolean; inverse?: boolean;
+  background?: Color;
+  truncate?: boolean; wrap?: boolean;
+  highlight?: (text: string) => import("./nodes.ts").Span[];
+}
+
+/** Two shapes are supported:
+ *
+ *    text("hi")
+ *    text("hi", someColor)
+ *    text("hi", someColor, { bold: true })
+ *    text("hi", { fg: someColor, bold: true })  // object shape; `fg` maps to color
+ *
+ *  The object shape came in for consumers that prefer object-with-`fg` — everyone
+ *  ends up laying out `{ fg: ..., bold: ... }` anyway, so having to hop between
+ *  positional-color and object-opts was friction. Existing call sites keep working
+ *  because the runtime dispatch checks the second-arg TYPE, not arity: a string
+ *  (SemanticColor) or array ([r,g,b]) is a Color; a plain object is TextOpts. */
+export function text(str: string): TextNode;
+export function text(str: string, color: Color, opts?: TextOpts): TextNode;
+export function text(str: string, opts: TextOpts & { fg?: Color }): TextNode;
 export function text(
   str: string,
-  color?: Color,
-  opts?: {
-    bold?: boolean; dim?: boolean; italic?: boolean; inverse?: boolean;
-    background?: Color;
-    truncate?: boolean; wrap?: boolean;
-    highlight?: (text: string) => import("./nodes.ts").Span[];
-  },
+  colorOrOpts?: Color | (TextOpts & { fg?: Color }),
+  opts?: TextOpts,
 ): TextNode {
-  return { type: "text", text: str, color, ...opts };
+  if (colorOrOpts === undefined) return { type: "text", text: str };
+  if (typeof colorOrOpts === "string" || Array.isArray(colorOrOpts)) {
+    // Positional shape: colorOrOpts IS the Color.
+    return { type: "text", text: str, color: colorOrOpts, ...opts };
+  }
+  // Object shape: pull `fg` off as the color; the rest are ordinary opts.
+  const { fg, ...rest } = colorOrOpts;
+  return { type: "text", text: str, color: fg, ...rest };
 }
 
 export function spacer(): SpacerNode {
