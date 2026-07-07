@@ -30,9 +30,9 @@ export type EventType = (typeof EventType)[keyof typeof EventType];
 export interface EventBase {
   session: string;
   /** Type string. Known system types live in the `EventType` enum; user
-   *  events are `user.*`; state bag changes are `state.set` / `state.delete`.
-   *  Kept as a plain `string` here so subtype interfaces can carry their
-   *  own literal types without fighting the compiler. */
+   *  events are `user.*`. Kept as a plain `string` here so subtype
+   *  interfaces can carry their own literal types without fighting
+   *  the compiler. */
   type: string;
   ts: string;
 }
@@ -134,20 +134,6 @@ export interface UserEvent extends EventBase {
   text?: string;
 }
 
-/** Emitted automatically whenever `setState` writes a key. Mirrors
- *  what `pty state set` records. Consumers of the event stream can
- *  react to state changes without polling the metadata file. */
-export interface StateSetEvent extends EventBase {
-  type: "state.set";
-  key: string;
-  value: unknown;
-}
-
-export interface StateDeleteEvent extends EventBase {
-  type: "state.delete";
-  key: string;
-}
-
 /** Emitted whenever `setDisplayName` actually changes the stored value.
  *  `previous` / `value` are `null` when absent. Skipped on no-op writes
  *  so consumers don't get spurious refresh pings. */
@@ -179,8 +165,6 @@ export type EventRecord =
   | SessionAbandonedEvent
   | SessionFlappingEvent
   | UserEvent
-  | StateSetEvent
-  | StateDeleteEvent
   | DisplayNameChangeEvent
   | TagsChangeEvent;
 
@@ -216,7 +200,7 @@ const TRUNCATE_CHECK_INTERVAL = 100;
 
 /** One-shot helper to append a single event to a session's events log
  *  without keeping an EventWriter around. Used by CLI subcommands like
- *  `pty emit` and `pty state set` that run outside the daemon process.
+ *  `pty emit` that run outside the daemon process.
  *  Applies the same MAX_LINES/KEEP_LINES retention as `EventWriter` so
  *  scripts that write in a loop don't grow the log unbounded — the
  *  truncate path is skipped via a cheap stat when the file is small. */
@@ -229,16 +213,16 @@ export async function appendEvent(name: string, event: EventRecord): Promise<voi
 }
 
 /** Synchronous twin of `appendEvent` — lets synchronous metadata-mutation
- *  helpers (setDisplayName, updateTags, setState, deleteState) emit their
- *  change events inline without forcing their signatures to go async.
- *  Uses the same retention path with a sync stat fast-path.
+ *  helpers (setDisplayName, updateTags) emit their change events inline
+ *  without forcing their signatures to go async. Uses the same retention
+ *  path with a sync stat fast-path.
  *
  *  Concurrency note: `fs.appendFileSync` issues a single `write()` with
  *  `O_APPEND`, which POSIX guarantees is atomic for payloads up to
  *  `PIPE_BUF` bytes (typically 4096 on Linux/macOS). All built-in events
- *  are well under that. If a caller passes a `user.*` event or
- *  `state.set` with a > 4KB payload, concurrent appends could interleave
- *  — keep large payloads out of the event stream and in state. */
+ *  are well under that. If a caller passes a large `user.*` event
+ *  payload, concurrent appends could interleave — keep large payloads
+ *  out of the event stream. */
 export function appendEventSync(name: string, event: EventRecord): void {
   ensureSessionDir();
   const filePath = getEventsPath(name);
@@ -528,10 +512,6 @@ export function formatEvent(event: EventRecord): string {
       return event.reason === "idle" && event.idleDays !== undefined
         ? `${prefix} abandoned (idle ${event.idleDays}d)`
         : `${prefix} abandoned (${event.reason})`;
-    case "state.set":
-      return `${prefix} state.set ${event.key} = ${JSON.stringify(event.value)}`;
-    case "state.delete":
-      return `${prefix} state.delete ${event.key}`;
     case "display_name_change":
       return `${prefix} display_name -> ${JSON.stringify(event.value)} (was ${JSON.stringify(event.previous)})`;
     case "tags_change": {

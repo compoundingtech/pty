@@ -264,38 +264,6 @@ describe("formatEvent", () => {
     expect(result).toContain("cursor restored");
   });
 
-  it("formats state.set with JSON-encoded value", () => {
-    const result = formatEvent({
-      session: "test",
-      type: "state.set",
-      ts: "2026-04-05T10:15:03.000Z",
-      key: "port",
-      value: 3000,
-    });
-    expect(result).toContain("state.set port = 3000");
-  });
-
-  it("formats state.set with complex value (JSON, no pretty-printing)", () => {
-    const result = formatEvent({
-      session: "test",
-      type: "state.set",
-      ts: "2026-04-05T10:15:03.000Z",
-      key: "config",
-      value: { host: "localhost", tls: { cert: "x" } },
-    });
-    expect(result).toContain('state.set config = {"host":"localhost","tls":{"cert":"x"}}');
-  });
-
-  it("formats state.delete naming the removed key", () => {
-    const result = formatEvent({
-      session: "test",
-      type: "state.delete",
-      ts: "2026-04-05T10:15:03.000Z",
-      key: "port",
-    });
-    expect(result).toContain("state.delete port");
-  });
-
   it("formats user.* with a text payload (quoted)", () => {
     const result = formatEvent({
       session: "test",

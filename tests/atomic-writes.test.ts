@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import {
   atomicWriteFileSync, atomicWriteFile,
-  updateTags, setState, readMetadata,
+  updateTags, readMetadata,
 } from "../src/sessions.ts";
 import { appendEventSync, readRecentEvents } from "../src/events.ts";
 
@@ -199,26 +199,6 @@ describe("concurrent pty tag via multiple CLI processes", () => {
     expect(leftover).toEqual([]);
   }, 30000);
 
-  it("in-process Promise.all of setState calls leaves metadata valid", async () => {
-    const dir = makeSessionDir();
-    const name = uniqueName();
-    await startDaemon(dir, name);
-    process.env.PTY_SESSION_DIR = dir;
-
-    // 50 concurrent setState calls in the same process — stress-tests the
-    // atomic helper under the sync Promise.all-of-sync-functions pattern.
-    await Promise.all(
-      Array.from({ length: 50 }, (_, i) =>
-        Promise.resolve().then(() => setState(name, `k${i}`, i)),
-      ),
-    );
-
-    const meta = readMetadata(name);
-    expect(meta).not.toBeNull();
-    // All 50 should have landed — Node's single-threaded eventloop + sync
-    // setState means writes serialize, no losses.
-    expect(Object.keys(meta!.state ?? {}).sort()).toHaveLength(50);
-  }, 15000);
 });
 
 describe("event log truncation vs concurrent reader", () => {

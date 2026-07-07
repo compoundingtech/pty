@@ -1,54 +1,50 @@
 #compdef pty
 # Zsh completion for pty
-# Place in your fpath or source directly
+# Place in your fpath (e.g. ~/.zsh/completions/_pty) or install via
+# scripts/install-completions.sh.
 
 _pty() {
-  local session_dir="${PTY_SESSION_DIR:-${HOME}/.local/state/pty}"
-  local wrap_dir="${PTY_BIN_PATH:-${HOME}/.local/pty/bin}"
+  local root="${PTY_ROOT:-${PTY_SESSION_DIR:-${HOME}/.local/state/pty}}"
 
   _pty_sessions() {
     local -a sessions
-    if [[ -d "${session_dir}" ]]; then
-      sessions=(${session_dir}/*.json(N:t:r))
+    if [[ -d "${root}" ]]; then
+      sessions=(${root}/*.json(N:t:r))
     fi
     _describe 'session' sessions
-  }
-
-  _pty_wrapped() {
-    local -a wrapped
-    if [[ -d "${wrap_dir}" ]]; then
-      wrapped=(${wrap_dir}/*(N:t))
-    fi
-    _describe 'wrapped command' wrapped
   }
 
   local -a commands
   commands=(
     'run:Create a session and attach'
     'attach:Attach to an existing session'
-    'a:Attach to an existing session'
-    'exec:Replace the current session command'
-    'peek:Print current screen or follow output'
-    'send:Send text or keys to a session'
-    'events:Follow terminal events from sessions'
-    'list:List active sessions'
-    'ls:List active sessions'
-    'stats:Show live session metrics'
-    'restart:Restart an exited session'
-    'kill:Kill a running session'
-    'rm:Remove an exited session'
-    'remove:Remove an exited session'
-    'gc:Reconcile sessions (kill orphan children, respawn permanents, sweep exited)'
-    'tag:Show or modify session tags'
+    'a:Alias for attach'
+    'exec:Replace the current session process'
+    'peek:Print current screen (or follow / wait-for-text)'
+    'send:Send text or key events'
+    'events:Follow event log'
+    'list:List sessions'
+    'ls:Alias for list'
+    'stats:Live CPU / memory / PIDs'
+    'restart:SIGTERM + respawn'
+    'kill:SIGTERM a running session'
+    'rm:Remove exited metadata'
+    'remove:Alias for rm'
+    'gc:Reconciliation pass'
+    'tag:Read / write tags on one session'
+    'tag-multi:Bulk tag ops across sessions'
+    'emit:Publish a user.* event'
+    'rename:Set / show / clear displayName'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
-    'wrap:Auto-wrap a command in pty sessions'
-    'unwrap:Remove a wrapper'
-    'test:Run tests (vitest)'
-    'help:Show usage information'
+    'test:Run the pty test suite (vitest)'
+    'help:Show usage'
   )
 
   _arguments -C \
+    '(--root)--root[Pin PTY_ROOT for this call]:path:_directories' \
+    '(--preselect-new)--preselect-new[TUI: pre-select "Create new session..."]' \
+    '(--filter-tag)*--filter-tag[TUI: filter to k=v (repeatable)]:tag:' \
     '1:command:->command' \
     '*::arg:->args'
 
@@ -60,68 +56,95 @@ _pty() {
       case ${words[1]} in
         attach|a)
           _arguments \
-            '(-r --auto-restart)'{-r,--auto-restart}'[Auto-restart if exited]' \
+            '-r[Auto-restart if the session is exited]' \
+            '--force[Attach even from inside another pty]' \
             '1:session:_pty_sessions'
+          ;;
+        exec)
+          _normal
           ;;
         peek)
           _arguments \
-            '(-f --follow)'{-f,--follow}'[Follow output read-only]' \
-            '--plain[Output plain text without ANSI codes]' \
+            '-f[Follow output read-only]' \
+            '--plain[Plain text (no ANSI)]' \
             '--full[Include full scrollback]' \
             '--wait[Wait until text appears]:pattern:' \
-            '(-t --timeout)'{-t,--timeout}'[Timeout in seconds]:seconds:' \
+            '-t[Timeout in seconds for --wait]:seconds:' \
             '1:session:_pty_sessions'
           ;;
         send)
           _arguments \
             '1:session:_pty_sessions' \
-            '--with-delay[Delay between --seq items (seconds)]:seconds:' \
-            '*--seq[Send a sequence item]:value:'
-          ;;
-        kill|rm|remove)
-          _arguments '1:session:_pty_sessions'
-          ;;
-        restart)
-          _arguments \
-            '(-y --yes)'{-y,--yes}'[Skip confirmation for running sessions]' \
-            '1:session:_pty_sessions'
+            '*--seq[Ordered chunk / key event]:value:' \
+            '--with-delay[Delay between --seq items (sec)]:seconds:' \
+            '--paste[Wrap in bracketed-paste markers]:text:'
           ;;
         events)
           _arguments \
-            '--all[Follow events from all sessions]' \
-            '--recent[Show recent events and exit]' \
-            '--json[Output raw JSONL]' \
+            '--all[Follow every session, interleaved]' \
+            '--recent[Print recent + exit]' \
+            '--json[Emit raw JSONL]' \
             '--wait[Wait for a specific event type]:type:' \
-            '(-t --timeout)'{-t,--timeout}'[Timeout in seconds]:seconds:' \
-            '1:session:_pty_sessions'
-          ;;
-        stats)
-          _arguments \
-            '--json[Output as JSON]' \
-            '--all[Include exited sessions]' \
+            '-t[Timeout in seconds for --wait]:seconds:' \
             '1:session:_pty_sessions'
           ;;
         list|ls)
           _arguments \
-            '--json[Output as JSON]' \
-            '--tags[Show tags as #key=value]'
+            '--json[Emit JSON]' \
+            '--tags[Include internal bookkeeping tags]' \
+            '*--filter-tag[Filter to k=v (ALL must match)]:tag:' \
+            '--remote[Include remote sessions via pty-relay]'
+          ;;
+        stats)
+          _arguments \
+            '--json[Emit JSON]' \
+            '1:session:_pty_sessions'
+          ;;
+        restart)
+          _arguments \
+            '-y[Skip confirmation]' \
+            '--force[Attach after restart even from inside another pty]' \
+            '1:session:_pty_sessions'
+          ;;
+        kill|rm|remove)
+          _arguments '1:session:_pty_sessions'
           ;;
         gc)
           _arguments \
             '(-n --dry-run)'{-n,--dry-run}'[Preview without changing anything]' \
-            '--print-launchd-plist[Print a macOS launchd plist that runs pty gc]' \
-            '--interval[Plist StartInterval in seconds (default 30)]:seconds:'
+            '--idle-days[Reap permanents with no attach in N days]:days:' \
+            '--fast-fail-window[Fast-fail window in seconds (default 60)]:seconds:' \
+            '--fast-fail-limit[Consecutive fast fails before flapping (default 3)]:count:' \
+            '--print-launchd-plist[Emit a launchd plist that runs pty gc]' \
+            '--interval[Plist StartInterval seconds (default 30)]:seconds:'
           ;;
         tag)
-          _arguments '1:session:_pty_sessions'
-          ;;
-        wrap)
           _arguments \
-            '(-l --list)'{-l,--list}'[List all wrapped commands]' \
-            '1:command:_command_names -e'
+            '1:session:_pty_sessions' \
+            '*--rm[Remove tag key]:key:'
           ;;
-        unwrap)
-          _arguments '1:wrapped:_pty_wrapped'
+        tag-multi)
+          _arguments \
+            '--all[Selector: every session]' \
+            '*--filter-tag[Selector: k=v (repeatable)]:tag:' \
+            '*--rm[Remove tag key]:key:' \
+            '--json[Read mode: emit JSON]' \
+            '(-y --yes)'{-y,--yes}'[Confirm --all + write]'
+          ;;
+        emit)
+          _arguments \
+            '--json[JSON payload]:payload:' \
+            '--text[Text payload]:text:' \
+            '1:session:_pty_sessions'
+          ;;
+        rename)
+          _arguments \
+            '--show[Print current displayName]' \
+            '--clear[Remove displayName]' \
+            '1:session:_pty_sessions'
+          ;;
+        up|down)
+          _arguments '1:directory:_directories'
           ;;
         run)
           # After --, fall back to normal (command + file) completion
@@ -135,12 +158,20 @@ _pty() {
             fi
           done
           _arguments \
-            '(-d --detach)'{-d,--detach}'[Create in background]' \
-            '(-a --attach)'{-a,--attach}'[Attach if already running]' \
-            '(-e --ephemeral)'{-e,--ephemeral}'[Auto-remove on exit]' \
-            '--name[Session name]:name:' \
+            '-d[Create in background (detached)]' \
+            '-a[Create OR attach if id already exists]' \
+            '-e[Ephemeral: auto-remove on clean exit]' \
+            '--id[Pin on-disk id]:id:' \
+            '--name[Display label]:label:' \
+            '--no-display-name[Skip the auto-generated label]' \
+            '*--tag[Tag session with k=v]:tag:' \
             '--cwd[Working directory]:dir:_directories' \
-            '*--tag[Tag session with key=value]:tag:'
+            '--isolate-env[Scrub env to a safe allow-list]'
+          ;;
+        test)
+          _arguments \
+            '-t[Run matching tests]:pattern:' \
+            '1:mode:(watch)'
           ;;
       esac
       ;;

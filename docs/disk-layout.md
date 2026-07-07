@@ -42,7 +42,6 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   exitedAt?: string;
   lastLines?: string[];       // snapshotted at exit
   tags?: { [k: string]: string };
-  state?: { [k: string]: unknown };
   displayName?: string;
   lastAttachAt?: string;      // ISO 8601 — set by the daemon on every non-readonly ATTACH
 }
@@ -78,11 +77,9 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_flapping` | `counter, limit, window` — (`pty gc` flipped a permanent session to `strategy.status=flapping` after N consecutive fast-fail respawns; subsequent ticks skip it) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
-| `state.set` | `key, value` |
-| `state.delete` | `key` |
 | `user.<name>` | `data?, text?` — free-form, via `pty emit` |
 
-A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` / `state.set` payloads in `state` (atomic-rename), not events.
+A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` payloads out of the event stream.
 
 ## Reading from outside pty
 
@@ -90,4 +87,4 @@ A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins a
 jq -r '.tags["role"] // empty' "$PTY_ROOT/myserver.json"
 ```
 
-For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `state.set` / `tags_change` / `display_name_change` fire on every mutation.
+For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `tags_change` / `display_name_change` / `session_*` fire on every mutation.

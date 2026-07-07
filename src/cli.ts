@@ -26,7 +26,6 @@ import {
   atomicWriteFileSync,
   getSessionDir,
   DEFAULT_SESSION_DIR,
-  getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
@@ -73,72 +72,109 @@ function extractFilterTags(args: string[]): Record<string, string> {
 
 function usage(): void {
   console.log(`Usage:
-  pty                                       Interactive session manager
-  pty --preselect-new                       Open the TUI with "Create new session..." pre-selected
-  pty --filter-tag key=value                Filter TUI to sessions with a tag; auto-applied to new sessions
-  pty --root <path> <subcommand> [...]     Pin the state registry for this call (same as PTY_ROOT env)
-  pty run -- <command> [args...]            Create a session and attach (random id + auto label)
-  pty run --id <id> -- <command>            Pin the on-disk id (sock + json filename)
-  pty run --name <dn> -- <command>          Set the display label (arbitrary length / chars)
-  pty run --id <id> --name <dn> -- <cmd>    Pin both id and display label
-  pty run -d -- <command> [args...]         Create in the background
-  pty run -a -- <command> [args...]         Create or attach if already running
-  pty run --tag key=value -- <command>      Tag a session with metadata
-  pty run --cwd /path -- <command>          Run in a specific directory
-  pty run --isolate-env -- <command>        Scrub env down to a safe allow-list (for remote-reachable sessions)
-  pty run --no-display-name -- <command>    Skip the friendly cwd+command label (just an id)
-  pty rename <new>                        Inside a session, set its displayName
-  pty rename <ref> <new>                  Outside, set displayName on <ref>
-  pty rename --show <ref>                 Show current displayName for <ref>
-  pty rename --clear [ref]                Remove displayName (ref required outside a session)
-  pty attach <name>                        Attach to an existing session
-  pty attach --force <name>                Attach even when already inside a pty session (nested)
-  pty exec -- <command> [args...]          Replace the current session's command
-  pty attach -r <name>                     Attach, auto-restart if exited
-  pty peek <name>                          Print current screen and exit
-  pty peek --plain <name>                  Print current screen as plain text (no ANSI)
-  pty peek --full <name>                   Print full scrollback (not just viewport)
-  pty peek --wait "text" <name>            Wait until text appears on screen
-  pty peek --wait "text" -t 10 <name>      Wait with timeout (seconds)
-  pty peek -f <name>                       Follow output read-only (Ctrl+\\ to stop)
-  pty send <name> "text"                   Send text to a session
-  pty send <name> --seq "text" --seq key:return  Send an ordered sequence
-  pty send <name> --with-delay 0.5 --seq ...     Delay between each --seq item
-  pty send <name> --paste "<big text>"           Wrap payload in bracketed-paste markers
-  pty restart <name>                       Restart a session (prompts if running)
-  pty restart -y <name>                    Restart without confirmation
-  pty events <name>                        Follow events from a session
-  pty events --all                         Follow events from all sessions
-  pty events --recent <name>               Show recent events and exit
-  pty events --json <name>                 Output raw JSONL
-  pty list                                 List active sessions (with tags)
-  pty list --tags                          Show all tags including internal bookkeeping (ptyfile*, strategy, etc.)
-  pty list --json                          List sessions as JSON
-  pty list --filter-tag key=value          List only sessions matching the tag (repeatable)
-  pty up                                   Start all sessions from pty.toml
-  pty up <dir>                             Start sessions from <dir>/pty.toml
-  pty up <name> [<name>...]               Start specific sessions from pty.toml
-  pty down                                 Stop all sessions from pty.toml
-  pty down <dir>                           Stop sessions from <dir>/pty.toml
-  pty down <name> [<name>...]             Stop specific sessions from pty.toml
-  pty kill <name>                          Kill or remove a session
-  pty gc                                   Remove all exited sessions
-  pty tag <name>                           Show tags on a session
-  pty tag <name> key=value [key=value...]  Set tags
-  pty tag <name> --rm key [--rm key...]    Remove tags
-  pty tag-multi <selector> [ops...]        Read/write tags across multiple sessions (--all / --filter-tag k=v / <name>...)
-  pty gc --print-launchd-plist [--interval=N]   Print a launchd plist that runs 'pty gc' every N seconds (default 30)
-  pty gc [--dry-run] [--idle-days N]       Reconciliation pass; --idle-days N reaps permanent sessions with no attach in N days
-  pty gc --fast-fail-window=N              Fast-fail window (seconds) for the respawn cap (default 60; per-session tag wins)
-  pty gc --fast-fail-limit=N               Consecutive fast fails before a permanent session is flagged flapping (default 3)
-  pty wrap <command>                       Auto-wrap a command in pty sessions
-  pty unwrap <command>                     Remove a wrap
-  pty wrap --list                          List wrapped commands
-  pty test                                 Run tests (vitest)
-  pty test watch                           Watch mode
-  pty test -t "pattern"                    Run matching tests
+  pty                                     Interactive session manager (fullscreen TUI)
+  pty --preselect-new                     Open the TUI with "Create new session..." pre-selected
+  pty --filter-tag key=value              Filter the TUI to sessions matching the tag (repeatable);
+                                          new sessions inherit the tag
 
-Detach from a session with Ctrl+\\ (press twice to send Ctrl+\\ to the process)`);
+Create sessions:
+  pty run -- <command> [args...]          Create a session and attach (random id + auto display label)
+  pty run --id <id> -- <command>          Pin the on-disk id (sock / json filename; charset-validated)
+  pty run --name <label> -- <command>     Set an explicit display label (any printable, ≤ 500 chars)
+  pty run --no-display-name -- <cmd>      Skip the friendly cwd+command label (just an id)
+  pty run -d -- <command>                 Create in the background (detached)
+  pty run -a -- <command>                 Create OR attach if a session with the same id already exists
+  pty run -e -- <command>                 Ephemeral: auto-remove metadata on clean exit
+  pty run --tag key=value -- <command>    Tag a session (repeatable)
+  pty run --cwd /path -- <command>        Run in a specific directory
+  pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
+                                          (intended for remote-reachable sessions)
+
+Attach & interact:
+  pty attach <ref>                        Attach to an existing session (alias: pty a)
+  pty attach --force <ref>                Attach even from inside another pty session (nested)
+  pty attach -r <ref>                     Attach, auto-restart if the session is exited
+  pty exec -- <command> [args...]         Replace the current session's process (inside a session)
+  pty send <ref> "text"                   Send raw text (no implicit newline)
+  pty send <ref> --seq "text" --seq key:return   Send an ordered sequence of chunks / key events
+  pty send <ref> --with-delay 0.5 --seq ...      Insert a delay (seconds) between --seq items
+  pty send <ref> --paste "<big text>"     Wrap the payload in bracketed-paste markers
+
+Observe:
+  pty peek <ref>                          Print current screen and exit
+  pty peek --plain <ref>                  Print current screen as plain text (no ANSI)
+  pty peek --full <ref>                   Print full scrollback (not just the viewport)
+  pty peek --wait "text" [-t N] <ref>     Wait until text appears (optional timeout in seconds)
+  pty peek -f <ref>                       Follow output read-only (Ctrl+\\ to stop)
+  pty events <ref>                        Follow events from a session
+  pty events --all                        Follow events from every session, interleaved
+  pty events --recent <ref>               Print recent events and exit
+  pty events --json <ref>                 Emit raw JSONL
+  pty stats                               Live CPU / memory / PIDs for every session
+  pty stats <ref>                         Live metrics for a single session
+  pty stats --json                        Emit stats as JSON (one snapshot)
+  pty list                                List sessions (text; alias: pty ls)
+  pty list --json                         List sessions as JSON
+  pty list --tags                         Include internal bookkeeping tags (ptyfile*, strategy.*)
+  pty list --filter-tag key=value         Filter to sessions with the tag (repeatable, ALL must match)
+  pty list --remote                       Include remote sessions via pty-relay (when installed)
+
+Modify:
+  pty rename <label>                      Inside a session: set its displayName
+  pty rename <ref> <label>                Outside: set displayName on <ref>
+  pty rename --show <ref>                 Print the current displayName
+  pty rename --clear [ref]                Remove the displayName
+  pty tag <ref>                           Show tags on a session
+  pty tag <ref> key=value [key=value...]  Set tags
+  pty tag <ref> --rm key [--rm key...]    Remove tags
+  pty tag-multi <selector> [ops...]       Bulk read / write tags across sessions
+                                          Selector (one of): --all | --filter-tag k=v | <ref>...
+                                          Ops (any of): key=value | --rm key
+                                          --all + write requires --yes
+  pty emit user.<type> [--json <p>] [--text <s>]     Publish a user.* event (inside a session)
+  pty emit <ref> user.<type> [...]        Same, targeting a specific session
+
+Lifecycle:
+  pty restart <ref>                       SIGTERM + respawn using stored metadata (prompts if running)
+  pty restart -y <ref>                    Same, no prompt
+  pty kill <ref>                          SIGTERM a running session's daemon
+  pty rm <ref>                            Remove an exited session's metadata (alias: pty remove)
+  pty gc                                  Reconciliation pass: orphan-kill, abandoned-reap,
+                                          permanent-respawn, exited-sweep
+  pty gc --dry-run                        Preview without changing anything (alias: -n)
+  pty gc --idle-days N                    Also reap permanents with no attach in N days
+  pty gc --fast-fail-window=N             Fast-fail window (seconds) for the respawn cap
+                                          (default 60; per-session strategy.fast-fail-window wins)
+  pty gc --fast-fail-limit=N              Consecutive fast fails before a permanent is flagged
+                                          flapping (default 3; per-session tag wins)
+  pty gc --print-launchd-plist [--interval=N]
+                                          Print a launchd plist that runs 'pty gc' every N seconds
+                                          (default 30); Label + logPath derived from PTY_ROOT
+
+Multi (pty.toml):
+  pty up                                  Start every session in ./pty.toml
+  pty up <dir>                            Start sessions in <dir>/pty.toml
+  pty up <name> [<name>...]               Start specific sessions from ./pty.toml
+  pty down                                Stop every session in ./pty.toml
+  pty down <dir>                          Stop sessions in <dir>/pty.toml
+  pty down <name> [<name>...]             Stop specific sessions
+
+Global:
+  pty --root <path> <subcommand> [...]    Pin the state registry for this call (== PTY_ROOT env)
+  pty help | pty --help | pty -h          Show this usage
+  pty test [watch | -t "pattern"]         Run the pty test suite (vitest passthrough)
+
+Session references (<ref>): the on-disk id (validated: [A-Za-z0-9._-], ≤ 255 chars,
+socket path ≤ 104 bytes), or a displayName. Inside a session, most commands default
+to $PTY_SESSION when the ref is omitted (see 'pty rename', 'pty exec', 'pty emit').
+
+Env:
+  PTY_ROOT                Registry dir (default ~/.local/state/pty). Canonical.
+  PTY_SESSION_DIR         Deprecated alias for PTY_ROOT; still works, one-time notice.
+  PTY_ROOT_LEGACY_SILENT  Suppress the PTY_SESSION_DIR deprecation notice.
+  PTY_SESSION             Set by the daemon inside a session; drives nesting detection.
+
+Detach from an attached session with Ctrl+\\ (press twice to send Ctrl+\\ to the child).`);
 }
 
 /** Resolve a user-supplied session reference (name OR displayName) to the
@@ -925,11 +961,6 @@ async function main(): Promise<void> {
       break;
     }
 
-    case "state": {
-      await cmdState(args.slice(1));
-      break;
-    }
-
     case "up": {
       if (args[1] === "-h" || args[1] === "--help") {
         console.log("Usage: pty up [dir] [name...]\n\nStart sessions defined in pty.toml.");
@@ -989,27 +1020,6 @@ async function main(): Promise<void> {
       }
       const resolvedRmName = await resolveRef(args[1]);
       await cmdRm(resolvedRmName);
-      break;
-    }
-
-    case "wrap": {
-      if (args[1] === "--list" || args[1] === "-l") {
-        cmdWrapList();
-      } else if (!args[1]) {
-        console.error("Usage: pty wrap <command>");
-        process.exit(1);
-      } else {
-        cmdWrap(args[1]);
-      }
-      break;
-    }
-
-    case "unwrap": {
-      if (!args[1]) {
-        console.error("Usage: pty unwrap <command>");
-        process.exit(1);
-      }
-      cmdUnwrap(args[1]);
       break;
     }
 
@@ -2446,150 +2456,9 @@ Examples:
   pty emit myserver user.tests-passed --json '{"n": 42}'`);
 }
 
-// --- state: per-session JSON data bag ---
-
-async function cmdState(argv: string[]): Promise<void> {
-  const sub = argv[0];
-  if (!sub || sub === "-h" || sub === "--help") {
-    printStateHelp();
-    return;
-  }
-
-  // pty state <sub> [ref] [key] [value]
-  // ref defaults to $PTY_SESSION inside a session.
-  const rest = argv.slice(1);
-
-  // Figure out whether the first positional is a session-ref or a key.
-  // Heuristic: if it names an existing session, treat it as the ref;
-  // otherwise fall back to $PTY_SESSION. This matches the `pty exec`,
-  // `pty rename` etc. pattern.
-  async function resolveStateTarget(): Promise<{ name: string; rest: string[] }> {
-    const inside = process.env.PTY_SESSION;
-    if (rest.length > 0) {
-      const candidate = rest[0];
-      try {
-        validateName(candidate);
-        const existing = await getSession(candidate);
-        if (existing) return { name: candidate, rest: rest.slice(1) };
-      } catch {
-        // Not a valid session name — treat as the key instead.
-      }
-    }
-    if (!inside) {
-      console.error(`pty state ${sub}: no session ref given and not running inside a pty session`);
-      console.error(`  tip: run inside a pty session, or pass the session-ref: pty state ${sub} <session-ref> ...`);
-      process.exit(1);
-    }
-    return { name: await resolveRef(inside), rest };
-  }
-
-  try {
-    switch (sub) {
-      case "get": {
-        const { name, rest: r } = await resolveStateTarget();
-        if (r.length === 0) {
-          const bag = getState(name);
-          console.log(JSON.stringify(bag, null, 2));
-          return;
-        }
-        if (r.length > 1) {
-          console.error("pty state get: unexpected extra args");
-          process.exit(1);
-        }
-        const value = getStateKey(name, r[0]);
-        if (value === undefined) {
-          process.exit(1); // "missing key" — silent, non-zero exit
-        }
-        console.log(JSON.stringify(value, null, 2));
-        return;
-      }
-      case "set": {
-        const { name, rest: r } = await resolveStateTarget();
-        if (r.length < 1) {
-          console.error("pty state set: expected <key> [value]. If value is omitted, JSON is read from stdin.");
-          process.exit(1);
-        }
-        if (r.length > 2) {
-          console.error("pty state set: too many positional arguments. Quote the JSON value so the shell keeps it as one argument: pty state set <ref> <key> '<json>'.");
-          process.exit(1);
-        }
-        const key = r[0];
-        let raw: string;
-        if (r.length === 2) {
-          raw = r[1];
-        } else {
-          raw = await readAllStdin();
-        }
-        let value: unknown;
-        try { value = JSON.parse(raw); }
-        catch (e: any) {
-          console.error(`pty state set: value is not valid JSON: ${e.message}`);
-          process.exit(1);
-        }
-        setState(name, key, value);
-        // state.set event is emitted by setState itself.
-        return;
-      }
-      case "delete":
-      case "rm": {
-        const { name, rest: r } = await resolveStateTarget();
-        if (r.length !== 1) {
-          console.error(`pty state ${sub}: expected <key>`);
-          process.exit(1);
-        }
-        const key = r[0];
-        deleteState(name, key);
-        // state.delete event is emitted by deleteState when a key was
-        // actually removed; a delete on a missing key is a silent no-op.
-        return;
-      }
-      case "keys": {
-        const { name, rest: r } = await resolveStateTarget();
-        if (r.length > 0) {
-          console.error("pty state keys: unexpected extra args");
-          process.exit(1);
-        }
-        const keys = listStateKeys(name);
-        for (const k of keys) console.log(k);
-        return;
-      }
-      default:
-        printStateHelp();
-        process.exit(1);
-    }
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-}
-
-function printStateHelp(): void {
-  console.log(`Usage:
-  pty state get    [<ref>] [<key>]     # print full bag or one key (JSON)
-  pty state set    [<ref>] <key> [v]   # set <key> to JSON value v (or stdin)
-  pty state delete [<ref>] <key>       # remove a key
-  pty state keys   [<ref>]             # list keys
-
-Inside a pty session, <ref> defaults to $PTY_SESSION. Every set/delete
-emits a matching state.set / state.delete event so followers of
-'pty events <ref>' see state transitions live.
-
-Values are JSON — "42" is the number 42, '"42"' is the string "42".
-Use 'pty state set foo "$(cat payload.json)"' for larger payloads,
-or pipe via stdin:  cat payload.json | pty state set foo`);
-}
-
-async function readAllStdin(): Promise<string> {
-  // Collect all of stdin. Used by 'pty state set <key>' when no value arg
-  // is given — allows shell piping for large JSON payloads.
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => { data += chunk; });
-    process.stdin.on("end", () => resolve(data));
-    process.stdin.on("error", reject);
-  });
-}
+// (state / wrap / unwrap removed in the lean-core pass — smalltalk's
+//  folder + bus own agent state; wrap was orthogonal shim generation
+//  that isn't part of the session-primitive contract.)
 
 
 function hasPtyFile(dir: string): boolean {
@@ -3061,104 +2930,6 @@ function timeAgo(date: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
-}
-
-
-// ── Wrap/Unwrap ──
-
-const DEFAULT_WRAP_DIR = path.join(os.homedir(), ".local", "pty", "bin");
-
-function getWrapDir(): string {
-  return process.env.PTY_BIN_PATH ?? DEFAULT_WRAP_DIR;
-}
-
-function ensureWrapDir(): void {
-  fs.mkdirSync(getWrapDir(), { recursive: true, mode: 0o700 });
-}
-
-function checkWrapInPath(): void {
-  const wrapDir = getWrapDir();
-  const pathDirs = (process.env.PATH ?? "").split(":");
-  if (!pathDirs.includes(wrapDir)) {
-    console.error(`\nAdd this to your shell profile to use wrapped commands:\n`);
-    console.error(`  export PATH="${wrapDir}:$PATH"\n`);
-  }
-}
-
-/**
- * Resolve the real binary path, skipping our wrap directory.
- * Searches PATH with the wrap dir excluded so we find the original binary.
- */
-function resolveRealBinary(name: string): string | null {
-  const wrapDir = getWrapDir();
-  const pathDirs = (process.env.PATH ?? "").split(":").filter(d => d !== wrapDir);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, name);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  return null;
-}
-
-function cmdWrap(command: string): void {
-  const cmdName = path.basename(command);
-  const realPath = resolveRealBinary(cmdName);
-  if (!realPath) {
-    console.error(`Command not found in PATH: ${cmdName}`);
-    process.exit(1);
-  }
-
-  ensureWrapDir();
-  const wrapPath = path.join(getWrapDir(), cmdName);
-
-  // The wrapper script uses pty run -a (create or attach) with auto-naming.
-  // It resolves pty from PATH (excluding the wrap dir to avoid recursion).
-  const script = `#!/bin/sh
-# Generated by: pty wrap ${cmdName}
-# Wraps ${realPath} in a pty session
-exec pty run -a -- ${realPath} "$@"
-`;
-
-  fs.writeFileSync(wrapPath, script, { mode: 0o755 });
-  console.log(`Wrapped: ${cmdName} → ${realPath}`);
-  console.log(`Wrapper: ${wrapPath}`);
-  checkWrapInPath();
-}
-
-function cmdUnwrap(command: string): void {
-  const cmdName = path.basename(command);
-  const wrapPath = path.join(getWrapDir(), cmdName);
-  if (!fs.existsSync(wrapPath)) {
-    console.error(`Not wrapped: ${cmdName}`);
-    process.exit(1);
-  }
-  fs.unlinkSync(wrapPath);
-  console.log(`Unwrapped: ${cmdName}`);
-}
-
-function cmdWrapList(): void {
-  const wrapDir = getWrapDir();
-  let files: string[];
-  try {
-    files = fs.readdirSync(wrapDir);
-  } catch {
-    console.log("No wrapped commands.");
-    return;
-  }
-  if (files.length === 0) {
-    console.log("No wrapped commands.");
-    return;
-  }
-  console.log("Wrapped commands:");
-  for (const file of files.sort()) {
-    const content = fs.readFileSync(path.join(wrapDir, file), "utf-8");
-    const match = content.match(/exec pty run -a -- (.+) "\$@"/);
-    const target = match ? match[1] : "?";
-    console.log(`  ${file} → ${target}`);
-  }
-  checkWrapInPath();
 }
 
 main().catch((err) => {
