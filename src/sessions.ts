@@ -460,8 +460,13 @@ export const DEFAULT_FAST_FAIL_LIMIT = 3;
 /** SHA-256 of a session's respawn command line, used to auto-reset the
  *  fast-fail counter when the operator edits the pty.toml (or otherwise
  *  changes the stored command). Kept short — the tag surface is user-
- *  facing, not a cryptographic identifier. */
-function commandFingerprint(command: string, args: string[]): string {
+ *  facing, not a cryptographic identifier.
+ *
+ *  Exported on `@myobie/pty/client` so convoy's reconcile loop computes
+ *  identical hashes (see `notes/lean-pty-core-supervision-spec.md` §8.1
+ *  — wire-format freeze). Any change to the hash shape requires a joint
+ *  version bump across pty and convoy. */
+export function commandFingerprint(command: string, args: string[]): string {
   const h = createHash("sha256");
   h.update(command);
   h.update("\0");

@@ -42,8 +42,13 @@ export {
   type FollowerOptions,
 } from "./events.ts";
 
-// Project files
-export { readPtyFile, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
+// Project files — pty.toml reader shared with convoy's manifest processing
+// (convoy reads pty.toml verbatim per notes/lean-pty-core-supervision-spec.md §4).
+export { readPtyFile, commandWithEnvExports, type PtyFile, type PtySessionDef } from "./ptyfile.ts";
+
+// Reboot-cutover: shared classifier primitives that convoy's respawn loop
+// mirrors verbatim (spec §5 + §8.1 wire-format freeze).
+export { commandFingerprint, DEFAULT_FAST_FAIL_WINDOW_SEC, DEFAULT_FAST_FAIL_LIMIT } from "./sessions.ts";
 
 // Tag filter helpers (used by --filter-tag; shared with pty-relay)
 export { extractFilterTags, matchesAllTags, isReservedTagKey } from "./tags.ts";
