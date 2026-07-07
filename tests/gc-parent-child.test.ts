@@ -158,10 +158,11 @@ describe("pty gc — parent-child orphan-kill", () => {
     expect(result.stdout).toContain(`Killed orphan child: ${b}`);
   }, 15000);
 
-  it("combined parent= AND strategy=permanent: child is killed, not respawned", async () => {
-    // Orphan-kill (step 1) runs BEFORE permanent respawn (step 2), so a
-    // child with both tags whose parent has died should be removed —
-    // not respawned as a permanent.
+  it("combined parent= AND strategy=permanent: child is killed (orphan-kill), metadata removed", async () => {
+    // Orphan-kill (step 1) removes a child whose parent has died. Post-
+    // reboot pty gc doesn't respawn permanents anyway (convoy owns
+    // respawn), so the child is simply gone — its metadata is removed
+    // by cleanupAll and convoy sees no session to respawn.
     const dir = makeSessionDir();
     const parent = uniqueName("par");
     const child = uniqueName("ch");
@@ -175,7 +176,6 @@ describe("pty gc — parent-child orphan-kill", () => {
     const result = runCli(dir, "gc");
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`Killed orphan child: ${child}`);
-    expect(result.stdout).not.toContain(`Respawned: ${child}`);
     expect(fs.existsSync(path.join(dir, `${child}.json`))).toBe(false);
   }, 15000);
 

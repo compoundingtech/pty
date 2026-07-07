@@ -104,21 +104,18 @@ pty emit myserver user.note --text "checkpoint reached"     # with a text payloa
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
-pty gc                                    # reconcile sessions: kill orphan children, respawn permanents, sweep exited
+pty gc                                    # clean-only reconcile: orphan-kill, abandoned-reap, sweep exited
 pty gc --dry-run                          # preview what gc would do without changing anything
+pty gc --idle-days N                      # also reap permanent sessions with no attach in N days
 pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist   # install macOS auto-gc
 pty tag myserver role=web env=prod        # set one or more tags on a session
 pty tag myserver --rm role --rm env       # remove one or more tags
 pty tag-multi --filter-tag role=web env=prod    # bulk write across matching sessions
 pty tag-multi --all --json                # bulk read tags across every session
 pty tag-multi --all --yes audit=today     # write to every session (--yes required)
-
-pty up                                    # start all sessions from ./pty.toml
-pty up ./backend                          # start sessions from ./backend/pty.toml
-pty up claude dev                         # start specific sessions from ./pty.toml
-pty down                                  # stop all sessions from ./pty.toml
-pty down claude                           # stop specific sessions
 ```
+
+Manifest-processing (`pty up` / `pty down`) has moved to convoy. `pty.toml` is now read by `convoy up`; pty's public API keeps `readPtyFile` + `commandWithEnvExports` exported on `@myobie/pty/client` so convoy shares the parser without vendoring. See `notes/lean-pty-core-supervision-spec.md`.
 
 ### Nesting Prevention
 
@@ -186,7 +183,7 @@ command = "bin/serve"
 tags = { role = "server" }
 ```
 
-Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
+`pty.toml` manifest processing (start / stop / reconcile) is owned by convoy — run `convoy up` in the project directory to start the declared sessions. Convoy reads the same file verbatim; pty's public API exposes `readPtyFile` and `commandWithEnvExports` on `@myobie/pty/client` so convoy shares the parser. For ad-hoc single sessions, `pty run -d -- <cmd>` still creates a background session directly.
 
 Each session also supports two optional fields:
 
@@ -210,20 +207,18 @@ PORT = "8080"
 LOG_LEVEL = "debug"
 ```
 
-The values are exported into the session's shell before the command runs — `pty up` wraps every toml-managed session in `/bin/sh -c` so the `export K='V'; …` prefix is honored. They take effect on the next `pty up` after the session has stopped — restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` followed by `pty up` is the way to pick up a changed env block on an already-running session.
+The values are exported into the session's shell before the command runs — convoy's `up` wraps every toml-managed session in `/bin/sh -c` so the `export K='V'; …` prefix is honored. They take effect on the next `convoy up` after the session has stopped. Restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` (convoy respawns on its next reconcile tick) is the way to pick up a changed env block on an already-running session.
 
 ### Permanent sessions
 
-Tag a session with `strategy=permanent` and `pty gc` will respawn it whenever its daemon exits or vanishes:
+Tag a session with `strategy=permanent` and convoy's reconcile loop will respawn it whenever its daemon exits or vanishes. `pty gc` is clean-only: it kills orphan children (`parent=` tag), reaps abandoned permanents (cwd-gone; opt-in idle), and sweeps exited non-permanent metadata — never respawns.
 
 ```sh
 pty tag myserver strategy=permanent
 
-# After myserver exits — manually or by crash — the next `pty gc` run
-# brings it back. No backoff, no retry budget; the cron interval below
-# is the rate limit. Sessions managed by pty.toml re-read the toml on
-# respawn so command/env edits take effect immediately.
-pty gc
+# After myserver exits — manually or by crash — convoy's next reconcile
+# tick respawns it (default 30 s). Sessions managed by pty.toml re-read
+# the toml on respawn so command/env edits take effect immediately.
 ```
 
 From `pty.toml`:
@@ -234,26 +229,9 @@ command = "bin/serve"
 tags = { strategy = "permanent" }
 ```
 
-Restart is stateless — every `pty gc` invocation re-derives intent from on-disk metadata. There's no in-memory restart counter, no `[failed]` state, no persisted bookkeeping. If a session's binary isn't reachable (volume not mounted, broken symlink), `pty gc` reports `Respawn failed:` and the next tick tries again.
+The reboot moment relocated respawn + the fast-fail crash-loop cap from `pty gc` to convoy. Convoy owns the classifier (fast-fail window + counter + flapping mark + command-hash reset); pty owns the wire-format for the tags convoy writes (`strategy.consecutive-fast-fails`, `strategy.last-respawn-at`, `strategy.command-hash`, `strategy.status`). See `notes/lean-pty-core-supervision-spec.md` §5 + §8.1 for the full contract.
 
-**Fast-fail cap** — a permanent session whose leaf exits within `strategy.fast-fail-window` seconds of its previous `pty gc` respawn counts as a fast fail. After `strategy.fast-fail-limit` consecutive fast fails, `pty gc` writes `strategy.status=flapping` on the session, emits a `session_flapping` event, and stops respawning it. Subsequent gc ticks print `Skipped (flapping): <name>` and take no action. Defaults: 60 s window, 3 consecutive fast fails.
-
-A flagged session shows `[flapping]` (red) in `pty list` in place of `[permanent]` — the operator's expectation has changed, so the badge reflects that.
-
-Reset a flagged session with one of:
-
-- `pty restart <name>` or `pty up` — the manual respawn drops all fast-fail bookkeeping (`strategy.status`, `strategy.consecutive-fast-fails`, `strategy.last-respawn-at`, `strategy.command-hash`), treating restart as an operator "please try again" signal.
-- `pty tag <name> --rm strategy.status` — surgical reset that clears only the mark, leaving the counter intact for observability.
-- Edit the session's `pty.toml` command — the classifier notices the SHA-256 fingerprint change and auto-resets the counter and mark on the next gc tick.
-
-Per-session overrides tune the cap without editing gc's globals:
-
-```sh
-pty tag myserver strategy.fast-fail-window=120  # allow 2min of runtime before "fast"
-pty tag myserver strategy.fast-fail-limit=5     # tolerate 5 fast fails before flapping
-```
-
-CLI globals mirror the per-session tags (`--fast-fail-window=N`, `--fast-fail-limit=N`); the per-session tag wins when both are set.
+The **operator-restart path** post-reboot: `pty kill <ref>` → convoy's reconcile tick sees the session gone → respawns via `pty run -d`. A manual kill on a long-lived agent doesn't count as a fast fail (it lived past the window). `pty restart` still works for a one-verb "kill and respawn now" that also strips convoy's bookkeeping tags to give the restart a clean slate.
 
 ### Parent-child sessions
 
@@ -265,7 +243,7 @@ pty run -d --name webserver-tail --tag parent=webserver -- tail -f log/web.log
 # If `webserver` dies, the next `pty gc` SIGTERMs `webserver-tail`.
 ```
 
-What triggers the kill: the parent's metadata file is gone OR the parent's pid file is gone OR the parent's process isn't alive. What doesn't: the parent's exit code, the parent's `exitedAt` timestamp. Combinator with `strategy=permanent` is well-defined — orphan-kill wins (the child is removed, not respawned).
+What triggers the kill: the parent's metadata file is gone OR the parent's pid file is gone OR the parent's process isn't alive. What doesn't: the parent's exit code, the parent's `exitedAt` timestamp. Combinator with `strategy=permanent` is well-defined — orphan-kill wins (child removed by `pty gc`; convoy has nothing to respawn on the next tick).
 
 Cycles (A→B, B→A) resolve deterministically by name-sorted iteration: whichever name sorts first dies first on the tick where both parents are gone; the loser dies the same tick because its parent (the just-killed winner) is also dead. No cycle detection needed.
 

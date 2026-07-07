@@ -29,7 +29,7 @@
 
             # Generated from package-lock.json.
             # Regenerate with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-            npmDepsHash = "sha256-mer8rhDyD/j+htWDU8F1EH7MrnuS8pS57WdQgGH8cnQ=";
+            npmDepsHash = "sha256-yzWiYJ7sbxG1ulvmqA4X4ybs0Qtp7xacwy8PA0GCYBA=";
 
             # node-pty has native code that needs these at build time
             nativeBuildInputs = with pkgs; [ python3 pkg-config ];

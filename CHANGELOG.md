@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.0 — reboot cutover
+
+Reboot-moment release: pty relocates permanent-session respawn and the fast-fail crash-loop cap out to convoy. `pty gc` becomes clean-only; `pty-daemon` is spawned by the host rather than pty; `pty up` / `pty down` move to `convoy up` / `convoy down`. See `notes/lean-pty-core-supervision-spec.md` for the full contract.
+
+### BREAKING — CLI surface
+
+- **Removed `pty up` and `pty down`.** Manifest processing is now `convoy up` / `convoy down`. `pty.toml` stays as the manifest file name; convoy reads it verbatim. `readPtyFile` + `commandWithEnvExports` remain exported on `@myobie/pty/client` so convoy shares the parser without vendoring.
+- **Removed `pty gc --fast-fail-window` and `--fast-fail-limit`.** The fast-fail respawn cap moved to convoy's reconcile loop. Per-session `strategy.fast-fail-window` / `strategy.fast-fail-limit` tags still work but are now read by convoy, not pty.
+- **`pty gc` is clean-only.** The reconciliation pass keeps STEP 1 (orphan-kill on `parent=` tag), STEP 1.5 (abandoned-reap: cwd-gone; opt-in idle via `--idle-days` or `strategy.idle-days` tag), and STEP 3 (sweep exited non-permanent metadata). STEP 2 (permanent respawn) is gone. Permanent sessions that are gone stay in-place on disk for convoy's next reconcile tick to notice. Never spawns anything.
+
+### BREAKING — API surface
+
+- **`GcResult` trimmed.** `respawned`, `respawnFailed`, `flapped`, and `flappingSkipped` fields removed. The surviving shape is `{ removed, killedOrphanChildren, abandoned }`.
+- **`sessions.ts:respawnPermanent` deleted.** The helper's role (respawn a `strategy=permanent` session, re-read pty.toml, thread bookkeeping tags) is now convoy's. Convoy either `execFile`'s `pty run -d` (recommended, per Nathan's Q2) or imports `spawnDaemon` from `@myobie/pty/client` directly.
+- **`sessions.ts:classifyFlapping` deleted.** The classifier's role (fast-fail counter + command-hash divergence reset + flapping-status flip) is now convoy's. `commandFingerprint` stays exported so convoy computes byte-identical hashes; see spec §8.1 wire-format freeze.
+- **`[flapping]` badge removed from `strategyMarker` / `pty list`.** Convoy renders its own list view if desired; pty stays neutral on the status.
+- **`SessionFlappingEvent` interface + `EventType.SESSION_FLAPPING` stay exported.** Convoy imports both from `@myobie/pty/client` and emits the event via `appendEventSync`. The event payload shape is frozen (spec §8.1): `{ session, type: "session_flapping", ts, counter, limit, window }`. Any change requires a joint pty ⇄ convoy version bump.
+
+### Non-breaking additions (from the pre-cutover branch)
+
+- **Exported from `@myobie/pty/client`**: `commandFingerprint`, `DEFAULT_FAST_FAIL_WINDOW_SEC`, `DEFAULT_FAST_FAIL_LIMIT` (wire-format primitives convoy needs); `readPtyFile`, `commandWithEnvExports` (parser convoy shares).
+
+### Tests
+
+- Deleted: `tests/gc-flapping.test.ts`, `tests/gc-permanent.test.ts`, `tests/up-down.test.ts`, `tests/up-name-decouple.test.ts` — all exercised behavior that moved out of pty.
+- Extracted `tests/pty-root-length-backstop.test.ts` from the previous `tests/gc-flap-clear-badge-root-len.test.ts`, keeping only the PTY_ROOT length backstop cases.
+- `tests/gc-abandoned.test.ts` and `tests/gc-parent-child.test.ts` updated to assert the post-reboot behavior (exited permanents are left in-place; orphan-kill still removes children including permanent ones).
+
+### Migration
+
+- Reboot-only. This release is not incremental — it changes ownership of respawn. Bringing 0.11.0 pty online alongside a convoy that expects 0.12.0 pty (or vice versa) will leave permanent sessions with no respawn owner. Sequencing on Nathan's machine (or Johannes's): quiesce network → install pty 0.12.0 + convoy → run `convoy up`.
+
 ## 0.11.0
 
 ### `@myobie/pty/tui` — `text()` accepts an object form `{ fg, bold, ... }`

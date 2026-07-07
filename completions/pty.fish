@@ -62,8 +62,6 @@ complete -c pty -n __pty_needs_command -a tag       -d 'Read / write tags on one
 complete -c pty -n __pty_needs_command -a tag-multi -d 'Bulk tag ops across sessions'
 complete -c pty -n __pty_needs_command -a emit      -d 'Publish a user.* event'
 complete -c pty -n __pty_needs_command -a rename    -d 'Set / show / clear displayName'
-complete -c pty -n __pty_needs_command -a up        -d 'Start sessions from pty.toml'
-complete -c pty -n __pty_needs_command -a down      -d 'Stop sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a test      -d 'Run the pty test suite (vitest)'
 complete -c pty -n __pty_needs_command -a help      -d 'Show usage'
 
@@ -132,11 +130,9 @@ complete -c pty -n '__pty_using_command kill' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command rm'     -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command remove' -a '(__pty_sessions)' -d 'Session'
 
-# ── gc ─────────────────────────────────────────────────────────────────
+# ── gc (clean-only post-reboot; convoy owns respawn) ───────────────────
 complete -c pty -n '__pty_using_command gc' -s n -l dry-run -d 'Preview without changing anything'
 complete -c pty -n '__pty_using_command gc' -l idle-days -x -d 'Reap permanents with no attach in N days'
-complete -c pty -n '__pty_using_command gc' -l fast-fail-window -x -d 'Fast-fail window (seconds; default 60)'
-complete -c pty -n '__pty_using_command gc' -l fast-fail-limit -x -d 'Consecutive fast fails before flapping (default 3)'
 complete -c pty -n '__pty_using_command gc' -l print-launchd-plist -d 'Emit a launchd plist that runs pty gc'
 complete -c pty -n '__pty_using_command gc' -l interval -x -d 'Plist StartInterval seconds (default 30)'
 
@@ -160,11 +156,6 @@ complete -c pty -n '__pty_using_command emit' -l text -x -d 'Text payload'
 complete -c pty -n '__pty_using_command rename' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command rename' -l show -d 'Print current displayName'
 complete -c pty -n '__pty_using_command rename' -l clear -d 'Remove displayName'
-
-# ── up / down ──────────────────────────────────────────────────────────
-for verb in up down
-    complete -c pty -n "__pty_using_command $verb" -a '(__fish_complete_directories)' -d 'Directory containing pty.toml'
-end
 
 # ── test ───────────────────────────────────────────────────────────────
 complete -c pty -n '__pty_using_command test' -a 'watch' -d 'Watch mode'
