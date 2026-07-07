@@ -34,7 +34,9 @@ import {
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
-import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
+// pty.toml parsing moved to convoy post-reboot; `readPtyFile` +
+// `commandWithEnvExports` stay exported from `@myobie/pty/client` so
+// convoy shares the parser without vendoring.
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 
@@ -138,26 +140,17 @@ Lifecycle:
   pty restart <ref>                       SIGTERM + respawn using stored metadata (prompts if running)
   pty restart -y <ref>                    Same, no prompt
   pty kill <ref>                          SIGTERM a running session's daemon
+                                          (convoy's reconcile respawns strategy=permanent sessions)
   pty rm <ref>                            Remove an exited session's metadata (alias: pty remove)
-  pty gc                                  Reconciliation pass: orphan-kill, abandoned-reap,
-                                          permanent-respawn, exited-sweep
+  pty gc                                  Clean-only reconciliation: orphan-kill (parent= tag),
+                                          abandoned-reap (cwd-gone; opt-in idle), sweep exited
+                                          non-permanent metadata. Never respawns — convoy owns
+                                          respawn post-reboot.
   pty gc --dry-run                        Preview without changing anything (alias: -n)
-  pty gc --idle-days N                    Also reap permanents with no attach in N days
-  pty gc --fast-fail-window=N             Fast-fail window (seconds) for the respawn cap
-                                          (default 60; per-session strategy.fast-fail-window wins)
-  pty gc --fast-fail-limit=N              Consecutive fast fails before a permanent is flagged
-                                          flapping (default 3; per-session tag wins)
+  pty gc --idle-days N                    Also reap permanent sessions with no attach in N days
   pty gc --print-launchd-plist [--interval=N]
                                           Print a launchd plist that runs 'pty gc' every N seconds
                                           (default 30); Label + logPath derived from PTY_ROOT
-
-Multi (pty.toml):
-  pty up                                  Start every session in ./pty.toml
-  pty up <dir>                            Start sessions in <dir>/pty.toml
-  pty up <name> [<name>...]               Start specific sessions from ./pty.toml
-  pty down                                Stop every session in ./pty.toml
-  pty down <dir>                          Stop sessions in <dir>/pty.toml
-  pty down <name> [<name>...]             Stop specific sessions
 
 Global:
   pty --root <path> <subcommand> [...]    Pin the state registry for this call (== PTY_ROOT env)
@@ -827,8 +820,6 @@ async function main(): Promise<void> {
       const printPlist = gcArgs.includes("--print-launchd-plist");
       let interval = 30;
       let idleDays: number | undefined;
-      let fastFailWindowSec: number | undefined;
-      let fastFailLimit: number | undefined;
       const parsePositive = (flag: string, raw: string): number => {
         const v = parseInt(raw, 10);
         if (!Number.isFinite(v) || v <= 0) {
@@ -847,21 +838,13 @@ async function main(): Promise<void> {
           idleDays = parsePositive("--idle-days", gcArgs[++i]);
         } else if (a.startsWith("--idle-days=")) {
           idleDays = parsePositive("--idle-days", a.slice("--idle-days=".length));
-        } else if (a === "--fast-fail-window" && i + 1 < gcArgs.length) {
-          fastFailWindowSec = parsePositive("--fast-fail-window", gcArgs[++i]);
-        } else if (a.startsWith("--fast-fail-window=")) {
-          fastFailWindowSec = parsePositive("--fast-fail-window", a.slice("--fast-fail-window=".length));
-        } else if (a === "--fast-fail-limit" && i + 1 < gcArgs.length) {
-          fastFailLimit = parsePositive("--fast-fail-limit", gcArgs[++i]);
-        } else if (a.startsWith("--fast-fail-limit=")) {
-          fastFailLimit = parsePositive("--fast-fail-limit", a.slice("--fast-fail-limit=".length));
         }
       }
       if (printPlist) {
         printLaunchdPlist(interval);
         break;
       }
-      await cmdGc(dryRun, idleDays, fastFailWindowSec, fastFailLimit);
+      await cmdGc(dryRun, idleDays);
       break;
     }
 
@@ -941,7 +924,7 @@ async function main(): Promise<void> {
 
         if (ptyfilePath) {
           console.error(`\nWarning: this session is managed by ${ptyfilePath}`);
-          console.error("Running 'pty up' will sync tags from the toml and may overwrite this change.");
+          console.error("Running 'convoy up' will sync tags from the toml and may overwrite this change.");
           console.error("To make it permanent, edit the pty.toml file directly.");
         }
       } catch (e: any) {
@@ -961,51 +944,6 @@ async function main(): Promise<void> {
       break;
     }
 
-    case "up": {
-      if (args[1] === "-h" || args[1] === "--help") {
-        console.log("Usage: pty up [dir] [name...]\n\nStart sessions defined in pty.toml.");
-        break;
-      }
-      // pty up [dir] [name...]
-      const upArgs = args.slice(1);
-      let dir: string | undefined;
-      const names: string[] = [];
-
-      for (const arg of upArgs) {
-        if (arg.startsWith("-")) break;
-        if (!dir && names.length === 0 && hasPtyFile(arg)) {
-          dir = arg;
-        } else {
-          names.push(arg);
-        }
-      }
-
-      await cmdUp(dir, names);
-      break;
-    }
-
-    case "down": {
-      if (args[1] === "-h" || args[1] === "--help") {
-        console.log("Usage: pty down [dir] [name...]\n\nStop sessions defined in pty.toml.");
-        break;
-      }
-      // pty down [dir] [name...]
-      const downArgs = args.slice(1);
-      let dir: string | undefined;
-      const names: string[] = [];
-
-      for (const arg of downArgs) {
-        if (arg.startsWith("-")) break;
-        if (!dir && names.length === 0 && hasPtyFile(arg)) {
-          dir = arg;
-        } else {
-          names.push(arg);
-        }
-      }
-
-      await cmdDown(dir, names);
-      break;
-    }
 
     case "rename": {
       await cmdRename(args.slice(1));
@@ -1969,19 +1907,12 @@ async function cmdRm(name: string): Promise<void> {
   console.log(`Session "${name}" removed.`);
 }
 
-async function cmdGc(
-  dryRun: boolean,
-  idleDays?: number,
-  fastFailWindowSec?: number,
-  fastFailLimit?: number,
-): Promise<void> {
-  const result = await gc({ dryRun, idleDays, fastFailWindowSec, fastFailLimit });
+async function cmdGc(dryRun: boolean, idleDays?: number): Promise<void> {
+  const result = await gc({ dryRun, idleDays });
   const prunedTags = await pruneOrphanLayoutTags({ dryRun });
 
   const killedVerb = dryRun ? "Would kill orphan child" : "Killed orphan child";
   const abandonVerb = dryRun ? "Would abandon" : "Abandoned";
-  const respawnVerb = dryRun ? "Would respawn" : "Respawned";
-  const flapVerb = dryRun ? "Would flap" : "Flapping";
   const removeVerb = dryRun ? "Would remove" : "Removed";
   const prunedVerb = dryRun ? "Would prune" : "Pruned";
 
@@ -1993,23 +1924,6 @@ async function cmdGc(
       ? `idle ${a.idleDays}d`
       : a.reason;
     console.log(`${abandonVerb}: ${a.name} (${detail})`);
-  }
-  for (const r of result.respawned) {
-    const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
-    console.log(`${respawnVerb}: ${r.name}${note}`);
-  }
-  for (const f of result.respawnFailed) {
-    console.log(`Respawn failed: ${f.name} — ${f.error}`);
-  }
-  for (const fl of result.flapped) {
-    console.log(
-      `${flapVerb}: ${fl.name} (${fl.counter} fast-fails in ${fl.window}s, limit ${fl.limit})`,
-    );
-  }
-  for (const name of result.flappingSkipped) {
-    console.log(
-      `Skipped (flapping): ${name} — remove strategy.status tag to retry`,
-    );
   }
   for (const name of result.removed) {
     console.log(`${removeVerb}: ${name}`);
@@ -2024,10 +1938,6 @@ async function cmdGc(
   const totalActions =
     result.killedOrphanChildren.length +
     result.abandoned.length +
-    result.respawned.length +
-    result.respawnFailed.length +
-    result.flapped.length +
-    result.flappingSkipped.length +
     result.removed.length +
     totalTags;
 
@@ -2042,18 +1952,6 @@ async function cmdGc(
   }
   if (result.abandoned.length > 0) {
     parts.push(`${result.abandoned.length} abandoned`);
-  }
-  if (result.respawned.length > 0) {
-    parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);
-  }
-  if (result.respawnFailed.length > 0) {
-    parts.push(`${result.respawnFailed.length} respawn failure${result.respawnFailed.length === 1 ? "" : "s"}`);
-  }
-  if (result.flapped.length > 0) {
-    parts.push(`${result.flapped.length} flapping`);
-  }
-  if (result.flappingSkipped.length > 0) {
-    parts.push(`${result.flappingSkipped.length} skipped-flapping`);
   }
   if (result.removed.length > 0) {
     parts.push(`${result.removed.length} stale session${result.removed.length === 1 ? "" : "s"}`);
@@ -2461,254 +2359,6 @@ Examples:
 //  that isn't part of the session-primitive contract.)
 
 
-function hasPtyFile(dir: string): boolean {
-  try {
-    return fs.statSync(path.join(path.resolve(dir), "pty.toml")).isFile();
-  } catch {
-    return false;
-  }
-}
-
-async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
-  let ptyFile;
-  try {
-    ptyFile = readPtyFile(dir);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
-  let sessions = ptyFile.sessions;
-  if (names.length > 0) {
-    const nameSet = new Set(names);
-    const matchesName = (s: PtySessionDef) => nameSet.has(s.displayName) || nameSet.has(s.shortName);
-    const unknown = names.filter((n) => !sessions.some((s) => s.displayName === n || s.shortName === n));
-    if (unknown.length > 0) {
-      console.error(`Unknown session${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`);
-      console.error(`Available: ${sessions.map((s) => s.shortName).join(", ")}`);
-      process.exit(1);
-    }
-    sessions = sessions.filter(matchesName);
-  }
-
-  const tomlPath = path.join(ptyFile.dir, "pty.toml");
-  const existing = await listSessions();
-  /** Find an existing session that came from this same (ptyfile, ptyfile.session)
-   *  pair. The toml-derived displayName is just a label; identity is the tag
-   *  pair, so renaming a session or hitting a long-name collision doesn't lose
-   *  the binding. */
-  const findByTags = (shortName: string) => existing.find((s) =>
-    s.metadata?.tags?.ptyfile === tomlPath &&
-    s.metadata?.tags?.["ptyfile.session"] === shortName
-  );
-  const allRefSet = await allRefs();
-
-  let started = 0;
-  let skipped = 0;
-
-  for (const sess of sessions) {
-    const userTomlKeys = Object.keys(sess.tags ?? {}).sort();
-    const ptyfileTagsValue = userTomlKeys.join(",");
-    const tomlTags: Record<string, string> = {
-      ...sess.tags,
-      ptyfile: tomlPath,
-      "ptyfile.session": sess.shortName,
-      "ptyfile.tags": ptyfileTagsValue,
-    };
-
-    const bound = findByTags(sess.shortName);
-
-    if (bound && bound.status === "running") {
-      // Sync tags from toml to the running session (including ptyfile metadata).
-      // Track which tag keys came from the toml via "ptyfile.tags" so that
-      // removing a tag from the toml causes it to be removed here (but
-      // manually-added tags — those not in "ptyfile.tags" — are preserved).
-      const currentTags = bound.metadata?.tags ?? {};
-
-      const updates: Record<string, string> = {};
-      for (const [k, v] of Object.entries(tomlTags)) {
-        if (currentTags[k] !== v) updates[k] = v;
-      }
-
-      const prevTomlKeys = (currentTags["ptyfile.tags"] ?? "")
-        .split(",")
-        .map((k) => k.trim())
-        .filter((k) => k.length > 0);
-      const newKeySet = new Set(userTomlKeys);
-      const removals = prevTomlKeys.filter((k) => !newKeySet.has(k));
-
-      // Manual `pty up` is an operator "reset" signal, same shape as
-      // `pty restart` in cmdRestart above. Drop any `pty gc` flapping
-      // bookkeeping the session may have accumulated so a re-`pty up`
-      // gives the session a clean slate. These keys are gc-owned, never
-      // toml-declared, so they aren't in `prevTomlKeys`.
-      for (const k of [
-        "strategy.status",
-        "strategy.consecutive-fast-fails",
-        "strategy.last-respawn-at",
-        "strategy.command-hash",
-      ]) {
-        if (currentTags[k] !== undefined && !removals.includes(k)) removals.push(k);
-      }
-
-      const label = bound.metadata?.displayName ?? bound.name;
-      if (Object.keys(updates).length > 0 || removals.length > 0) {
-        try {
-          updateTags(bound.name, updates, removals);
-          const changedTagUpdates = Object.entries(updates)
-            .filter(([k]) => k !== "ptyfile" && k !== "ptyfile.session" && k !== "ptyfile.tags")
-            .map(([k, v]) => `${k}=${v}`);
-          const changedRemovals = removals.map((k) => `-${k}`);
-          const changed = [...changedTagUpdates, ...changedRemovals].join(", ");
-          if (changed) {
-            console.log(`  ● ${label} (already running, updated tags: ${changed})`);
-          } else {
-            console.log(`  ● ${label} (already running)`);
-          }
-        } catch {
-          console.log(`  ● ${label} (already running)`);
-        }
-      } else {
-        console.log(`  ● ${label} (already running)`);
-      }
-      skipped++;
-      continue;
-    }
-
-    // Clean up an exited bound session so its slot can be reused.
-    if (bound && isGone(bound.status)) {
-      cleanupAll(bound.name);
-    }
-
-    // Pick the on-disk id: honor the pty.toml's `id = "..."` if set,
-    // otherwise generate a random one. Either way validate before spawn so
-    // long pinned ids fail with a clear up-front error.
-    let name: string;
-    if (sess.id) {
-      try {
-        validateName(sess.id);
-      } catch (e: any) {
-        console.error(`  ✗ ${sess.displayName}: ${e.message}`);
-        continue;
-      }
-      if (allRefSet.has(sess.id)) {
-        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use (as a name or displayName).`);
-        continue;
-      }
-      name = sess.id;
-      allRefSet.add(sess.id);
-    } else {
-      let candidate: string | null = null;
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const c = randomSessionName();
-        if (!allRefSet.has(c)) { candidate = c; allRefSet.add(c); break; }
-      }
-      if (!candidate) {
-        console.error(`  ✗ ${sess.displayName}: could not generate a unique session id after 8 attempts.`);
-        continue;
-      }
-      name = candidate;
-    }
-
-    // Validate the toml-derived displayName once. Default `<prefix>-<short>`
-    // is always safe; an explicit `display_name` field could be anything.
-    try {
-      validateDisplayName(sess.displayName);
-    } catch (e: any) {
-      console.error(`  ✗ ${sess.displayName}: ${e.message}`);
-      continue;
-    }
-
-    try {
-      await spawnDaemon({
-        name,
-        command: "/bin/sh",
-        args: ["-c", commandWithEnvExports(sess)],
-        displayCommand: sess.command,
-        cwd: ptyFile.dir,
-        tags: tomlTags,
-        displayName: sess.displayName,
-      });
-      console.log(`  ● ${sess.displayName} (started)`);
-      started++;
-    } catch (e: any) {
-      console.error(`  ✗ ${sess.displayName}: ${e.message}`);
-    }
-  }
-
-  if (started === 0 && skipped === sessions.length) {
-    console.log("All sessions already running.");
-  } else if (started > 0) {
-    console.log(`Started ${started} session${started === 1 ? "" : "s"}.`);
-  }
-}
-
-async function cmdDown(dir: string | undefined, names: string[]): Promise<void> {
-  let ptyFile;
-  try {
-    ptyFile = readPtyFile(dir);
-  } catch (e: any) {
-    console.error(e.message);
-    process.exit(1);
-  }
-
-  let sessions = ptyFile.sessions;
-  if (names.length > 0) {
-    const nameSet = new Set(names);
-    sessions = sessions.filter((s) => nameSet.has(s.displayName) || nameSet.has(s.shortName));
-  }
-
-  const tomlPath = path.join(ptyFile.dir, "pty.toml");
-  const existing = await listSessions();
-  const findByTags = (shortName: string) => existing.find((s) =>
-    s.metadata?.tags?.ptyfile === tomlPath &&
-    s.metadata?.tags?.["ptyfile.session"] === shortName
-  );
-  let stopped = 0;
-
-  for (const sess of sessions) {
-    const existingSession = findByTags(sess.shortName);
-    if (!existingSession) continue;
-
-    const label = existingSession.metadata?.displayName ?? existingSession.name;
-
-    // Strip the `strategy` tag so `pty gc` doesn't respawn the session
-    // on its next tick. The `supervisor.status` tag is no longer a thing.
-    const wasPermanent = existingSession.metadata?.tags?.strategy === "permanent";
-    if (wasPermanent) {
-      try {
-        updateTags(existingSession.name, {}, ["strategy"]);
-      } catch {}
-    }
-
-    if (existingSession.status === "running" && existingSession.pid) {
-      try {
-        process.kill(existingSession.pid, "SIGTERM");
-        console.log(`  ○ ${label} (stopped${wasPermanent ? ", removed from supervision" : ""})`);
-        stopped++;
-      } catch {
-        console.error(`  ✗ ${label}: failed to stop`);
-      }
-      cleanupSocket(existingSession.name);
-    } else if (isGone(existingSession.status)) {
-      cleanupAll(existingSession.name);
-      console.log(`  ○ ${label} (cleaned up)`);
-      stopped++;
-    }
-  }
-
-  if (stopped === 0) {
-    console.log("No sessions to stop.");
-  } else {
-    console.log(`Stopped ${stopped} session${stopped === 1 ? "" : "s"}.`);
-  }
-
-  // Warn if any stopped sessions are toml-managed
-  const anyTomlManaged = sessions.some((sess) => findByTags(sess.shortName)?.metadata?.tags?.ptyfile);
-  if (anyTomlManaged && stopped > 0) {
-    console.error("\nNote: strategy tags will be restored on the next 'pty up'.");
-  }
-}
 
 async function cmdRestart(
   name: string,
@@ -2880,13 +2530,13 @@ function ask(prompt: string): Promise<string> {
   });
 }
 
-/** Strip `pty gc`'s flapping bookkeeping from a tag map before a manual
- *  restart / respawn. `strategy.status`, `strategy.consecutive-fast-fails`,
+/** Strip convoy's flapping bookkeeping from a tag map before a manual
+ *  restart. `strategy.status`, `strategy.consecutive-fast-fails`,
  *  `strategy.last-respawn-at`, and `strategy.command-hash` are all
- *  gc-owned — they exist to track auto-respawn state, and an operator
- *  action ("please try again") is a signal to reset them. Returns
- *  `undefined` when the input is missing/empty so downstream defaults
- *  (spawnDaemon skips the `tags` field entirely) apply. */
+ *  convoy-owned post-reboot — they track auto-respawn state, and an
+ *  operator running `pty restart` is a "please try again with fresh
+ *  state" signal. Returns `undefined` when the input is missing/empty
+ *  so downstream defaults apply. */
 function clearFlappingBookkeeping(
   tags: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
@@ -2904,12 +2554,6 @@ function clearFlappingBookkeeping(
 
 function strategyMarker(tags?: Record<string, string>): string {
   if (!tags) return "";
-  // Flapping supersedes permanent visually because it's what changed the
-  // operator's expectation ("gc stopped respawning this on purpose").
-  // Rendered red so it stands out from the yellow [permanent].
-  if (tags["strategy.status"] === "flapping") {
-    return " \x1b[31m[flapping]\x1b[0m";
-  }
   if (tags.strategy === "permanent") return " \x1b[33m[permanent]\x1b[0m";
   return "";
 }

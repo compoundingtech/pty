@@ -309,18 +309,19 @@ describe("pty gc — abandoned-reap step 1.5", () => {
 });
 
 describe("pty gc — abandoned reap does not disrupt other buckets", () => {
-  it("still respawns a normal exited permanent session in the same pass", async () => {
-    // Two sessions: one abandoned (cwd-gone, live), one exited (should
-    // respawn normally). Both permanent. Same gc pass handles both.
+  it("reaps a cwd-gone permanent alongside a normal exited permanent (which is left in-place for convoy)", async () => {
+    // Two sessions: one abandoned (cwd-gone, live), one exited-permanent
+    // (post-reboot: pty gc leaves it alone; convoy's reconcile loop owns
+    // respawn). Same gc pass handles both.
     const dir = makeSessionDir();
 
     const abandonName = uniqueName();
     const abandonCwd = makeCwd();
     await startDaemon(dir, abandonName, abandonCwd, "sleep", ["60"], { strategy: "permanent" });
 
-    const respawnName = uniqueName();
-    const respawnCwd = makeCwd();
-    await startDaemon(dir, respawnName, respawnCwd, "true", [], { strategy: "permanent" });
+    const leftAloneName = uniqueName();
+    const leftAloneCwd = makeCwd();
+    await startDaemon(dir, leftAloneName, leftAloneCwd, "true", [], { strategy: "permanent" });
 
     await new Promise((r) => setTimeout(r, 800)); // let `true` exit
     fs.rmSync(abandonCwd, { recursive: true, force: true });
@@ -328,12 +329,9 @@ describe("pty gc — abandoned reap does not disrupt other buckets", () => {
     const result = runCli(dir, "gc");
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`Abandoned: ${abandonName} (cwd-gone)`);
-    expect(result.stdout).toContain(`Respawned: ${respawnName}`);
-
-    // Track any respawn pid for cleanup.
-    try {
-      const pid = parseInt(fs.readFileSync(path.join(dir, `${respawnName}.pid`), "utf-8").trim(), 10);
-      if (Number.isFinite(pid)) bgPids.push(pid);
-    } catch {}
+    // Post-reboot: pty gc no longer respawns; exited permanent stays
+    // in-place with its metadata for convoy's reconcile loop to notice.
+    expect(result.stdout).not.toContain(`Respawned: ${leftAloneName}`);
+    expect(result.stdout).not.toContain(`Removed: ${leftAloneName}`);
   }, 25000);
 });

@@ -35,8 +35,6 @@ _pty() {
     'tag-multi:Bulk tag ops across sessions'
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
-    'up:Start sessions from pty.toml'
-    'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
     'help:Show usage'
   )
@@ -113,8 +111,6 @@ _pty() {
           _arguments \
             '(-n --dry-run)'{-n,--dry-run}'[Preview without changing anything]' \
             '--idle-days[Reap permanents with no attach in N days]:days:' \
-            '--fast-fail-window[Fast-fail window in seconds (default 60)]:seconds:' \
-            '--fast-fail-limit[Consecutive fast fails before flapping (default 3)]:count:' \
             '--print-launchd-plist[Emit a launchd plist that runs pty gc]' \
             '--interval[Plist StartInterval seconds (default 30)]:seconds:'
           ;;
@@ -142,9 +138,6 @@ _pty() {
             '--show[Print current displayName]' \
             '--clear[Remove displayName]' \
             '1:session:_pty_sessions'
-          ;;
-        up|down)
-          _arguments '1:directory:_directories'
           ;;
         run)
           # After --, fall back to normal (command + file) completion

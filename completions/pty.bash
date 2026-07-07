@@ -7,7 +7,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test help"
+  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename test help"
 
   # Complete subcommand (first positional).
   if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -86,7 +86,7 @@ _pty() {
       ;;
     gc)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "-n --dry-run --idle-days --fast-fail-window --fast-fail-limit --print-launchd-plist --interval" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-n --dry-run --idle-days --print-launchd-plist --interval" -- "${cur}"))
       fi
       ;;
     tag)
@@ -109,11 +109,6 @@ _pty() {
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
-      ;;
-    up|down)
-      # Complete directories (containing pty.toml) or session names from an
-      # already-loaded toml. Directories are more common; keep it simple.
-      COMPREPLY=($(compgen -o dirnames -- "${cur}"))
       ;;
     exec)
       # After --, fall through to default (command + args) completion.
