@@ -101,13 +101,6 @@ pty emit user.deploy.started              # emit a user event (inside a session)
 pty emit myserver user.build.finished --json '{"ok":true}'  # with JSON payload
 pty emit myserver user.note --text "checkpoint reached"     # with a text payload
 
-pty state set myserver port 3000          # set a JSON-parsed state key
-pty state set myserver config < cfg.json  # pipe a bigger value from stdin
-pty state get myserver port               # print a single key's JSON value
-pty state get myserver                    # print the whole bag (pretty JSON)
-pty state keys myserver                   # list keys (one per line)
-pty state delete myserver port            # remove a key
-
 pty restart myserver                      # restart an exited session
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
@@ -125,40 +118,17 @@ pty up ./backend                          # start sessions from ./backend/pty.to
 pty up claude dev                         # start specific sessions from ./pty.toml
 pty down                                  # stop all sessions from ./pty.toml
 pty down claude                           # stop specific sessions
-
-pty wrap claude                           # auto-wrap claude in pty sessions
-pty unwrap claude                         # remove the wrapper
-pty wrap --list                           # show wrapped commands
 ```
-
-### Wrapping Commands
-
-`pty wrap` creates a small shell script that shadows a command so it always runs in a pty session:
-
-```sh
-pty wrap claude
-# Now running "claude" anywhere automatically gets a persistent session
-```
-
-The wrapper uses `pty run -a` (create or attach if already running), so running the command twice in the same directory reattaches instead of creating a duplicate.
-
-Wrappers live in `~/.local/pty/bin/`. Add it to the front of your PATH:
-
-```sh
-export PATH="$HOME/.local/pty/bin:$PATH"
-```
-
-Detach with `Ctrl+\`. (Press `Ctrl+\` twice to send it through to the process.)
 
 ### Nesting Prevention
 
-If you run `pty run` (or a wrapped command) inside an existing pty session, pty detects the nesting via the `PTY_SESSION` environment variable and runs the command directly instead of creating a session-inside-a-session. This means wrapped commands "just work" inside pty sessions without double-wrapping.
+If you run `pty run` inside an existing pty session, pty detects the nesting via the `PTY_SESSION` environment variable and runs the command directly instead of creating a session-inside-a-session.
 
 Use `pty run -d` to explicitly create a background session from inside another session.
 
 ### Events
 
-Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — plus metadata mutations: `display_name_change` on rename, `tags_change` on tag updates, `state.set` / `state.delete` on state bag writes, and any `user.*` events published via `pty emit`. Everything goes into per-session JSONL files.
+Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — plus metadata mutations: `display_name_change` on rename, `tags_change` on tag updates, and any `user.*` events published via `pty emit`. Everything goes into per-session JSONL files.
 
 ```sh
 pty events myserver              # follow events live (like tail -f)

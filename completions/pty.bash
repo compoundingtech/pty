@@ -1,68 +1,126 @@
 # Bash completion for pty
 # Source this file or copy to /etc/bash_completion.d/pty
+# (or install via scripts/install-completions.sh).
 
 _pty() {
   local cur prev commands
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag up down wrap unwrap test help"
+  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test help"
 
-  # Complete subcommand
+  # Complete subcommand (first positional).
   if [[ ${COMP_CWORD} -eq 1 ]]; then
-    COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
+    if [[ "${cur}" == -* ]]; then
+      COMPREPLY=($(compgen -W "--root --preselect-new --filter-tag --help -h" -- "${cur}"))
+    else
+      COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
+    fi
     return
   fi
 
-  local session_dir="${PTY_SESSION_DIR:-${HOME}/.local/state/pty}"
+  # Session-name provider — used by verbs that take a <ref>.
+  local root="${PTY_ROOT:-${PTY_SESSION_DIR:-${HOME}/.local/state/pty}}"
   local names=""
-  if [[ -d "${session_dir}" ]]; then
-    names=$(ls "${session_dir}"/*.json 2>/dev/null | xargs -I{} basename {} .json)
+  if [[ -d "${root}" ]]; then
+    names=$(ls "${root}"/*.json 2>/dev/null | xargs -I{} basename {} .json)
   fi
 
   case "${COMP_WORDS[1]}" in
-    attach|a|peek|send|kill|restart|events|rm|remove|stats|tag)
+    attach|a)
       if [[ "${cur}" == -* ]]; then
-        case "${COMP_WORDS[1]}" in
-          attach|a) COMPREPLY=($(compgen -W "--auto-restart -r" -- "${cur}")) ;;
-          peek) COMPREPLY=($(compgen -W "--follow -f --plain --full --wait --timeout -t" -- "${cur}")) ;;
-          send) COMPREPLY=($(compgen -W "--seq --with-delay" -- "${cur}")) ;;
-          restart) COMPREPLY=($(compgen -W "--yes -y" -- "${cur}")) ;;
-          events) COMPREPLY=($(compgen -W "--all --recent --json --wait --timeout -t" -- "${cur}")) ;;
-          stats) COMPREPLY=($(compgen -W "--json --all" -- "${cur}")) ;;
-        esac
+        COMPREPLY=($(compgen -W "-r --force" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    peek)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "-f --plain --full --wait -t" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    send)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--seq --with-delay --paste" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    events)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--all --recent --json --wait -t" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    stats)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--json" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    restart)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "-y --force" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    kill|rm|remove)
+      COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      ;;
+    rename)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--show --clear" -- "${cur}"))
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
       ;;
     list|ls)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--json --tags" -- "${cur}"))
+        COMPREPLY=($(compgen -W "--json --tags --filter-tag --remote" -- "${cur}"))
       fi
       ;;
     gc)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--dry-run -n --print-launchd-plist --interval" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-n --dry-run --idle-days --fast-fail-window --fast-fail-limit --print-launchd-plist --interval" -- "${cur}"))
       fi
       ;;
-    wrap)
+    tag)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--list -l" -- "${cur}"))
+        COMPREPLY=($(compgen -W "--rm" -- "${cur}"))
       else
-        COMPREPLY=($(compgen -c -- "${cur}"))
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
       ;;
-    unwrap)
-      # Complete from wrapped commands in ~/.local/pty/bin (or $PTY_BIN_PATH)
-      local wrap_dir="${PTY_BIN_PATH:-${HOME}/.local/pty/bin}"
-      if [[ -d "${wrap_dir}" ]]; then
-        local wrapped
-        wrapped=$(ls "${wrap_dir}" 2>/dev/null)
-        COMPREPLY=($(compgen -W "${wrapped}" -- "${cur}"))
+    tag-multi)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--all --filter-tag --rm --json -y --yes" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
+      ;;
+    emit)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "--json --text" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
+      fi
+      ;;
+    up|down)
+      # Complete directories (containing pty.toml) or session names from an
+      # already-loaded toml. Directories are more common; keep it simple.
+      COMPREPLY=($(compgen -o dirnames -- "${cur}"))
+      ;;
+    exec)
+      # After --, fall through to default (command + args) completion.
+      COMPREPLY=($(compgen -o default -- "${cur}"))
       ;;
     run)
-      # After --, fall back to default file completion
+      # After --, fall back to default file completion for the command.
       local i
       for (( i=2; i < COMP_CWORD; i++ )); do
         if [[ "${COMP_WORDS[i]}" == "--" ]]; then
@@ -70,9 +128,16 @@ _pty() {
           return
         fi
       done
-      # Before --, complete flags
+      # Before --, complete flags.
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "--detach -d --attach -a --ephemeral -e --name --cwd --tag" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-d -a -e --id --name --no-display-name --tag --cwd --isolate-env" -- "${cur}"))
+      fi
+      ;;
+    test)
+      if [[ "${cur}" == -* ]]; then
+        COMPREPLY=($(compgen -W "-t" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "watch" -- "${cur}"))
       fi
       ;;
   esac

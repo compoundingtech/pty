@@ -7,7 +7,6 @@ export {
   validateName, updateTags, setDisplayName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
-  getState, getStateKey, setState, deleteState, listStateKeys,
   type SessionInfo, type SessionMetadata, type PrunedTagResult, type GcResult,
 } from "./sessions.ts";
 
@@ -38,7 +37,7 @@ export {
   type FocusRequestEvent, type CursorVisibleEvent,
   type SessionStartEvent, type SessionExitEvent, type SessionExecEvent,
   type SessionRespawnEvent,
-  type UserEvent, type StateSetEvent, type StateDeleteEvent,
+  type UserEvent,
   type DisplayNameChangeEvent, type TagsChangeEvent,
   type FollowerOptions,
 } from "./events.ts";

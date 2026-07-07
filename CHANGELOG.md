@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Lean-core: `pty state` and `pty wrap` REMOVED (BREAKING)
+
+Two subcommands and their public API surface are removed with no back-compat shim. Both were auxiliary to the session primitive contract and better served elsewhere.
+
+- **Removed `pty state` (subcommand + programmatic API + events + metadata field).** Redundant with smalltalk's folder-and-bus persistence.
+  - CLI: `pty state {get, set, delete, keys}` gone.
+  - Public API on `@myobie/pty/client`: `getState`, `getStateKey`, `setState`, `deleteState`, `listStateKeys` gone. Removing these is a breaking export change.
+  - Event types `state.set` and `state.delete` gone; their interfaces (`StateSetEvent`, `StateDeleteEvent`) removed from `EventRecord`.
+  - `SessionMetadata.state?` field gone — this is a **PUBLIC FORMAT / Storage format** change. Existing on-disk metadata files with a populated `state` object will silently drop that field on the next daemon-side rewrite.
+  - Tests: `tests/state.test.ts` (485 LOC) deleted; `tests/atomic-writes.test.ts` and `tests/events.test.ts` shed their state-specific cases.
+
+- **Removed `pty wrap` / `pty unwrap` / `pty wrap --list`.** Orthogonal shim generation; not part of the session-primitive contract.
+  - The `PTY_BIN_PATH` env var no longer has a consumer; treat as removed.
+  - `~/.local/pty/bin/` (default wrap dir) is no longer created; existing shims can be `rm -rf`'d by hand.
+
+- Usage-check swept the pty repo + `eval-sandbox/st-evals` + `convoy` + `~/bin/pty-claude-launcher.sh` + `cos` + `pty-relay` + `pty-layout` before the delete: no external consumers of state helpers or the wrap surface anywhere.
+
+### `pty` — `--help` and shell completions rewritten (accuracy pass)
+
+- New `usage()` groups commands logically (Create / Attach & interact / Observe / Modify / Lifecycle / Multi / Global), lists every flag every subcommand actually accepts (`--id`, `--name`, `--no-display-name`, `--isolate-env`, `--filter-tag`, `--remote`, `--force`, `--paste`, `--idle-days`, `--fast-fail-window`, `--fast-fail-limit`, `--print-launchd-plist`, and all the `tag-multi` selectors), and documents `<ref>` semantics + the four env vars (`PTY_ROOT`, `PTY_SESSION_DIR`, `PTY_ROOT_LEGACY_SILENT`, `PTY_SESSION`).
+- Completion scripts (`completions/pty.{fish,bash,zsh}`) rewritten against the same surface — every current subcommand + every accepted flag covered; `state`, `wrap`, `unwrap` removed. Fish, bash and zsh all consistent.
+
 ### Follow-ups to #56 (fast-fail cap) + PTY_ROOT length backstop
 
 - **`pty restart` and `pty up` now clear the `pty gc` flapping bookkeeping.** Manual restart is an operator "please try again" signal — dropping `strategy.status`, `strategy.consecutive-fast-fails`, `strategy.last-respawn-at`, and `strategy.command-hash` on the restarted session gives it a clean slate, so the next `pty gc` tick isn't a no-op (silent skip against a stale flapping flag). Auto-reset on command-hash divergence already handled the toml-edit case; this handles the operator-intervenes-without-edit case that gc otherwise can't infer. Applies to both `pty restart` and `pty up`'s "already running, tag-sync" path.

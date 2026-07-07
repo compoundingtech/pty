@@ -234,12 +234,11 @@ describe("pty emit CLI", () => {
 
 describe("appendEvent retention", () => {
   it("caps the events log when scripts write in a loop", async () => {
-    // Regression: previously `appendEvent` (used by `pty emit` and the
-    // `pty state set/delete` event emissions) did a raw fsp.appendFile
-    // with no truncation, while the daemon's EventWriter enforces a
-    // 1000-line cap. A script that ran `pty state set` in a tight loop
-    // would grow events.jsonl without bound. Now appendEvent calls the
-    // same retention path.
+    // Regression: previously `appendEvent` (used by `pty emit`) did a
+    // raw fsp.appendFile with no truncation, while the daemon's
+    // EventWriter enforces a 1000-line cap. A script that emitted in a
+    // tight loop would grow events.jsonl without bound. Now appendEvent
+    // calls the same retention path.
     process.env.PTY_SESSION_DIR = makeSessionDir();
     const name = uniqueName();
 
