@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
+
+### `@myobie/pty/tui` — `text()` accepts an object form `{ fg, bold, ... }`
+
+- `text()` gains a second calling shape: `text(str, { fg: someColor, bold: true, italic: true, ... })`. The `fg` key maps to the `color` slot; the rest are the existing `TextOpts`. The original positional shape `text(str, color?, opts?)` continues to work — dispatch is by second-arg TYPE (string / array → positional Color, plain object → opts-with-fg), not arity.
+- Motivation: consumers of the `@myobie/pty/tui` barrel that lay out `{ fg: ..., bold: ... }` maps ran headlong into a compile error (`'fg' does not exist`) when the object reached the positional-`color` slot. Both shapes now compose cleanly.
 
 ### Lean-core: `pty state` and `pty wrap` REMOVED (BREAKING)
 

@@ -34,6 +34,35 @@ describe("builders", () => {
     expect(n.color).toEqual([255, 0, 0]);
   });
 
+  it("text() object shape: { fg, bold, ... }", () => {
+    // Consumers that prefer the object form pass `fg` for the color and
+    // any TextOpts inline. `fg` maps to `color`; the rest spread as-is.
+    const n = text("hi", { fg: [255, 0, 0], bold: true });
+    expect(n.color).toEqual([255, 0, 0]);
+    expect(n.bold).toBe(true);
+  });
+
+  it("text() object shape: `fg` with a SemanticColor string", () => {
+    const n = text("hi", { fg: "primary", italic: true });
+    expect(n.color).toBe("primary");
+    expect(n.italic).toBe(true);
+  });
+
+  it("text() object shape without `fg` leaves color unset", () => {
+    const n = text("hi", { bold: true, dim: true });
+    expect(n.color).toBeUndefined();
+    expect(n.bold).toBe(true);
+    expect(n.dim).toBe(true);
+  });
+
+  it("text() with no args after str", () => {
+    const n = text("hi");
+    expect(n.type).toBe("text");
+    expect(n.text).toBe("hi");
+    expect(n.color).toBeUndefined();
+    expect(n.bold).toBeUndefined();
+  });
+
   it("spacer, gap, separator, indent", () => {
     expect(spacer().type).toBe("spacer");
     expect(gap(3).size).toBe(3);
