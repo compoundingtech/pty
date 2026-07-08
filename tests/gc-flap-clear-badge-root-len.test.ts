@@ -88,8 +88,16 @@ describe("pty restart clears strategy.status=flapping + bookkeeping", () => {
 
     // Restart it. -y skips the prompt; command is "sh -c 'exit 1'" which
     // will exit almost immediately — that's fine, we care about the tag
-    // snapshot right after spawn.
-    const r = runCli(dir, "restart", "-y", name);
+    // snapshot right after spawn. PTY_SESSION is set so restart takes its
+    // "already inside a session, don't attach" branch and returns 0 instead of
+    // attaching to the just-exited session (a non-TTY attach here would inherit
+    // that session's exit code 1). Setting it explicitly rather than relying on
+    // an ambient PTY_SESSION leaking from the harness.
+    const r = spawnSync(nodeBin, [cliPath, "restart", "-y", name], {
+      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: "outer" },
+      encoding: "utf-8",
+      timeout: 15000,
+    });
     expect(r.status).toBe(0);
 
     // Give the daemon a moment to write its metadata.
