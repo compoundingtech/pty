@@ -26,6 +26,38 @@ function autoName(): string {
   return `test-${process.pid}-${Date.now()}-${++nameCounter}`;
 }
 
+/**
+ * Build the environment for a spawned `pty` process: the caller's base env
+ * merged with `optsEnv`, minus the harness's own pty-internal context.
+ *
+ * Two hazards this guards against when the test harness ITSELF runs inside a
+ * pty session:
+ *   - PTY_SESSION / PTY_SERVER_CONFIG leaking in would trip the spawned CLI's
+ *     nesting-prevention guard (or hand it a bogus server config). Always
+ *     scrubbed.
+ *   - PTY_ROOT / PTY_SESSION_DIR leaking in would override the caller's
+ *     intended isolation, because getSessionDir() prefers ambient PTY_ROOT over
+ *     the per-call PTY_SESSION_DIR — so the spawned `pty` would read the real
+ *     live session dir. Scrubbed ONLY when the caller didn't set them
+ *     explicitly via `optsEnv`, so a deliberate root override still wins.
+ *
+ * Pure and exported for unit testing.
+ */
+export function buildSpawnEnv(
+  base: Record<string, string | undefined>,
+  optsEnv?: Record<string, string>,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    ...(base as Record<string, string>),
+    ...optsEnv,
+  };
+  delete env.PTY_SERVER_CONFIG;
+  delete env.PTY_SESSION;
+  if (optsEnv?.PTY_ROOT === undefined) delete env.PTY_ROOT;
+  if (optsEnv?.PTY_SESSION_DIR === undefined) delete env.PTY_SESSION_DIR;
+  return env;
+}
+
 export class Session {
   private terminal: Terminal;
   private serialize: SerializeAddon;
@@ -77,16 +109,7 @@ export class Session {
     const serialize = new xtermSerialize.SerializeAddon();
     terminal.loadAddon(serialize);
 
-    const env: Record<string, string> = {
-      ...(process.env as Record<string, string>),
-      ...opts.env,
-    };
-    // Scrub pty-internal env vars so the spawned CLI sees a clean user
-    // environment, not the test harness's own pty context. Without this,
-    // any test that runs `pty` inside a Session inherits the harness's
-    // PTY_SESSION and trips the nesting-prevention guard.
-    delete env.PTY_SERVER_CONFIG;
-    delete env.PTY_SESSION;
+    const env = buildSpawnEnv(process.env as Record<string, string | undefined>, opts.env);
 
     const proc = pty.spawn(command, args, {
       name: "xterm-256color",
