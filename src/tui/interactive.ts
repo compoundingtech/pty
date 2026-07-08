@@ -503,7 +503,12 @@ async function doRestart(session: SessionInfo): Promise<void> {
   }
   cleanupAll(session.name);
   try {
-    await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
+    // Preserve displayName (and tags) so a restarted session keeps its name
+    // rather than reverting to its raw id.
+    await spawnDaemon({
+      name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags,
+      ...(meta.displayName ? { displayName: meta.displayName } : {}),
+    });
   } catch {
     // Refresh list to show updated state
     const updated = await listSessions();

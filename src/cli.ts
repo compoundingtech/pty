@@ -1186,9 +1186,13 @@ async function handleDeadSession(
     }
   }
 
-  // Restart
+  // Restart. Preserve displayName (and tags) so the respawned session keeps its
+  // name instead of falling back to the raw id.
   cleanupAll(session.name);
-  await spawnDaemon({ name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags });
+  await spawnDaemon({
+    name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags,
+    ...(meta.displayName ? { displayName: meta.displayName } : {}),
+  });
   console.log(`Session "${session.name}" restarted.`);
   doAttach(session.name);
 }
@@ -2751,7 +2755,13 @@ async function cmdRestart(
   // command edit already clears these; this handles the operator-
   // intervenes-without-edit case that gc otherwise can't infer.
   const restartTags = clearFlappingBookkeeping(meta.tags);
-  await spawnDaemon({ name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: restartTags });
+  // Preserve the human-friendly displayName across the respawn — without it the
+  // restarted session reads as its raw id (e.g. claude-203827) instead of its
+  // name, which breaks naming + the TUI peek. Tags are carried above.
+  await spawnDaemon({
+    name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: restartTags,
+    ...(meta.displayName ? { displayName: meta.displayName } : {}),
+  });
   console.log(`Session "${name}" restarted.`);
 
   // Nesting guard: restart itself is fine, but attaching would nest a client

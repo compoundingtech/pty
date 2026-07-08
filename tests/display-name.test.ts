@@ -360,3 +360,37 @@ describe("commands resolve a long displayName even when it would fail validateNa
     expect(running).toHaveLength(0);
   });
 });
+
+describe("pty restart preserves displayName + tags", () => {
+  // Regression: `pty restart` re-spawned the daemon from stored metadata but
+  // dropped `displayName`, so a restarted session read as its raw id (e.g.
+  // claude-203827) instead of its name — breaking naming and the TUI peek.
+  // Tags were already carried; this locks in both.
+  it("keeps displayName and tags across a restart", () => {
+    const dir = makeSessionDir();
+    const create = runCli(
+      dir, {},
+      "run", "-d", "--id", "svc", "--name", "My Service", "--tag", "role=web", "--", "cat",
+    );
+    expect(create.status).toBe(0);
+
+    let s = listJson(dir).find((x: any) => x.name === "svc")!;
+    expect(s).toBeDefined();
+    expect(s.displayName).toBe("My Service");
+    expect(s.tags?.role).toBe("web");
+    collectPid(dir, "svc");
+
+    // Restart. Setting PTY_SESSION makes the CLI take the "already inside a
+    // session, not attaching" branch and return, instead of hanging on attach
+    // in this non-TTY test process.
+    const restart = runCli(dir, { PTY_SESSION: "outer" }, "restart", "-y", "svc");
+    expect(restart.status).toBe(0);
+    expect(restart.stdout).toContain("restarted");
+
+    s = listJson(dir).find((x: any) => x.name === "svc")!;
+    expect(s).toBeDefined();
+    expect(s.displayName).toBe("My Service");
+    expect(s.tags?.role).toBe("web");
+    collectPid(dir, "svc");
+  });
+});
