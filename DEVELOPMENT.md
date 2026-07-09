@@ -5,7 +5,7 @@ A persistent terminal session manager. Run long-lived processes, detach, reconne
 ## Objectives
 
 - Replace tmux/zellij for **session persistence** of long-running processes
-- Simple CLI: `pty run <name> <command>`, `pty attach <name>`, `pty peek <name>`, `pty restart <name>`
+- Simple CLI: `pty run -- <command>`, `pty attach <name>`, `pty peek <name>`, `pty restart <name>`
 - Reliable detach/reattach with full screen replay (colors, cursor position, scrollback)
 - Work seamlessly over SSH (Unix sockets, no port management)
 - Multi-client support (multiple people can observe or interact with a session)
@@ -26,24 +26,24 @@ npm test               # run all tests once
 npm run test:watch     # run tests in watch mode
 npm run verify-docs    # run executable examples in docs/testing.md
 
-# Usage (during development)
-npx tsx src/cli.ts run <name> -- <command> [args...]
-npx tsx src/cli.ts run -d <name> -- <command> [args...]
-npx tsx src/cli.ts attach <name>
-npx tsx src/cli.ts peek <name>
-npx tsx src/cli.ts peek -f <name>
-npx tsx src/cli.ts list
-npx tsx src/cli.ts restart <name>
-npx tsx src/cli.ts kill <name>
-npx tsx src/cli.ts test                  # run tests via vitest
-npx tsx src/cli.ts test -t "pattern"     # run matching tests
+# Usage (during development — run the TS source directly with Node)
+node --experimental-strip-types src/cli.ts run -- <command> [args...]
+node --experimental-strip-types src/cli.ts run -d -- <command> [args...]
+node --experimental-strip-types src/cli.ts attach <name>
+node --experimental-strip-types src/cli.ts peek <name>
+node --experimental-strip-types src/cli.ts peek -f <name>
+node --experimental-strip-types src/cli.ts list
+node --experimental-strip-types src/cli.ts restart <name>
+node --experimental-strip-types src/cli.ts kill <name>
+node --experimental-strip-types src/cli.ts test                  # run tests via vitest
+node --experimental-strip-types src/cli.ts test -t "pattern"     # run matching tests
 ```
 
 Detach from any attached/following session with **Ctrl+\\**. Press Ctrl+\\ twice quickly to send it to the process.
 
-### No build step
+### Build
 
-This project ships TypeScript source directly — there is no compile step. All `.ts` files use `.ts` import extensions and are executed at runtime by [tsx](https://tsx.is). The `bin/pty` entry point locates tsx from `node_modules` and runs `src/cli.ts`. The `tsc` command is used only for typechecking (`noEmit: true`).
+Source is written in TypeScript with `.ts` import extensions. `npm run build` compiles `src/` to `dist/` via `tsc -p tsconfig.build.json` (`rewriteRelativeImportExtensions` turns the `.ts` import specifiers into `.js` in the output), and the published package ships `dist/`. The `bin/pty` entry point runs the compiled `dist/cli.js` with Node — so run `npm run build` before invoking the installed `pty`. During development you can skip the build and run the source directly with Node's native type stripping: `node --experimental-strip-types src/cli.ts …`. The separate `tsconfig.json` (`noEmit: true`, `allowImportingTsExtensions: true`) backs `npm run typecheck` only.
 
 ## Architecture
 
@@ -70,7 +70,7 @@ This project ships TypeScript source directly — there is no compile step. All 
      (attach)   (attach)     (read-only)
 ```
 
-Each session is a detached Node.js process running `src/server.ts` via tsx. It spawns the command in a PTY, feeds all output through xterm-headless to maintain a screen buffer, and listens on a Unix socket for client connections.
+Each session is a detached Node.js process running the compiled `server.js` with Node. It spawns the command in a PTY, feeds all output through xterm-headless to maintain a screen buffer, and listens on a Unix socket for client connections.
 
 ## Protocol
 
@@ -90,13 +90,13 @@ Binary packets over Unix sockets: `[type: uint8][length: uint32BE][payload]`
 
 ## Key Design Decisions
 
-### No build step — ship TypeScript directly
+### Compile to `dist/`, keep `.ts` sources runnable
 
-There is no `dist/` directory. Source files use `.ts` import extensions and run directly via tsx. The `tsconfig.json` has `noEmit: true` and `allowImportingTsExtensions: true` — tsc is only used for typechecking. This eliminates the compile-then-run dance entirely. tsx is a regular dependency (not devDependency) because it's needed at runtime.
+The published package ships compiled JavaScript in `dist/` (`tsc -p tsconfig.build.json`, with `rewriteRelativeImportExtensions` rewriting `.ts` imports to `.js`), so an install never depends on a TypeScript runtime or Node's still-experimental type stripping. Sources keep `.ts` import extensions, so during development they also run directly under `node --experimental-strip-types` with no build. `tsconfig.json` (`noEmit: true`, `allowImportingTsExtensions: true`) is typecheck-only.
 
 ### No TypeScript enums
 
-We avoid TS enums because they emit runtime code that can't be type-stripped. Instead, we use `as const` objects with a derived union type. This is compatible with all TS runtimes: Node's native type stripping, tsx, esbuild, swc.
+We avoid TS enums because they emit runtime code that can't be type-stripped. Instead, we use `as const` objects with a derived union type. This keeps the sources runnable under Node's native type stripping (and any other type-stripper) without a build.
 
 ### Peek clients don't affect terminal size
 
@@ -116,7 +116,7 @@ Each session is an independent Node.js process. No central daemon, no shared sta
 
 ### Unix sockets for local IPC
 
-Fast, zero-config, and work transparently over SSH. No ports to manage, no firewall rules. Session sockets live at `~/.local/state/pty/<name>.sock` (override with `$PTY_SESSION_DIR`).
+Fast, zero-config, and work transparently over SSH. No ports to manage, no firewall rules. Session sockets live at `~/.local/state/pty/<name>.sock` (override the root with `$PTY_ROOT`).
 
 ### PtyServer never calls process.exit()
 
@@ -210,7 +210,7 @@ completions/
   pty.bash        Bash tab completion
   pty.zsh         Zsh tab completion
 bin/
-  pty             Entry point (locates tsx, runs src/cli.ts)
+  pty             Entry point (runs dist/cli.js with Node)
 ```
 
 ## Future
