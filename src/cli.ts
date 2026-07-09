@@ -5,6 +5,7 @@ import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { attach, peek, send, queryStats, type StatsResult } from "./client.ts";
+import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
@@ -162,6 +163,7 @@ Multi (pty.toml):
 Global:
   pty --root <path> <subcommand> [...]    Pin the state registry for this call (== PTY_ROOT env)
   pty help | pty --help | pty -h          Show this usage
+  pty version | pty --version | pty -v    Print the version (<semver>+<short-sha>)
   pty test [watch | -t "pattern"]         Run the pty test suite (vitest passthrough)
 
 Session references (<ref>): the on-disk id (validated: [A-Za-z0-9._-], ≤ 255 chars,
@@ -1025,6 +1027,14 @@ async function main(): Promise<void> {
 
     case "test": {
       await cmdTest(args.slice(1));
+      break;
+    }
+
+    case "version":
+    case "--version":
+    case "-v":
+    case "-V": {
+      printVersion();
       break;
     }
 
