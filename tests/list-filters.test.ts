@@ -156,7 +156,7 @@ describe("vanished status", () => {
 });
 
 describe("listSessions guards against deleting state for live daemons", () => {
-  // Refs https://github.com/myobie/pty/issues/34. listSessions used to
+  // Refs https://github.com/compoundingtech/pty/issues/34. listSessions used to
   // unconditionally `cleanupSocket` whenever the socket-reachable probe
   // failed and `cleanupAll` whenever metadata was older than 24h. Both
   // ran even if the recorded pid was still alive — once the .sock or

@@ -69,7 +69,7 @@
 
             meta = with pkgs.lib; {
               description = "Persistent terminal sessions with detach/attach support";
-              homepage = "https://github.com/myobie/pty";
+              homepage = "https://github.com/compoundingtech/pty";
               license = licenses.mit;
               mainProgram = "pty";
             };
