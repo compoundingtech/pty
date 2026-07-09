@@ -25,22 +25,34 @@ Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]` and be at most 
 
 ### `getSessionDir(): string`
 
-Returns the session directory path (`PTY_SESSION_DIR` env var or `~/.local/state/pty`).
+Returns the session directory path — `$PTY_ROOT` if set (the legacy `$PTY_SESSION_DIR` name is still honored), otherwise `~/.local/state/pty`.
 
 ### `getSocketPath(name: string): string`
 
 Returns the Unix socket path for a session.
 
-### `gc(opts?: { dryRun?: boolean }): Promise<string[]>`
+### `gc(opts?: { dryRun?: boolean; idleDays?: number; fastFailWindowSec?: number; fastFailLimit?: number }): Promise<GcResult>`
 
-Remove all exited **and** vanished sessions. Returns the names of removed sessions. Pass `{ dryRun: true }` to walk the same set without deleting anything — useful for preview UIs.
+Run one reconciliation pass: remove exited/vanished non-permanent sessions, kill orphaned `parent=` children, reap abandoned permanents, and respawn (or flap-skip) `strategy=permanent` sessions. Returns a `GcResult` describing everything the pass did. Pass `{ dryRun: true }` to compute the same plan without mutating anything — useful for preview UIs.
 
 ```typescript
-const removed = await gc();
-console.log(`Cleaned up ${removed.length} sessions`);
+const result = await gc();
+console.log(`Removed ${result.removed.length}, respawned ${result.respawned.length}`);
 
-const would = await gc({ dryRun: true });
-console.log(`Would clean up: ${would.join(", ")}`);
+const plan = await gc({ dryRun: true });
+console.log(`Would remove: ${plan.removed.join(", ")}`);
+```
+
+```typescript
+interface GcResult {
+  removed: string[];                                                              // exited/vanished non-permanent sessions cleaned up
+  killedOrphanChildren: { name: string; parent: string; reason: "missing" | "dead" }[];
+  abandoned: { name: string; reason: "cwd-gone" | "idle"; idleDays?: number }[];  // live permanents reaped as abandoned
+  respawned: { name: string; ptyfileReread: boolean }[];
+  respawnFailed: { name: string; error: string }[];
+  flapped: { name: string; counter: number; limit: number; window: number }[];    // flipped to strategy.status=flapping this tick
+  flappingSkipped: string[];                                                       // already-flapping, skipped this tick
+}
 ```
 
 ### `isGone(status): boolean`
@@ -60,7 +72,7 @@ interface PrunedTagResult {
 
 ### `isReservedTagKey(key: string): boolean`
 
-Returns `true` for pty's internal bookkeeping keys (`ptyfile`, `ptyfile.session`, `ptyfile.tags`, `supervisor.status`, `strategy`) and for any key starting with `:` (the tool-owned-tag convention). Downstream tools should hide reserved keys from user-facing listings by default but still allow writes — set and unset them as needed.
+Returns `true` for pty's internal bookkeeping keys (`ptyfile`, `ptyfile.session`, `ptyfile.tags`, `strategy`) and for any key starting with `:` (the tool-owned-tag convention). Downstream tools should hide reserved keys from user-facing listings by default but still allow writes — set and unset them as needed.
 
 ### `cleanupSocket(name: string): void`
 
