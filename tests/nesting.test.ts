@@ -191,7 +191,7 @@ describe("pty nesting prevention", () => {
     const name = uniqueName();
 
     // Remove PTY_SESSION from env explicitly
-    const env = { ...process.env, PTY_SESSION_DIR: dir };
+    const env: Record<string, string | undefined> = { ...process.env, PTY_SESSION_DIR: dir };
     delete env.PTY_SESSION;
 
     const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--id", name, "--", "cat"], {
