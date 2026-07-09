@@ -15,8 +15,8 @@ npm install -g @myobie/pty
 Or with Nix:
 
 ```sh
-nix profile install github:myobie/pty   # install the CLI
-nix develop github:myobie/pty           # dev shell with node, npm, native deps
+nix profile install github:compoundingtech/pty   # install the CLI
+nix develop github:compoundingtech/pty           # dev shell with node, npm, native deps
 ```
 
 Requires Node.js. Works on macOS and Linux.

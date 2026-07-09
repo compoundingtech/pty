@@ -284,7 +284,7 @@ Two subcommands and their public API surface are removed with no back-compat shi
 ## 0.8.0
 
 ### Relay integration
-- Interactive TUI (`pty` with no args) discovers [pty-relay](https://github.com/myobie/pty-relay) on PATH and shows remote sessions alongside local ones, grouped by host
+- Interactive TUI (`pty` with no args) discovers [pty-relay](https://github.com/compoundingtech/pty-relay) on PATH and shows remote sessions alongside local ones, grouped by host
 - Remote sessions are fetched asynchronously — local sessions render immediately, remote groups appear when the relay responds
 - Enter on a remote session spawns `pty-relay connect` with pause/resume
 - Add `pty list --remote` to include remote hosts in the text and JSON output
