@@ -7,12 +7,12 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test help"
+  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test version help"
 
   # Complete subcommand (first positional).
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
-      COMPREPLY=($(compgen -W "--root --preselect-new --filter-tag --help -h" -- "${cur}"))
+      COMPREPLY=($(compgen -W "--root --preselect-new --filter-tag --help -h --version -v" -- "${cur}"))
     else
       COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
     fi

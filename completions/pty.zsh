@@ -38,6 +38,7 @@ _pty() {
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
+    'version:Print the version'
     'help:Show usage'
   )
 
