@@ -193,3 +193,66 @@ describe("pty gc --print-launchd-plist per-root Label + logPath", () => {
     expect(plist).toContain("<string>com.myobie.pty.gc.weird-name-with-spaces</string>");
   });
 });
+
+describe("run -d honors PTY_ROOT for isolation; PTY_SESSION_DIR masking is visible", () => {
+  // Regression for the scratch-session leak: a detached session must land in
+  // PTY_ROOT and NOT in a co-set (deprecated) PTY_SESSION_DIR or the default
+  // registry. PTY_ROOT is the isolation mechanism; PTY_SESSION_DIR is legacy.
+  it("a -d session lands ONLY under PTY_ROOT (not the co-set PTY_SESSION_DIR, not the default)", () => {
+    const root = makeRoot();
+    const scratch = makeRoot(); // legacy var that must be ignored
+    const name = `rd${Math.random().toString(36).slice(2, 7)}`;
+    // `cat` waits on stdin, so the session stays running while we inspect.
+    const res = runCli(["run", "-d", "--id", name, "--", "cat"], {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      PTY_ROOT: root,
+      PTY_SESSION_DIR: scratch,
+      PTY_ROOT_LEGACY_SILENT: "1",
+    });
+    try {
+      expect(res.status).toBe(0);
+      // Landed under PTY_ROOT.
+      expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(true);
+      expect(fs.existsSync(path.join(root, `${name}.sock`))).toBe(true);
+      // NOT under the deprecated PTY_SESSION_DIR.
+      expect(fs.existsSync(path.join(scratch, `${name}.json`))).toBe(false);
+      // NOT in the real default registry.
+      const def = path.join(os.homedir(), ".local", "state", "pty", `${name}.json`);
+      expect(fs.existsSync(def)).toBe(false);
+    } finally {
+      runCli(["kill", name], {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        PTY_ROOT: root,
+        PTY_ROOT_LEGACY_SILENT: "1",
+      });
+    }
+  });
+
+  it("warns (once) that PTY_ROOT wins when PTY_SESSION_DIR is also set", () => {
+    const res = runCli(["list", "--json"], {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      PTY_ROOT: makeRoot(),
+      PTY_SESSION_DIR: makeRoot(),
+      // no PTY_ROOT_LEGACY_SILENT → the masking warning should surface
+    });
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/both PTY_ROOT and PTY_SESSION_DIR are set/);
+    // Exactly once per invocation.
+    expect(res.stderr.match(/both PTY_ROOT and PTY_SESSION_DIR are set/g)?.length).toBe(1);
+  });
+
+  it("PTY_ROOT_LEGACY_SILENT suppresses the masking warning", () => {
+    const res = runCli(["list", "--json"], {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      PTY_ROOT: makeRoot(),
+      PTY_SESSION_DIR: makeRoot(),
+      PTY_ROOT_LEGACY_SILENT: "1",
+    });
+    expect(res.status).toBe(0);
+    expect(res.stderr).not.toMatch(/both PTY_ROOT and PTY_SESSION_DIR/);
+  });
+});
