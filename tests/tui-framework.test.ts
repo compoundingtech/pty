@@ -7,7 +7,7 @@ import {
   groupedSelectable, statusBar, footer, askBar, textInput, fpsCounter,
   canvas, screen, overlay,
   layoutRoot, layoutVertical, layoutRow, textWidth,
-  renderToAnsi, resolveColor,
+  renderToAnsi, resolveColor, createFocusManager,
   type UINode, type RenderOpts,
 } from "../src/tui/index.ts";
 import { CellBuffer } from "../src/tui/buffer.ts";
@@ -509,6 +509,7 @@ describe("text wrap", () => {
       navigate: () => {}, back: () => {},
       openOverlay: () => {}, closeOverlay: () => {},
       isTextInputActive: () => false, setTextInputActive: () => {},
+      quit: () => {}, focus: createFocusManager(),
     };
     const buf = myScreen.renderToBuffer(ctx);
     const line0 = buf.cells[0].map(c => c.char).join("").trim();
@@ -549,6 +550,7 @@ describe("text highlight", () => {
       navigate: () => {}, back: () => {},
       openOverlay: () => {}, closeOverlay: () => {},
       isTextInputActive: () => false, setTextInputActive: () => {},
+      quit: () => {}, focus: createFocusManager(),
     };
     const buf = myScreen.renderToBuffer(ctx);
     // "Hello" (chars 0-4) should be bold + accent color
@@ -578,6 +580,7 @@ describe("text highlight", () => {
       navigate: () => {}, back: () => {},
       openOverlay: () => {}, closeOverlay: () => {},
       isTextInputActive: () => false, setTextInputActive: () => {},
+      quit: () => {}, focus: createFocusManager(),
     };
     const buf = myScreen.renderToBuffer(ctx);
     // Word-wrap: "AAA" / " BBB" / " CCC" (breaks before spaces)
@@ -612,6 +615,7 @@ describe("text highlight", () => {
       navigate: () => {}, back: () => {},
       openOverlay: () => {}, closeOverlay: () => {},
       isTextInputActive: () => false, setTextInputActive: () => {},
+      quit: () => {}, focus: createFocusManager(),
     };
     const buf = myScreen.renderToBuffer(ctx);
     expect(buf.cells[0][0].bold).toBe(true);

@@ -109,7 +109,7 @@ describe("pty exec", () => {
 
   it("errors when not inside a pty session", () => {
     const dir = makeSessionDir();
-    const env = { ...process.env, PTY_SESSION_DIR: dir };
+    const env: Record<string, string | undefined> = { ...process.env, PTY_SESSION_DIR: dir };
     delete env.PTY_SESSION;
 
     const result = spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "hi"], {
