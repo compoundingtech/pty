@@ -12,6 +12,7 @@ import { appendEventSync } from "./events.ts";
 export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
 
 let hasWarnedLegacyRootEnv = false;
+let hasWarnedRootMasksLegacy = false;
 
 const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -70,8 +71,22 @@ export function validateDisplayName(name: string): void {
 
 export function getSessionDir(): string {
   const root = process.env.PTY_ROOT;
-  if (root && root.length > 0) return root;
   const legacy = process.env.PTY_SESSION_DIR;
+  if (root && root.length > 0) {
+    // PTY_ROOT (canonical) wins. If a caller ALSO set the deprecated
+    // PTY_SESSION_DIR — e.g. a test/scratch harness trying to isolate — it's
+    // silently masked, so their sessions land under PTY_ROOT instead of the dir
+    // they asked for. Warn once (unless silenced) so the masking is visible
+    // rather than an invisible leak into the wrong registry.
+    if (legacy && legacy.length > 0 && !hasWarnedRootMasksLegacy && !process.env.PTY_ROOT_LEGACY_SILENT) {
+      hasWarnedRootMasksLegacy = true;
+      process.stderr.write(
+        `pty: both PTY_ROOT and PTY_SESSION_DIR are set — using PTY_ROOT (${root}); ` +
+        `PTY_SESSION_DIR (${legacy}) is ignored (deprecated). For isolation, set PTY_ROOT.\n`
+      );
+    }
+    return root;
+  }
   if (legacy && legacy.length > 0) {
     if (!hasWarnedLegacyRootEnv && !process.env.PTY_ROOT_LEGACY_SILENT) {
       hasWarnedLegacyRootEnv = true;

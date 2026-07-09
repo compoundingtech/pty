@@ -168,6 +168,8 @@ Distinct roots share no sockets, no metadata, no events, no gc. A launchd cron (
 
 `PTY_SESSION_DIR` (the pre-Phase-2 name for the same env var) still works and emits a one-time deprecation notice. Set `PTY_ROOT_LEGACY_SILENT=1` to suppress the notice while migrating.
 
+**`PTY_ROOT` is the isolation mechanism — use it, not `PTY_SESSION_DIR`.** When both are set, `PTY_ROOT` (canonical) wins and the deprecated `PTY_SESSION_DIR` is ignored — with a one-time warning so the masking is visible. So a scratch/test harness running inside an environment that already exports `PTY_ROOT` (e.g. a supervised session tree) must set `PTY_ROOT` to isolate; setting only `PTY_SESSION_DIR` would be silently overridden by the ambient `PTY_ROOT` and its sessions would land in the ambient registry.
+
 ### Project Files
 
 A project can include a `pty.toml` to declare its sessions:
