@@ -1,153 +1,75 @@
-# PTY — Run and manage background processes
+---
+name: pty
+description: >-
+  Run and manage long-lived or background processes — dev servers, test suites,
+  builds, interactive CLIs, agents — in persistent, detachable terminal
+  sessions. Reach for pty INSTEAD of `&` / nohup / raw background shell whenever
+  you need to start work, go do something else, then come back to read its
+  output, send it input, or restart it; and for any interactive tool that needs
+  a real TTY (auth/keychain prompts, TUIs, REPLs).
+when_to_use: >-
+  An agent needs to start a process and check on it later; run a dev server /
+  test suite / build and wait for a readiness or result line; drive an
+  interactive CLI that needs a real terminal; or keep a process alive across
+  disconnects. NOT for one-shot commands whose output you read immediately —
+  run those directly.
+---
 
-Run `pty --help` to see the full command reference.
+# pty — persistent terminal sessions
 
-Use `pty` to run processes in managed terminal sessions. Prefer pty over raw
-background commands (`&`, `nohup`, piping) for better lifecycle control,
-readable output, and the ability to wait for results.
+## What it is
+`pty` runs a command in a managed terminal session you can detach from and
+reconnect to later, from anywhere (including over SSH). It's the terminal /
+session layer: `run`, `list`, `peek`, `send`, `restart`, `kill`, `up`.
 
-## When to use
+## When to reach for it
+- A long-lived / background process: dev server, test suite, build, watcher, an agent.
+- An interactive CLI that needs a real TTY: keychain/auth prompts, a TUI, a REPL.
+- Any "start it, go do something else, come back to read / send / restart" task.
 
-- Running any long-lived or background process (dev servers, test suites, builds)
-- Interactive CLI tools that need a real terminal (auth via keychain, TUI, REPL)
-- Any task where you want to start work, do something else, then check results
-- Processes you may need to re-read output from later
+Prefer `pty` over `&` / `nohup` / pipes for these — you get lifecycle control,
+readable replayed output, and the ability to wait for specific text. For a
+one-shot command whose output you read right now, just run it directly.
 
-## Session lifecycle
-
-`strategy=permanent` sessions are restarted by `pty gc` (typically a launchd `StartInterval=30` task — `pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist`). Restarts are stateless — no backoff tracking, no retry budget. Expect up to one interval of latency before a session comes back.
-
-### 1. Create a detached session
-
-```bash
-pty run -d --name <descriptive-name> --tag owner=<agent> -- <command> [args...]
+## The idiom (happy path)
+```sh
+pty run -d --name <name> --tag owner=<you> -- <command>   # start detached, tagged
+pty peek --wait "<ready text>" --plain <name> -t 30       # block until ready
+pty peek --full --plain <name>                            # read full output
+pty send <name> --seq "<text>" --seq key:return           # send input + Enter
+pty kill <name>                                           # clean up when done
 ```
+Tag the sessions you create; only touch sessions you created.
 
-Use `--cwd` to run in a specific directory:
+## Footguns (the ones that actually bite)
+- **A broken global `pty` on `$PATH` silently breaks the whole message bus.**
+  `st` / smalltalk delivery shells out to `pty send` found on `$PATH`. If a
+  global-install symlink points at a stale or broken `pty`, *every* agent's
+  message delivery fails network-wide — silently. Run `pty` from the intended
+  install; if you do global-install, confirm `pty --version` works before
+  trusting delivery.
+- **Isolation is `PTY_ROOT`, not `PTY_SESSION_DIR`.** To keep scratch/test
+  sessions out of the production registry, set `PTY_ROOT=<dir>`.
+  `PTY_SESSION_DIR` is a deprecated alias and is *ignored* when `PTY_ROOT` is
+  already set (as it is inside a supervised session tree) — so setting only
+  `PTY_SESSION_DIR` there leaks your sessions into the ambient registry. pty
+  now warns when both are set.
+- **Sending text + Enter: mind the timing (top cause of "I sent it but nothing
+  happened").** `pty send <ref> "text"` sends NO newline — to submit, use
+  `pty send <ref> --seq "text" --seq key:return`. The *why* it can silently fail:
+  a terminal program processes a burst of bytes differently from spaced-out
+  input. With zero spacing, the trailing `key:return` routinely arrives before
+  the program's readline / PTY event loop has parsed and rendered the typed
+  text (and before bracketed-paste framing closes), so the Enter submits an
+  empty or partial line. `pty send` now inserts a **0.3s gap between `--seq`
+  items by default** so each chunk is consumed before the next — you usually
+  don't need to think about it. Overrides: `--with-delay <sec>` to tune (some
+  slow TUIs want 0.5s+), and **`--with-delay 0` for a raw back-to-back stream**
+  (fast/bulk sends where you know the receiver can take it).
+- **Don't nest.** Inside a session, a bare `pty run` runs the command directly
+  (nesting guard); use `pty run -d` to explicitly background a new session from
+  inside one.
 
-```bash
-pty run -d --name <name> --cwd /path/to/project --tag owner=<agent> -- <command>
-```
-
-Tag sessions so they are identifiable. Never touch sessions you did not create.
-
-### 2. Wait for the process to be ready
-
-```bash
-pty peek --wait "expected text" --plain <name> -t 10
-```
-
-Check the output to confirm the process has started (e.g. "Authenticated",
-"Listening", a prompt character).
-
-### 3. Send input (if interactive)
-
-```bash
-pty send <name> "your message here"
-pty send <name> --seq key:return
-```
-
-For multi-step input use `--seq` chains:
-
-```bash
-pty send <name> --seq "first line" --seq key:return
-```
-
-Use `--with-delay` if the tool needs time between inputs:
-
-```bash
-pty send <name> --with-delay 0.5 --seq "text" --seq key:return
-```
-
-### 4. Wait for output and read results
-
-Wait for specific text to appear:
-
-```bash
-pty peek --wait "expected output" --plain <name> -t 120
-```
-
-Read the full scrollback (not just the visible screen):
-
-```bash
-pty peek --full --plain <name>
-```
-
-Read just the current visible screen:
-
-```bash
-pty peek --plain <name>
-```
-
-Check recent events without following:
-
-```bash
-pty events --recent <name>
-```
-
-### 5. Clean up
-
-Always kill sessions you created when done:
-
-```bash
-pty kill <name>
-```
-
-## Rules
-
-- **Always use `--plain` with peek** so output is readable (no ANSI escapes)
-- **Always use `-t` (timeout)** on `--wait` so you don't block forever
-- **Always tag sessions** so they are identifiable and attributable
-- **Always clean up** — kill sessions when you are done
-- **Never touch sessions you did not create** — check `pty list --tags` if unsure
-- **Use `--full` when output may exceed the screen** — peek without it only
-  shows the visible terminal buffer
-
-## Naming conventions
-
-Name sessions by purpose: `gemini-review`, `test-runner`, `dev-server`, etc.
-Keep names lowercase with hyphens.
-
-## Quick reference
-
-| Action | Command |
-|---|---|
-| Create detached | `pty run -d --name <n> --tag owner=<a> -- <cmd>` |
-| Peek (plain) | `pty peek --plain <n>` |
-| Peek (full scrollback) | `pty peek --full --plain <n>` |
-| Wait for text | `pty peek --wait "text" --plain <n> -t 30` |
-| Send text | `pty send <n> "text"` |
-| Send enter | `pty send <n> --seq key:return` |
-| Recent events | `pty events --recent <n>` |
-| Follow events | `pty events <n>` |
-| List sessions | `pty list --tags` |
-| Kill session | `pty kill <n>` |
-
-## Common patterns
-
-### Run a dev server and wait for it
-
-```bash
-pty run -d --name dev-server --tag owner=agent -- npm run dev
-pty peek --wait "Listening" --plain dev-server -t 30
-# Server is ready — do your work
-pty kill dev-server
-```
-
-### Run tests and read results
-
-```bash
-pty run -d --name tests --tag owner=agent -- npm test
-pty peek --wait "passed" --wait "failed" --plain tests -t 120
-pty peek --full --plain tests
-pty kill tests
-```
-
-### Run a build and check for errors
-
-```bash
-pty run -d --name build --tag owner=agent -- npm run build
-pty peek --wait "error" --wait "successfully" --plain build -t 60
-pty peek --full --plain build
-pty kill build
-```
+## The exact surface
+Run `pty --help` for the full subcommand list, and `pty <subcommand> --help` for
+that command's flags and examples. `pty --version` prints `<semver>+<short-sha>`.
