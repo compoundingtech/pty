@@ -20,6 +20,7 @@ import {
 import {
   getSocketPath,
   getPidPath,
+  getMetadataPath,
   ensureSessionDir,
   cleanup,
   cleanupAll,
@@ -879,6 +880,11 @@ export class PtyServer {
   }
 
   private saveExitMetadata(exitCode: number): void {
+    // Don't resurrect a session whose metadata was already removed. On teardown
+    // the daemon re-flushes exit metadata during its (possibly watchdog-delayed)
+    // shutdown; if a caller already `pty rm`'d the session, re-creating its
+    // `.json` here would leave a stray registry file (and its atomic tmp) behind.
+    if (!fs.existsSync(getMetadataPath(this.name))) return;
     const existing = readMetadata(this.name);
     writeMetadata(this.name, {
       command: this.options.command,

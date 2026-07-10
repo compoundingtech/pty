@@ -15,6 +15,7 @@ import {
   isGone,
   cleanupAll,
   cleanupSocket,
+  waitForProcessExit,
   validateName,
   validateDisplayName,
   acquireLock,
@@ -2087,11 +2088,21 @@ async function cmdKill(name: string): Promise<void> {
 
   try {
     process.kill(session.pid, "SIGTERM");
-    console.log(`Session "${name}" killed.`);
   } catch {
     console.error(`Failed to kill session "${name}".`);
+    cleanupSocket(name);
+    return;
   }
+
+  // Wait for the daemon to fully exit before returning. Its shutdown re-flushes
+  // exit metadata to disk (an atomic tmp-write + rename); if we returned while
+  // that was still in flight, a caller that immediately `pty rm`s the session
+  // could race the late write and leave a stray temp file behind. Bounded — the
+  // SIGTERM shutdown path settles in ~2s; if it somehow overruns we clean up and
+  // return anyway (the daemon finishes on its own).
+  await waitForProcessExit(session.pid, 3000);
   cleanupSocket(name);
+  console.log(`Session "${name}" killed.`);
 
   if (wasPermanent && session.metadata?.tags?.ptyfile) {
     console.error(`Note: this session is managed by ${session.metadata.tags.ptyfile}`);

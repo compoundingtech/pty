@@ -72,9 +72,12 @@ function timeSend(dir: string, args: string[]): number {
 }
 
 describe("pty send --seq delay is applied end-to-end", () => {
-  // 4 items = 3 inter-item gaps → default ≈ 900ms of spacing, plenty above the
-  // node-startup noise floor once we subtract the straight-stream baseline.
-  const ITEMS = ["--seq", "a", "--seq", "b", "--seq", "c", "--seq", "d"];
+  // 9 items = 8 inter-item gaps. At the 0.3s default that's ~2.4s of real
+  // inserted delay — a large enough signal that startup / scheduling noise
+  // under a saturated parallel test run can't close the gap vs the straight
+  // stream. (The exact per-value delay is proven deterministically by the
+  // resolveSeqDelayMs unit tests above; this just proves it's wired.)
+  const ITEMS = ["a", "b", "c", "d", "e", "f", "g", "h", "i"].flatMap((v) => ["--seq", v]);
 
   it("default spaces items but --with-delay 0 does not (0 = straight stream)", async () => {
     const dir = fs.mkdtempSync(path.join(testRoot, "d-"));
@@ -84,11 +87,9 @@ describe("pty send --seq delay is applied end-to-end", () => {
     const straight = timeSend(dir, [name, "--with-delay", "0", ...ITEMS]);
     const dflt = timeSend(dir, [name, ...ITEMS]);
 
-    // The default adds ~900ms (3 × 0.3s) over the straight stream. Generous
-    // margin (≥ 600ms) keeps it robust under load.
-    expect(dflt - straight).toBeGreaterThan(600);
-    // And the straight stream itself is quick (no 0.9s of inserted delay).
-    expect(straight).toBeLessThan(dflt - 500);
+    // The default adds ~2.4s (8 × 0.3s) over the straight stream. Assert well
+    // below that (≥ 1.2s) so a saturated CI run can't false-fail.
+    expect(dflt - straight).toBeGreaterThan(1200);
   }, 30000);
 
   it("--with-delay N scales the spacing", async () => {
@@ -99,7 +100,7 @@ describe("pty send --seq delay is applied end-to-end", () => {
     const straight = timeSend(dir, [name, "--with-delay", "0", ...ITEMS]);
     const slow = timeSend(dir, [name, "--with-delay", "0.2", ...ITEMS]);
 
-    // 3 gaps × 0.2s ≈ 600ms over the straight baseline.
-    expect(slow - straight).toBeGreaterThan(400);
+    // 8 gaps × 0.2s ≈ 1.6s over the straight baseline; assert ≥ 0.9s.
+    expect(slow - straight).toBeGreaterThan(900);
   }, 30000);
 });
