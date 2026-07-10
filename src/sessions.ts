@@ -1047,13 +1047,26 @@ function readPid(name: string): number | null {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
+}
+
+/** Poll until `pid` is gone (or `timeoutMs` elapses). Returns true if the
+ *  process exited within the budget, false if it was still alive at timeout.
+ *  Used by `pty kill` to wait for the daemon's shutdown (which re-flushes exit
+ *  metadata) to finish before returning, so a following `pty rm` can't race it. */
+export async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return !isProcessAlive(pid);
 }
 
 function isSocketReachable(socketPath: string): Promise<boolean> {
