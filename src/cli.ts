@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { attach, peek, send, queryStats, type StatsResult } from "./client.ts";
+import { attach, peek, send, queryStats, resolveSeqDelayMs, type StatsResult } from "./client.ts";
 import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
@@ -71,6 +71,271 @@ function extractFilterTags(args: string[]): Record<string, string> {
   }
 }
 
+// Per-subcommand help. `pty <cmd> --help` (or `-h`) prints the matching entry:
+// usage synopsis, every flag, and at least one concrete example. Kept here as
+// the single source so the deprecation/error paths and --help never drift.
+// A test (tests/help.test.ts) asserts every subcommand has an entry.
+const COMMAND_HELP: Record<string, string> = {
+  run: `Usage: pty run [flags] -- <command> [args...]
+
+Create a session and attach to it (use -d to leave it running in the background).
+
+Flags:
+  --id <id>            Pin the on-disk id (sock/json filename; charset-validated, ≤ 104-byte sock path)
+  --name <label>       Explicit display label (any printable text, ≤ 500 chars)
+  --no-display-name    Skip the auto cwd+command label — just the id
+  -d, --detach         Create in the background; don't attach
+  -a, --attach         Create, OR attach if a session with the same id already exists
+  -e, --ephemeral      Auto-remove metadata on clean exit
+  --tag key=value      Tag the session (repeatable)
+  --cwd <path>         Working directory for the command
+  --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
+  --force              Create even from inside another pty session (bypass the nesting guard)
+
+Examples:
+  pty run -- node server.js
+  pty run -d --name "API" --tag role=web -- node server.js`,
+
+  attach: `Usage: pty attach [-r] [--force] <ref>
+
+Reconnect to a session (alias: pty a). Detach again with Ctrl+\\.
+
+Flags:
+  -r, --auto-restart   Auto-restart the session if it has exited
+  --force              Attach even from inside another pty session (nested)
+
+Examples:
+  pty attach myserver
+  pty attach -r myserver`,
+
+  exec: `Usage: pty exec -- <command> [args...]
+
+Replace the current session's leaf process with a new command. Run INSIDE a
+session (uses $PTY_SESSION); the session keeps its id and metadata.
+
+Examples:
+  pty exec -- codex
+  pty exec -- bash -l`,
+
+  peek: `Usage: pty peek [-f] [--plain] [--full] [--wait <text> [-t <sec>]] <ref>
+
+Print a session's screen (or follow it, or wait for text) without attaching.
+
+Flags:
+  --plain              Plain text, no ANSI escapes (best for scripts / agents)
+  --full               Full scrollback, not just the visible viewport
+  -f, --follow         Follow output read-only (Ctrl+\\ to stop)
+  --wait <text>        Block until <text> appears on screen
+  -t, --timeout <sec>  Timeout (seconds) for --wait
+
+Examples:
+  pty peek --plain myserver
+  pty peek --wait "Listening" -t 10 --plain myserver`,
+
+  send: `Usage: pty send <ref> "text"
+       pty send <ref> --seq <chunk> [--seq key:<name>] ...
+
+Send text or key events to a session. Raw text is sent with NO implicit newline —
+to send text followed by Enter, use --seq (see the second example).
+
+Flags:
+  --seq <value>        Ordered chunk or key event (repeatable). key:<name> sends a
+                       key, e.g. key:return, key:ctrl+c, key:tab
+  --with-delay <sec>   Delay (seconds) between --seq items. DEFAULT 0.3s so a
+                       trailing key:return doesn't race ahead of the program
+                       parsing the text. --with-delay 0 = straight stream (no gap).
+  --paste "<text>"     Wrap the payload in bracketed-paste markers
+
+Examples:
+  pty send myserver "hello"
+  pty send myserver --seq "git status" --seq key:return        # 0.3s gap by default
+  pty send myserver --with-delay 0 --seq a --seq b --seq c     # back-to-back, no gap`,
+
+  events: `Usage: pty events [--all | <ref>] [--recent] [--json] [--wait <type> [-t <sec>]]
+
+Follow a session's event log (bell, title, notifications, tag/rename changes, user.* events).
+
+Flags:
+  --all                Follow every session, interleaved (omit <ref>)
+  --recent             Print recent events and exit (don't follow)
+  --json               Emit raw JSONL
+  --wait <type>        Block until an event of <type> appears
+  -t, --timeout <sec>  Timeout (seconds) for --wait
+
+Examples:
+  pty events myserver
+  pty events --recent --json myserver`,
+
+  list: `Usage: pty list [--json] [--tags] [--filter-tag k=v] [--remote] [--status <s>] [--summary]
+
+List sessions (alias: pty ls). User tags show by default.
+
+Flags:
+  --json               Emit JSON
+  --tags               Include internal bookkeeping tags (ptyfile*, strategy.*)
+  --filter-tag k=v     Only sessions with the tag (repeatable, ALL must match)
+  --remote             Include remote sessions via pty-relay (when installed)
+  --status <state>     Filter by status: running | exited | vanished
+  --older-than <dur>   Only sessions older than a duration (e.g. 30m, 2h, 3d)
+  --newer-than <dur>   Only sessions newer than a duration
+  --summary            Print a one-line count summary instead of the list
+
+Examples:
+  pty list
+  pty list --filter-tag role=web --json`,
+
+  stats: `Usage: pty stats [--json] [--all] [<ref>]
+
+Live CPU / memory / PIDs. Omit <ref> for every session.
+
+Flags:
+  --json               Emit stats as JSON (one snapshot)
+  --all                Include every session (with an explicit <ref> given)
+
+Examples:
+  pty stats
+  pty stats --json myserver`,
+
+  restart: `Usage: pty restart [-y] [--force] <ref>
+
+SIGTERM the session's daemon and respawn it from stored metadata (command, cwd,
+tags, displayName). Prompts first if it's still running.
+
+Flags:
+  -y, --yes            Skip the "kill and restart?" prompt
+  --force              Attach after restart even from inside another pty session
+
+Examples:
+  pty restart myserver
+  pty restart -y myserver`,
+
+  kill: `Usage: pty kill <ref>
+
+SIGTERM a running session's daemon. Metadata is kept — restart or \`pty rm\` it later.
+
+Examples:
+  pty kill myserver`,
+
+  rm: `Usage: pty rm <ref>
+
+Remove an exited session's files (socket/pid/json/events) (alias: pty remove).
+Won't remove a running session — kill it first.
+
+Examples:
+  pty rm myserver`,
+
+  gc: `Usage: pty gc [-n] [--idle-days N] [--fast-fail-window=N] [--fast-fail-limit=N]
+       pty gc --print-launchd-plist [--interval=N]
+
+One reconciliation pass: sweep exited/vanished, orphan-kill \`parent=<name>\` children,
+reap abandoned permanents, respawn \`strategy=permanent\` sessions.
+
+Flags:
+  -n, --dry-run           Preview without changing anything
+  --idle-days N           Also reap permanents with no attach in N days
+  --fast-fail-window=N    Fast-fail window seconds (default 60; per-session tag wins)
+  --fast-fail-limit=N     Consecutive fast fails before flapping (default 3; per-session tag wins)
+  --print-launchd-plist   Print a macOS launchd plist that runs 'pty gc' on an interval
+  --interval=N            Plist StartInterval seconds (default 30)
+
+Examples:
+  pty gc --dry-run
+  pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist`,
+
+  tag: `Usage: pty tag <ref>                           Show tags
+       pty tag <ref> key=value [key=value...]   Set tags
+       pty tag <ref> --rm key [--rm key...]     Remove tags
+
+Read or write tags on one session. Updates apply before removals.
+
+Flags:
+  --rm <key>           Remove a tag key (repeatable)
+
+Examples:
+  pty tag myserver role=web env=prod
+  pty tag myserver --rm env`,
+
+  "tag-multi": `Usage: pty tag-multi <selector> [ops...]
+
+Bulk read / write tags across many sessions.
+  Selector (one of): --all | --filter-tag k=v (repeatable) | <ref>...
+  Ops (any of):      key=value | --rm key
+
+Flags:
+  --all                Select every session
+  --filter-tag k=v     Select sessions with the tag (repeatable)
+  --rm <key>           Remove a tag key (repeatable)
+  --json               Read mode: emit tags as JSON
+  -y, --yes            Required to write when the selector is --all
+
+Examples:
+  pty tag-multi --filter-tag role=web env=prod
+  pty tag-multi --all --json`,
+
+  emit: `Usage: pty emit <type> [--json <payload>] [--text <string>]
+       pty emit <ref> <type> [--json <payload>] [--text <string>]
+
+Publish a user.* event to a session's event log. Inside a session the ref
+defaults to $PTY_SESSION. Types must start with "user." — "session_*", "state.*",
+"bell", etc. are reserved.
+
+Flags:
+  --json <payload>     Attach a JSON payload
+  --text <string>     Attach a text payload
+
+Examples:
+  pty emit user.build-done
+  pty emit user.progress --json '{"pct": 40}'
+  pty emit myserver user.tests-passed --json '{"n": 42}'`,
+
+  rename: `Usage: pty rename <new-display-name>          Inside a session: set displayName
+       pty rename <ref> <new-display-name>    Outside: set displayName on <ref>
+       pty rename --show <ref>                Show the current displayName
+       pty rename --clear [ref]               Clear the displayName
+
+displayName is a mutable alias; the session's stable id (name) never changes.
+
+Examples:
+  pty rename my-friendly-name
+  pty rename webapp "Web Frontend"
+  pty rename --show webapp`,
+
+  up: `Usage: pty up [<dir>] [<name>...]
+
+Start sessions declared in a pty.toml. With no args, reads ./pty.toml and starts all.
+
+Examples:
+  pty up
+  pty up ./backend
+  pty up web worker`,
+
+  down: `Usage: pty down [<dir>] [<name>...]
+
+Stop sessions declared in a pty.toml.
+
+Examples:
+  pty down
+  pty down web`,
+
+  test: `Usage: pty test [watch | -t "<pattern>"]
+
+Run the pty test suite (a thin vitest passthrough).
+
+Examples:
+  pty test
+  pty test -t "peek"`,
+};
+
+/** Print a subcommand's focused help. Resolves aliases; returns false for an
+ *  unknown command so the caller can fall through. */
+function printCommandHelp(cmd: string): boolean {
+  const canonical = ({ a: "attach", ls: "list", remove: "rm" } as Record<string, string>)[cmd] ?? cmd;
+  const help = COMMAND_HELP[canonical];
+  if (!help) return false;
+  console.log(help);
+  return true;
+}
+
 function usage(): void {
   console.log(`Usage:
   pty                                     Interactive session manager (fullscreen TUI)
@@ -90,6 +355,7 @@ Create sessions:
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
+  pty run --force -- <command>            Create even from inside another pty session (nested)
 
 Attach & interact:
   pty attach <ref>                        Attach to an existing session (alias: pty a)
@@ -98,7 +364,8 @@ Attach & interact:
   pty exec -- <command> [args...]         Replace the current session's process (inside a session)
   pty send <ref> "text"                   Send raw text (no implicit newline)
   pty send <ref> --seq "text" --seq key:return   Send an ordered sequence of chunks / key events
-  pty send <ref> --with-delay 0.5 --seq ...      Insert a delay (seconds) between --seq items
+                                          (0.3s gap between items by default)
+  pty send <ref> --with-delay <sec> --seq ...    Override the gap; --with-delay 0 = straight stream
   pty send <ref> --paste "<big text>"     Wrap the payload in bracketed-paste markers
 
 Observe:
@@ -325,6 +592,14 @@ async function main(): Promise<void> {
   }
 
   const command = dispatchArgs[0];
+
+  // A subcommand's own `--help` / `-h` (in the first position after the command)
+  // prints that command's focused help and exits 0. `--root <path>` is already
+  // spliced out of `args` above, so `args[1]` is the token after the subcommand.
+  // First-position only, so `pty send <ref> --help` still sends "--help" as text.
+  if ((args[1] === "-h" || args[1] === "--help") && printCommandHelp(command)) {
+    return;
+  }
 
   switch (command) {
     case "interactive":
@@ -683,7 +958,9 @@ async function main(): Promise<void> {
       send({
         name: resolvedSendName,
         data,
-        delayMs: delaySecs != null ? delaySecs * 1000 : undefined,
+        // Default to a 0.3s inter-item gap so a trailing key:return doesn't race
+        // ahead of the program parsing the typed text. `--with-delay 0` opts out.
+        delayMs: resolveSeqDelayMs(delaySecs),
         ...(paste ? { paste: true } : {}),
       });
       break;
@@ -964,11 +1241,7 @@ async function main(): Promise<void> {
     }
 
     case "up": {
-      if (args[1] === "-h" || args[1] === "--help") {
-        console.log("Usage: pty up [dir] [name...]\n\nStart sessions defined in pty.toml.");
-        break;
-      }
-      // pty up [dir] [name...]
+      // pty up [dir] [name...]  (--help handled by the central interceptor)
       const upArgs = args.slice(1);
       let dir: string | undefined;
       const names: string[] = [];
@@ -987,11 +1260,7 @@ async function main(): Promise<void> {
     }
 
     case "down": {
-      if (args[1] === "-h" || args[1] === "--help") {
-        console.log("Usage: pty down [dir] [name...]\n\nStop sessions defined in pty.toml.");
-        break;
-      }
-      // pty down [dir] [name...]
+      // pty down [dir] [name...]  (--help handled by the central interceptor)
       const downArgs = args.slice(1);
       let dir: string | undefined;
       const names: string[] = [];
@@ -1831,16 +2100,9 @@ async function cmdKill(name: string): Promise<void> {
 }
 
 function renameUsage(): void {
-  console.error(
-    "Usage:\n" +
-    "  pty rename <new-display-name>         Inside a session: set displayName on the current session\n" +
-    "  pty rename <ref> <new-display-name>   Outside: set displayName on <ref>\n" +
-    "  pty rename --show <ref>               Show the current displayName for <ref>\n" +
-    "  pty rename --clear                    Inside a session: clear displayName\n" +
-    "  pty rename --clear <ref>              Outside: clear displayName on <ref>\n" +
-    "\n" +
-    "displayName is a mutable alias. The session's stable id (name) never changes."
-  );
+  // Single source of truth: the same text `pty rename --help` prints, to stderr
+  // for the error paths.
+  console.error(COMMAND_HELP.rename);
 }
 
 async function cmdRename(rawArgs: string[]): Promise<void> {
@@ -2455,19 +2717,8 @@ async function cmdEmit(argv: string[]): Promise<void> {
 }
 
 function printEmitHelp(): void {
-  console.log(`Usage:
-  pty emit <type> [--json <payload>] [--text <string>]
-  pty emit <session-ref> <type> [--json <payload>] [--text <string>]
-
-Publishes a user.* event to a session's events log. Inside a pty
-session, the ref defaults to $PTY_SESSION. Event types must start
-with "user." — "session_*", "state.*", "bell", etc. are reserved.
-
-Examples:
-  pty emit user.build-done
-  pty emit user.progress --json '{"pct": 40}'
-  pty emit user.note --text "starting deploy"
-  pty emit myserver user.tests-passed --json '{"n": 42}'`);
+  // Single source of truth: same text as `pty emit --help`.
+  console.log(COMMAND_HELP.emit);
 }
 
 // (state / wrap / unwrap removed in the lean-core pass — smalltalk's

@@ -171,6 +171,22 @@ export interface SendOptions {
   paste?: boolean;
 }
 
+/** Default spacing (ms) the `pty send` CLI inserts between `--seq` items when
+ *  the caller doesn't pass `--with-delay`. A burst of bytes and spaced-out
+ *  input are processed differently by terminal programs — a trailing `key:return`
+ *  fired with zero delay routinely lands before the program has parsed/rendered
+ *  the typed text, submitting an empty or partial line. 0.3s lets each chunk be
+ *  consumed. See docs/SKILL.md. This default lives in the CLI layer only; the
+ *  library `send()` still treats `delayMs` literally (undefined/0 = no spacing). */
+export const DEFAULT_SEQ_DELAY_MS = 300;
+
+/** Resolve the `pty send` inter-item delay in ms from the `--with-delay <sec>`
+ *  argument: absent → the 0.3s default; an explicit value (including 0, the
+ *  straight-stream escape hatch) → that value. Pure; exported for testing. */
+export function resolveSeqDelayMs(withDelaySecs: number | undefined): number {
+  return withDelaySecs != null ? Math.round(withDelaySecs * 1000) : DEFAULT_SEQ_DELAY_MS;
+}
+
 /** Send data to a session without attaching. Silent on success. */
 export function send(options: SendOptions): void {
   const socketPath = getSocketPath(options.name);
