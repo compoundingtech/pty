@@ -68,7 +68,13 @@ export interface SessionStartEvent extends EventBase {
 
 export interface SessionExitEvent extends EventBase {
   type: "session_exit";
+  /** The child's exit status. A signal death (e.g. OOM SIGKILL) is surfaced as
+   *  128 + signal (SIGKILL 9 → 137), matching shell `$?` semantics, so a
+   *  consumer gating on "nonzero" catches it. */
   exitCode: number;
+  /** The raw signal number when the child was killed by a signal (absent on a
+   *  normal exit). `exitCode` already encodes it as 128 + signal. */
+  signal?: number;
 }
 
 export interface SessionExecEvent extends EventBase {
@@ -503,7 +509,9 @@ export function formatEvent(event: EventRecord): string {
       return `${prefix} started${tagStr}`;
     }
     case "session_exit":
-      return `${prefix} exited (code ${event.exitCode})`;
+      return event.signal
+        ? `${prefix} killed by signal ${event.signal} (code ${event.exitCode})`
+        : `${prefix} exited (code ${event.exitCode})`;
     case "session_exec":
       return `${prefix} exec ${event.command} (was ${event.previousCommand})`;
     case "session_respawn":
