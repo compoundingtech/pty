@@ -70,7 +70,7 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `focus_request` | — |
 | `cursor_visible` | — |
 | `session_start` | `tags?` |
-| `session_exit` | `exitCode` |
+| `session_exit` | `exitCode, signal?` — signal death (e.g. OOM SIGKILL) surfaces as `exitCode` = 128 + `signal` (SIGKILL 9 → 137), matching shell `$?`; `signal` carries the raw number |
 | `session_exec` | `previousCommand, command` |
 | `session_respawn` | — (`pty gc` respawned a `strategy=permanent` session) |
 | `session_abandoned` | `reason: "cwd-gone" \| "idle", idleDays?` — (`pty gc` reaped a live permanent session detected as abandoned) |

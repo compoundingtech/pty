@@ -497,18 +497,27 @@ export class PtyServer {
       }
     });
 
-    this.ptyProcess.onExit(({ exitCode }) => {
+    this.ptyProcess.onExit(({ exitCode, signal }) => {
       this.exited = true;
-      this.exitCode = exitCode;
-      this.broadcast(encodeExit(exitCode));
-      this.emitEvent(EventType.SESSION_EXIT, { exitCode });
+      // A signal death (e.g. an OS OOM SIGKILL) arrives from node-pty with a
+      // nonzero `signal` and often exitCode 0 — if we recorded only the raw
+      // exitCode, a killed process would look like a clean finish and any
+      // consumer gating on "nonzero exit" (convoy's crash→ding) would miss it.
+      // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
+      const code = signal ? 128 + signal : exitCode;
+      this.exitCode = code;
+      this.broadcast(encodeExit(code));
+      this.emitEvent(EventType.SESSION_EXIT, {
+        exitCode: code,
+        ...(signal ? { signal } : {}),
+      });
       // Save exit status immediately so the session shows as "exited"
       // in pty list during the cleanup window. lastLines may be incomplete
       // here since PTY data could still be in-flight — close() will
       // update with the final output.
-      this.saveExitMetadata(exitCode);
+      this.saveExitMetadata(code);
       this.resolveChildExited();
-      options.onExit?.(exitCode);
+      options.onExit?.(code);
     });
 
     // Create Unix socket server
