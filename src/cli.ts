@@ -29,6 +29,7 @@ import {
   getSessionDir,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
+  type SessionMetadata,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
@@ -2986,6 +2987,18 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
   }
 }
 
+/** Detect a session that should NOT be blindly `pty restart`ed: a stateful
+ *  interactive agent. Two signals — a `role=agent` tag, or a `claude --resume`
+ *  in the stored command. Returns a short human reason, or null. */
+function statefulAgentReason(meta: SessionMetadata): string | null {
+  if (meta.tags?.role === "agent") return "role=agent tag";
+  const argv = [meta.command, ...(meta.args ?? []), meta.displayCommand].filter(Boolean).join(" ");
+  if (/(^|\s|\/)claude(\s|$)/.test(argv) && /(^|\s)--resume(\s|=|$)/.test(argv)) {
+    return "claude --resume command";
+  }
+  return null;
+}
+
 async function cmdRestart(
   name: string,
   yes = false,
@@ -3002,6 +3015,22 @@ async function cmdRestart(
   if (!meta) {
     console.error(`Session "${name}" has no metadata — cannot restart.`);
     cleanupAll(name);
+    process.exit(1);
+  }
+
+  // Guardrail: `pty restart` blindly re-runs the stored argv — fine for a
+  // stateless daemon, a footgun for a stateful interactive agent. Restarting a
+  // `claude --resume` agent kills its in-progress work AND can wedge the resume
+  // (the re-exec races the old pts teardown; claude freezes on its exit screen
+  // and the daemon orphans). Refuse for agent-shaped sessions unless --force —
+  // the right way to cycle an agent is through its supervisor (e.g. convoy).
+  const agentReason = statefulAgentReason(meta);
+  if (agentReason && !forceNested) {
+    console.error(`Session "${name}" looks like a stateful agent (${agentReason}).`);
+    console.error(
+      "`pty restart` kills its in-progress work and can wedge a `claude --resume`. " +
+      "Cycle it through its supervisor (e.g. `convoy up`) instead — or pass --force to restart anyway."
+    );
     process.exit(1);
   }
 
