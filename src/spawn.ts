@@ -84,6 +84,15 @@ export interface SpawnDaemonOptions {
    *  handler still surfaces immediate failures within milliseconds, so
    *  this only governs the "alive but slow" case. */
   startTimeoutMs?: number;
+  /** Env var names to DELETE from the daemon's inherited environment before it
+   *  spawns — and therefore before the session child inherits it. Used by the
+   *  operator-initiated restart paths to strip the *restarter's* ambient
+   *  bus-identity vars (ST_AGENT/ST_ROOT), so a session re-exec'd from a
+   *  different shell can't come back under that shell's identity. See the
+   *  cos-restart incident. Applied on the spawnViaNode path; the CLI-fallback
+   *  path can't express it (a bundled consumer that hits the fallback also
+   *  isn't the operator-restart context this guards). */
+  scrubEnv?: string[];
 }
 
 /** Default time we wait for a daemon's Unix socket to appear after
@@ -151,6 +160,11 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
   // when its spawner is gone. Off by default — opt in via
   // `bindToSpawnerLifetime` when the caller owns the daemon's lifetime.
   const env: Record<string, string> = { ...process.env, PTY_SERVER_CONFIG: config };
+  // Strip caller-requested vars (e.g. the restarter's leaked bus identity)
+  // before the daemon — and thus the session child — can inherit them.
+  if (options.scrubEnv) {
+    for (const key of options.scrubEnv) delete env[key];
+  }
   if (options.bindToSpawnerLifetime) env.PTY_SPAWNER_PID = String(process.pid);
   const child = spawn(launcherCmd, [...launcherArgs, serverModule], {
     detached: true,

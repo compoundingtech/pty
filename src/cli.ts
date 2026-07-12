@@ -1473,6 +1473,7 @@ async function handleDeadSession(
   await spawnDaemon({
     name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags,
     ...(meta.displayName ? { displayName: meta.displayName } : {}),
+    scrubEnv: RESTART_SCRUBBED_ENV,
   });
   console.log(`Session "${session.name}" restarted.`);
   doAttach(session.name);
@@ -2999,6 +3000,18 @@ function statefulAgentReason(meta: SessionMetadata): string | null {
   return null;
 }
 
+/** Bus-identity env vars stripped from an operator-initiated restart's re-exec.
+ *  `pty restart` (and the dead-session "Restart? [Y/n]" path) re-run a stored
+ *  command under the RESTARTER's shell env. If that shell belongs to a different
+ *  convoy agent, its ST_AGENT/ST_ROOT leak into the re-exec'd session and it
+ *  comes back under the wrong bus identity — the cos-restart incident, where
+ *  restarting cos from smalltalk's shell brought cos back as smalltalk-claude
+ *  (exit 129). Scrubbing them means a restarted session never inherits the
+ *  restarter's identity; the blessed way to restart an agent with a correct
+ *  identity is its supervisor (convoy). Fresh `pty run` is unaffected — a
+ *  convoy-launched create legitimately inherits its own identity. */
+const RESTART_SCRUBBED_ENV = ["ST_AGENT", "ST_ROOT"];
+
 async function cmdRestart(
   name: string,
   yes = false,
@@ -3062,6 +3075,7 @@ async function cmdRestart(
   await spawnDaemon({
     name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: restartTags,
     ...(meta.displayName ? { displayName: meta.displayName } : {}),
+    scrubEnv: RESTART_SCRUBBED_ENV,
   });
   console.log(`Session "${name}" restarted.`);
 
