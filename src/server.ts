@@ -941,6 +941,15 @@ export class PtyServer {
       });
     });
   }
+
+  /** Hard-kill the child with SIGKILL, bypassing the graceful SIGHUP that
+   *  close() sends. Used by the shutdown backstop: when a graceful close()
+   *  has wedged (e.g. a frozen child that ignores SIGHUP), the daemon is about
+   *  to force-exit and must not leave the child orphaned to init still alive.
+   *  Best-effort — a SIGKILL is unblockable, but the child may already be gone. */
+  forceKillChild(): void {
+    try { this.ptyProcess.kill("SIGKILL"); } catch {}
+  }
 }
 
 /** How often the spawner-PID watchdog checks for liveness. 5s is fast enough
@@ -998,11 +1007,45 @@ if (process.argv[1]?.endsWith("/server.js")) {
 
   const isEphemeral = config.ephemeral === true;
 
+  // Hard deadline for a graceful shutdown before the daemon force-exits. The
+  // graceful path (server.close()) is itself only internally bounded on the
+  // child-exit wait (~2s); the outer promise can still hang indefinitely if
+  // socketServer.close()'s callback never fires (a lingering/untracked socket)
+  // or eventWriter.flush() stalls. That is exactly how a restart wedged the
+  // daemon alive+orphaned (ppid=1), needing kill -9. This backstop guarantees
+  // the daemon exits — and reaps its child — regardless. Env-overridable so
+  // tests can force the backstop path deterministically.
+  const SHUTDOWN_DEADLINE_MS = (() => {
+    const raw = Number(process.env.PTY_SHUTDOWN_DEADLINE_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 5000;
+  })();
+
+  // Idempotent: SIGTERM, SIGINT, the child's onExit, and the spawner watchdog
+  // can all trigger shutdown, sometimes overlapping. Only the first arms the
+  // deadline and drives close(); later callers get the same in-flight promise.
+  let shutdownPromise: Promise<never> | null = null;
   function cleanShutdown(code: number): Promise<never> {
-    return server.close().then(() => {
+    if (shutdownPromise) return shutdownPromise;
+    const deadline = setTimeout(() => {
+      console.error(
+        `pty daemon "${config.name}": graceful shutdown exceeded ` +
+        `${SHUTDOWN_DEADLINE_MS}ms — forcing exit (child reaped)`,
+      );
+      // Don't leave a frozen child orphaned, and don't leave a stale pid/sock
+      // pointing at a daemon that's about to vanish.
+      server.forceKillChild();
+      try {
+        if (isEphemeral) cleanupAll(config.name);
+        else cleanup(config.name);
+      } catch {}
+      process.exit(code);
+    }, SHUTDOWN_DEADLINE_MS);
+    shutdownPromise = server.close().then(() => {
+      clearTimeout(deadline);
       if (isEphemeral) cleanupAll(config.name);
       process.exit(code);
     });
+    return shutdownPromise;
   }
 
   const server = new PtyServer({
