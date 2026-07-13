@@ -12,12 +12,7 @@ Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless)
 npm install -g @myobie/pty
 ```
 
-Or with Nix:
-
-```sh
-nix profile install github:compoundingtech/pty   # install the CLI
-nix develop github:compoundingtech/pty           # dev shell with node, npm, native deps
-```
+Or install with Nix — see [nix.md](nix.md).
 
 Requires Node.js. Works on macOS and Linux.
 
