@@ -215,12 +215,15 @@ it can exit on detach. (The SIGHUP-ignore + keep-alive still apply; wrapping is
 the robust daemon form.)
 
 Flags:
-  --socket <path>      Unix socket path to listen on (required)
+  --socket <path>          Unix socket path to listen on (required to serve)
+  --print-systemd-unit     Print a systemd user unit (Type=simple owns the
+                           process — the durable daemon form) instead of serving
   PTY_REMOTE_SERVE_DEBUG=1   Env: log signal/exit/exception lifecycle to stderr
 
 Examples:
   pty remote-serve --socket ~/.local/state/pty-remote.sock
   setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &   # wrapped (recommended)
+  pty remote-serve --print-systemd-unit > ~/.config/systemd/user/pty-remote-serve.service
   fabric expose pty-view --socket ~/.local/state/pty-remote.sock   # on the peer`,
 
   stats: `Usage: pty stats [--json] [--all] [<ref>]
@@ -1154,9 +1157,15 @@ async function main(): Promise<void> {
 
     case "remote-serve": {
       const sockIdx = args.indexOf("--socket");
+      if (args.includes("--print-systemd-unit")) {
+        // Print a ready-to-install systemd user unit instead of serving.
+        // Default the socket to the runtime dir (outside PTY_ROOT).
+        printSystemdUnit(sockIdx >= 0 ? args[sockIdx + 1] : "%t/pty-remote.sock");
+        break;
+      }
       const sockPath = sockIdx >= 0 ? args[sockIdx + 1] : null;
       if (!sockPath) {
-        console.error("Usage: pty remote-serve --socket <path>");
+        console.error("Usage: pty remote-serve --socket <path>  |  pty remote-serve --print-systemd-unit");
         console.error(
           "Serves the remote-access control protocol on a Unix socket for a fabric\n" +
           "peer to expose (fabric expose pty-view --socket <path>). Run in the same\n" +
@@ -2698,6 +2707,54 @@ function printLaunchdPlist(interval: number): void {
 </plist>
 `;
   process.stdout.write(plist);
+}
+
+/** Print a ready-to-install systemd USER unit that runs `pty remote-serve` under
+ *  Type=simple (systemd owns the process directly — the durable form of "run it
+ *  wrapped, not as a bare session leader", plus Restart=on-failure crash
+ *  recovery). Mirrors `pty gc --print-launchd-plist`: authoritative + drift-proof
+ *  so the ExecStart / PTY_ROOT / socket surface stays correct as remote-serve
+ *  evolves. Install with e.g.:
+ *    pty remote-serve --print-systemd-unit > ~/.config/systemd/user/pty-remote-serve.service
+ *    systemctl --user enable --now pty-remote-serve.service
+ *  Then expose it over fabric with a SEPARATE unit (pty stays fabric-agnostic):
+ *    fabric expose pty-view --socket <SOCKET>   (ordered After= this + fabric). */
+function printSystemdUnit(socketPath: string): void {
+  const sessionDir = getSessionDir();
+  const node = process.execPath;
+  const cli = process.argv[1];
+  // node + the resolved CLI script so the unit doesn't depend on the `pty` shim
+  // being on systemd's (minimal) PATH — same reasoning as the launchd plist.
+  const unit = `[Unit]
+Description=pty remote-serve — fabric remote-control socket for this machine's pty sessions
+After=network.target
+
+[Service]
+Type=simple
+# remote-serve enumerates + routes sessions from PTY_ROOT — it MUST be the same
+# root the sessions use. Generated from the root this command saw; verify it.
+Environment=PTY_ROOT=${sessionDir}
+ExecStart=${node} ${cli} remote-serve --socket ${socketPath}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+`;
+  process.stdout.write(unit);
+  // Warn (to stderr, so stdout stays a clean unit) if the socket lives inside
+  // PTY_ROOT — pty would mis-scan it as a phantom session.
+  if (socketPath === sessionDir || socketPath.startsWith(sessionDir + "/")) {
+    console.error(
+      `\nWarning: --socket "${socketPath}" is inside PTY_ROOT (${sessionDir}); ` +
+      `pty would mis-count it as a session. Use a path OUTSIDE PTY_ROOT (default: %t/pty-remote.sock).`,
+    );
+  }
+  // Reminder: fabric exposure is a separate unit (pty is transport-agnostic).
+  console.error(
+    `\nExpose it over fabric with a separate unit:\n` +
+    `  fabric expose pty-view --socket ${socketPath}   (ordered After= this unit + the fabric daemon)`,
+  );
 }
 
 // --- tag-multi: read/write tags across multiple sessions in one call ---
