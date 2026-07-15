@@ -13,7 +13,7 @@ const cliSource = fs.readFileSync(path.join(__dirname, "..", "src", "cli.ts"), "
 const COMMANDS = [
   "run", "attach", "exec", "peek", "send", "events", "list", "stats",
   "restart", "kill", "rm", "gc", "tag", "tag-multi", "emit", "rename",
-  "up", "down", "test", "remote-serve", "remote-serve-handle",
+  "up", "down", "test", "remote-serve",
 ];
 // Aliases that must resolve to the same help.
 const ALIASES = ["a", "ls", "remove"];

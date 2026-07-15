@@ -4,10 +4,10 @@ import { execFileSync } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { listSessions, getSocketPath, type SessionInfo } from "./sessions.ts";
 
-/** ALPN / fabric protocol name under which a pty control socket is exposed and
- *  dialed. `fabric expose pty-view --socket <sock>` on the remote;
- *  `fabric dial <peer> pty-view` on the client. Matches fabric's own docs. */
-export const PTY_REMOTE_ALPN = "pty-view";
+/** ALPN / fabric service name under which pty exposes its remote-access control
+ *  protocol. `fabric expose pty-remote --exec -- pty remote-serve --stdio` on the
+ *  remote; `fabric dial <peer> pty-remote` on the client. */
+export const PTY_REMOTE_ALPN = "pty-remote";
 
 /** The `fabric` CLI is the only thing pty knows about the cross-machine
  *  transport — it hands us a local Unix socket and we speak our own protocol
@@ -157,7 +157,7 @@ export function handleRemoteConnection(input: Readable, output: Writable, done: 
  *  stays transport-agnostic: fabric (or anything) exposes this socket to peers.
  *  Reads sessions from the ambient $PTY_ROOT, so run it in the same env the
  *  sessions use. Returns the listening server. (The on-demand fabric `--exec`
- *  path uses `runRemoteServeHandleStdio` instead — same handler, no daemon.) */
+ *  path uses `runRemoteServeStdio` instead — same handler, no daemon.) */
 export function serveRemoteControl(socketPath: string): net.Server {
   try {
     fs.unlinkSync(socketPath);
@@ -174,12 +174,12 @@ export function serveRemoteControl(socketPath: string): net.Server {
 }
 
 /** On-demand handler for fabric `--exec`: fabric spawns this ONCE per tunnel
- *  session and pipes the connection to stdin/stdout (`pty remote-serve-handle
- *  --stdio`). Run the shared handler on stdin/stdout and exit when the
- *  interaction ends. No persistent daemon — fabric owns the accept, the
- *  persistence, and roaming (a drop/reconnect reuses THIS process by stalling
- *  then resuming the pipes), so there's nothing to re-implement here. */
-export function runRemoteServeHandleStdio(): void {
+ *  session and pipes the connection to stdin/stdout (`pty remote-serve --stdio`).
+ *  Run the shared handler on stdin/stdout and exit when the interaction ends. No
+ *  persistent daemon — fabric owns the accept, the persistence, and roaming (a
+ *  drop/reconnect reuses THIS process by stalling then resuming the pipes), so
+ *  there's nothing to re-implement here. */
+export function runRemoteServeStdio(): void {
   handleRemoteConnection(process.stdin, process.stdout, () => process.exit(0));
   process.stdin.resume();
 }

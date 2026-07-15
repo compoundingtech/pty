@@ -118,13 +118,11 @@ pty down claude                           # stop specific sessions
 
 ### Remote over fabric
 
-`pty list --remote <peer>` lists another machine's sessions over [fabric](https://github.com/compoundingtech/fabric), which hands consumers a plain local Unix socket — pty never touches iroh. The remote machine runs a small control server that fabric exposes under the `pty-view` ALPN:
+`pty list --remote <peer>` lists another machine's sessions over [fabric](https://github.com/compoundingtech/fabric), which hands consumers a plain local Unix socket — pty never touches iroh. The remote machine serves a small control protocol that fabric exposes under the `pty-remote` ALPN. The recommended form is **on-demand**: fabric spawns the handler per dial, pipes the connection to its stdin/stdout, and owns persistence + roaming (no persistent pty daemon):
 
 ```sh
-# On the remote peer — serve the control protocol, then expose it over fabric.
-# Run it WRAPPED (not exec'd as a bare session leader — see below):
-setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &
-fabric expose pty-view --socket ~/.local/state/pty-remote.sock
+# On the remote peer — fabric spawns `pty remote-serve --stdio` per dial:
+fabric expose pty-remote --exec -- pty remote-serve --stdio
 ```
 
 From any trusted peer, the ordinary session commands take `--remote <peer>` — `<ref>` is the session's name/id **on the remote**:
@@ -138,9 +136,9 @@ pty attach --remote <peer> <ref>          # attach interactively (the resilient 
 
 Under the hood, `remote-serve` routes each command's connection through to the target session's local socket, so the ordinary per-session protocol runs unchanged over the fabric hop. A pty session already persists on its daemon and replays its screen on attach — so `pty attach --remote` to a long-lived remote pty **is** a persistent remote shell.
 
-`pty remote-serve` reads the ambient `PTY_ROOT`, so run it in the same environment the sessions use, and give it a socket path **outside** `PTY_ROOT` (a control socket inside it would be mis-counted as a phantom session).
+`pty remote-serve --stdio` reads the ambient `PTY_ROOT`, so run it in the same environment the sessions use.
 
-Run `remote-serve` **wrapped** — under `sh -c`, systemd, launchd, or another supervisor — so the pty process is a *child* of the session leader. Exec'd directly as the session leader with no controlling TTY (`setsid pty remote-serve … </dev/null &`), it can exit on detach.
+There is also a transitional **listening-daemon** form, `pty remote-serve --socket <path>` (`fabric expose pty-remote --socket <path>`), being retired in favor of `--stdio`. If you use it, give it a socket path **outside** `PTY_ROOT` (a control socket inside it would be mis-counted as a phantom session), and run it **wrapped** — under `sh -c`, systemd, launchd, or another supervisor — so the pty process is a *child* of the session leader (exec'd directly as the session leader with no controlling TTY, e.g. `setsid pty remote-serve --socket … </dev/null &`, it can exit on detach).
 
 ### Nesting Prevention
 
