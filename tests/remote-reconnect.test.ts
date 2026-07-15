@@ -143,32 +143,34 @@ describe("attach --remote reconnect harness", () => {
       expect(proxy.activeCount()).toBeGreaterThan(0);     // a live tunnel exists
 
       proxy.drop();                                        // sever it
-      sleepSync(200);
-      expect(proxy.activeCount()).toBe(0);                 // tunnel gone ✓
+      expect(proxy.activeCount()).toBe(0);                 // tunnel gone immediately ✓
+      // (attach --remote will now re-dial + re-attach — that's the reconnect test below)
     } finally {
       await session.close();
     }
   }, 25000);
 
-  // Unskip when attach --remote RECONNECT lands (task #23). The impl is gated on
-  // the fabric-codex stall-vs-loud-close seam; the harness above is ready for it.
-  it.skip("survives a tunnel drop: reconnects + re-attaches + resumes without exiting", async () => {
+  it("survives a tunnel drop: re-dials, re-attaches, and resumes without exiting", async () => {
     const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
       rows: 24, cols: 80,
       env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
     });
     try {
-      await session.waitForText("RECONNECT_READY", 8000);
-      proxy.drop();                                        // simulate a loud fabric close
-      // EXPECTED once reconnect lands:
-      // - attach does NOT exit on the drop
-      // - it shows a reconnecting indicator, then re-dials (fresh tunnel) + re-attaches
-      // - the daemon replays screen+modes so the session resumes (RECONNECT_READY still shown)
-      await session.waitForText("RECONNECT_READY", 15000); // re-attach replays the screen
+      await session.waitForText("RECONNECT_READY", 8000);  // attached
+      session.sendKeys("BEFORE_DROP\r");
+      await session.waitForText("BEFORE_DROP", 8000);       // input works pre-drop (cat echoes)
+
+      proxy.drop();                                          // simulate a LOUD fabric close
+      // attach must NOT exit: it re-dials (fresh tunnel via fake fabric) + re-attaches,
+      // and the daemon replays the screen. The remote cat session persisted, so input
+      // flows again and echoes back — which only happens if reconnect succeeded.
+      // NB: async wait (not sleepSync) — the proxy runs in THIS process, so the loop
+      // must stay live to accept the child's reconnect dial.
+      await new Promise((r) => setTimeout(r, 3000));         // let the backoff + local re-dial complete
       session.sendKeys("AFTER_RECONNECT\r");
-      await session.waitForText("AFTER_RECONNECT", 8000);  // input flows again post-reconnect
+      await session.waitForText("AFTER_RECONNECT", 12000);   // resumed end-to-end
     } finally {
       await session.close();
     }
-  }, 30000);
+  }, 40000);
 });
