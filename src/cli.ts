@@ -40,7 +40,7 @@ import {
 import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
-import { serveRemoteControl, fetchRemoteList, dialAndRoute, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import { serveRemoteControl, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -1805,7 +1805,17 @@ async function cmdAttachRemote(peer: string, name: string): Promise<void> {
     // On a loud fabric close, re-dial + re-route to the same remote session and
     // re-attach (the daemon replays its screen, so the session resumes). A
     // recoverable transport stall keeps the socket open, so it's just waited out.
-    reconnect: () => dialAndRoute(peer, name),
+    // Contract: null = transport failure (host unreachable) → attach keeps
+    // retrying; throw = the host is reachable but the session is gone → attach
+    // gives up cleanly.
+    reconnect: async () => {
+      try {
+        return await dialAndRoute(peer, name);
+      } catch (e) {
+        if (e instanceof RouteRefusedError) throw e; // reachable-but-gone → clean give-up
+        return null; // transport failure → keep retrying (unlimited by default)
+      }
+    },
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });

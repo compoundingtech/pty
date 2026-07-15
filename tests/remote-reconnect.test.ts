@@ -35,11 +35,15 @@ class KillableFabricProxy {
   readonly socketPath: string;
   private server: net.Server;
   private pairs: Array<[net.Socket, net.Socket]> = [];
+  private blocked = false;
 
   constructor(targetCtrlSock: string, socketPath: string) {
     this.socketPath = socketPath;
     try { fs.unlinkSync(socketPath); } catch { /* no stale socket */ }
     this.server = net.createServer((client) => {
+      // Blocked = the peer is unreachable: new dials connect but the tunnel
+      // fails immediately (a transport failure, not a "session gone" refusal).
+      if (this.blocked) { try { client.destroy(); } catch { /* gone */ } return; }
       const target = net.createConnection(targetCtrlSock);
       const pair: [net.Socket, net.Socket] = [client, target];
       this.pairs.push(pair);
@@ -68,6 +72,11 @@ class KillableFabricProxy {
       try { target.destroy(); } catch { /* already gone */ }
     }
   }
+
+  /** Simulate the peer going unreachable: new dials fail (transport failure). */
+  block(): void { this.blocked = true; }
+  /** Peer reachable again: new dials tunnel through normally. */
+  unblock(): void { this.blocked = false; }
 
   close(): void {
     this.drop();
@@ -173,4 +182,58 @@ describe("attach --remote reconnect harness", () => {
       await session.close();
     }
   }, 40000);
+
+  it("survives a LONG transport outage (unlimited retry) and reconnects when the peer returns", async () => {
+    const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
+      rows: 24, cols: 80,
+      env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
+    });
+    try {
+      await session.waitForText("RECONNECT_READY", 8000);
+
+      // Peer goes unreachable (transport failure), and the live tunnel drops.
+      // With unlimited-while-open retry, attach must NOT give up — it keeps
+      // re-dialing (all failing) through many backoff cycles.
+      proxy.block();
+      proxy.drop();
+      await session.waitForText("reconnecting", 8000);       // shows the reconnecting indicator
+      await new Promise((r) => setTimeout(r, 6000));         // outage spanning several failed retries
+
+      // Peer reachable again → the next retry succeeds → session resumes.
+      proxy.unblock();
+      await new Promise((r) => setTimeout(r, 6000));         // let a retry land + re-attach
+      session.sendKeys("AFTER_OUTAGE\r");
+      await session.waitForText("AFTER_OUTAGE", 12000);      // reconnected + resumed after the outage
+    } finally {
+      proxy.unblock();
+      await session.close();
+    }
+  }, 60000);
+
+  it("gives up cleanly when the peer is reachable but the session is gone (no infinite spin)", async () => {
+    // A throwaway session we kill mid-attach so the route-op returns 'no such
+    // session' (reachable host, session gone) — a clean give-up, not retry-forever.
+    const sid = `gone-${rand()}`;
+    const c = runCli(srvRoot, ["run", "-d", "--id", sid, "--", "sh", "-c", "echo GONE_READY; cat"]);
+    expect(c.status).toBe(0);
+    try { bgPids.push(Number(fs.readFileSync(path.join(srvRoot, `${sid}.pid`), "utf8").trim())); } catch {}
+    sleepSync(400);
+
+    const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", sid], {
+      rows: 24, cols: 80,
+      env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
+    });
+    try {
+      await session.waitForText("GONE_READY", 8000);
+      // Kill the remote session, then drop the tunnel. The reconnect re-dials
+      // successfully (host reachable) but the route-op refuses (session gone) →
+      // attach gives up cleanly with "session ended", not an infinite reconnect.
+      runCli(srvRoot, ["kill", sid]);
+      sleepSync(400);
+      proxy.drop();
+      await session.waitForText("session ended", 12000);
+    } finally {
+      await session.close();
+    }
+  }, 30000);
 });

@@ -377,24 +377,29 @@ export interface AttachOptions {
    *  `<name>.sock`. Used by `attach --remote`: a fabric-dialed, control-server-
    *  routed socket. When set, `name` is only used for display. */
   socket?: net.Socket;
-  /** Re-establish the (routed) socket after a loud disconnect — e.g.
-   *  `() => dialAndRoute(peer, name)` for `attach --remote`. When set, an
-   *  UNEXPECTED socket close (not a session EXIT, not a user detach) triggers a
-   *  re-dial + re-attach with backoff instead of exiting, and the daemon's
-   *  screen replay resumes the session. A recoverable transport stall keeps the
-   *  socket open (no close event), so it's ridden out by simply waiting;
-   *  reconnect fires only on a genuine close (fabric's loud give-up). */
+  /** Re-establish the (routed) socket after a loud disconnect — e.g. for
+   *  `attach --remote`. Contract:
+   *   - RESOLVE a socket → reconnected; re-attach over it.
+   *   - RESOLVE null → transient/transport failure (host unreachable) → keep
+   *     retrying with backoff (unlimited by default — a roaming laptop can
+   *     reopen hours later).
+   *   - REJECT → clean give-up: the host is reachable but the session is gone.
+   *  A recoverable stall keeps the socket open (no close event), so reconnect
+   *  fires only on a genuine close (fabric's loud give-up), never on a stall. */
   reconnect?: () => Promise<net.Socket | null>;
 }
 
 /** Backoff schedule for `attach --remote` reconnect attempts, then a cap. */
 const RECONNECT_BACKOFF_MS = [100, 250, 500, 1000, 2000, 5000, 10000];
 const RECONNECT_BACKOFF_CAP_MS = 15000;
-/** Give up after this many consecutive failed re-establish attempts (a roaming
- *  laptop can reopen minutes later, so this is generous). Env-overridable. */
+/** Consecutive transport-failure attempts before giving up. Default: UNLIMITED
+ *  while the terminal is open — the faithful roaming behavior (close the laptop,
+ *  travel, reopen, and it comes back; the user stops it with Ctrl-\ / Ctrl-C).
+ *  A reachable-but-gone session gives up cleanly regardless (a rejected reconnect,
+ *  see AttachOptions.reconnect). Env-overridable for a finite bound in scripts. */
 const RECONNECT_MAX_ATTEMPTS = (() => {
   const raw = Number(process.env.PTY_RECONNECT_MAX_ATTEMPTS);
-  return Number.isInteger(raw) && raw > 0 ? raw : 40;
+  return Number.isInteger(raw) && raw > 0 ? raw : Infinity;
 })();
 
 export function attach(options: AttachOptions): void {
@@ -560,14 +565,24 @@ export function attach(options: AttachOptions): void {
   async function reconnectLoop(): Promise<void> {
     if (reconnecting) return;
     reconnecting = true;
-    stdout.write("\r\n[reconnecting…]\r\n");
+    stdout.write(`\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n`);
     let attempt = 0;
     while (!detaching && !exitHandled) {
       const delay = RECONNECT_BACKOFF_MS[attempt] ?? RECONNECT_BACKOFF_CAP_MS;
       await new Promise((r) => setTimeout(r, delay));
       if (detaching || exitHandled) break;
       let fresh: net.Socket | null = null;
-      try { fresh = await options.reconnect!(); } catch { fresh = null; }
+      try {
+        fresh = await options.reconnect!();
+      } catch {
+        // Reject = reachable host that says the session is gone → clean give-up.
+        // (Transport failures resolve null, so we keep retrying below.)
+        if (detaching || exitHandled) break;
+        reconnecting = false;
+        stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
+        finish(0);
+        return;
+      }
       if (detaching || exitHandled) { try { fresh?.destroy(); } catch {} break; }
       if (fresh) {
         socket = fresh; // input handlers now target the fresh socket
@@ -575,9 +590,12 @@ export function attach(options: AttachOptions): void {
         bindSocket(fresh, true); // pre-connected; onReady → encodeAttach → daemon SCREEN replay
         return;
       }
+      // Transport failure (host unreachable) — retry, unlimited by default so a
+      // laptop closed for hours still reconnects on reopen. Only a finite env cap
+      // ends it (besides the user's Ctrl-\ / Ctrl-C).
       if (++attempt >= RECONNECT_MAX_ATTEMPTS) {
         reconnecting = false;
-        console.error(`\r\nRemote session "${options.name}" unreachable — gave up after ${attempt} reconnect attempts.`);
+        stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
         finish(1);
         return;
       }

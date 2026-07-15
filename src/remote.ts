@@ -45,6 +45,18 @@ export interface RemoteListResponse {
  *  routed command reliably knows the route succeeded (or, on `{error}`, failed).*/
 const ROUTE_OK = JSON.stringify({ ok: true });
 
+/** The dial reached the peer's control server but it REFUSED the route — the
+ *  host is reachable and reports the session is gone/absent. Distinct from a
+ *  transport failure (dial/connect/timeout = host unreachable): `attach --remote`
+ *  reconnect gives up cleanly on this (the session truly ended) but retries
+ *  forever on a transport failure (the outage is recoverable). */
+export class RouteRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RouteRefusedError";
+  }
+}
+
 function toRow(s: SessionInfo): RemoteSessionRow {
   const m = s.metadata;
   return {
@@ -192,8 +204,10 @@ export function dialAndRoute(peer: string, name: string, timeoutMs = 10000): Pro
         return;
       }
       if (resp.error || !resp.ok) {
+        // Reached the host; it refused the route (session gone). Distinct from a
+        // transport failure so reconnect can give up cleanly vs retry forever.
         sock.destroy();
-        reject(new Error(resp.error ?? "route refused"));
+        reject(new RouteRefusedError(resp.error ?? "route refused"));
         return;
       }
       // Hand back anything that arrived after the ack line so the caller's
