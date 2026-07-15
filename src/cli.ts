@@ -40,6 +40,7 @@ import {
 import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
+import { serveRemoteControl, fetchRemoteList, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -168,7 +169,7 @@ Examples:
   pty events myserver
   pty events --recent --json myserver`,
 
-  list: `Usage: pty list [--json] [--tags] [--filter-tag k=v] [--remote] [--status <s>] [--summary]
+  list: `Usage: pty list [--json] [--tags] [--filter-tag k=v] [--remote [<peer>]] [--status <s>] [--summary]
 
 List sessions (alias: pty ls). User tags show by default.
 
@@ -176,7 +177,9 @@ Flags:
   --json               Emit JSON
   --tags               Include internal bookkeeping tags (ptyfile*, strategy.*)
   --filter-tag k=v     Only sessions with the tag (repeatable, ALL must match)
-  --remote             Include remote sessions via pty-relay (when installed)
+  --remote <peer>      Also list a fabric peer's sessions (over fabric; the peer
+                       runs 'pty remote-serve' exposed as 'fabric expose pty-view')
+  --remote             Bare (no peer): include pty-relay hosts (when installed)
   --status <state>     Filter by status: running | exited | vanished
   --older-than <dur>   Only sessions older than a duration (e.g. 30m, 2h, 3d)
   --newer-than <dur>   Only sessions newer than a duration
@@ -184,7 +187,23 @@ Flags:
 
 Examples:
   pty list
+  pty list --remote hetzner
   pty list --filter-tag role=web --json`,
+
+  "remote-serve": `Usage: pty remote-serve --socket <path>
+
+Serve the remote-access control protocol on a Unix socket, so a fabric peer can
+expose it and other machines can 'pty list --remote <this-peer>'. Reads sessions
+from the ambient PTY_ROOT — run it in the same env the sessions use, and pick a
+socket path OUTSIDE PTY_ROOT (a control socket inside it would be mis-scanned as
+a phantom session).
+
+Flags:
+  --socket <path>      Unix socket path to listen on (required)
+
+Examples:
+  pty remote-serve --socket ~/.local/state/pty-remote.sock
+  fabric expose pty-view --socket ~/.local/state/pty-remote.sock   # on the peer`,
 
   stats: `Usage: pty stats [--json] [--all] [<ref>]
 
@@ -387,7 +406,9 @@ Observe:
   pty list --json                         List sessions as JSON
   pty list --tags                         Include internal bookkeeping tags (ptyfile*, strategy.*)
   pty list --filter-tag key=value         Filter to sessions with the tag (repeatable, ALL must match)
+  pty list --remote <peer>                List a fabric peer's sessions (over fabric)
   pty list --remote                       Include remote sessions via pty-relay (when installed)
+  pty remote-serve --socket <path>        Serve the control protocol for a fabric peer to expose
 
 Modify:
   pty rename <label>                      Inside a session: set its displayName
@@ -1010,6 +1031,8 @@ async function main(): Promise<void> {
       let statusFilter: "running" | "exited" | "vanished" | null = null;
       let olderThanMs: number | null = null;
       let newerThanMs: number | null = null;
+      let remoteFlag = false;
+      let remotePeer: string | null = null;
       const consumed = new Set<number>();
       for (let i = 1; i < listArgs.length; i++) {
         const arg = listArgs[i];
@@ -1032,24 +1055,52 @@ async function main(): Promise<void> {
           else newerThanMs = parsed;
           consumed.add(i); consumed.add(i + 1);
           i++;
+        } else if (arg === "--remote") {
+          // `--remote <peer>` lists that peer's sessions over fabric. Bare
+          // `--remote` (no peer, or followed by another flag) keeps the legacy
+          // pty-relay aggregate. A following non-flag token is the peer name.
+          remoteFlag = true;
+          if (val && !val.startsWith("-")) {
+            remotePeer = val;
+            consumed.add(i); consumed.add(i + 1);
+            i++;
+          } else {
+            consumed.add(i);
+          }
         }
       }
       const remainingArgs = listArgs.filter((_, i) => !consumed.has(i));
 
       const jsonFlag = remainingArgs.includes("--json");
       const tagsFlag = remainingArgs.includes("--tags");
-      const remoteFlag = remainingArgs.includes("--remote");
       const summaryFlag = remainingArgs.includes("--summary");
       await cmdList({
         json: jsonFlag,
         showTags: tagsFlag,
         remote: remoteFlag,
+        remotePeer,
         filterTags: listFilterTags,
         statusFilter,
         olderThanMs,
         newerThanMs,
         summary: summaryFlag,
       });
+      break;
+    }
+
+    case "remote-serve": {
+      const sockIdx = args.indexOf("--socket");
+      const sockPath = sockIdx >= 0 ? args[sockIdx + 1] : null;
+      if (!sockPath) {
+        console.error("Usage: pty remote-serve --socket <path>");
+        console.error(
+          "Serves the remote-access control protocol on a Unix socket for a fabric\n" +
+          "peer to expose (fabric expose pty-view --socket <path>). Run in the same\n" +
+          "PTY_ROOT env as the sessions; use a socket path OUTSIDE PTY_ROOT."
+        );
+        process.exit(1);
+      }
+      await cmdRemoteServe(sockPath);
       break;
     }
 
@@ -1623,6 +1674,9 @@ interface ListOptions {
   json?: boolean;
   showTags?: boolean;
   remote?: boolean;
+  /** When set, list this fabric peer's sessions over fabric (the new path);
+   *  `remote` without a peer keeps the legacy pty-relay aggregate. */
+  remotePeer?: string | null;
   filterTags?: Record<string, string>;
   statusFilter?: "running" | "exited" | "vanished" | null;
   olderThanMs?: number | null;
@@ -1630,11 +1684,59 @@ interface ListOptions {
   summary?: boolean;
 }
 
+async function cmdRemoteServe(socketPath: string): Promise<void> {
+  // Diagnostics for the detached-liveness investigation — off unless
+  // PTY_REMOTE_SERVE_DEBUG is set, so normal service logs stay quiet.
+  const debug = !!process.env.PTY_REMOTE_SERVE_DEBUG;
+  const dlog = (m: string) => { if (debug) console.error(`[remote-serve ${new Date().toISOString()}] ${m}`); };
+
+  const server = serveRemoteControl(socketPath);
+  server.on("error", (e) => {
+    console.error(`pty remote-serve: ${e.message}`);
+    process.exit(1);
+  });
+  server.on("listening", () => {
+    console.log(`pty remote-serve listening on ${socketPath}`);
+    dlog(`up pid=${process.pid} stdinTTY=${!!process.stdin.isTTY}`);
+  });
+
+  // Belt: pin the event loop so nothing about stdin/handle-refcounting can drain
+  // it. Suspenders (the real fix): a detached service must outlive the terminal
+  // or session that launched it. SIGHUP's default action is termination, so a
+  // plain `… </dev/null &` / setsid / fabric-shell launch is killed by the
+  // hangup the moment its launching session tears down (the ref'd timer can't
+  // save a process from an unhandled terminating signal — which is why the
+  // timer alone didn't hold on Linux). Ignore SIGHUP, like a daemon should.
+  // SIGTERM/SIGINT remain the graceful way to stop it.
+  const keepAlive = setInterval(() => {}, 1 << 30);
+  process.on("SIGHUP", () => dlog("SIGHUP received — ignoring (detached service stays up)"));
+
+  if (debug) {
+    process.on("beforeExit", (code) => dlog(`beforeExit code=${code}`));
+    process.on("exit", (code) => dlog(`exit code=${code}`));
+    process.on("uncaughtException", (e) => dlog(`uncaughtException: ${(e as Error)?.stack ?? String(e)}`));
+    process.on("unhandledRejection", (r) => dlog(`unhandledRejection: ${String(r)}`));
+  }
+
+  await new Promise<void>((resolve) => {
+    const stop = (sig: string) => {
+      dlog(`${sig} — shutting down`);
+      clearInterval(keepAlive);
+      try { server.close(); } catch {}
+      try { fs.unlinkSync(socketPath); } catch {}
+      resolve();
+    };
+    process.on("SIGTERM", () => stop("SIGTERM"));
+    process.on("SIGINT", () => stop("SIGINT"));
+  });
+}
+
 async function cmdList(opts: ListOptions = {}): Promise<void> {
   const {
     json = false,
     showTags = false,
     remote = false,
+    remotePeer = null,
     filterTags = {},
     statusFilter = null,
     olderThanMs = null,
@@ -1687,7 +1789,23 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
     }[];
     error: string | null;
   }[] = [];
-  if (remote) {
+  if (remotePeer) {
+    // Fabric path: `fabric dial <peer> pty-view` prints a local Unix socket
+    // that tunnels to the peer's exposed `pty remote-serve`; we speak our own
+    // list protocol over it and render it as one host group.
+    let error: string | null = null;
+    let sessions: typeof remoteHosts[number]["sessions"] = [];
+    try {
+      const dialSock = execFileSync(FABRIC_BIN, ["dial", remotePeer, PTY_REMOTE_ALPN], {
+        encoding: "utf-8", timeout: 10000,
+      }).trim();
+      if (!dialSock) throw new Error(`fabric dial ${remotePeer} returned no socket`);
+      sessions = await fetchRemoteList(dialSock);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    remoteHosts = [{ label: remotePeer, sessions, error }];
+  } else if (remote) {
     try {
       const relayBin = execFileSync("which", ["pty-relay"], { encoding: "utf-8" }).trim();
       const result = spawnSync(relayBin, ["ls", "--json"], { encoding: "utf-8", timeout: 5000 });
