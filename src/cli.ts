@@ -99,17 +99,20 @@ Examples:
   pty run -- node server.js
   pty run -d --name "API" --tag role=web -- node server.js`,
 
-  attach: `Usage: pty attach [-r] [--force] <ref>
+  attach: `Usage: pty attach [-r] [--force] [--remote <peer>] <ref>
 
 Reconnect to a session (alias: pty a). Detach again with Ctrl+\\.
 
 Flags:
   -r, --auto-restart   Auto-restart the session if it has exited
   --force              Attach even from inside another pty session (nested)
+  --remote <peer>      Attach a session on a fabric peer (over fabric); <ref> is
+                       the session's name/id ON THE REMOTE
 
 Examples:
   pty attach myserver
-  pty attach -r myserver`,
+  pty attach -r myserver
+  pty attach --remote hetzner myshell`,
 
   exec: `Usage: pty exec -- <command> [args...]
 
@@ -397,6 +400,7 @@ Attach & interact:
   pty attach <ref>                        Attach to an existing session (alias: pty a)
   pty attach --force <ref>                Attach even from inside another pty session (nested)
   pty attach -r <ref>                     Attach, auto-restart if the session is exited
+  pty attach --remote <peer> <ref>        Attach a session on a fabric peer (over fabric)
   pty exec -- <command> [args...]         Replace the current session's process (inside a session)
   pty send <ref> "text"                   Send raw text (no implicit newline)
   pty send <ref> --seq "text" --seq key:return   Send an ordered sequence of chunks / key events
@@ -847,10 +851,12 @@ async function main(): Promise<void> {
       let autoRestart = false;
       let force = false;
       let attachName: string | null = null;
+      let attachRemotePeer: string | null = null;
       for (let ai = 1; ai < args.length; ai++) {
         const a = args[ai];
         if (a === "--auto-restart" || a === "-r") autoRestart = true;
         else if (a === "--force") force = true;
+        else if (a === "--remote" && ai + 1 < args.length) { attachRemotePeer = args[++ai]; }
         else if (!attachName) attachName = a;
         else {
           console.error(`pty attach: unexpected argument "${a}"`);
@@ -858,13 +864,14 @@ async function main(): Promise<void> {
         }
       }
       if (!attachName) {
-        console.error("Usage: pty attach [-r|--auto-restart] [--force] <name>");
+        console.error("Usage: pty attach [-r|--auto-restart] [--force] [--remote <peer>] <name>");
         process.exit(1);
       }
       // Nesting guard runs BEFORE name validation / ref resolution. A nested
       // caller gets the informative nesting message even if they mistyped
       // the session name — otherwise they'd fix the typo, try again, and
-      // only then discover they shouldn't attach at all.
+      // only then discover they shouldn't attach at all. Applies to --remote
+      // too: a nested remote attach tangles detach keys just the same.
       ensureNotNested("attach", {
         force,
         hint:
@@ -872,8 +879,13 @@ async function main(): Promise<void> {
           "  Detach first (Ctrl+\\) or, from inside pty-layout, use ^]n to pick a session.\n" +
           "  Pass --force to attach anyway (nested clients are usually a mistake).",
       });
-      const resolvedAttachName = await resolveRef(attachName);
-      await cmdAttach(resolvedAttachName, autoRestart, force);
+      if (attachRemotePeer) {
+        // The name is the session's id ON THE REMOTE — don't resolve locally.
+        await cmdAttachRemote(attachRemotePeer, attachName);
+      } else {
+        const resolvedAttachName = await resolveRef(attachName);
+        await cmdAttach(resolvedAttachName, autoRestart, force);
+      }
       break;
     }
 
@@ -1773,6 +1785,25 @@ async function cmdSendRemote(
     delayMs,
     socket,
     ...(paste ? { paste: true } : {}),
+  });
+}
+
+/** `pty attach --remote <peer> <name>`: dial the peer's exposed pty control
+ *  socket over fabric, route it to the named remote session, and attach over
+ *  that tunnel — the resilient shell is a long-lived remote pty you attach to. */
+async function cmdAttachRemote(peer: string, name: string): Promise<void> {
+  let socket;
+  try {
+    socket = await dialAndRoute(peer, name);
+  } catch (e) {
+    console.error(`pty attach --remote ${peer}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  attach({
+    name,
+    socket,
+    onDetach: () => process.exit(0),
+    onExit: (code) => process.exit(code),
   });
 }
 

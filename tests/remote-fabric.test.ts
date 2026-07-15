@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { Session } from "../src/testing/index.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -223,4 +224,33 @@ describe("pty send --remote over fabric", () => {
     expect(s.status).not.toBe(0);
     expect(s.stderr).toMatch(/not found/);
   }, 20000);
+});
+
+describe("pty attach --remote over fabric", () => {
+  it("attaches a remote session: streams its screen and forwards input bidirectionally", async () => {
+    // Unique id per attempt so a retry (retry:2) doesn't collide with a session
+    // a prior attempt already created.
+    const sid = `shell-${rand()}`;
+    const c = runCli(srvRoot, ["run", "-d", "--id", sid, "--", "sh", "-c", "echo ATTACH_READY_MARK; cat"]);
+    expect(c.status).toBe(0);
+    try { bgPids.push(Number(fs.readFileSync(path.join(srvRoot, `${sid}.pid`), "utf8").trim())); } catch {}
+    sleepSync(400);
+
+    // Spawn the interactive `pty attach --remote` in a real PTY. env merges with
+    // process.env — the vitest setup has scrubbed PTY_SESSION, so the nesting
+    // guard doesn't fire here.
+    const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", sid], {
+      rows: 24, cols: 80,
+      env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
+    });
+    try {
+      // Screen replayed over the fabric hop on attach.
+      await session.waitForText("ATTACH_READY_MARK", 8000);
+      // Input forwarded through the splice; cat echoes it back.
+      session.sendKeys("PING_OVER_ATTACH\r");
+      await session.waitForText("PING_OVER_ATTACH", 8000);
+    } finally {
+      await session.close();
+    }
+  }, 25000);
 });
