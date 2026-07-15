@@ -373,12 +373,15 @@ export interface AttachOptions {
   name: string;
   onExit?: (code: number) => void;
   onDetach?: () => void;
+  /** Attach over this ALREADY-CONNECTED socket instead of dialing the local
+   *  `<name>.sock`. Used by `attach --remote`: a fabric-dialed, control-server-
+   *  routed socket. When set, `name` is only used for display. */
+  socket?: net.Socket;
 }
 
 export function attach(options: AttachOptions): void {
-  const socketPath = getSocketPath(options.name);
   const reader = new PacketReader();
-  const socket = net.createConnection(socketPath);
+  const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
 
   const stdin = process.stdin;
   const stdout = process.stdout;
@@ -415,7 +418,7 @@ export function attach(options: AttachOptions): void {
     socket.destroy();
   }
 
-  socket.on("connect", () => {
+  const onReady = () => {
     enterRawMode();
 
     // Tell the server our terminal size
@@ -487,7 +490,11 @@ export function attach(options: AttachOptions): void {
       };
       stdout.on("resize", resizeHandler);
     }
-  });
+  };
+
+  // A caller-supplied socket is already connected (dialed + routed over fabric).
+  if (options.socket) process.nextTick(onReady);
+  else socket.on("connect", onReady);
 
   socket.on("data", (data: Buffer) => {
     let packets;
@@ -525,8 +532,14 @@ export function attach(options: AttachOptions): void {
     if (exitHandled) return;
     exitHandled = true;
     cleanExit();
-    if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-      console.error(`Session "${options.name}" not found or not running.`);
+    const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
+      || err.code === "ECONNRESET" || err.code === "EPIPE";
+    if (notReachable) {
+      console.error(
+        options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`,
+      );
     } else {
       console.error(`Connection error: ${err.message}`);
     }
