@@ -177,3 +177,26 @@ describe("pty ls --remote over fabric", () => {
     try { fs.rmSync(sock, { force: true }); } catch {}
   }, 15000);
 });
+
+const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+describe("pty peek --remote over fabric", () => {
+  it("peeks a remote session's screen (route-op splice)", () => {
+    // A marker session on the "remote" (srvRoot); reachable by the running
+    // remote-serve, which resolves <name>.sock live from its PTY_ROOT.
+    const c = runCli(srvRoot, ["run", "-d", "--id", "pk", "--", "sh", "-c", "printf 'PEEK_MARKER_9x\\r\\n'; sleep 300"]);
+    expect(c.status).toBe(0);
+    try { bgPids.push(Number(fs.readFileSync(path.join(srvRoot, "pk.pid"), "utf8").trim())); } catch {}
+    sleepSync(500); // let the child render into the daemon's screen buffer
+
+    const p = runCli(cliRoot, ["peek", "--remote", "testpeer", "pk", "--plain"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(p.status).toBe(0);
+    expect(p.stdout).toContain("PEEK_MARKER_9x");
+  }, 20000);
+
+  it("errors (exit 1) peeking a nonexistent remote session", () => {
+    const p = runCli(cliRoot, ["peek", "--remote", "testpeer", "does-not-exist", "--plain"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(p.status).not.toBe(0);
+    expect(p.stderr).toMatch(/not found or not running/);
+  }, 20000);
+});

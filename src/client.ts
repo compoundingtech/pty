@@ -63,17 +63,21 @@ export interface PeekOptions {
   full?: boolean; // If true, include full scrollback, not just the viewport.
   onExit?: (code: number) => void;
   onDetach?: () => void;
+  /** Speak the peek protocol over this ALREADY-CONNECTED socket instead of
+   *  dialing the local `<name>.sock`. Used by `peek --remote`: a fabric-dialed,
+   *  control-server-routed socket that transparently pipes to the remote
+   *  session's daemon. When set, `name` is only used for display. */
+  socket?: net.Socket;
 }
 
 /** Read-only view of a session. Input is ignored by the server. */
 export function peek(options: PeekOptions): void {
-  const socketPath = getSocketPath(options.name);
   const reader = new PacketReader();
-  const socket = net.createConnection(socketPath);
+  const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
   const stdout = process.stdout;
   const follow = options.follow ?? false;
 
-  socket.on("connect", () => {
+  const onReady = () => {
     socket.write(encodePeek(options.plain, options.full));
 
     if (follow) {
@@ -96,7 +100,18 @@ export function peek(options: PeekOptions): void {
       });
       stdin.resume();
     }
-  });
+  };
+
+  // A caller-supplied socket is already connected (dialed + routed over fabric),
+  // so there's no "connect" event to wait for — kick off on the next tick.
+  if (options.socket) process.nextTick(onReady);
+  else socket.on("connect", onReady);
+
+  // Track whether we ever received a screen. If the connection closes before
+  // any screen arrives in one-shot mode, the session isn't serving us (e.g. a
+  // `--remote` route to a name that doesn't exist on the peer, where the control
+  // server closes the tunnel) — surface that instead of exiting 0 silently.
+  let gotScreen = false;
 
   socket.on("data", (data: Buffer) => {
     let packets;
@@ -108,6 +123,7 @@ export function peek(options: PeekOptions): void {
     for (const packet of packets) {
       switch (packet.type) {
         case MessageType.SCREEN:
+          gotScreen = true;
           stdout.write(packet.payload);
           if (!follow) {
             if (!options.plain) {
@@ -142,8 +158,16 @@ export function peek(options: PeekOptions): void {
   });
 
   socket.on("error", (err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-      console.error(`Session "${options.name}" not found or not running.`);
+    // ECONNRESET/EPIPE also mean "gone": a `--remote` route to a missing session
+    // has the control server close the tunnel as we write the first frame.
+    const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
+      || err.code === "ECONNRESET" || err.code === "EPIPE";
+    if (notReachable) {
+      console.error(
+        options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`,
+      );
     } else {
       console.error(`Connection error: ${err.message}`);
     }
@@ -153,6 +177,16 @@ export function peek(options: PeekOptions): void {
   socket.on("close", () => {
     if (process.stdin.isTTY && process.stdin.isRaw) {
       process.stdin.setRawMode(false);
+    }
+    // Closed in one-shot mode before any screen — the (possibly remote) session
+    // isn't reachable. Don't exit 0 with no output.
+    if (!follow && !gotScreen) {
+      console.error(
+        options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`,
+      );
+      process.exit(1);
     }
   });
 }
