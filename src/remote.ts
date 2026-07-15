@@ -1,6 +1,7 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { listSessions, getSocketPath, type SessionInfo } from "./sessions.ts";
 
 /** ALPN / fabric protocol name under which a pty control socket is exposed and
@@ -69,62 +70,94 @@ function toRow(s: SessionInfo): RemoteSessionRow {
   };
 }
 
-async function handleRequest(line: string, residual: Buffer, sock: net.Socket): Promise<void> {
-  let req: { op?: string; name?: unknown };
-  try {
-    req = JSON.parse(line);
-  } catch {
-    sock.end(JSON.stringify({ error: "malformed request" }) + "\n");
-    return;
-  }
-  if (req.op === "list") {
-    try {
-      const sessions = (await listSessions()).map(toRow);
-      sock.end(JSON.stringify({ sessions }) + "\n");
-    } catch (e) {
-      sock.end(JSON.stringify({ error: (e as Error).message }) + "\n");
-    }
-    return;
-  }
-  if (req.op === "route" && typeof req.name === "string") {
-    routeToSession(req.name, residual, sock);
-    return;
-  }
-  sock.end(JSON.stringify({ error: `unknown op: ${String(req.op)}` }) + "\n");
-}
+/** Handle ONE remote-control interaction over a generic duplex: read the 1-line
+ *  request from `input`, then serve `list` (write the session set) or `route`
+ *  (ACK, then splice input <-> the session's `<name>.sock` <-> output). `done`
+ *  fires exactly once when the interaction is finished — the caller decides what
+ *  that means: the listening server ends the accepted socket; the on-demand
+ *  stdio handler exits the process. Shared so both entry points run identical
+ *  logic. `input`/`output` are the same object for a socket, or process.stdin/
+ *  process.stdout under fabric `--exec`. */
+export function handleRemoteConnection(input: Readable, output: Writable, done: () => void): void {
+  // Accumulate BYTES (not a string): a `route` request is one JSON line followed
+  // by raw per-session protocol bytes; string round-tripping would corrupt them.
+  let buf: Buffer = Buffer.alloc(0);
+  let handled = false;
+  let finished = false;
+  const finish = () => { if (finished) return; finished = true; done(); };
 
-/** Splice a routed client connection through to a session's local `<name>.sock`,
- *  so the caller can speak the ordinary per-session protocol over the fabric
- *  hop. `residual` is any bytes that already arrived AFTER the request line —
- *  they must be forwarded before the pipe or the first protocol frame is lost. */
-function routeToSession(name: string, residual: Buffer, sock: net.Socket): void {
-  const target = net.createConnection(getSocketPath(name));
-  target.on("connect", () => {
-    // ACK the route BEFORE splicing so the client knows it succeeded — the
-    // per-session protocol has no ack, so a fire-and-forget `send --remote` to a
-    // missing session would otherwise exit 0 with the bytes silently dropped.
-    // The client reads this one line, then everything after is the raw splice.
-    sock.write(ROUTE_OK + "\n");
-    if (residual.length > 0) target.write(residual);
-    sock.pipe(target);
-    target.pipe(sock);
-    sock.resume(); // was paused at request-line boundary; now the pipe is wired
-  });
-  target.on("error", () => {
-    // Route failed (session gone/unreachable): report it as the route response
-    // (still a line, before any splice), then close. sock is paused but writes
-    // are unaffected.
-    try { sock.end(JSON.stringify({ error: `session "${name}" not found` }) + "\n"); } catch {}
-  });
-  target.on("close", () => { try { sock.destroy(); } catch {} });
-  sock.on("error", () => { try { target.destroy(); } catch {} });
-  sock.on("close", () => { try { target.destroy(); } catch {} });
+  const onData = (chunk: Buffer) => {
+    if (handled) return;
+    buf = Buffer.concat([buf, chunk]);
+    const nl = buf.indexOf(0x0a); // '\n'
+    if (nl === -1) return; // wait for the full request line
+    handled = true;
+    input.pause(); // hold further bytes until we dispatch/splice
+    input.removeListener("data", onData);
+    const line = buf.subarray(0, nl).toString("utf-8");
+    const residual = buf.subarray(nl + 1); // bytes after the request line (route: first frame)
+    void dispatch(line, residual);
+  };
+  input.on("data", onData);
+  input.on("error", () => finish());
+  input.on("end", () => { if (!handled) finish(); }); // EOF before a full request
+
+  function writeLine(line: string): void {
+    output.write(line + "\n", () => finish());
+  }
+
+  async function dispatch(line: string, residual: Buffer): Promise<void> {
+    let req: { op?: string; name?: unknown };
+    try {
+      req = JSON.parse(line);
+    } catch {
+      writeLine(JSON.stringify({ error: "malformed request" }));
+      return;
+    }
+    if (req.op === "list") {
+      try {
+        writeLine(JSON.stringify({ sessions: (await listSessions()).map(toRow) }));
+      } catch (e) {
+        writeLine(JSON.stringify({ error: (e as Error).message }));
+      }
+      return;
+    }
+    if (req.op === "route" && typeof req.name === "string") {
+      route(req.name, residual);
+      return;
+    }
+    writeLine(JSON.stringify({ error: `unknown op: ${String(req.op)}` }));
+  }
+
+  function route(name: string, residual: Buffer): void {
+    const target = net.createConnection(getSocketPath(name));
+    const teardown = () => { try { target.destroy(); } catch {} finish(); };
+    target.on("connect", () => {
+      // ACK the route BEFORE splicing so the client knows it succeeded (the
+      // per-session protocol has no ack). Then wire the bidirectional splice.
+      output.write(ROUTE_OK + "\n");
+      if (residual.length > 0) target.write(residual);
+      input.pipe(target);
+      target.pipe(output, { end: false }); // `finish` owns the final teardown
+      input.resume(); // was paused at the request-line boundary; pipe is wired
+    });
+    target.on("error", () => {
+      // Reachable-but-gone: the client turns this line into a clean give-up
+      // (see RouteRefusedError on the dial side).
+      output.write(JSON.stringify({ error: `session "${name}" not found` }) + "\n", () => teardown());
+    });
+    target.on("close", teardown);
+    input.on("error", teardown);
+    input.on("end", teardown);
+    input.on("close", teardown);
+  }
 }
 
 /** Serve the pty remote-access control protocol on a plain Unix socket. pty
  *  stays transport-agnostic: fabric (or anything) exposes this socket to peers.
  *  Reads sessions from the ambient $PTY_ROOT, so run it in the same env the
- *  sessions use. Returns the listening server. */
+ *  sessions use. Returns the listening server. (The on-demand fabric `--exec`
+ *  path uses `runRemoteServeHandleStdio` instead — same handler, no daemon.) */
 export function serveRemoteControl(socketPath: string): net.Server {
   try {
     fs.unlinkSync(socketPath);
@@ -132,32 +165,23 @@ export function serveRemoteControl(socketPath: string): net.Server {
     // no stale socket to clear
   }
   const server = net.createServer((sock) => {
-    // Accumulate BYTES (not a string): a `route` request is one JSON line
-    // followed by raw per-session protocol bytes, and string round-tripping
-    // would corrupt those. Read up to the first newline as the request line;
-    // everything after it is `residual` handed to the handler (e.g. the first
-    // protocol frame that arrived in the same chunk).
-    let buf: Buffer = Buffer.alloc(0);
-    let handled = false;
-    const onData = (chunk: Buffer) => {
-      if (handled) return;
-      buf = Buffer.concat([buf, chunk]);
-      const nl = buf.indexOf(0x0a); // '\n'
-      if (nl === -1) return; // wait for the full request line
-      handled = true;
-      sock.pause(); // hold further bytes until the handler dispatches/splices
-      sock.removeListener("data", onData);
-      const line = buf.subarray(0, nl).toString("utf-8");
-      const residual = buf.subarray(nl + 1);
-      void handleRequest(line, residual, sock);
-    };
-    sock.on("data", onData);
-    sock.on("error", () => {
-      /* client vanished mid-request; nothing to do */
-    });
+    // A socket is a single duplex — input and output are the same stream.
+    handleRemoteConnection(sock, sock, () => { try { sock.end(); } catch {} });
+    sock.on("error", () => { /* client vanished mid-request; nothing to do */ });
   });
   server.listen(socketPath);
   return server;
+}
+
+/** On-demand handler for fabric `--exec`: fabric spawns this ONCE per tunnel
+ *  session and pipes the connection to stdin/stdout (`pty remote-serve-handle
+ *  --stdio`). Run the shared handler on stdin/stdout and exit when the
+ *  interaction ends. No persistent daemon — fabric owns the accept, the
+ *  persistence, and roaming (a drop/reconnect reuses THIS process by stalling
+ *  then resuming the pipes), so there's nothing to re-implement here. */
+export function runRemoteServeHandleStdio(): void {
+  handleRemoteConnection(process.stdin, process.stdout, () => process.exit(0));
+  process.stdin.resume();
 }
 
 /** Dial a fabric peer's exposed pty control socket and route it to a specific

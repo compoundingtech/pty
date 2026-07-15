@@ -15,6 +15,7 @@ const HEAVY_PTY_TESTS = [
   "tests/resize-tui.test.ts",
   "tests/remote-fabric.test.ts",
   "tests/remote-reconnect.test.ts",
+  "tests/remote-exec-bridge.test.ts",
 ];
 
 // Runs once per worker before any test module — scrubs ambient
