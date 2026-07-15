@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
-// Proves the on-demand `pty remote-serve-handle --stdio` end-to-end by mimicking
+// Proves the on-demand `pty remote-serve --stdio` end-to-end by mimicking
 // fabric's `--exec` deploy: a local socket that, per connection, spawns the
 // handler and pipes socket <-> child stdin/stdout. The REAL `--remote` client
 // (list/peek/send) runs through it — no persistent remote-serve daemon involved.
@@ -30,8 +30,8 @@ const bridgeScript = path.join(os.tmpdir(), `pr-xb-bridge-${rand()}.cjs`);
 const fakeFabric = path.join(os.tmpdir(), `pr-xb-fabric-${rand()}.sh`);
 const bgPids: number[] = [];
 
-// Out-of-process exec-bridge: mimic `fabric expose pty-view --exec -- pty
-// remote-serve-handle --stdio`. Per accepted connection, spawn the handler and
+// Out-of-process exec-bridge: mimic `fabric expose pty-remote --exec -- pty
+// remote-serve --stdio`. Per accepted connection, spawn the handler and
 // bridge the socket <-> its stdin/stdout. Runs detached so it survives the
 // test worker's blocking spawnSync calls.
 const BRIDGE_SRC = `
@@ -41,7 +41,7 @@ const fs = require("node:fs");
 const [bridgeSock, cliPath, srvRoot] = process.argv.slice(2);
 try { fs.unlinkSync(bridgeSock); } catch {}
 const server = net.createServer((sock) => {
-  const child = spawn(process.execPath, [cliPath, "remote-serve-handle", "--stdio"], {
+  const child = spawn(process.execPath, [cliPath, "remote-serve", "--stdio"], {
     env: { ...process.env, PTY_ROOT: srvRoot, PTY_ROOT_LEGACY_SILENT: "1" },
     stdio: ["pipe", "pipe", "ignore"], // fabric routes child stderr to its log; drop it here
   });
@@ -93,7 +93,7 @@ afterAll(() => {
   for (const d of [srvRoot, cliRoot]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* none */ } }
 });
 
-describe("pty --remote via fabric --exec (on-demand remote-serve-handle --stdio)", () => {
+describe("pty --remote via fabric --exec (on-demand remote-serve --stdio)", () => {
   it("list --remote works through the exec-bridge (handler spawned per dial)", () => {
     const r = runCli(cliRoot, ["ls", "--remote", "testpeer", "--json"], { PTY_FABRIC_BIN: fakeFabric });
     expect(r.status).toBe(0);

@@ -40,7 +40,7 @@ import {
 import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
-import { serveRemoteControl, runRemoteServeHandleStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -187,7 +187,7 @@ Flags:
   --tags               Include internal bookkeeping tags (ptyfile*, strategy.*)
   --filter-tag k=v     Only sessions with the tag (repeatable, ALL must match)
   --remote <peer>      Also list a fabric peer's sessions (over fabric; the peer
-                       runs 'pty remote-serve' exposed as 'fabric expose pty-view')
+                       runs 'pty remote-serve' exposed as 'fabric expose pty-remote')
   --remote             Bare (no peer): include pty-relay hosts (when installed)
   --status <state>     Filter by status: running | exited | vanished
   --older-than <dur>   Only sessions older than a duration (e.g. 30m, 2h, 3d)
@@ -199,49 +199,31 @@ Examples:
   pty list --remote hetzner
   pty list --filter-tag role=web --json`,
 
-  "remote-serve": `Usage: pty remote-serve --socket <path>
+  "remote-serve": `Usage: pty remote-serve (--stdio | --socket <path>)
 
-Serve the remote-access control protocol on a Unix socket, so a fabric peer can
-expose it and other machines can 'pty list --remote <this-peer>'. Reads sessions
-from the ambient PTY_ROOT — run it in the same env the sessions use, and pick a
-socket path OUTSIDE PTY_ROOT (a control socket inside it would be mis-scanned as
-a phantom session).
+Serve the remote-access control protocol so a fabric peer can expose pty and
+other machines can 'pty <cmd> --remote <this-peer>'. Reads sessions from the
+ambient PTY_ROOT — run it in the same env the sessions use. Two forms:
 
-Run it WRAPPED, not as a bare session leader. Launch it under a supervisor or a
-shell — 'setsid sh -c "pty remote-serve --socket …"', systemd, launchd — so the
-pty process is a CHILD of the session leader. Exec'd directly as the session
-leader without a controlling TTY (e.g. 'setsid pty remote-serve … </dev/null &')
-it can exit on detach. (The SIGHUP-ignore + keep-alive still apply; wrapping is
-the robust daemon form.)
+  --stdio            On-demand: serve ONE connection over stdin/stdout, then exit.
+                     fabric spawns it per dial and owns accept + persistence +
+                     roaming (a drop/reconnect reuses the SAME process). No
+                     persistent pty daemon. The recommended fabric form.
+  --socket <path>    Listening daemon: bind a Unix socket for a fabric peer to
+                     expose. Pick a path OUTSIDE PTY_ROOT (a control socket inside
+                     it is mis-scanned as a phantom session). Run it WRAPPED —
+                     'setsid sh -c "…"', systemd, launchd — so pty is a CHILD of
+                     the session leader (exec'd as a bare session leader without a
+                     TTY it can exit on detach). Being retired in favor of --stdio.
 
 Flags:
-  --socket <path>      Unix socket path to listen on (required)
   PTY_REMOTE_SERVE_DEBUG=1   Env: log signal/exit/exception lifecycle to stderr
 
 Examples:
-  pty remote-serve --socket ~/.local/state/pty-remote.sock
-  setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &   # wrapped (recommended)
-  fabric expose pty-view --socket ~/.local/state/pty-remote.sock   # on the peer
-
-For an ON-DEMAND deploy with no persistent daemon, use 'pty remote-serve-handle'
-with fabric --exec instead (fabric spawns it per dial).`,
-
-  "remote-serve-handle": `Usage: pty remote-serve-handle --stdio
-
-On-demand remote-access handler: serves ONE control connection over stdin/stdout
-then exits. Meant to be spawned by fabric per dial ('fabric expose pty-view
---exec -- pty remote-serve-handle --stdio') — no persistent pty daemon; fabric
-owns the accept + persistence + roaming (a drop/reconnect reuses the same
-process). Same list/route logic as 'pty remote-serve', reading sessions from the
-ambient PTY_ROOT. Run it in the sessions' PTY_ROOT env.
-
-Flags:
-  --stdio              Read the connection from stdin, write to stdout (required)
-
-Examples:
-  pty remote-serve-handle --stdio                        # reads one request on stdin, exits
-  printf '{"op":"list"}\\n' | pty remote-serve-handle --stdio   # one-shot list
-  fabric expose pty-view --exec -- pty remote-serve-handle --stdio   # the deploy shape`,
+  fabric expose pty-remote --exec -- pty remote-serve --stdio   # on-demand (recommended)
+  pty remote-serve --socket ~/.local/state/pty-remote.sock      # listening daemon
+  setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &   # wrapped
+  fabric expose pty-remote --socket ~/.local/state/pty-remote.sock   # expose the listening form`,
 
   stats: `Usage: pty stats [--json] [--all] [<ref>]
 
@@ -449,8 +431,8 @@ Observe:
   pty list --filter-tag key=value         Filter to sessions with the tag (repeatable, ALL must match)
   pty list --remote <peer>                List a fabric peer's sessions (over fabric)
   pty list --remote                       Include remote sessions via pty-relay (when installed)
-  pty remote-serve --socket <path>        Serve the control protocol for a fabric peer to expose
-  pty remote-serve-handle --stdio         On-demand handler (fabric --exec spawns it per dial; no daemon)
+  pty remote-serve --stdio                Serve remote access on-demand (fabric --exec spawns it per dial)
+  pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 
 Modify:
   pty rename <label>                      Inside a session: set its displayName
@@ -1174,35 +1156,29 @@ async function main(): Promise<void> {
     }
 
     case "remote-serve": {
+      // On-demand fabric `--exec` form: serve ONE connection over stdin/stdout
+      // then exit. fabric spawns it per dial and owns accept + persistence +
+      // roaming. The recommended (fabric-only) shape — no persistent daemon.
+      if (args.includes("--stdio")) {
+        runRemoteServeStdio();
+        break;
+      }
+      // Listening-daemon form (being retired): bind a Unix socket for a fabric
+      // peer to expose.
       const sockIdx = args.indexOf("--socket");
       const sockPath = sockIdx >= 0 ? args[sockIdx + 1] : null;
       if (!sockPath) {
-        console.error("Usage: pty remote-serve --socket <path>");
+        console.error("Usage: pty remote-serve (--stdio | --socket <path>)");
         console.error(
-          "Serves the remote-access control protocol on a Unix socket for a fabric\n" +
-          "peer to expose (fabric expose pty-view --socket <path>). Run in the same\n" +
-          "PTY_ROOT env as the sessions; use a socket path OUTSIDE PTY_ROOT."
+          "Serve the remote-access control protocol for a fabric peer to expose.\n" +
+          "  --stdio          on-demand, spawned by fabric per dial (recommended):\n" +
+          "                   fabric expose pty-remote --exec -- pty remote-serve --stdio\n" +
+          "  --socket <path>  listening daemon (fabric expose pty-remote --socket <path>)\n" +
+          "Run in the same PTY_ROOT env as the sessions; put --socket OUTSIDE PTY_ROOT."
         );
         process.exit(1);
       }
       await cmdRemoteServe(sockPath);
-      break;
-    }
-
-    case "remote-serve-handle": {
-      // On-demand handler for fabric `--exec`: fabric spawns this once per tunnel
-      // session and pipes the connection to stdin/stdout. Handles ONE interaction
-      // (list or route+splice) then exits. No persistent daemon.
-      if (!args.includes("--stdio")) {
-        console.error("Usage: pty remote-serve-handle --stdio");
-        console.error(
-          "Handles ONE remote-control connection over stdin/stdout — for fabric to\n" +
-          "spawn per dial: fabric expose pty-view --exec -- pty remote-serve-handle\n" +
-          "--stdio. Reads sessions from the ambient PTY_ROOT."
-        );
-        process.exit(1);
-      }
-      runRemoteServeHandleStdio();
       break;
     }
 
@@ -1979,7 +1955,7 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
     error: string | null;
   }[] = [];
   if (remotePeer) {
-    // Fabric path: `fabric dial <peer> pty-view` prints a local Unix socket
+    // Fabric path: `fabric dial <peer> pty-remote` prints a local Unix socket
     // that tunnels to the peer's exposed `pty remote-serve`; we speak our own
     // list protocol over it and render it as one host group.
     let error: string | null = null;
