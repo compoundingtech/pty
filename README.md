@@ -125,10 +125,18 @@ pty down claude                           # stop specific sessions
 # Run it WRAPPED (not exec'd as a bare session leader — see below):
 setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &
 fabric expose pty-view --socket ~/.local/state/pty-remote.sock
-
-# From any trusted peer:
-pty list --remote <peer>                  # e.g. pty list --remote hetzner
 ```
+
+From any trusted peer, the ordinary session commands take `--remote <peer>` — `<ref>` is the session's name/id **on the remote**:
+
+```sh
+pty list --remote <peer>                  # list the peer's sessions
+pty peek --remote <peer> <ref>            # print its current screen (read-only; -f to follow)
+pty send --remote <peer> <ref> --seq "ls" --seq key:return   # send input
+pty attach --remote <peer> <ref>          # attach interactively (the resilient shell)
+```
+
+Under the hood, `remote-serve` routes each command's connection through to the target session's local socket, so the ordinary per-session protocol runs unchanged over the fabric hop. A pty session already persists on its daemon and replays its screen on attach — so `pty attach --remote` to a long-lived remote pty **is** a persistent remote shell.
 
 `pty remote-serve` reads the ambient `PTY_ROOT`, so run it in the same environment the sessions use, and give it a socket path **outside** `PTY_ROOT` (a control socket inside it would be mis-counted as a phantom session).
 
