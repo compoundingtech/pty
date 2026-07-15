@@ -198,11 +198,20 @@ from the ambient PTY_ROOT — run it in the same env the sessions use, and pick 
 socket path OUTSIDE PTY_ROOT (a control socket inside it would be mis-scanned as
 a phantom session).
 
+Run it WRAPPED, not as a bare session leader. Launch it under a supervisor or a
+shell — 'setsid sh -c "pty remote-serve --socket …"', systemd, launchd — so the
+pty process is a CHILD of the session leader. Exec'd directly as the session
+leader without a controlling TTY (e.g. 'setsid pty remote-serve … </dev/null &')
+it can exit on detach. (The SIGHUP-ignore + keep-alive still apply; wrapping is
+the robust daemon form.)
+
 Flags:
   --socket <path>      Unix socket path to listen on (required)
+  PTY_REMOTE_SERVE_DEBUG=1   Env: log signal/exit/exception lifecycle to stderr
 
 Examples:
   pty remote-serve --socket ~/.local/state/pty-remote.sock
+  setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &   # wrapped (recommended)
   fabric expose pty-view --socket ~/.local/state/pty-remote.sock   # on the peer`,
 
   stats: `Usage: pty stats [--json] [--all] [<ref>]
