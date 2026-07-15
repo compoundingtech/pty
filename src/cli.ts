@@ -40,7 +40,7 @@ import {
 import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
-import { serveRemoteControl, fetchRemoteList, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import { serveRemoteControl, fetchRemoteList, dialAndRoute, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -120,7 +120,7 @@ Examples:
   pty exec -- codex
   pty exec -- bash -l`,
 
-  peek: `Usage: pty peek [-f] [--plain] [--full] [--wait <text> [-t <sec>]] <ref>
+  peek: `Usage: pty peek [-f] [--plain] [--full] [--wait <text> [-t <sec>]] [--remote <peer>] <ref>
 
 Print a session's screen (or follow it, or wait for text) without attaching.
 
@@ -130,9 +130,12 @@ Flags:
   -f, --follow         Follow output read-only (Ctrl+\\ to stop)
   --wait <text>        Block until <text> appears on screen
   -t, --timeout <sec>  Timeout (seconds) for --wait
+  --remote <peer>      Peek a session on a fabric peer (over fabric); <ref> is
+                       the session's name/id ON THE REMOTE (--wait not yet supported)
 
 Examples:
   pty peek --plain myserver
+  pty peek --remote hetzner myserver
   pty peek --wait "Listening" -t 10 --plain myserver`,
 
   send: `Usage: pty send <ref> "text"
@@ -404,6 +407,7 @@ Observe:
   pty peek --full <ref>                   Print full scrollback (not just the viewport)
   pty peek --wait "text" [-t N] <ref>     Wait until text appears (optional timeout in seconds)
   pty peek -f <ref>                       Follow output read-only (Ctrl+\\ to stop)
+  pty peek --remote <peer> <ref>          Peek a session on a fabric peer (over fabric)
   pty events <ref>                        Follow events from a session
   pty events --all                        Follow events from every session, interleaved
   pty events --recent <ref>               Print recent events and exit
@@ -888,6 +892,7 @@ async function main(): Promise<void> {
       let full = false;
       const waitPatterns: string[] = [];
       let timeoutSec = 0;
+      let remotePeer: string | null = null;
       let pi = 1;
       while (pi < args.length && args[pi].startsWith("-")) {
         if (args[pi] === "-f" || args[pi] === "--follow") { follow = true; pi++; }
@@ -895,18 +900,29 @@ async function main(): Promise<void> {
         else if (args[pi] === "--full") { full = true; pi++; }
         else if (args[pi] === "--wait" && pi + 1 < args.length) { waitPatterns.push(args[pi + 1]); pi += 2; }
         else if ((args[pi] === "-t" || args[pi] === "--timeout") && pi + 1 < args.length) { timeoutSec = parseFloat(args[pi + 1]); pi += 2; }
+        else if (args[pi] === "--remote" && pi + 1 < args.length) { remotePeer = args[pi + 1]; pi += 2; }
         else break;
       }
       const peekName = args[pi];
       if (!peekName) {
-        console.error("Usage: pty peek [-f] [--plain] [--full] [--wait <pattern>] [-t <seconds>] <name>");
+        console.error("Usage: pty peek [-f] [--plain] [--full] [--wait <pattern>] [-t <seconds>] [--remote <peer>] <name>");
         process.exit(1);
       }
-      const resolvedPeekName = await resolveRef(peekName);
-      if (waitPatterns.length > 0) {
-        await cmdPeekWait(resolvedPeekName, waitPatterns, timeoutSec, plain);
+      if (remotePeer) {
+        if (waitPatterns.length > 0) {
+          console.error("pty peek --wait is not supported with --remote yet.");
+          process.exit(1);
+        }
+        // The name is the session's id/name ON THE REMOTE host — don't resolve
+        // it against local sessions.
+        await cmdPeekRemote(remotePeer, peekName, follow, plain, full);
       } else {
-        cmdPeek(resolvedPeekName, follow, plain, full);
+        const resolvedPeekName = await resolveRef(peekName);
+        if (waitPatterns.length > 0) {
+          await cmdPeekWait(resolvedPeekName, waitPatterns, timeoutSec, plain);
+        } else {
+          cmdPeek(resolvedPeekName, follow, plain, full);
+        }
       }
       break;
     }
@@ -1674,6 +1690,34 @@ async function cmdPeek(name: string, follow: boolean, plain: boolean, full = fal
     follow,
     plain,
     full,
+    onDetach: () => process.exit(0),
+    onExit: (code) => process.exit(code),
+  });
+}
+
+/** `pty peek --remote <peer> <name>`: dial the peer's exposed pty control
+ *  socket over fabric, route it to the named remote session, and run the
+ *  ordinary peek protocol over that tunnel. */
+async function cmdPeekRemote(
+  peer: string,
+  name: string,
+  follow: boolean,
+  plain: boolean,
+  full: boolean,
+): Promise<void> {
+  let socket;
+  try {
+    socket = await dialAndRoute(peer, name);
+  } catch (e) {
+    console.error(`pty peek --remote ${peer}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  peek({
+    name,
+    follow,
+    plain,
+    full,
+    socket,
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });
