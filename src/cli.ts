@@ -140,6 +140,7 @@ Examples:
 
   send: `Usage: pty send <ref> "text"
        pty send <ref> --seq <chunk> [--seq key:<name>] ...
+       pty send --remote <peer> <ref> "text"
 
 Send text or key events to a session. Raw text is sent with NO implicit newline —
 to send text followed by Enter, use --seq (see the second example).
@@ -151,11 +152,13 @@ Flags:
                        trailing key:return doesn't race ahead of the program
                        parsing the text. --with-delay 0 = straight stream (no gap).
   --paste "<text>"     Wrap the payload in bracketed-paste markers
+  --remote <peer>      Send to a session on a fabric peer (over fabric); <ref> is
+                       the session's name/id ON THE REMOTE
 
 Examples:
   pty send myserver "hello"
   pty send myserver --seq "git status" --seq key:return        # 0.3s gap by default
-  pty send myserver --with-delay 0 --seq a --seq b --seq c     # back-to-back, no gap`,
+  pty send --remote hetzner myserver --seq "ls" --seq key:return`,
 
   events: `Usage: pty events [--all | <ref>] [--recent] [--json] [--wait <type> [-t <sec>]]
 
@@ -400,6 +403,7 @@ Attach & interact:
                                           (0.3s gap between items by default)
   pty send <ref> --with-delay <sec> --seq ...    Override the gap; --with-delay 0 = straight stream
   pty send <ref> --paste "<big text>"     Wrap the payload in bracketed-paste markers
+  pty send --remote <peer> <ref> "text"   Send to a session on a fabric peer (over fabric)
 
 Observe:
   pty peek <ref>                          Print current screen and exit
@@ -928,13 +932,30 @@ async function main(): Promise<void> {
     }
 
     case "send": {
-      const sendName = args[1];
+      // Extract `--remote <peer>` from anywhere (it takes the peer as its value)
+      // before the positional name/text parsing.
+      let sendRemotePeer: string | null = null;
+      const rawSend = args.slice(1);
+      const filteredSend: string[] = [];
+      for (let k = 0; k < rawSend.length; k++) {
+        if (rawSend[k] === "--remote") {
+          sendRemotePeer = rawSend[k + 1] ?? null;
+          if (!sendRemotePeer) {
+            console.error("pty send --remote requires a <peer>.");
+            process.exit(1);
+          }
+          k++; // skip the value
+          continue;
+        }
+        filteredSend.push(rawSend[k]);
+      }
+      const sendName = filteredSend[0];
       if (!sendName) {
-        console.error('Usage: pty send <name> "text"  or  pty send <name> --seq "text" --seq key:return');
+        console.error('Usage: pty send [--remote <peer>] <name> "text"  or  pty send <name> --seq "text" --seq key:return');
         process.exit(1);
       }
 
-      let sendArgs = args.slice(2);
+      let sendArgs = filteredSend.slice(1);
       // --paste can appear anywhere; pull it out before the rest of the
       // parsing so its position relative to --seq / text doesn't matter.
       let paste = false;
@@ -1002,15 +1023,21 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      const resolvedSendName = await resolveRef(sendName);
-      send({
-        name: resolvedSendName,
-        data,
-        // Default to a 0.3s inter-item gap so a trailing key:return doesn't race
-        // ahead of the program parsing the typed text. `--with-delay 0` opts out.
-        delayMs: resolveSeqDelayMs(delaySecs),
-        ...(paste ? { paste: true } : {}),
-      });
+      // Default to a 0.3s inter-item gap so a trailing key:return doesn't race
+      // ahead of the program parsing the typed text. `--with-delay 0` opts out.
+      const sendDelayMs = resolveSeqDelayMs(delaySecs);
+      if (sendRemotePeer) {
+        // The name is the session's id ON THE REMOTE — don't resolve locally.
+        await cmdSendRemote(sendRemotePeer, sendName, data, sendDelayMs, paste);
+      } else {
+        const resolvedSendName = await resolveRef(sendName);
+        send({
+          name: resolvedSendName,
+          data,
+          delayMs: sendDelayMs,
+          ...(paste ? { paste: true } : {}),
+        });
+      }
       break;
     }
 
@@ -1720,6 +1747,32 @@ async function cmdPeekRemote(
     socket,
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
+  });
+}
+
+/** `pty send --remote <peer> <name> …`: dial the peer's exposed pty control
+ *  socket over fabric, route it to the named remote session, and send over the
+ *  same tunnel the local `pty send` uses. */
+async function cmdSendRemote(
+  peer: string,
+  name: string,
+  data: string[],
+  delayMs: number,
+  paste: boolean,
+): Promise<void> {
+  let socket;
+  try {
+    socket = await dialAndRoute(peer, name);
+  } catch (e) {
+    console.error(`pty send --remote ${peer}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  send({
+    name,
+    data,
+    delayMs,
+    socket,
+    ...(paste ? { paste: true } : {}),
   });
 }
 

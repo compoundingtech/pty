@@ -203,6 +203,10 @@ export interface SendOptions {
    *  must have bracketed paste enabled (DECSET 2004); most modern
    *  shells and TUIs do by default. */
   paste?: boolean;
+  /** Speak the send protocol over this ALREADY-CONNECTED socket instead of
+   *  dialing the local `<name>.sock`. Used by `send --remote`: a fabric-dialed,
+   *  control-server-routed socket. When set, `name` is only used for display. */
+  socket?: net.Socket;
 }
 
 /** Default spacing (ms) the `pty send` CLI inserts between `--seq` items when
@@ -223,10 +227,9 @@ export function resolveSeqDelayMs(withDelaySecs: number | undefined): number {
 
 /** Send data to a session without attaching. Silent on success. */
 export function send(options: SendOptions): void {
-  const socketPath = getSocketPath(options.name);
-  const socket = net.createConnection(socketPath);
+  const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
 
-  socket.on("connect", async () => {
+  const onReady = async () => {
     if (options.paste && options.data.length > 0) {
       socket.write(encodeData(BRACKETED_PASTE_START));
     }
@@ -240,11 +243,23 @@ export function send(options: SendOptions): void {
       socket.write(encodeData(BRACKETED_PASTE_END));
     }
     socket.end();
-  });
+  };
+
+  // A caller-supplied socket is already connected (dialed + routed over fabric).
+  if (options.socket) process.nextTick(onReady);
+  else socket.on("connect", onReady);
+
+  let finished = false;
 
   socket.on("error", (err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-      console.error(`Session "${options.name}" not found or not running.`);
+    const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
+      || err.code === "ECONNRESET" || err.code === "EPIPE";
+    if (notReachable) {
+      console.error(
+        options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`,
+      );
     } else {
       console.error(`Connection error: ${err.message}`);
     }
@@ -252,7 +267,21 @@ export function send(options: SendOptions): void {
   });
 
   socket.on("finish", () => {
+    finished = true;
     process.exit(0);
+  });
+
+  // Closed before our write finished — the (possibly remote) session isn't
+  // reachable (e.g. a `--remote` route to a missing session). Don't exit 0.
+  socket.on("close", () => {
+    if (!finished) {
+      console.error(
+        options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`,
+      );
+      process.exit(1);
+    }
   });
 }
 
