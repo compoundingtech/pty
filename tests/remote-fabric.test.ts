@@ -121,10 +121,15 @@ describe("pty ls --remote over fabric", () => {
     }
   }, 20000);
 
-  it("survives a detached stdin=/dev/null launch and keeps serving (no loop-drain exit)", async () => {
-    // Repro of the reported Hetzner failure: backgrounded/detached with stdin
-    // closed, remote-serve must NOT exit ~2s later when the loop would drain if
-    // stdin were the only ref. It must stay up and keep answering `list`.
+  it("survives a detached (session-leader) stdin=/dev/null launch and keeps serving", async () => {
+    // Topology note: Node `detached: true` calls setsid(), so the spawned pty
+    // IS the session leader (PGID==PID) with no controlling TTY — i.e. the exact
+    // `setsid pty remote-serve …` shape, NOT a wrapped child. This locks the
+    // detached/loop-drain + SIGHUP behavior. CAVEAT: the deeper "pty as session
+    // leader dies below the JS layer" failure cos hit is Linux-specific and does
+    // NOT reproduce on macOS, so on a Mac this asserts the topology stays up but
+    // cannot exercise that Linux-only death; a Linux run would. remote-serve must
+    // not exit when stdin closes, and must keep answering `list`.
     const sock = path.join(os.tmpdir(), `pr-svc-${rand()}.sock`);
     const proc = spawn(nodeBin, [cliPath, "remote-serve", "--socket", sock], {
       env: { ...process.env, PTY_ROOT: srvRoot, PTY_ROOT_LEGACY_SILENT: "1" },

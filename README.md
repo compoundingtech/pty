@@ -64,6 +64,7 @@ pty rename --clear [ref]                  # remove displayName
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
 pty list --json                           # show as JSON
+pty list --remote hetzner                 # list a fabric peer's sessions (over fabric)
 pty list --remote                         # include remote sessions via pty-relay
 pty list --filter-tag role=web            # show only sessions with matching tag (repeatable)
 
@@ -114,6 +115,24 @@ pty up claude dev                         # start specific sessions from ./pty.t
 pty down                                  # stop all sessions from ./pty.toml
 pty down claude                           # stop specific sessions
 ```
+
+### Remote over fabric
+
+`pty list --remote <peer>` lists another machine's sessions over [fabric](https://github.com/compoundingtech/fabric), which hands consumers a plain local Unix socket — pty never touches iroh. The remote machine runs a small control server that fabric exposes under the `pty-view` ALPN:
+
+```sh
+# On the remote peer — serve the control protocol, then expose it over fabric.
+# Run it WRAPPED (not exec'd as a bare session leader — see below):
+setsid sh -c 'pty remote-serve --socket ~/.local/state/pty-remote.sock' </dev/null &
+fabric expose pty-view --socket ~/.local/state/pty-remote.sock
+
+# From any trusted peer:
+pty list --remote <peer>                  # e.g. pty list --remote hetzner
+```
+
+`pty remote-serve` reads the ambient `PTY_ROOT`, so run it in the same environment the sessions use, and give it a socket path **outside** `PTY_ROOT` (a control socket inside it would be mis-counted as a phantom session).
+
+Run `remote-serve` **wrapped** — under `sh -c`, systemd, launchd, or another supervisor — so the pty process is a *child* of the session leader. Exec'd directly as the session leader with no controlling TTY (`setsid pty remote-serve … </dev/null &`), it can exit on detach.
 
 ### Nesting Prevention
 
