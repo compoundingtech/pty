@@ -1802,6 +1802,10 @@ async function cmdAttachRemote(peer: string, name: string): Promise<void> {
   attach({
     name,
     socket,
+    // On a loud fabric close, re-dial + re-route to the same remote session and
+    // re-attach (the daemon replays its screen, so the session resumes). A
+    // recoverable transport stall keeps the socket open, so it's just waited out.
+    reconnect: () => dialAndRoute(peer, name),
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });

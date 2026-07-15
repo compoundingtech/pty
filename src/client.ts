@@ -377,72 +377,82 @@ export interface AttachOptions {
    *  `<name>.sock`. Used by `attach --remote`: a fabric-dialed, control-server-
    *  routed socket. When set, `name` is only used for display. */
   socket?: net.Socket;
+  /** Re-establish the (routed) socket after a loud disconnect — e.g.
+   *  `() => dialAndRoute(peer, name)` for `attach --remote`. When set, an
+   *  UNEXPECTED socket close (not a session EXIT, not a user detach) triggers a
+   *  re-dial + re-attach with backoff instead of exiting, and the daemon's
+   *  screen replay resumes the session. A recoverable transport stall keeps the
+   *  socket open (no close event), so it's ridden out by simply waiting;
+   *  reconnect fires only on a genuine close (fabric's loud give-up). */
+  reconnect?: () => Promise<net.Socket | null>;
 }
 
-export function attach(options: AttachOptions): void {
-  const reader = new PacketReader();
-  const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
+/** Backoff schedule for `attach --remote` reconnect attempts, then a cap. */
+const RECONNECT_BACKOFF_MS = [100, 250, 500, 1000, 2000, 5000, 10000];
+const RECONNECT_BACKOFF_CAP_MS = 15000;
+/** Give up after this many consecutive failed re-establish attempts (a roaming
+ *  laptop can reopen minutes later, so this is generous). Env-overridable. */
+const RECONNECT_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.PTY_RECONNECT_MAX_ATTEMPTS);
+  return Number.isInteger(raw) && raw > 0 ? raw : 40;
+})();
 
+export function attach(options: AttachOptions): void {
   const stdin = process.stdin;
   const stdout = process.stdout;
+  const canReconnect = !!options.reconnect;
+
+  // `socket` is mutable: the reconnect loop swaps in a fresh routed socket, and
+  // the (once-wired) input handlers write to whichever socket is current.
+  let socket: net.Socket = options.socket ?? net.createConnection(getSocketPath(options.name));
+  const firstPreConnected = !!options.socket;
+  let reader = new PacketReader();
 
   let detaching = false;
   let rawWasSet = false;
   let exitCode = 0;
+  let exitHandled = false;
+  let sessionExited = false; // saw an EXIT packet — the session really ended; don't reconnect
+  let reconnecting = false;
+  let inputWired = false;
   let stdinDataHandler: ((data: Buffer) => void) | null = null;
   let resizeHandler: (() => void) | null = null;
 
   function enterRawMode(): void {
-    if (stdin.isTTY && !stdin.isRaw) {
-      stdin.setRawMode(true);
-      rawWasSet = true;
-    }
+    if (stdin.isTTY && !stdin.isRaw) { stdin.setRawMode(true); rawWasSet = true; }
   }
-
   function exitRawMode(): void {
-    if (rawWasSet && stdin.isTTY) {
-      stdin.setRawMode(false);
-    }
+    if (rawWasSet && stdin.isTTY) stdin.setRawMode(false);
   }
-
+  function teardownInput(): void {
+    if (stdinDataHandler) { stdin.removeListener("data", stdinDataHandler); stdinDataHandler = null; }
+    if (resizeHandler && stdout instanceof tty.WriteStream) { stdout.removeListener("resize", resizeHandler); resizeHandler = null; }
+  }
   function cleanExit(): void {
-    if (stdinDataHandler) {
-      stdin.removeListener("data", stdinDataHandler);
-      stdinDataHandler = null;
-    }
-    if (resizeHandler && stdout instanceof tty.WriteStream) {
-      stdout.removeListener("resize", resizeHandler);
-      resizeHandler = null;
-    }
+    teardownInput();
     exitRawMode();
-    socket.destroy();
+    try { socket.destroy(); } catch {}
+  }
+  function finish(code: number): void {
+    if (exitHandled) return;
+    exitHandled = true;
+    cleanExit();
+    if (options.onExit) options.onExit(code); else process.exit(code);
   }
 
-  const onReady = () => {
-    enterRawMode();
-
-    // Tell the server our terminal size
-    const rows = (stdout as tty.WriteStream).rows ?? 24;
-    const cols = (stdout as tty.WriteStream).columns ?? 80;
-    socket.write(encodeAttach(rows, cols));
-
-    // Forward stdin to server
-    // Double Ctrl+\ passthrough: press once = detach, press twice quickly = send Ctrl+\ to process
+  // Wire stdin/resize forwarding ONCE. Handlers write to the CURRENT `socket`,
+  // so they keep working after the reconnect loop swaps the socket.
+  function wireInput(): void {
+    if (inputWired) return;
+    inputWired = true;
     let lastDetachKeyTime = 0;
     const DOUBLE_TAP_MS = 300;
-
     stdinDataHandler = (raw: Buffer) => {
       const data = normalizeDetachKey(raw);
-
       // Fast path: no detach key in this chunk
-      if (data.indexOf(DETACH_KEY) === -1) {
-        socket.write(encodeData(data.toString()));
-        return;
-      }
-
+      if (data.indexOf(DETACH_KEY) === -1) { try { socket.write(encodeData(data.toString())); } catch {} return; }
       // Slow path: detach key found — process byte by byte
       const forward: number[] = [];
-
       for (let i = 0; i < data.length; i++) {
         if (data[i] === DETACH_KEY) {
           const now = Date.now();
@@ -456,7 +466,7 @@ export function attach(options: AttachOptions): void {
             setTimeout(() => {
               if (lastDetachKeyTime === now) {
                 detaching = true;
-                socket.write(encodeDetach());
+                try { socket.write(encodeDetach()); } catch {}
                 cleanExit();
                 stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
                 options.onDetach?.();
@@ -467,38 +477,29 @@ export function attach(options: AttachOptions): void {
           forward.push(data[i]);
         }
       }
-
-      if (forward.length > 0) {
-        socket.write(encodeData(Buffer.from(forward).toString()));
-      }
+      if (forward.length > 0) { try { socket.write(encodeData(Buffer.from(forward).toString())); } catch {} }
     };
     stdin.on("data", stdinDataHandler);
-
-    // Explicitly resume stdin. We cannot rely on the auto-resume from
-    // .on("data") because Node.js skips it when _readableState.flowing
-    // is exactly `false` (as opposed to the initial `null`). This state
-    // can be left behind by readline (restart prompt) or other code that
-    // previously consumed stdin.
+    // Explicitly resume stdin — see the note on readline leaving flowing=false.
     stdin.resume();
-
-    // Handle terminal resize
     if (stdout instanceof tty.WriteStream) {
-      resizeHandler = () => {
-        const rows = stdout.rows;
-        const cols = stdout.columns;
-        socket.write(encodeResize(rows, cols));
-      };
+      resizeHandler = () => { try { socket.write(encodeResize(stdout.rows, stdout.columns)); } catch {} };
       stdout.on("resize", resizeHandler);
     }
-  };
+  }
 
-  // A caller-supplied socket is already connected (dialed + routed over fabric).
-  if (options.socket) process.nextTick(onReady);
-  else socket.on("connect", onReady);
+  function onReady(): void {
+    enterRawMode();
+    const rows = (stdout as tty.WriteStream).rows ?? 24;
+    const cols = (stdout as tty.WriteStream).columns ?? 80;
+    try { socket.write(encodeAttach(rows, cols)); } catch {}
+    wireInput();
+  }
 
-  socket.on("data", (data: Buffer) => {
+  function handleData(data: Buffer): void {
     let packets;
-    try { packets = reader.feed(data); } catch (err: any) {
+    try { packets = reader.feed(data); }
+    catch (err: any) {
       console.error(`pty client: dropping connection — ${err.message}`);
       try { socket.destroy(); } catch {}
       return;
@@ -508,57 +509,80 @@ export function attach(options: AttachOptions): void {
         case MessageType.DATA:
           stdout.write(packet.payload);
           break;
-
         case MessageType.SCREEN:
-          // Clear screen and write the replayed buffer
+          // Clear screen and write the replayed buffer (also how a reconnect resumes).
           stdout.write("\x1b[2J\x1b[H");
           stdout.write(packet.payload);
           break;
-
         case MessageType.EXIT:
           exitCode = decodeExit(packet.payload);
-          exitHandled = true;
-          cleanExit();
+          sessionExited = true; // real exit — never reconnect past it
           stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} exited with code ${exitCode}]\r\n`);
-          options.onExit?.(exitCode);
+          finish(exitCode);
           return;
       }
     }
-  });
+  }
 
-  let exitHandled = false;
-
-  socket.on("error", (err: NodeJS.ErrnoException) => {
-    if (exitHandled) return;
-    exitHandled = true;
-    cleanExit();
-    const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
-      || err.code === "ECONNRESET" || err.code === "EPIPE";
-    if (notReachable) {
-      console.error(
-        options.socket
-          ? `Remote session "${options.name}" not found or not running.`
-          : `Session "${options.name}" not found or not running.`,
-      );
-    } else {
-      console.error(`Connection error: ${err.message}`);
-    }
-    if (options.onExit) {
-      options.onExit(1);
-    } else {
-      process.exit(1);
-    }
-  });
-
-  socket.on("close", () => {
-    if (!detaching && !exitHandled) {
-      exitHandled = true;
+  function handleDisconnect(err?: NodeJS.ErrnoException): void {
+    if (exitHandled || detaching || reconnecting) return;
+    if (canReconnect && !sessionExited) { void reconnectLoop(); return; }
+    // No reconnect: preserve the original not-found / exit-code behavior.
+    if (err) {
       cleanExit();
-      if (options.onExit) {
-        options.onExit(exitCode);
+      const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
+        || err.code === "ECONNRESET" || err.code === "EPIPE";
+      if (notReachable) {
+        console.error(options.socket
+          ? `Remote session "${options.name}" not found or not running.`
+          : `Session "${options.name}" not found or not running.`);
       } else {
-        process.exit(exitCode);
+        console.error(`Connection error: ${err.message}`);
+      }
+      finish(1);
+    } else {
+      finish(exitCode);
+    }
+  }
+
+  function bindSocket(s: net.Socket, preConnected: boolean): void {
+    reader = new PacketReader();
+    s.on("data", handleData);
+    s.on("error", (err: NodeJS.ErrnoException) => handleDisconnect(err));
+    s.on("close", () => handleDisconnect());
+    if (preConnected) process.nextTick(onReady);
+    else s.on("connect", onReady);
+  }
+
+  // Re-establish the routed socket on a loud disconnect and re-attach; the
+  // daemon replays screen+modes so the session resumes. Only reached when
+  // `options.reconnect` is set (attach --remote) and the session didn't EXIT.
+  async function reconnectLoop(): Promise<void> {
+    if (reconnecting) return;
+    reconnecting = true;
+    stdout.write("\r\n[reconnecting…]\r\n");
+    let attempt = 0;
+    while (!detaching && !exitHandled) {
+      const delay = RECONNECT_BACKOFF_MS[attempt] ?? RECONNECT_BACKOFF_CAP_MS;
+      await new Promise((r) => setTimeout(r, delay));
+      if (detaching || exitHandled) break;
+      let fresh: net.Socket | null = null;
+      try { fresh = await options.reconnect!(); } catch { fresh = null; }
+      if (detaching || exitHandled) { try { fresh?.destroy(); } catch {} break; }
+      if (fresh) {
+        socket = fresh; // input handlers now target the fresh socket
+        reconnecting = false;
+        bindSocket(fresh, true); // pre-connected; onReady → encodeAttach → daemon SCREEN replay
+        return;
+      }
+      if (++attempt >= RECONNECT_MAX_ATTEMPTS) {
+        reconnecting = false;
+        console.error(`\r\nRemote session "${options.name}" unreachable — gave up after ${attempt} reconnect attempts.`);
+        finish(1);
+        return;
       }
     }
-  });
+  }
+
+  bindSocket(socket, firstPreConnected);
 }
