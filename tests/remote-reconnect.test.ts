@@ -7,12 +7,14 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { Session } from "../src/testing/index.ts";
 
-// ── Reconnect test harness (scaffold) ────────────────────────────────────────
-// Prepped ahead of the attach --remote RECONNECT implementation (task #23). The
-// reconnect impl itself is gated on the fabric-codex stall-vs-loud-close seam
-// (reconnecting on a recoverable stall would be the bug), so the reconnect
-// assertions below are `it.skip` until that lands — but the KillableFabricProxy
-// is real, reusable infra and its drop mechanism is verified here now.
+// ── Reconnect test harness ───────────────────────────────────────────────────
+// Covers the attach --remote RECONNECT path. Reconnect fires only on a LOUD
+// fabric close, never on a recoverable stall (reconnecting on a stall would be the
+// bug — fabric transparently resumes those). The KillableFabricProxy below models
+// that seam: `.drop()` severs every live tunnel (a loud close / a server-side TTL
+// reap) while the listener stays up, so attach re-dials a FRESH tunnel and
+// re-attaches to the still-alive pty session by identity, and the daemon replays
+// its screen.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
