@@ -146,4 +146,29 @@ describe("pty ls --remote over fabric", () => {
     try { process.kill(proc.pid!, "SIGTERM"); } catch {}
     try { fs.rmSync(sock, { force: true }); } catch {}
   }, 15000);
+
+  it("ignores SIGHUP and keeps serving (the detached-launch death on Linux)", async () => {
+    // The Hetzner failure: a detached launch is killed by the SIGHUP its
+    // launching session sends on teardown (SIGHUP's default action terminates).
+    // remote-serve must ignore it. Deterministic everywhere — POSIX SIGHUP.
+    const sock = path.join(os.tmpdir(), `pr-hup-${rand()}.sock`);
+    const proc = spawn(nodeBin, [cliPath, "remote-serve", "--socket", sock], {
+      env: { ...process.env, PTY_ROOT: srvRoot, PTY_ROOT_LEGACY_SILENT: "1" },
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    proc.unref();
+    bgPids.push(proc.pid!);
+    expect(waitForFile(sock, 5000)).toBe(true);
+
+    process.kill(proc.pid!, "SIGHUP");
+    await new Promise((r) => setTimeout(r, 600));
+    expect(() => process.kill(proc.pid!, 0)).not.toThrow(); // survived SIGHUP
+
+    const resp = await rawList(sock); // and still functional
+    expect(resp.sessions.map((s) => s.name)).toContain("demo");
+
+    try { process.kill(proc.pid!, "SIGTERM"); } catch {}
+    try { fs.rmSync(sock, { force: true }); } catch {}
+  }, 15000);
 });

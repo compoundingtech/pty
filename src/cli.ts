@@ -1685,6 +1685,11 @@ interface ListOptions {
 }
 
 async function cmdRemoteServe(socketPath: string): Promise<void> {
+  // Diagnostics for the detached-liveness investigation — off unless
+  // PTY_REMOTE_SERVE_DEBUG is set, so normal service logs stay quiet.
+  const debug = !!process.env.PTY_REMOTE_SERVE_DEBUG;
+  const dlog = (m: string) => { if (debug) console.error(`[remote-serve ${new Date().toISOString()}] ${m}`); };
+
   const server = serveRemoteControl(socketPath);
   server.on("error", (e) => {
     console.error(`pty remote-serve: ${e.message}`);
@@ -1692,26 +1697,37 @@ async function cmdRemoteServe(socketPath: string): Promise<void> {
   });
   server.on("listening", () => {
     console.log(`pty remote-serve listening on ${socketPath}`);
+    dlog(`up pid=${process.pid} stdinTTY=${!!process.stdin.isTTY}`);
   });
 
-  // Long-running service: pin the event loop independent of stdin. A detached
-  // launch (systemd/launchd/setsid/nohup, or plain `… </dev/null &`) closes
-  // stdin immediately — that must not end the process. Relying on the listening
-  // socket handle alone to hold the loop is not portable: on some platforms it
-  // doesn't, so once stdin EOFs the loop drains and Node exits 0 ("listening…
-  // then gone", no error). A ref'd timer guarantees liveness until we're
-  // signalled. Don't read/hold stdin — nothing here consumes it.
+  // Belt: pin the event loop so nothing about stdin/handle-refcounting can drain
+  // it. Suspenders (the real fix): a detached service must outlive the terminal
+  // or session that launched it. SIGHUP's default action is termination, so a
+  // plain `… </dev/null &` / setsid / fabric-shell launch is killed by the
+  // hangup the moment its launching session tears down (the ref'd timer can't
+  // save a process from an unhandled terminating signal — which is why the
+  // timer alone didn't hold on Linux). Ignore SIGHUP, like a daemon should.
+  // SIGTERM/SIGINT remain the graceful way to stop it.
   const keepAlive = setInterval(() => {}, 1 << 30);
+  process.on("SIGHUP", () => dlog("SIGHUP received — ignoring (detached service stays up)"));
+
+  if (debug) {
+    process.on("beforeExit", (code) => dlog(`beforeExit code=${code}`));
+    process.on("exit", (code) => dlog(`exit code=${code}`));
+    process.on("uncaughtException", (e) => dlog(`uncaughtException: ${(e as Error)?.stack ?? String(e)}`));
+    process.on("unhandledRejection", (r) => dlog(`unhandledRejection: ${String(r)}`));
+  }
 
   await new Promise<void>((resolve) => {
-    const shutdown = () => {
+    const stop = (sig: string) => {
+      dlog(`${sig} — shutting down`);
       clearInterval(keepAlive);
       try { server.close(); } catch {}
       try { fs.unlinkSync(socketPath); } catch {}
       resolve();
     };
-    process.on("SIGTERM", shutdown);
-    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", () => stop("SIGTERM"));
+    process.on("SIGINT", () => stop("SIGINT"));
   });
 }
 
