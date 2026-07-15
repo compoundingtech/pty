@@ -197,6 +197,30 @@ describe("pty peek --remote over fabric", () => {
   it("errors (exit 1) peeking a nonexistent remote session", () => {
     const p = runCli(cliRoot, ["peek", "--remote", "testpeer", "does-not-exist", "--plain"], { PTY_FABRIC_BIN: fakeFabric });
     expect(p.status).not.toBe(0);
-    expect(p.stderr).toMatch(/not found or not running/);
+    expect(p.stderr).toMatch(/not found/); // route ack reports the missing session
+  }, 20000);
+});
+
+describe("pty send --remote over fabric", () => {
+  it("delivers input to a remote session through the route splice", () => {
+    // A `cat` session on the "remote" echoes whatever it receives.
+    const c = runCli(srvRoot, ["run", "-d", "--id", "sink", "--", "sh", "-c", "cat"]);
+    expect(c.status).toBe(0);
+    try { bgPids.push(Number(fs.readFileSync(path.join(srvRoot, "sink.pid"), "utf8").trim())); } catch {}
+    sleepSync(300);
+
+    const s = runCli(cliRoot, ["send", "--remote", "testpeer", "sink", "--seq", "SEND_REMOTE_OK", "--seq", "key:return"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(s.status).toBe(0);
+    sleepSync(400);
+
+    // Confirm it landed: peek the same session, cat echoed the text back.
+    const p = runCli(cliRoot, ["peek", "--remote", "testpeer", "sink", "--plain"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(p.stdout).toContain("SEND_REMOTE_OK");
+  }, 20000);
+
+  it("errors (exit 1) sending to a nonexistent remote session", () => {
+    const s = runCli(cliRoot, ["send", "--remote", "testpeer", "does-not-exist", "--seq", "x"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(s.status).not.toBe(0);
+    expect(s.stderr).toMatch(/not found/);
   }, 20000);
 });
