@@ -1693,15 +1693,26 @@ async function cmdRemoteServe(socketPath: string): Promise<void> {
   server.on("listening", () => {
     console.log(`pty remote-serve listening on ${socketPath}`);
   });
-  const shutdown = () => {
-    try { server.close(); } catch {}
-    try { fs.unlinkSync(socketPath); } catch {}
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  // Run until signalled.
-  await new Promise<never>(() => {});
+
+  // Long-running service: pin the event loop independent of stdin. A detached
+  // launch (systemd/launchd/setsid/nohup, or plain `… </dev/null &`) closes
+  // stdin immediately — that must not end the process. Relying on the listening
+  // socket handle alone to hold the loop is not portable: on some platforms it
+  // doesn't, so once stdin EOFs the loop drains and Node exits 0 ("listening…
+  // then gone", no error). A ref'd timer guarantees liveness until we're
+  // signalled. Don't read/hold stdin — nothing here consumes it.
+  const keepAlive = setInterval(() => {}, 1 << 30);
+
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      clearInterval(keepAlive);
+      try { server.close(); } catch {}
+      try { fs.unlinkSync(socketPath); } catch {}
+      resolve();
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+  });
 }
 
 async function cmdList(opts: ListOptions = {}): Promise<void> {

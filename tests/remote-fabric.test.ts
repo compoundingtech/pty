@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,21 @@ function waitForFile(p: string, timeoutMs: number): boolean {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
   return false;
+}
+
+/** Speak the control protocol directly (no fabric): one line {"op":"list"},
+ *  read until the server half-closes, parse the JSON response. */
+function rawList(sockPath: string): Promise<{ sessions: { name: string }[] }> {
+  return new Promise((resolve, reject) => {
+    const c = net.createConnection(sockPath);
+    let buf = "";
+    c.on("connect", () => c.write(JSON.stringify({ op: "list" }) + "\n"));
+    c.on("data", (d: Buffer) => { buf += d.toString("utf8"); });
+    c.on("end", () => {
+      try { resolve(JSON.parse(buf.trim())); } catch (e) { reject(e); }
+    });
+    c.on("error", reject);
+  });
 }
 
 beforeAll(() => {
@@ -104,4 +120,30 @@ describe("pty ls --remote over fabric", () => {
       fs.rmSync(badFabric, { force: true });
     }
   }, 20000);
+
+  it("survives a detached stdin=/dev/null launch and keeps serving (no loop-drain exit)", async () => {
+    // Repro of the reported Hetzner failure: backgrounded/detached with stdin
+    // closed, remote-serve must NOT exit ~2s later when the loop would drain if
+    // stdin were the only ref. It must stay up and keep answering `list`.
+    const sock = path.join(os.tmpdir(), `pr-svc-${rand()}.sock`);
+    const proc = spawn(nodeBin, [cliPath, "remote-serve", "--socket", sock], {
+      env: { ...process.env, PTY_ROOT: srvRoot, PTY_ROOT_LEGACY_SILENT: "1" },
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"], // stdin = /dev/null
+    });
+    proc.unref();
+    bgPids.push(proc.pid!);
+    expect(waitForFile(sock, 5000)).toBe(true);
+
+    // Past the ~2s window where a stdin-dependent loop would have drained.
+    await new Promise((r) => setTimeout(r, 2500));
+    expect(() => process.kill(proc.pid!, 0)).not.toThrow(); // still alive
+
+    // And still functional over its socket.
+    const resp = await rawList(sock);
+    expect(resp.sessions.map((s) => s.name)).toContain("demo");
+
+    try { process.kill(proc.pid!, "SIGTERM"); } catch {}
+    try { fs.rmSync(sock, { force: true }); } catch {}
+  }, 15000);
 });
