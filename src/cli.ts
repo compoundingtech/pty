@@ -26,9 +26,12 @@ import {
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  getSocketPath,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
 } from "./sessions.ts";
+import * as net from "node:net";
+import { encodeResizeAuthoritative } from "./protocol.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
   EventFollower, EventWriter, EventType,
@@ -351,6 +354,7 @@ async function main(): Promise<void> {
       let explicitId: string | null = null;
       let explicitDisplayName: string | null = null;
       let cwd: string | null = null;
+      let size: { cols: number; rows: number } | null = null;
       const tags: Record<string, string> = {};
       let i = 1;
       while (i < args.length && args[i] !== "--") {
@@ -363,6 +367,15 @@ async function main(): Promise<void> {
         else if (args[i] === "--id" && i + 1 < args.length) { explicitId = args[i + 1]; i += 2; }
         else if (args[i] === "--name" && i + 1 < args.length) { explicitDisplayName = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
+        else if (args[i] === "--size" && i + 1 < args.length) {
+          const m = /^(\d+)x(\d+)$/.exec(args[i + 1]);
+          if (!m) {
+            console.error(`Invalid --size "${args[i + 1]}". Use --size <cols>x<rows>, e.g. --size 120x40`);
+            process.exit(1);
+          }
+          size = { cols: parseInt(m[1], 10), rows: parseInt(m[2], 10) };
+          i += 2;
+        }
         else if (args[i] === "--tag" && i + 1 < args.length) {
           const eq = args[i + 1].indexOf("=");
           if (eq === -1) {
@@ -523,7 +536,7 @@ async function main(): Promise<void> {
         }
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName, size);
       break;
     }
 
@@ -531,11 +544,13 @@ async function main(): Promise<void> {
     case "a": {
       let autoRestart = false;
       let force = false;
+      let geometryNeutral = false;
       let attachName: string | null = null;
       for (let ai = 1; ai < args.length; ai++) {
         const a = args[ai];
         if (a === "--auto-restart" || a === "-r") autoRestart = true;
         else if (a === "--force") force = true;
+        else if (a === "--no-resize" || a === "--neutral") geometryNeutral = true;
         else if (!attachName) attachName = a;
         else {
           console.error(`pty attach: unexpected argument "${a}"`);
@@ -543,7 +558,7 @@ async function main(): Promise<void> {
         }
       }
       if (!attachName) {
-        console.error("Usage: pty attach [-r|--auto-restart] [--force] <name>");
+        console.error("Usage: pty attach [-r|--auto-restart] [--no-resize] [--force] <name>");
         process.exit(1);
       }
       // Nesting guard runs BEFORE name validation / ref resolution. A nested
@@ -558,7 +573,22 @@ async function main(): Promise<void> {
           "  Pass --force to attach anyway (nested clients are usually a mistake).",
       });
       const resolvedAttachName = await resolveRef(attachName);
-      await cmdAttach(resolvedAttachName, autoRestart, force);
+      await cmdAttach(resolvedAttachName, autoRestart, force, geometryNeutral);
+      break;
+    }
+
+    case "resize": {
+      // pty resize <name> <cols>x<rows> — set the authoritative session-owned
+      // geometry. Works on any session; pins it going forward.
+      const resizeName = args[1];
+      const spec = args[2];
+      const m = spec ? /^(\d+)x(\d+)$/.exec(spec) : null;
+      if (!resizeName || !m) {
+        console.error("Usage: pty resize <name> <cols>x<rows>");
+        process.exit(1);
+      }
+      const resolved = await resolveRef(resizeName);
+      await cmdResize(resolved, parseInt(m[1], 10), parseInt(m[2], 10));
       break;
     }
 
@@ -1080,6 +1110,7 @@ async function cmdRun(
   explicitCwd: string | null = null,
   isolateEnv = false,
   displayName: string | null = null,
+  size: { cols: number; rows: number } | null = null,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -1121,6 +1152,8 @@ async function cmdRun(
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
+      // `--size` authors an authoritative, pinned session geometry.
+      ...(size ? { rows: size.rows, cols: size.cols, pinGeometry: true } : {}),
     });
   } finally {
     releaseLock(name);
@@ -1139,6 +1172,7 @@ async function cmdAttach(
   name: string,
   autoRestart = false,
   _force = false,
+  geometryNeutral = false,
 ): Promise<void> {
   // Nesting guard runs in the dispatcher (before name resolution) so the
   // user gets the nesting hint even for typo'd refs. cmdAttach itself is
@@ -1153,7 +1187,7 @@ async function cmdAttach(
   }
 
   if (session.status === "running") {
-    doAttach(name);
+    doAttach(name, geometryNeutral);
     return;
   }
 
@@ -1207,9 +1241,36 @@ async function handleDeadSession(
   doAttach(session.name);
 }
 
-function doAttach(name: string): void {
+/** Send an authoritative RESIZE to a running session and pin its geometry. */
+async function cmdResize(name: string, cols: number, rows: number): Promise<void> {
+  if (cols <= 0 || rows <= 0) {
+    console.error(`Invalid size ${cols}x${rows}.`);
+    process.exit(1);
+  }
+  const socketPath = getSocketPath(name);
+  await new Promise<void>((resolve) => {
+    const socket = net.createConnection(socketPath);
+    socket.on("connect", () => {
+      socket.write(encodeResizeAuthoritative(rows, cols));
+      socket.end();
+    });
+    socket.on("finish", () => resolve());
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
+        console.error(`Session "${name}" not found or not running.`);
+      } else {
+        console.error(`Connection error: ${err.message}`);
+      }
+      process.exit(1);
+    });
+  });
+  console.log(`Session "${name}" resized to ${cols}x${rows} (session-owned).`);
+}
+
+function doAttach(name: string, geometryNeutral = false): void {
   attach({
     name,
+    geometryNeutral,
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });

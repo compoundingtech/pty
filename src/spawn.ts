@@ -24,6 +24,10 @@ export interface SpawnDaemonOptions {
   ephemeral?: boolean;
   rows?: number;
   cols?: number;
+  /** Pin `rows`/`cols` as the authoritative session-owned geometry (from
+   *  `pty run --size`). negotiateSize() becomes a no-op; only `pty resize`
+   *  changes the size afterwards. */
+  pinGeometry?: boolean;
   tags?: Record<string, string>;
   /** Optional human-friendly alias for the session, stored in
    *  SessionMetadata.displayName. `name` stays the immutable id. */
@@ -137,6 +141,7 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
     cwd: options.cwd ?? process.cwd(),
     rows,
     cols,
+    ...(options.pinGeometry ? { pinGeometry: true } : {}),
     ephemeral: options.ephemeral ?? false,
     ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
     ...(options.displayName ? { displayName: options.displayName } : {}),
@@ -210,6 +215,9 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
     cliArgs.push("--no-display-name");
   }
   if (options.cwd) cliArgs.push("--cwd", options.cwd);
+  if (options.pinGeometry && options.cols && options.rows) {
+    cliArgs.push("--size", `${options.cols}x${options.rows}`);
+  }
   if (options.isolateEnv) cliArgs.push("--isolate-env");
   if (options.tags) {
     for (const [k, v] of Object.entries(options.tags)) {

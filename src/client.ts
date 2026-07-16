@@ -292,6 +292,11 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
 
 export interface AttachOptions {
   name: string;
+  /** Non-disturbing attach (`pty attach --no-resize`). Forwards input but does
+   *  NOT contribute the client's geometry and does NOT nudge the child. The
+   *  session renders in its own coordinate space; the client letterboxes/pans
+   *  locally. Backward-compatible: sends a 5-byte ATTACH flags frame. */
+  geometryNeutral?: boolean;
   onExit?: (code: number) => void;
   onDetach?: () => void;
 }
@@ -339,10 +344,12 @@ export function attach(options: AttachOptions): void {
   socket.on("connect", () => {
     enterRawMode();
 
-    // Tell the server our terminal size
+    // Tell the server our terminal size. In geometry-neutral mode the size is
+    // advisory only (the server ignores it for negotiation) — sent so the flags
+    // byte rides along on a well-formed 5-byte ATTACH frame.
     const rows = (stdout as tty.WriteStream).rows ?? 24;
     const cols = (stdout as tty.WriteStream).columns ?? 80;
-    socket.write(encodeAttach(rows, cols));
+    socket.write(encodeAttach(rows, cols, options.geometryNeutral === true));
 
     // Forward stdin to server
     // Double Ctrl+\ passthrough: press once = detach, press twice quickly = send Ctrl+\ to process
@@ -399,8 +406,12 @@ export function attach(options: AttachOptions): void {
     // previously consumed stdin.
     stdin.resume();
 
-    // Handle terminal resize
-    if (stdout instanceof tty.WriteStream) {
+    // Handle terminal resize. Skipped entirely for geometry-neutral clients:
+    // they never renegotiate the session's size, so local terminal resizes stay
+    // local (the client re-letterboxes its own viewport). Even if this handler
+    // were left on, negotiateSize() ignores neutral clients server-side — but
+    // not sending RESIZE avoids the wasted round-trips.
+    if (stdout instanceof tty.WriteStream && options.geometryNeutral !== true) {
       resizeHandler = () => {
         const rows = stdout.rows;
         const cols = stdout.columns;

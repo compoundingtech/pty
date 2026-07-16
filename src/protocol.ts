@@ -51,11 +51,35 @@ export function encodeData(data: string): Buffer {
   return encodePacket(MessageType.DATA, Buffer.from(data));
 }
 
-export function encodeAttach(rows: number, cols: number): Buffer {
-  const payload = Buffer.alloc(4);
+// Optional flags byte appended to an ATTACH/RESIZE payload. Backward-compatible:
+// the server guards `payload.length < 4` and `decodeSize` reads only bytes 0-3,
+// so a legacy 4-byte frame is byte-identical and an old server ignores byte 4.
+export const ATTACH_FLAG_GEOMETRY_NEUTRAL = 0x01; // input yes, geometry no, nudge no
+export const RESIZE_FLAG_AUTHORITATIVE = 0x01; // `pty resize`: set session-owned size
+
+export function encodeAttach(
+  rows: number,
+  cols: number,
+  geometryNeutral = false
+): Buffer {
+  const payload = Buffer.alloc(geometryNeutral ? 5 : 4);
   payload.writeUInt16BE(rows, 0);
   payload.writeUInt16BE(cols, 2);
+  if (geometryNeutral) payload.writeUInt8(ATTACH_FLAG_GEOMETRY_NEUTRAL, 4);
   return encodePacket(MessageType.ATTACH, payload);
+}
+
+/** Read the optional flags byte from an ATTACH/RESIZE payload (0 if absent). */
+export function decodeFlags(payload: Buffer): number {
+  return payload.length >= 5 ? payload.readUInt8(4) : 0;
+}
+
+export function encodeResizeAuthoritative(rows: number, cols: number): Buffer {
+  const payload = Buffer.alloc(5);
+  payload.writeUInt16BE(rows, 0);
+  payload.writeUInt16BE(cols, 2);
+  payload.writeUInt8(RESIZE_FLAG_AUTHORITATIVE, 4);
+  return encodePacket(MessageType.RESIZE, payload);
 }
 
 export function encodeDetach(): Buffer {

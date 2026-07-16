@@ -16,6 +16,9 @@ import {
   encodeScreen,
   encodeStatusResponse,
   decodeSize,
+  decodeFlags,
+  ATTACH_FLAG_GEOMETRY_NEUTRAL,
+  RESIZE_FLAG_AUTHORITATIVE,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -36,6 +39,9 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** Non-disturbing observer: forwards input (not readonly) but is inert in
+   *  negotiateSize() and is never nudged. Orthogonal to readonly/attachSeq. */
+  geometryNeutral: boolean;
 }
 
 export interface ServerOptions {
@@ -46,6 +52,10 @@ export interface ServerOptions {
   cwd: string;
   rows: number;
   cols: number;
+  /** When true, `rows`/`cols` are an authoritative session-owned geometry:
+   *  negotiateSize() becomes a no-op and only `pty resize` (setSessionSize)
+   *  changes the size. Authored via `pty run --size <cols>x<rows>`. */
+  pinGeometry?: boolean;
   tags?: Record<string, string>;
   /** Optional human-friendly alias recorded in SessionMetadata.displayName.
    *  Mutable via `pty rename`; `name` stays the immutable stable id. */
@@ -241,6 +251,9 @@ export class PtyServer {
   private mouseTracking1002 = false; // button-motion tracking
   private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
+  // Session-owns-geometry: when set, negotiateSize() is a no-op and only an
+  // authoritative `pty resize` (or the initial --size pin) changes the size.
+  private pinnedGeometry: { rows: number; cols: number } | null = null;
   private eventWriter: EventWriter;
   private lastTitle = "";
   readonly ready: Promise<void>;
@@ -267,6 +280,13 @@ export class PtyServer {
     });
     this.serialize = new xtermSerialize.SerializeAddon();
     this.terminal.loadAddon(this.serialize);
+
+    // --size authored an authoritative geometry: pin it so no attach can
+    // renegotiate the child away from it. The terminal was already created at
+    // this size above, so no resize is needed here.
+    if (options.pinGeometry) {
+      this.pinnedGeometry = { rows: options.rows, cols: options.cols };
+    }
 
     // Track terminal modes not exposed by xterm's serialize addon
     this.terminal.parser.registerCsiHandler(
@@ -573,6 +593,7 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      geometryNeutral: false,
     };
     this.clients.set(socket, client);
 
@@ -592,6 +613,10 @@ export class PtyServer {
           case MessageType.ATTACH: {
             if (packet.payload.length < 4) break;
             const size = decodeSize(packet.payload);
+            // Optional 5th flags byte marks a geometry-neutral client: input
+            // yes, geometry no, nudge no. A legacy 4-byte ATTACH leaves it false.
+            client.geometryNeutral =
+              (decodeFlags(packet.payload) & ATTACH_FLAG_GEOMETRY_NEUTRAL) !== 0;
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
@@ -624,7 +649,12 @@ export class PtyServer {
                 // drew (e.g., background fills in ratatui). Nudge the child
                 // with a SIGWINCH so it does a fresh full redraw, whose DATA
                 // overwrites any serialize artifacts on the client.
-                this.nudgeRedraw();
+                //
+                // Suppressed for geometry-neutral clients: the nudge is a real
+                // SIGWINCH + reflow that would disturb the running child. A
+                // neutral observer accepts the imperfect serialize() snapshot as
+                // the price of not perturbing the agent.
+                if (!client.geometryNeutral) this.nudgeRedraw();
               }
             };
 
@@ -678,9 +708,20 @@ export class PtyServer {
           case MessageType.RESIZE: {
             if (!client.readonly && packet.payload.length >= 4) {
               const size = decodeSize(packet.payload);
+              // Authoritative RESIZE = `pty resize`: set the session-owned size
+              // directly (a legitimate SIGWINCH the child adapts to), bypassing
+              // min-wins negotiation and without a nudge.
+              if (decodeFlags(packet.payload) & RESIZE_FLAG_AUTHORITATIVE) {
+                this.setSessionSize(size.cols, size.rows);
+                break;
+              }
               client.rows = size.rows;
               client.cols = size.cols;
               client.attachSeq = ++this.attachCounter;
+              // negotiateSize() itself skips geometryNeutral clients, so even a
+              // misbehaving neutral client that sends RESIZE cannot move the
+              // child — the defense lives server-side, not in the client's
+              // choice not to send RESIZE.
               this.negotiateSize();
             }
             break;
@@ -736,9 +777,13 @@ export class PtyServer {
 
     let attached = 0;
     let readOnly = 0;
+    let neutral = 0;
     for (const c of this.clients.values()) {
       if (c.readonly) readOnly++;
-      else if (c.attachSeq > 0) attached++;
+      else if (c.attachSeq > 0) {
+        attached++;
+        if (c.geometryNeutral) neutral++;
+      }
     }
 
     const createdAt = meta?.createdAt ?? null;
@@ -773,6 +818,13 @@ export class PtyServer {
         total: attached + readOnly,
         attached,
         readOnly,
+        neutral,
+      },
+      geometry: {
+        owner: this.pinnedGeometry ? "session" : "clients",
+        pinned: this.pinnedGeometry
+          ? { cols: this.pinnedGeometry.cols, rows: this.pinnedGeometry.rows }
+          : null,
       },
       modes: {
         sgrMouse: this.sgrMouseMode,
@@ -788,11 +840,18 @@ export class PtyServer {
   /** Resize the PTY to the smallest dimensions across all connected writable clients.
    *  Returns true if the size actually changed. */
   private negotiateSize(): boolean {
+    // Session-owns-geometry: a pinned session ignores all client geometry.
+    // Only setSessionSize() (an authoritative `pty resize`) moves it.
+    if (this.pinnedGeometry) return false;
+
     let rows = 0;
     let cols = 0;
 
     for (const client of this.clients.values()) {
-      if (!client.readonly && client.attachSeq > 0) {
+      // Geometry-neutral clients are inert here — this is what makes N
+      // heterogeneous observers safe: every extra neutral viewer, at any size,
+      // contributes nothing to the min.
+      if (!client.readonly && client.attachSeq > 0 && !client.geometryNeutral) {
         rows = rows === 0 ? client.rows : Math.min(rows, client.rows);
         cols = cols === 0 ? client.cols : Math.min(cols, client.cols);
       }
@@ -807,6 +866,19 @@ export class PtyServer {
       }
     }
     return false;
+  }
+
+  /** Authoritatively set the session-owned size (from `pty resize` or the
+   *  initial --size pin). Bypasses min-wins negotiation and does NOT nudge —
+   *  this SIGWINCH is legitimate and the child should adapt to it. */
+  private setSessionSize(cols: number, rows: number): void {
+    if (rows <= 0 || cols <= 0) return;
+    this.pinnedGeometry = { rows, cols };
+    if (cols !== this.terminal.cols || rows !== this.terminal.rows) {
+      this.ptyProcess.resize(cols, rows);
+      this.terminal.resize(cols, rows);
+      this.lastResizeTime = Date.now();
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
@@ -998,6 +1070,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     cwd: config.cwd ?? process.cwd(),
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
+    pinGeometry: config.pinGeometry === true,
     tags: config.tags,
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
