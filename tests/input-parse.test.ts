@@ -65,12 +65,55 @@ describe("parseKey: shift+tab (backtab)", () => {
     ]);
   });
 
-  it("kitty plain tab (no shift) stays as tab char via existing path", () => {
-    // mods = 0, wire = 1
-    const events = parse("\x1b[9;1u");
-    expect(events).toHaveLength(1);
-    expect(events[0].char).toBe("\t");
-    expect(events[0].shift).toBe(false);
+  it("kitty plain tab (no shift) -> named 'tab' (matches the legacy \\t encoding)", () => {
+    // mods = 0, wire = 1. Decodes to the SAME named event as a legacy tab byte
+    // so consumers keying on key.name === "tab" work under CSI-u too.
+    expect(parse("\x1b[9;1u")).toEqual([
+      { name: "tab", ctrl: false, alt: false, shift: false },
+    ]);
+  });
+});
+
+describe("parseKey: kitty CSI-u named special keys", () => {
+  // Regression (Nathan): in kitty with the keyboard protocol active, Escape and
+  // the other control keys arrive as CSI-u (`ESC[27u`), and the modifiers param
+  // is OMITTED when no modifiers are held. Requiring the `;mods` dropped the
+  // bare-Escape form entirely (fell through to "unknown CSI" skip), and even the
+  // explicit-param form decoded to the raw `\x1b` CHAR instead of a named event
+  // — so consumers matching key.name === "escape" never fired (two-stage esc
+  // "did nothing"). Both forms must decode to the named key.
+  it("ESC[27u (mods omitted) -> escape", () => {
+    expect(parse("\x1b[27u")).toEqual([
+      { name: "escape", ctrl: false, alt: false, shift: false },
+    ]);
+  });
+
+  it("ESC[27;1u (explicit no-mods) -> escape", () => {
+    expect(parse("\x1b[27;1u")).toEqual([
+      { name: "escape", ctrl: false, alt: false, shift: false },
+    ]);
+  });
+
+  it("ESC[13u -> return, ESC[127u -> backspace (mods omitted)", () => {
+    expect(parse("\x1b[13u")).toEqual([
+      { name: "return", ctrl: false, alt: false, shift: false },
+    ]);
+    expect(parse("\x1b[127u")).toEqual([
+      { name: "backspace", ctrl: false, alt: false, shift: false },
+    ]);
+  });
+
+  it("modifiers still decode on a named key: ESC[27;5u -> ctrl+escape", () => {
+    // mods = 5 -> bitmask 4 = ctrl.
+    expect(parse("\x1b[27;5u")).toEqual([
+      { name: "escape", ctrl: true, alt: false, shift: false },
+    ]);
+  });
+
+  it("a non-special codepoint still decodes to its char: ESC[97u -> 'a'", () => {
+    expect(parse("\x1b[97u")).toEqual([
+      { name: "a", char: "a", ctrl: false, alt: false, shift: false },
+    ]);
   });
 });
 
