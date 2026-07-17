@@ -310,7 +310,13 @@ export interface StatsResult {
     pid: number;
     resources: ProcessResources | null;
   };
-  clients: { total: number; attached: number; readOnly: number };
+  clients: {
+    total: number;
+    attached: number;
+    readOnly: number;
+    geometryNeutral?: number;
+  };
+  capabilities?: { geometryNeutralAttach?: boolean };
   modes: {
     sgrMouse: boolean;
     cursorHidden: boolean;
@@ -371,6 +377,10 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
 
 export interface AttachOptions {
   name: string;
+  /** Receive output and send input without participating in PTY geometry or
+   * attach-time redraw nudges. Callers must first verify the daemon advertises
+   * `capabilities.geometryNeutralAttach` in stats. */
+  geometryNeutral?: boolean;
   onExit?: (code: number) => void;
   onDetach?: () => void;
   /** Attach over this ALREADY-CONNECTED socket instead of dialing the local
@@ -487,7 +497,7 @@ export function attach(options: AttachOptions): void {
     stdin.on("data", stdinDataHandler);
     // Explicitly resume stdin — see the note on readline leaving flowing=false.
     stdin.resume();
-    if (stdout instanceof tty.WriteStream) {
+    if (stdout instanceof tty.WriteStream && !options.geometryNeutral) {
       resizeHandler = () => { try { socket.write(encodeResize(stdout.rows, stdout.columns)); } catch {} };
       stdout.on("resize", resizeHandler);
     }
@@ -497,7 +507,7 @@ export function attach(options: AttachOptions): void {
     enterRawMode();
     const rows = (stdout as tty.WriteStream).rows ?? 24;
     const cols = (stdout as tty.WriteStream).columns ?? 80;
-    try { socket.write(encodeAttach(rows, cols)); } catch {}
+    try { socket.write(encodeAttach(rows, cols, options.geometryNeutral === true)); } catch {}
     wireInput();
   }
 

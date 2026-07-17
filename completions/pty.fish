@@ -83,6 +83,7 @@ complete -c pty -n '__pty_using_command run' -F
 for verb in attach a
     complete -c pty -n "__pty_using_command $verb" -a '(__pty_sessions)' -d 'Session'
     complete -c pty -n "__pty_using_command $verb" -s r -d 'Auto-restart if the session is exited'
+    complete -c pty -n "__pty_using_command $verb" -l no-resize -d 'Preserve shared PTY geometry'
     complete -c pty -n "__pty_using_command $verb" -l force -d 'Attach even from inside another pty'
 end
 
