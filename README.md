@@ -210,16 +210,19 @@ tags = { role = "server" }
 
 Run `pty up` in the project directory (or `pty up /path/to/project`) to start all sessions. Run `pty down` to stop them. You can also start specific sessions: `pty up dev serve`.
 
-Each session also supports two optional fields:
+Each session also supports these optional fields:
 
 ```toml
 [sessions.serve]
 command = "bin/serve"
 id = "srv"                       # pin the on-disk id (sock + json filename)
 display_name = "My Web Server"   # override the default `<prefix>-<sessionKey>` label
+cwd = "packages/web"             # working directory (default: the manifest's dir)
 ```
 
 `id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` is permissive (≤ 500 chars, any printable text); omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
+
+`cwd` sets the session's working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the default). This decouples where a session runs from where its `pty.toml` lives — so a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can still run its sessions in the repo root with `cwd = ".."`. The declared `cwd` is honored on the initial `pty up` and preserved across `strategy=permanent` respawns.
 
 Sessions can also declare per-session environment variables:
 

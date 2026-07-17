@@ -264,4 +264,57 @@ tags = { strategy = "permanent" }
       if (Number.isFinite(pid)) bgPids.push(pid);
     } catch {}
   }, 25000);
+
+  it("pty.toml respawn honors a per-session cwd (respawns in the declared dir, not the manifest dir)", async () => {
+    // Guards sessions.ts respawnPermanent: cwd = sessDef.cwd ?? ptyFile.dir.
+    // A permanent session whose manifest lives in projectDir but declares a
+    // separate cwd must respawn in that cwd, NOT the manifest dir — the
+    // .convoy/pty.toml layout depends on this.
+    const dir = makeSessionDir();
+    const projectDir = fs.mkdtempSync(path.join(testRoot, "proj-"));
+    const runDir = fs.mkdtempSync(path.join(testRoot, "rundir-"));
+    sessionDirs.push(projectDir, runDir);
+    const tomlPath = path.join(projectDir, "pty.toml");
+    const marker = `/tmp/pty-gc-cwd-${Date.now()}.flag`;
+    fs.writeFileSync(tomlPath, `[sessions.perm]
+command = "touch ${marker}"
+cwd = "${runDir}"
+tags = { strategy = "permanent" }
+`);
+
+    const up = runCli(dir, "up", projectDir);
+    expect(up.status).toBe(0);
+    const found = JSON.parse(runCli(dir, "list", "--json").stdout).find((s: any) => s.displayName === "perm");
+    expect(found).toBeDefined();
+    const sessionName: string = found.name;
+    expect(found.cwd).toBe(runDir); // spawn path honors cwd
+
+    // First run touches the marker; reset it, then wait for the exit record.
+    const s1 = Date.now();
+    while (Date.now() - s1 < 5000 && !fs.existsSync(marker)) await new Promise((r) => setTimeout(r, 100));
+    expect(fs.existsSync(marker)).toBe(true);
+    fs.unlinkSync(marker);
+    const s2 = Date.now();
+    while (Date.now() - s2 < 5000 && !readMeta(dir, sessionName).exitedAt) await new Promise((r) => setTimeout(r, 100));
+    expect(readMeta(dir, sessionName).exitedAt).toBeTruthy();
+
+    // gc respawns via the toml reread. Wait for the respawned run to touch the
+    // marker again — by then the daemon has written its metadata (incl cwd).
+    const result = runCli(dir, "gc");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Respawned: ${sessionName}`);
+    const s3 = Date.now();
+    while (Date.now() - s3 < 5000 && !fs.existsSync(marker)) await new Promise((r) => setTimeout(r, 100));
+    expect(fs.existsSync(marker)).toBe(true);
+
+    const respawned = readMeta(dir, sessionName);
+    expect(respawned.cwd).toBe(runDir);         // honored the cwd field on respawn
+    expect(respawned.cwd).not.toBe(projectDir); // NOT the manifest dir
+
+    try { fs.unlinkSync(marker); } catch {}
+    try {
+      const pid = parseInt(fs.readFileSync(path.join(dir, `${sessionName}.pid`), "utf-8").trim(), 10);
+      if (Number.isFinite(pid)) bgPids.push(pid);
+    } catch {}
+  }, 25000);
 });

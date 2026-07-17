@@ -62,6 +62,63 @@ NOT_A_STRING = 42
   });
 });
 
+describe("readPtyFile cwd", () => {
+  it("omits cwd when not present", () => {
+    const dir = makeDir("nocwd", `
+[sessions.plain]
+command = "cat"
+`);
+    expect(readPtyFile(dir).sessions[0].cwd).toBeUndefined();
+  });
+
+  it("keeps an absolute cwd as-is", () => {
+    const dir = makeDir("abscwd", `
+[sessions.svc]
+command = "cat"
+cwd = "/opt/app"
+`);
+    expect(readPtyFile(dir).sessions[0].cwd).toBe("/opt/app");
+  });
+
+  it("resolves a relative cwd against the manifest's directory", () => {
+    // A manifest kept in a subdir points its session at the repo root via "..".
+    const sub = makeDir("relcwd", `
+[sessions.svc]
+command = "cat"
+cwd = ".."
+`);
+    // sub is <testRoot>/relcwd-XX.../ ; ".." resolves to <testRoot>/relcwd-XX...'s parent.
+    expect(readPtyFile(sub).sessions[0].cwd).toBe(path.resolve(sub, ".."));
+  });
+
+  it("resolves '.' to the manifest directory (the default behavior, made explicit)", () => {
+    const dir = makeDir("dotcwd", `
+[sessions.svc]
+command = "cat"
+cwd = "."
+`);
+    expect(readPtyFile(dir).sessions[0].cwd).toBe(path.resolve(dir));
+  });
+
+  it("rejects a non-string cwd", () => {
+    const dir = makeDir("badcwd", `
+[sessions.bad]
+command = "cat"
+cwd = 42
+`);
+    expect(() => readPtyFile(dir)).toThrow(/"cwd" must be a non-empty string/);
+  });
+
+  it("rejects an empty-string cwd", () => {
+    const dir = makeDir("emptycwd", `
+[sessions.bad]
+command = "cat"
+cwd = ""
+`);
+    expect(() => readPtyFile(dir)).toThrow(/"cwd" must be a non-empty string/);
+  });
+});
+
 describe("commandWithEnvExports", () => {
   it("returns the bare command when env is absent", () => {
     expect(commandWithEnvExports({

@@ -381,6 +381,45 @@ command = "cat"
     expect(session.cwd).toBe(projDir);
   }, 15000);
 
+  it("honors an explicit absolute cwd field (runs there, not in the manifest dir)", () => {
+    const projDir = makeProjectDir();
+    const runDir = makeProjectDir(); // where the session should actually run
+    const sessDir = makeSessionDir();
+    writePtyToml(projDir, `
+[sessions.elsewhere]
+command = "cat"
+cwd = "${runDir}"
+`);
+
+    runCli(sessDir, "up", projDir);
+
+    const session = listJson(sessDir).find((s: any) => s.displayName === "elsewhere");
+    expect(session).toBeDefined();
+    expect(session.cwd).toBe(runDir);      // explicit cwd wins
+    expect(session.cwd).not.toBe(projDir); // NOT the manifest dir
+  }, 15000);
+
+  it("resolves a relative cwd against the manifest dir (the .convoy/pty.toml case)", () => {
+    // Manifest kept in <project>/.convoy/pty.toml; the session should run in the
+    // project root via cwd = "..", NOT in .convoy/. This is the convoy layout.
+    const projDir = makeProjectDir();
+    const convoyDir = path.join(projDir, ".convoy");
+    fs.mkdirSync(convoyDir, { recursive: true });
+    fs.writeFileSync(path.join(convoyDir, "pty.toml"), `
+[sessions.rooted]
+command = "cat"
+cwd = ".."
+`);
+    const sessDir = makeSessionDir();
+
+    runCli(sessDir, "up", convoyDir);
+
+    const session = listJson(sessDir).find((s: any) => s.displayName === "rooted");
+    expect(session).toBeDefined();
+    expect(session.cwd).toBe(projDir);       // resolved to the repo root
+    expect(session.cwd).not.toBe(convoyDir); // NOT the manifest (.convoy) dir
+  }, 15000);
+
   it("uses prefix for session names", () => {
     const projDir = makeProjectDir();
     const sessDir = makeSessionDir();

@@ -3186,7 +3186,7 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
         command: "/bin/sh",
         args: ["-c", commandWithEnvExports(sess)],
         displayCommand: sess.command,
-        cwd: ptyFile.dir,
+        cwd: sess.cwd ?? ptyFile.dir,
         tags: tomlTags,
         displayName: sess.displayName,
       });

@@ -935,7 +935,7 @@ async function respawnPermanent(
         command = "/bin/sh";
         args = ["-c", commandWithEnvExports(sessDef)];
         displayCommand = sessDef.command;
-        cwd = ptyFile.dir;
+        cwd = sessDef.cwd ?? ptyFile.dir;
         tags = {
           ...sessDef.tags,
           ptyfile: ptyfilePath,
