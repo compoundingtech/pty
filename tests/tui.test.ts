@@ -707,6 +707,46 @@ describe("interactive TUI", () => {
   );
 
   it(
+    "kitty keyboard protocol: CSI-u escape clears filter, then quits",
+    async () => {
+      // Regression (Nathan): in kitty with the keyboard protocol active, Escape
+      // arrives as `CSI 27 u` (`\x1b[27u`) — or `\x1b[27;1u` with an explicit
+      // no-mods param — NOT a bare `\x1b`. The input parser must decode both to
+      // a named "escape" event, else the two-stage esc (clear filter / quit)
+      // silently does nothing. The bare-`\x1b` path is covered above; this locks
+      // the kitty CSI-u encodings.
+      const sessionDir = makeSessionDir();
+      const tui = createTuiSession(sessionDir);
+      await tui.waitForText("Create new session...", 10000);
+
+      // --- form without modifiers: `\x1b[27u` ---
+      tui.type("abc");
+      await new Promise((r) => setTimeout(r, 200));
+      expect(tui.screenshot().text).toContain("abc");
+
+      tui.type("\x1b[27u"); // kitty Escape, mods omitted
+      await new Promise((r) => setTimeout(r, 200));
+      expect(tui.screenshot().text).toContain("Create new session..."); // filter cleared
+      expect(tui.screenshot().text).not.toContain("abc");
+
+      // --- form with explicit no-mods param: `\x1b[27;1u` ---
+      tui.type("xyz");
+      await new Promise((r) => setTimeout(r, 200));
+      expect(tui.screenshot().text).toContain("xyz");
+
+      tui.type("\x1b[27;1u"); // kitty Escape, modifiers=1 (none)
+      await new Promise((r) => setTimeout(r, 200));
+      expect(tui.screenshot().text).toContain("Create new session..."); // filter cleared
+
+      // --- second escape (no filter) quits ---
+      tui.type("\x1b[27u");
+      await new Promise((r) => setTimeout(r, 500));
+      expect(tui.screenshot().text).not.toContain("Create new session...");
+    },
+    15000
+  );
+
+  it(
     "multiple attach/detach cycles work without breaking input",
     async () => {
       const sessionDir = makeSessionDir();

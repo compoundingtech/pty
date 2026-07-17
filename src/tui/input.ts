@@ -29,6 +29,20 @@ export interface MouseEvent {
 
 export type InputEvent = KeyEvent | MouseEvent;
 
+// Kitty keyboard-protocol codepoints that must decode to a NAMED key event
+// (`{ name: "escape" }`) rather than the raw control char (`{ name: "\x1b" }`),
+// so consumers matching `key.name === "escape"` / "return" / … work the same
+// under CSI-u as under the legacy encoding. Mirrors the legacy bare-key parsing
+// below (0x1b→escape, 0x0d→return, 0x09→tab, 0x7f→backspace) and the inverse
+// of `CSI_U_KEYCODES` in keys.ts. Space (0x20) is intentionally absent — it
+// decodes to a printable " " char via the default path, which types correctly.
+const KITTY_CODEPOINT_NAMES: Record<number, string> = {
+  27: "escape",
+  13: "return",
+  9: "tab",
+  127: "backspace",
+};
+
 /** Type guard: narrows an InputEvent to a MouseEvent. */
 export function isMouseEvent(e: InputEvent): e is MouseEvent {
   return (e as MouseEvent).kind === "mouse";
@@ -153,13 +167,17 @@ export function parseInput(data: Buffer): InputEvent[] {
         // Page Down: ESC[6~
         if (rest.startsWith("6~")) { events.push({ name: "pagedown", ctrl: false, alt: false, shift: false }); i += 4; continue; }
 
-        // Kitty keyboard protocol: ESC[<code>;<modifiers>u
-        const kittyMatch = rest.match(/^(\d+);(\d+)u/);
+        // Kitty keyboard protocol: ESC[<code>[;<modifiers>]u. The modifiers
+        // param is OPTIONAL — kitty OMITS it when no modifiers are held, so a
+        // bare Escape arrives as `ESC[27u` (not `ESC[27;1u`). Requiring the `;`
+        // made that form fall through to the "unknown CSI" skip below and the
+        // key was silently lost (the two-stage esc "did nothing" bug).
+        const kittyMatch = rest.match(/^(\d+)(?:;(\d+))?u/);
         if (kittyMatch) {
           const codepoint = parseInt(kittyMatch[1], 10);
-          // Wire format is (modifiers + 1); subtract to get the bitmask.
+          // Wire format is (modifiers + 1); absent = 1 (no modifiers).
           // Bit 0 = shift, bit 1 = alt, bit 2 = ctrl, bit 3 = super (ignored).
-          const mods = parseInt(kittyMatch[2], 10) - 1;
+          const mods = (kittyMatch[2] ? parseInt(kittyMatch[2], 10) : 1) - 1;
           const shift = (mods & 0x01) !== 0;
           const alt = (mods & 0x02) !== 0;
           const ctrl = (mods & 0x04) !== 0;
@@ -167,6 +185,10 @@ export function parseInput(data: Buffer): InputEvent[] {
           // can handle it the same as the legacy ESC[Z encoding.
           if (codepoint === 0x09 && shift) {
             events.push({ name: "backtab", ctrl, alt, shift });
+          } else if (KITTY_CODEPOINT_NAMES[codepoint]) {
+            // Escape / return / tab / backspace must decode to their NAMED event
+            // (consumers match key.name), not the raw control char.
+            events.push({ name: KITTY_CODEPOINT_NAMES[codepoint], ctrl, alt, shift });
           } else {
             const ch = String.fromCodePoint(codepoint);
             events.push({ name: ch, char: ch, ctrl, alt, shift });
