@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0
+
+### `pty.toml` — per-session `cwd` field
+
+- Sessions in a `pty.toml` accept an optional `cwd = "..."` setting the working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the unchanged default).
+- Decouples where a session runs from where its `pty.toml` lives: a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can run its sessions in the repo root via `cwd = ".."`. Honored on the initial `pty up` and preserved across `strategy=permanent` respawns (`respawnPermanent` no longer forces `cwd` to the manifest's directory when the session declares one).
+- `PtySessionDef` on `@myobie/pty/client` gains an optional `cwd?: string` (resolved absolute).
+
 ## 0.11.0
 
 ### `@myobie/pty/tui` — `text()` accepts an object form `{ fg, bold, ... }`

@@ -18,6 +18,12 @@ export interface PtySessionDef {
    *  generates a random short id at spawn time. */
   id: string | null;
   command: string;
+  /** Optional working directory, from `cwd = "..."` in the toml. Absolute paths
+   *  are used as-is; relative paths resolve against the manifest's directory.
+   *  When unset, the session's cwd defaults to the manifest directory — so a
+   *  manifest kept in a subdir (e.g. `.convoy/pty.toml`) can still run its
+   *  sessions in the repo root via `cwd = ".."`. */
+  cwd?: string;
   tags?: Record<string, string>;
   env?: Record<string, string>;
 }
@@ -104,7 +110,18 @@ export function readPtyFile(dir?: string): PtyFile {
         }
       }
 
-      sessions.push({ displayName, shortName: rawName, id, command: d.command, tags, env });
+      // Optional `cwd` — the session's working directory. Absolute stays
+      // absolute; relative resolves against the manifest's dir. Lets a manifest
+      // live in a subdir (`.convoy/pty.toml`) while its sessions run elsewhere.
+      let cwd: string | undefined;
+      if (d.cwd !== undefined) {
+        if (typeof d.cwd !== "string" || d.cwd.length === 0) {
+          throw new Error(`Session "${defaultDisplayName}" in ${filePath}: "cwd" must be a non-empty string`);
+        }
+        cwd = path.resolve(resolvedDir, d.cwd);
+      }
+
+      sessions.push({ displayName, shortName: rawName, id, command: d.command, cwd, tags, env });
     }
   }
 
