@@ -16,6 +16,8 @@ import {
   encodeScreen,
   encodeStatusResponse,
   decodeSize,
+  decodeAttachFlags,
+  ATTACH_FLAG_GEOMETRY_NEUTRAL,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -37,6 +39,7 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  geometryNeutral: boolean;
 }
 
 export interface ServerOptions {
@@ -583,6 +586,7 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      geometryNeutral: false,
     };
     this.clients.set(socket, client);
 
@@ -602,6 +606,8 @@ export class PtyServer {
           case MessageType.ATTACH: {
             if (packet.payload.length < 4) break;
             const size = decodeSize(packet.payload);
+            client.geometryNeutral =
+              (decodeAttachFlags(packet.payload) & ATTACH_FLAG_GEOMETRY_NEUTRAL) !== 0;
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
@@ -634,7 +640,9 @@ export class PtyServer {
                 // drew (e.g., background fills in ratatui). Nudge the child
                 // with a SIGWINCH so it does a fresh full redraw, whose DATA
                 // overwrites any serialize artifacts on the client.
-                this.nudgeRedraw();
+                // A geometry-neutral viewer accepts the serialized snapshot as
+                // is: nudging would perturb the shared child it came to observe.
+                if (!client.geometryNeutral) this.nudgeRedraw();
               }
             };
 
@@ -746,9 +754,13 @@ export class PtyServer {
 
     let attached = 0;
     let readOnly = 0;
+    let geometryNeutral = 0;
     for (const c of this.clients.values()) {
       if (c.readonly) readOnly++;
-      else if (c.attachSeq > 0) attached++;
+      else if (c.attachSeq > 0) {
+        attached++;
+        if (c.geometryNeutral) geometryNeutral++;
+      }
     }
 
     const createdAt = meta?.createdAt ?? null;
@@ -783,6 +795,10 @@ export class PtyServer {
         total: attached + readOnly,
         attached,
         readOnly,
+        geometryNeutral,
+      },
+      capabilities: {
+        geometryNeutralAttach: true,
       },
       modes: {
         sgrMouse: this.sgrMouseMode,
@@ -802,7 +818,7 @@ export class PtyServer {
     let cols = 0;
 
     for (const client of this.clients.values()) {
-      if (!client.readonly && client.attachSeq > 0) {
+      if (!client.readonly && client.attachSeq > 0 && !client.geometryNeutral) {
         rows = rows === 0 ? client.rows : Math.min(rows, client.rows);
         cols = cols === 0 ? client.cols : Math.min(cols, client.cols);
       }

@@ -70,6 +70,7 @@ pty list --filter-tag role=web            # show only sessions with matching tag
 
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
+pty attach --no-resize myserver           # interactive viewer; preserve shared PTY geometry
 pty exec -- codex                         # replace this session's process (inside a session)
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)

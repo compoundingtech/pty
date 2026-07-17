@@ -29,7 +29,7 @@ _pty() {
   case "${COMP_WORDS[1]}" in
     attach|a)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "-r --force" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-r --no-resize --force" -- "${cur}"))
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi

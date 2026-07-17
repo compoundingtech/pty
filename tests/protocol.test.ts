@@ -14,6 +14,8 @@ import {
   encodeStatus,
   encodeStatusResponse,
   decodeSize,
+  decodeAttachFlags,
+  ATTACH_FLAG_GEOMETRY_NEUTRAL,
   decodeExit,
 } from "../src/protocol.ts";
 import { Buffer } from "node:buffer";
@@ -41,6 +43,20 @@ describe("protocol", () => {
       const size = decodeSize(packets[0].payload);
       expect(size.rows).toBe(24);
       expect(size.cols).toBe(80);
+    });
+
+    it("keeps legacy ATTACH byte-identical and appends neutral geometry as a flag", () => {
+      const legacy = encodeAttach(24, 80);
+      expect(legacy).toEqual(
+        encodePacket(MessageType.ATTACH, Buffer.from([0, 24, 0, 80])),
+      );
+
+      const reader = new PacketReader();
+      const [neutral] = reader.feed(encodeAttach(24, 80, true));
+      expect(neutral.payload).toEqual(Buffer.from([0, 24, 0, 80, 1]));
+      expect(decodeSize(neutral.payload)).toEqual({ rows: 24, cols: 80 });
+      expect(decodeAttachFlags(neutral.payload) & ATTACH_FLAG_GEOMETRY_NEUTRAL).toBe(1);
+      expect(decodeAttachFlags(Buffer.from([0, 24, 0, 80]))).toBe(0);
     });
 
     it("round-trips a DETACH packet", () => {

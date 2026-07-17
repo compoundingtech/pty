@@ -58,6 +58,7 @@ _pty() {
         attach|a)
           _arguments \
             '-r[Auto-restart if the session is exited]' \
+            '--no-resize[Preserve shared PTY geometry]' \
             '--force[Attach even from inside another pty]' \
             '1:session:_pty_sessions'
           ;;
