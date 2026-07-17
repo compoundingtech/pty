@@ -16,6 +16,14 @@ const HEAVY_PTY_TESTS = [
   "tests/remote-fabric.test.ts",
   "tests/remote-reconnect.test.ts",
   "tests/remote-exec-bridge.test.ts",
+  // Real-IO / real-daemon timing tests that TIME OUT (5s default) under sustained
+  // parallel load — they spawn daemons / do heavy event-log IO / drive a TUI and
+  // pass in isolation but flake when the box is CPU-starved (many parallel PTY
+  // spawns + a busy host). Same "green in isolation, red under load" class as the
+  // rest of this list; serialize them so at most one runs at a time.
+  "tests/events.test.ts",
+  "tests/display-name.test.ts",
+  "demos/reminders/reminders-integration.test.ts",
 ];
 
 // Runs once per worker before any test module — scrubs ambient
