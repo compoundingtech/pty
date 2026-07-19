@@ -127,3 +127,8 @@ export {
   type BreadCrumbItem, type BreadCrumbInput, type BreadCrumbsOptions,
   breadCrumbs,
 } from "./breadcrumbs.ts";
+
+export {
+  type BarOptions,
+  barProgress, barLoader,
+} from "./progress-bars.ts";

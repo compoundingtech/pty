@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `barProgress` / `barLoader` SRCL-style progress bars
+
+- New `barProgress(percent, opts)` (a light `░` texture fill on a subtle track, SRCL's `BarProgress`) and `barLoader(percent, opts)` (a solid `█` fill, SRCL's `BarLoader`). `width`, fill `color`, and track `background` are configurable; percent clamps to 0–100. Each returns a `TextNode` (fill glyphs + spaces for the track) — distinct from, and leaving untouched, the framework's existing node-based `progressBar()`.
+
 ### `@myobie/pty/tui` — `breadCrumbs` SRCL-style breadcrumb trail
 
 - New `breadCrumbs(items, opts)` widget renders a breadcrumb trail (mirroring SRCL's `BreadCrumbs`): item labels joined by a ` ❯ ` separator. Accepts bare strings or `{ label }` items. The last (current) crumb is emphasized with the accent color + bold (`emphasizeLast`, default true); an optional `chips` mode puts each crumb on a muted fill like SRCL; the `separator` is configurable. Returns a `RowNode` of semantic-token-styled `TextNode`s. Maps to the network → host → agent drill-path.
