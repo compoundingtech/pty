@@ -2,6 +2,11 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `ptyPane` first-class live-session widget
+
+- New `renderPtyPane(buf, rect, handle, opts)` widget renders a live pty session into a `CellBuffer` region: border/title chrome with a focus color, scrollback (`scrollOffset`), a palette-index-preserving cell blit (unlike the base `ptyView` node, which flattens indexed colors to RGB and loses the outer terminal's theme), selection highlighting, cursor-with-scroll reporting (returns the on-screen 1-based cursor position, or `null` when the pane is unfocused or the cursor is scrolled off-screen), and a per-handle cell cache. Helpers `ptyPaneInnerRect`, `ptyPaneCursorRow`, `isSelectedInPane`, and `clearPtyPaneCache` are exported alongside it.
+- Generalizes the single-pane render path pty-layout grew into a reusable widget the framework owns; multi-pane tiling stays the host's job.
+
 ### Geometry-neutral interactive attach
 
 - `pty attach --no-resize <ref>` receives the live screen and forwards input without contributing its terminal dimensions to the shared PTY's min-wins size negotiation. It also suppresses the attach-time redraw `SIGWINCH` nudge. This supports embedded interactive viewers whose stdio is piped (and would otherwise report the 80x24 fallback) while leaving ordinary multi-viewer behavior unchanged. The CLI refuses the flag against a daemon that does not advertise `capabilities.geometryNeutralAttach`, rather than silently degrading.

@@ -111,3 +111,9 @@ export {
   type BarChartItem, type BarChartOptions,
   barChart,
 } from "./bar-chart.ts";
+
+export {
+  type PtyPaneOptions, type PtyPaneResult, type PtyPaneSelection,
+  renderPtyPane, ptyPaneInnerRect, effectiveCursorRow as ptyPaneCursorRow,
+  isSelectedInPane, clearPtyPaneCache,
+} from "./pty-pane.ts";
