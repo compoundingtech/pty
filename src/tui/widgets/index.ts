@@ -142,3 +142,13 @@ export {
   type ActionListItemOptions,
   actionListItem,
 } from "./action-list-item.ts";
+
+export {
+  type CodeBlockOptions,
+  codeBlock,
+} from "./code-block.ts";
+
+export {
+  type MessageOptions,
+  message,
+} from "./message.ts";
