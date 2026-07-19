@@ -82,6 +82,13 @@ export { layoutRoot, layoutVertical, layoutRow, layoutPanel, textWidth } from ".
 // Renderer
 export { renderToAnsi, resolveColor, type RenderOpts } from "./renderer.ts";
 
+// Design tokens — the single source for semantic-color resolution + a
+// framework-neutral serializer (the foundation for the same palette on web).
+export {
+  SEMANTIC_SLOTS, resolveSemantic, semanticColorNames, themeTokens,
+  type Rgb,
+} from "./tokens.ts";
+
 // Screen wrapper
 export { screen, overlay, type DeclarativeScreenConfig, type OverlayConfig } from "./screen.ts";
 
