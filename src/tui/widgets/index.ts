@@ -132,3 +132,13 @@ export {
   type BarOptions,
   barProgress, barLoader,
 } from "./progress-bars.ts";
+
+export {
+  type AccordionOptions,
+  accordion,
+} from "./accordion.ts";
+
+export {
+  type ActionListItemOptions,
+  actionListItem,
+} from "./action-list-item.ts";
