@@ -122,3 +122,13 @@ export {
   type BadgeVariant, type BadgeOptions,
   badge,
 } from "./badge.ts";
+
+export {
+  type BreadCrumbItem, type BreadCrumbInput, type BreadCrumbsOptions,
+  breadCrumbs,
+} from "./breadcrumbs.ts";
+
+export {
+  type BarOptions,
+  barProgress, barLoader,
+} from "./progress-bars.ts";
