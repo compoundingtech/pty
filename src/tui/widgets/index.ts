@@ -152,3 +152,8 @@ export {
   type MessageOptions,
   message,
 } from "./message.ts";
+
+export {
+  type SelectState, type SelectOptions, type HandleSelectKeyResult,
+  createSelectState, renderSelect, handleSelectKey,
+} from "./select.ts";

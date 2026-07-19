@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `select` SRCL-style dropdown
+
+- `renderSelect(options, selectedIndex, state, opts)` + `handleSelectKey(state, len, key)` + `createSelectState()` — a state-first dropdown (SRCL's `Select`): a caret + value button that opens an option list; Up/Down move the highlight, Enter commits, Escape closes. Caller owns the open/highlight state and the chosen index; renders with existing nodes (no renderer surgery). ComboBox (search + filter + pick) remains served by the existing `command-palette` widget.
+
 ### `@myobie/pty/tui` — `codeBlock` / `message` SRCL-style components
 
 - `codeBlock(code, opts)` — a numbered code/log block (SRCL's `CodeBlock`): one row per line with a right-aligned line-number gutter, an optional per-line `highlight` callback for syntax coloring, and `startLine` / `showLineNumbers` / `gutterColor`. Returns a `ColumnNode`. For logs, diffs, agent output.
