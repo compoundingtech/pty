@@ -117,3 +117,8 @@ export {
   renderPtyPane, ptyPaneInnerRect, effectiveCursorRow as ptyPaneCursorRow,
   isSelectedInPane, clearPtyPaneCache,
 } from "./pty-pane.ts";
+
+export {
+  type BadgeVariant, type BadgeOptions,
+  badge,
+} from "./badge.ts";

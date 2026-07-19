@@ -7,6 +7,10 @@
 - New `renderPtyPane(buf, rect, handle, opts)` widget renders a live pty session into a `CellBuffer` region: border/title chrome with a focus color, scrollback (`scrollOffset`), a palette-index-preserving cell blit (unlike the base `ptyView` node, which flattens indexed colors to RGB and loses the outer terminal's theme), selection highlighting, cursor-with-scroll reporting (returns the on-screen 1-based cursor position, or `null` when the pane is unfocused or the cursor is scrolled off-screen), and a per-handle cell cache. Helpers `ptyPaneInnerRect`, `ptyPaneCursorRow`, `isSelectedInPane`, and `clearPtyPaneCache` are exported alongside it.
 - Generalizes the single-pane render path pty-layout grew into a reusable widget the framework owns; multi-pane tiling stays the host's job.
 
+### `@myobie/pty/tui` — `badge` SRCL-style status chip
+
+- New `badge(label, opts)` widget renders a small SRCL-style chip: an uppercase, padded label on a muted fill (mirroring SRCL's `Badge` — `text-transform: uppercase`, `padding: 0 1ch`, filled background). Status `variant`s (`neutral | ok | warn | error | accent | info`) color the label, or fill the chip when `solid: true`. `uppercase` and `bold` are configurable. Returns a `TextNode` styled with semantic color tokens only (no terminal-only escapes), so the same call can render under a non-terminal backend.
+
 ### Geometry-neutral interactive attach
 
 - `pty attach --no-resize <ref>` receives the live screen and forwards input without contributing its terminal dimensions to the shared PTY's min-wins size negotiation. It also suppresses the attach-time redraw `SIGWINCH` nudge. This supports embedded interactive viewers whose stdio is piped (and would otherwise report the 80x24 fallback) while leaving ordinary multi-viewer behavior unchanged. The CLI refuses the flag against a daemon that does not advertise `capabilities.geometryNeutralAttach`, rather than silently degrading.
