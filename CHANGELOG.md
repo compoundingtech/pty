@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — semantic design-token layer (`tokens.ts`)
+
+- New `tokens` module is the single source of truth for semantic-color resolution: `SEMANTIC_SLOTS` (the one `SemanticColor`→theme-slot map), `resolveSemantic(color, theme)` (the canonical resolution `renderer.resolveColor` now delegates to — no behavior change), `semanticColorNames()`, and `themeTokens(theme)` — a serializer that emits a theme's tokens as a framework-neutral name→RGB map (e.g. for CSS custom properties), the foundation for driving the same palette on web as in the terminal. It's a leaf module (no dependency on the ANSI/render code), so the token vocabulary can be resolved and serialized without pulling in terminal rendering.
+
 ### `@myobie/pty/tui` — `select` SRCL-style dropdown
 
 - `renderSelect(options, selectedIndex, state, opts)` + `handleSelectKey(state, len, key)` + `createSelectState()` — a state-first dropdown (SRCL's `Select`): a caret + value button that opens an option list; Up/Down move the highlight, Enter commits, Escape closes. Caller owns the open/highlight state and the chosen index; renders with existing nodes (no renderer surgery). ComboBox (search + filter + pick) remains served by the existing `command-palette` widget.

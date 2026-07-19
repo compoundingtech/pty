@@ -15,6 +15,7 @@ import {
   boxChars,
 } from "./colors.ts";
 import { textWidth } from "./layout.ts";
+import { resolveSemantic } from "./tokens.ts";
 
 // --- Render options passed from screen wrapper ---
 
@@ -27,20 +28,9 @@ export interface RenderOpts {
 // --- Semantic color resolution ---
 
 export function resolveColor(color: Color | undefined, theme: Theme): [number, number, number] | null {
-  if (!color) return null;
-  if (Array.isArray(color)) return color;
-  switch (color) {
-    case "primary": return theme.fg1;
-    case "secondary": return theme.fg2;
-    case "accent": return theme.fgAc;
-    case "muted": return theme.fgMu;
-    case "ok": return theme.ok;
-    case "warn": return theme.warn;
-    case "error": return theme.err;
-    case "info": return theme.info;
-    case "border": return theme.border;
-    default: return null;
-  }
+  // Delegates to the canonical semantic-token resolution in tokens.ts so
+  // the name→slot mapping has a single source of truth.
+  return resolveSemantic(color, theme);
 }
 
 function fgColor(rgb: [number, number, number] | null): string {
