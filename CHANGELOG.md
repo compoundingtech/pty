@@ -2,6 +2,12 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `codeBlock` / `message` SRCL-style components
+
+- `codeBlock(code, opts)` — a numbered code/log block (SRCL's `CodeBlock`): one row per line with a right-aligned line-number gutter, an optional per-line `highlight` callback for syntax coloring, and `startLine` / `showLineNumbers` / `gutterColor`. Returns a `ColumnNode`. For logs, diffs, agent output.
+- `message(content, opts)` — a chat/bus message bubble (SRCL's `Message` + `MessageViewer`): a padded bubble on a direction-colored fill — incoming (muted, left) or `outgoing` (accent, right, = MessageViewer) — with an optional `from` label. Maps to the bus/inbox view. Returns a `ColumnNode`.
+- Both pure builders, semantic tokens only.
+
 ### `@myobie/pty/tui` — `accordion` / `actionListItem` SRCL-style components
 
 - `accordion(title, expanded, children, opts)` — a collapsible disclosure section (SRCL's `Accordion`): a `▸`/`▾` header that shows indented content when expanded. State-first (the caller owns `expanded`), returns a `ColumnNode`.
