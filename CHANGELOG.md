@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `breadCrumbs` SRCL-style breadcrumb trail
+
+- New `breadCrumbs(items, opts)` widget renders a breadcrumb trail (mirroring SRCL's `BreadCrumbs`): item labels joined by a ` ❯ ` separator. Accepts bare strings or `{ label }` items. The last (current) crumb is emphasized with the accent color + bold (`emphasizeLast`, default true); an optional `chips` mode puts each crumb on a muted fill like SRCL; the `separator` is configurable. Returns a `RowNode` of semantic-token-styled `TextNode`s. Maps to the network → host → agent drill-path.
+
 ### `@myobie/pty/tui` — `ptyPane` first-class live-session widget
 
 - New `renderPtyPane(buf, rect, handle, opts)` widget renders a live pty session into a `CellBuffer` region: border/title chrome with a focus color, scrollback (`scrollOffset`), a palette-index-preserving cell blit (unlike the base `ptyView` node, which flattens indexed colors to RGB and loses the outer terminal's theme), selection highlighting, cursor-with-scroll reporting (returns the on-screen 1-based cursor position, or `null` when the pane is unfocused or the cursor is scrolled off-screen), and a per-handle cell cache. Helpers `ptyPaneInnerRect`, `ptyPaneCursorRow`, `isSelectedInPane`, and `clearPtyPaneCache` are exported alongside it.
