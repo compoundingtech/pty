@@ -2,6 +2,12 @@
 
 ## 0.12.0
 
+### `@myobie/pty/tui` — `accordion` / `actionListItem` SRCL-style components
+
+- `accordion(title, expanded, children, opts)` — a collapsible disclosure section (SRCL's `Accordion`): a `▸`/`▾` header that shows indented content when expanded. State-first (the caller owns `expanded`), returns a `ColumnNode`.
+- `actionListItem(label, opts)` — a selectable action row (SRCL's `ActionListItem`): a 3-cell icon chip (accent-highlighted when `focused`) + label, with optional right-aligned text. Drops into a `selectable`/`virtual-list` for the agent/session roster. Returns a `RowNode`.
+- Both are pure builders styled with semantic tokens only.
+
 ### `@myobie/pty/tui` — `barProgress` / `barLoader` SRCL-style progress bars
 
 - New `barProgress(percent, opts)` (a light `░` texture fill on a subtle track, SRCL's `BarProgress`) and `barLoader(percent, opts)` (a solid `█` fill, SRCL's `BarLoader`). `width`, fill `color`, and track `background` are configurable; percent clamps to 0–100. Each returns a `TextNode` (fill glyphs + spaces for the track) — distinct from, and leaving untouched, the framework's existing node-based `progressBar()`.
