@@ -157,15 +157,15 @@ describe("pty gc --print-launchd-plist per-root Label + logPath", () => {
   it("default root keeps the legacy Label (backwards compat)", () => {
     // No PTY_ROOT / PTY_SESSION_DIR — resolves to DEFAULT_SESSION_DIR.
     const plist = plistFor({});
-    expect(plist).toContain("<string>com.myobie.pty.gc</string>");
-    expect(plist).not.toContain("<string>com.myobie.pty.gc.");
+    expect(plist).toContain("<string>com.compoundingtech.pty.gc</string>");
+    expect(plist).not.toContain("<string>com.compoundingtech.pty.gc.");
   });
 
   it("non-default root gets a suffixed Label (basename of root)", () => {
     const dir = path.join(testRoot, "my-network");
     fs.mkdirSync(dir, { recursive: true });
     const plist = plistFor({ PTY_ROOT: dir });
-    expect(plist).toContain("<string>com.myobie.pty.gc.my-network</string>");
+    expect(plist).toContain("<string>com.compoundingtech.pty.gc.my-network</string>");
   });
 
   it("non-default root's logPath lives inside that root", () => {
@@ -190,7 +190,7 @@ describe("pty gc --print-launchd-plist per-root Label + logPath", () => {
     fs.mkdirSync(dir, { recursive: true });
     const plist = plistFor({ PTY_ROOT: dir });
     // Spaces collapse to a single hyphen; label stays reverse-DNS-safe.
-    expect(plist).toContain("<string>com.myobie.pty.gc.weird-name-with-spaces</string>");
+    expect(plist).toContain("<string>com.compoundingtech.pty.gc.weird-name-with-spaces</string>");
   });
 });
 

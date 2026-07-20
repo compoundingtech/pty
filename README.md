@@ -9,7 +9,7 @@ Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless)
 ## Install
 
 ```sh
-npm install -g @myobie/pty
+npm install -g @compoundingtech/pty
 ```
 
 Or install with Nix — see [nix.md](nix.md).
@@ -103,7 +103,7 @@ pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # reconcile sessions: kill orphan children, respawn permanents, sweep exited
 pty gc --dry-run                          # preview what gc would do without changing anything
-pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist   # install macOS auto-gc
+pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist   # install macOS auto-gc
 pty tag myserver role=web env=prod        # set one or more tags on a session
 pty tag myserver --rm role --rm env       # remove one or more tags
 pty tag-multi --filter-tag role=web env=prod    # bulk write across matching sessions
@@ -185,7 +185,7 @@ pty --root /var/lib/pty-eval list           # one-off scope for this invocation
 PTY_ROOT=/var/lib/pty-eval pty list         # scope for a whole shell / process tree
 ```
 
-Distinct roots share no sockets, no metadata, no events, no gc. A launchd cron (`pty gc --print-launchd-plist`) inherits the current `$PTY_ROOT` and bakes a per-root Label (`com.myobie.pty.gc.<basename>`) plus per-root log path, so N isolated registries can each install their own gc plist without collision. On the default root the Label stays `com.myobie.pty.gc` — existing installs survive an upgrade unchanged.
+Distinct roots share no sockets, no metadata, no events, no gc. A launchd cron (`pty gc --print-launchd-plist`) inherits the current `$PTY_ROOT` and bakes a per-root Label (`com.compoundingtech.pty.gc.<basename>`) plus per-root log path, so N isolated registries can each install their own gc plist without collision. On the default root the Label stays `com.compoundingtech.pty.gc` — existing installs survive an upgrade unchanged.
 
 `PTY_SESSION_DIR` (the pre-Phase-2 name for the same env var) still works and emits a one-time deprecation notice. Set `PTY_ROOT_LEGACY_SILENT=1` to suppress the notice while migrating.
 
@@ -300,8 +300,8 @@ Cycles (A→B, B→A) resolve deterministically by name-sorted iteration: whiche
 `pty gc` is a one-shot reconciliation pass. The intended deployment is to run it on a short interval so permanent sessions come back quickly and orphans get cleaned promptly. The CLI ships an install helper for macOS:
 
 ```sh
-pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist
-launchctl load ~/Library/LaunchAgents/com.myobie.pty.gc.plist
+pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist
+launchctl load ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist
 ```
 
 Default interval is 30 seconds; tune with `pty gc --print-launchd-plist --interval=15` etc. Output goes to `~/.local/state/pty/gc.log`.
@@ -322,7 +322,7 @@ Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-f
 
 ## Client API
 
-@myobie/pty exposes a programmatic TypeScript API for building apps on top of pty sessions. Import from `@myobie/pty/client`.
+@compoundingtech/pty exposes a programmatic TypeScript API for building apps on top of pty sessions. Import from `@compoundingtech/pty/client`.
 
 ```typescript
 import {
@@ -330,10 +330,10 @@ import {
   SessionConnection, sendData, peekScreen, queryStats,
   EventFollower, readRecentEvents,
   extractFilterTags, matchesAllTags,
-} from "@myobie/pty/client";
-import { PtyServer } from "@myobie/pty/server";         // native addon (node-pty)
-import { resolveKey } from "@myobie/pty/keys";           // browser-safe
-import { PacketReader, MessageType } from "@myobie/pty/protocol"; // browser-safe
+} from "@compoundingtech/pty/client";
+import { PtyServer } from "@compoundingtech/pty/server";         // native addon (node-pty)
+import { resolveKey } from "@compoundingtech/pty/keys";           // browser-safe
+import { PacketReader, MessageType } from "@compoundingtech/pty/protocol"; // browser-safe
 ```
 
 ### Managing sessions
@@ -393,10 +393,10 @@ See **[docs/client.md](docs/client.md)** for the full API reference.
 
 ## Testing Library
 
-@myobie/pty includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.
+@compoundingtech/pty includes a terminal testing library — like Playwright, but for the terminal. Spawn any process in a real PTY, send keystrokes, take screenshots, assert on visible output.
 
 ```typescript
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("node", ["--experimental-strip-types", "my-app.ts"]);
 await session.waitForText("Ready");
@@ -420,7 +420,7 @@ See **[docs/testing.md](docs/testing.md)** for the full API reference, key names
 
 ## TUI Framework (alpha)
 
-@myobie/pty also includes an experimental declarative TUI framework for building terminal interfaces with reactive signals, layout, and efficient cell-buffer diffing. Import from `@myobie/pty/tui`.
+@compoundingtech/pty also includes an experimental declarative TUI framework for building terminal interfaces with reactive signals, layout, and efficient cell-buffer diffing. Import from `@compoundingtech/pty/tui`.
 
 > **Alpha** — the TUI framework API is unstable and will change. Use it for experiments, not production.
 

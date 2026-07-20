@@ -1,4 +1,4 @@
-# @myobie/pty/testing
+# @compoundingtech/pty/testing
 
 A terminal testing library — like Playwright, but for the terminal.
 
@@ -9,19 +9,19 @@ shell sessions, and simple command output.
 ## Install
 
 ```sh
-npm install @myobie/pty
+npm install @compoundingtech/pty
 ```
 
-Import from `@myobie/pty/testing`:
+Import from `@compoundingtech/pty/testing`:
 
 ```typescript
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 ```
 
 ## Quick Start
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("echo", ["hello world"]);
 const ss = await session.waitForText("hello world");
@@ -45,7 +45,7 @@ const session = Session.spawn(command, args?, opts?)
 - `env` — extra environment variables (merged with `process.env`)
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "echo 'spawned!'; sleep 1"]);
 const ss = await session.waitForText("spawned!");
@@ -69,7 +69,7 @@ const session = await Session.server(command, args?, opts?)
 After creating, call `session.attach()` to start receiving output:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = await Session.server("sh", ["-c", "echo 'served!'; sleep 30"]);
 await session.attach();
@@ -85,7 +85,7 @@ await session.close();
 Send raw keystrokes:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("cat");
 session.sendKeys("hello\n");
@@ -99,7 +99,7 @@ await session.close();
 Send a named key. Supports modifiers with `+`:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("cat");
 session.sendKeys("test line\n");
@@ -113,7 +113,7 @@ await session.close();
 Alias for `sendKeys()` — sends text character by character:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("cat");
 session.type("typed text\n");
@@ -143,7 +143,7 @@ Poll until the terminal contains the given text. Returns the matching screenshot
 Default timeout: 5000ms.
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "sleep 0.1; echo 'delayed'"]);
 const ss = await session.waitForText("delayed", 3000);
@@ -156,7 +156,7 @@ await session.close();
 Poll until the terminal no longer contains the given text:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "echo 'gone'; sleep 0.1; printf '\\033[2J\\033[H'"]);
 await session.waitForText("gone");
@@ -171,7 +171,7 @@ await session.close();
 Poll until a custom predicate returns true:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "echo 'line 1'; echo 'line 2'; sleep 1"]);
 const ss = await session.waitFor(
@@ -213,7 +213,7 @@ Examples: `ctrl+c`, `ctrl+z`, `alt+x`, `shift+a`, `ctrl+backspace`
 ### Testing a CLI tool
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "echo 'Usage: mytool [options]'; sleep 1"]);
 const ss = await session.waitForText("Usage:");
@@ -226,7 +226,7 @@ await session.close();
 Use the `ansi` field to verify ANSI escape codes:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("sh", ["-c", "printf '\\033[31mERROR\\033[0m\\n'; sleep 1"]);
 const ss = await session.waitForText("ERROR");
@@ -242,7 +242,7 @@ screen buffer, cursor position, and all rendering. Here's a complete example
 that launches vim, enters insert mode, types text, and verifies the result:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("vim", ["--clean"], { rows: 24, cols: 80 });
 
@@ -271,7 +271,7 @@ For programs that show a prompt and accept commands, use `waitFor()` with a
 regex to detect the prompt, then send commands and assert on their output:
 
 ```typescript test
-import { Session } from "@myobie/pty/testing";
+import { Session } from "@compoundingtech/pty/testing";
 
 const session = Session.spawn("bash", ["--norc", "--noprofile"]);
 

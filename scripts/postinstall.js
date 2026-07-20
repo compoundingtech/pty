@@ -3,7 +3,7 @@
 // post-install never chmods it. The previous workaround used a relative path
 // (`node_modules/node-pty/prebuilds/*/spawn-helper`) which silently no-ops
 // under pnpm with `enableGlobalVirtualStore`, where node-pty lives in a
-// sibling content-addressed link rather than nested under @myobie/pty.
+// sibling content-addressed link rather than nested under @compoundingtech/pty.
 //
 // The root-cause fix belongs in microsoft/node-pty; once that ships, this
 // script can be removed entirely.
@@ -27,7 +27,7 @@ let nodePtyDir;
 try {
   nodePtyDir = path.dirname(requireFromPkg.resolve("node-pty/package.json"));
 } catch {
-  console.warn("[@myobie/pty] node-pty not found; skipping spawn-helper chmod");
+  console.warn("[@compoundingtech/pty] node-pty not found; skipping spawn-helper chmod");
   process.exit(0);
 }
 

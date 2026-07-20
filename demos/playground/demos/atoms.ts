@@ -42,7 +42,7 @@ function atomsDemo(): Demo {
   };
 }
 
-const source = String.raw`import { text, dot, checkbox, progressBar, spinner } from "@myobie/pty/tui";
+const source = String.raw`import { text, dot, checkbox, progressBar, spinner } from "@compoundingtech/pty/tui";
 
 row(text("accent", "accent", { bold: true }))
 row(dot(true, "accent"))

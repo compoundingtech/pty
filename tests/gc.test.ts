@@ -271,7 +271,7 @@ describe("pty gc", () => {
     expect(result.stdout).toContain("<!DOCTYPE plist");
     // Non-default root (tests use a tmp registry) — Label carries the
     // basename suffix. Match either the default or the non-default shape.
-    expect(result.stdout).toMatch(/<string>com\.myobie\.pty\.gc(?:\.[A-Za-z0-9._-]+)?<\/string>/);
+    expect(result.stdout).toMatch(/<string>com\.compoundingtech\.pty\.gc(?:\.[A-Za-z0-9._-]+)?<\/string>/);
     expect(result.stdout).toContain("<key>StartInterval</key>");
     expect(result.stdout).toContain("<integer>30</integer>");
     // Phase-2: emitted env var is PTY_ROOT (canonical). Legacy

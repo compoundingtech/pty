@@ -29,9 +29,9 @@ console.log(`Found ${blocks.length} executable code blocks`);
 const importSet = new Set<string>();
 const testCases = blocks
   .map((code, i) => {
-    // Replace @myobie/pty/testing imports with relative path
+    // Replace @compoundingtech/pty/testing imports with relative path
     const adjusted = code.replace(
-      /from ["']@myobie\/pty\/testing["']/g,
+      /from ["']@compoundingtech\/pty\/testing["']/g,
       `from "${path.join(projectRoot, "src", "testing", "index.ts").replace(/\\/g, "/")}"`
     );
 

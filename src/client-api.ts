@@ -1,5 +1,5 @@
 // Public API for programmatic session management.
-// Import from "@myobie/pty/client".
+// Import from "@compoundingtech/pty/client".
 
 // Session management
 export {

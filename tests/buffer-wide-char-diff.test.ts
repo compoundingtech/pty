@@ -1,6 +1,6 @@
 // Regression tests for the CellBuffer diff() renderer's handling of
 // width-2 (emoji / CJK) characters. Filed by tui-sup while building
-// agent-viz on top of @myobie/pty/tui: a `📬` on an interactive tree
+// agent-viz on top of @compoundingtech/pty/tui: a `📬` on an interactive tree
 // would fossilize into `📬📬` when navigating shifted the glyph to a
 // different column. Two failure modes:
 //

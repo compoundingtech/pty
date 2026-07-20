@@ -282,7 +282,7 @@ Flags:
 
 Examples:
   pty gc --dry-run
-  pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.myobie.pty.gc.plist`,
+  pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist`,
 
   tag: `Usage: pty tag <ref>                           Show tags
        pty tag <ref> key=value [key=value...]   Set tags
@@ -2669,7 +2669,7 @@ async function cmdGc(
 
 /** Print a minimal launchd plist that runs `pty gc` every `interval`
  *  seconds. Pure stdout — the caller redirects to
- *  `~/Library/LaunchAgents/com.myobie.pty.gc.plist` and `launchctl load`s
+ *  `~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist` and `launchctl load`s
  *  it themselves. No FDA dance, no bundled binary; just node + the gc
  *  command, inheriting PATH and PTY_SESSION_DIR. If the SSD where node
  *  lives isn't mounted at boot, the invocation fails — the next tick
@@ -2691,11 +2691,11 @@ function printLaunchdPlist(interval: number): void {
   const sessionDir = getSessionDir();
   const isDefault = sessionDir === DEFAULT_SESSION_DIR;
   // Default root keeps the pre-Phase-2 label untouched so existing
-  // installs (`launchctl load ... com.myobie.pty.gc.plist`) survive
+  // installs (`launchctl load ... com.compoundingtech.pty.gc.plist`) survive
   // an upgrade. Non-default roots get a suffixed label so two networks
   // can each install their own plist without a `Label` collision.
   const suffix = isDefault ? "" : `.${labelBasenameFromRoot(sessionDir)}`;
-  const label = `com.myobie.pty.gc${suffix}`;
+  const label = `com.compoundingtech.pty.gc${suffix}`;
   // Per-root log so a network's gc noise stays inside its own registry.
   const logPath = path.join(sessionDir, "gc.log");
   const ptyBin = process.argv[1];

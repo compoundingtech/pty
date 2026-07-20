@@ -240,8 +240,8 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
     const err = result.error as NodeJS.ErrnoException;
     if (err.code === "ENOENT") {
       throw new Error(
-        `@myobie/pty: bundled-context spawn requires the \`pty\` CLI on PATH. ` +
-          `Install @myobie/pty so its \`bin/pty\` is available, or call ` +
+        `@compoundingtech/pty: bundled-context spawn requires the \`pty\` CLI on PATH. ` +
+          `Install @compoundingtech/pty so its \`bin/pty\` is available, or call ` +
           `setServerModulePath() with a real on-disk server.js before spawnDaemon.`,
       );
     }

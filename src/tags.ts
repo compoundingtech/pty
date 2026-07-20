@@ -2,7 +2,7 @@
  * Shared helpers for working with session tag filters.
  *
  * These are used by the pty CLI (`pty list --filter-tag`, `pty --filter-tag`)
- * and are exposed on `@myobie/pty/client` so tools like pty-relay can accept
+ * and are exposed on `@compoundingtech/pty/client` so tools like pty-relay can accept
  * and apply the same filter syntax.
  */
 
@@ -69,7 +69,7 @@ const EXACT_RESERVED = new Set([
  * of). Consumers should hide reserved keys from user-facing listings
  * by default but still allow writes — tools need to set and unset them.
  *
- * Exposed on `@myobie/pty/client` so downstream tools (pty-relay,
+ * Exposed on `@compoundingtech/pty/client` so downstream tools (pty-relay,
  * pty-layout) can use the same rule without duplicating deny-lists.
  */
 export function isReservedTagKey(key: string): boolean {
