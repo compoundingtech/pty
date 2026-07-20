@@ -1438,6 +1438,12 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "completions": {
+      // `pty completions <shell>` — print a fish/bash/zsh completion script.
+      const { cmdCompletions } = await import("./completions.ts");
+      process.exit(cmdCompletions(args.slice(1)));
+    }
+
     case "version":
     case "--version":
     case "-v":
