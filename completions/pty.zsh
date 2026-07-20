@@ -17,6 +17,7 @@ _pty() {
     'run:Create a session and attach'
     'attach:Attach to an existing session'
     'a:Alias for attach'
+    'resize:Set + pin a session's geometry'
     'exec:Replace the current session process'
     'peek:Print current screen (or follow / wait-for-text)'
     'send:Send text or key events'
@@ -62,6 +63,7 @@ _pty() {
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
             '--cwd[Working directory]' \
+            '--size[Pin session geometry (<cols>x<rows>)]' \
             '--isolate-env[Scrub env to a safe allow-list]' \
             '--force[Create even from inside another pty]'
           ;;
@@ -71,6 +73,10 @@ _pty() {
             '--no-resize[Preserve shared PTY geometry]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
+            '1:session:_pty_sessions'
+          ;;
+        resize)
+          _arguments \
             '1:session:_pty_sessions'
           ;;
         exec)

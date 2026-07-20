@@ -18,6 +18,7 @@ import {
   decodeSize,
   decodeAttachFlags,
   ATTACH_FLAG_GEOMETRY_NEUTRAL,
+  RESIZE_FLAG_AUTHORITATIVE,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -50,6 +51,14 @@ export interface ServerOptions {
   cwd: string;
   rows: number;
   cols: number;
+  /** When true, `rows`/`cols` are the authoritative session-owned geometry:
+   *  negotiateSize() becomes a no-op and only an authoritative `pty resize`
+   *  moves the size. Authored via `pty run --size <cols>x<rows>`.
+   *
+   *  This is the half of the geometry story that `--no-resize` cannot cover:
+   *  a neutral CLIENT opts out of voting, but a pinned SESSION revokes the
+   *  vote from every client, including plain attachers that never opted in. */
+  pinGeometry?: boolean;
   tags?: Record<string, string>;
   /** Optional human-friendly alias recorded in SessionMetadata.displayName.
    *  Mutable via `pty rename`; `name` stays the immutable stable id. */
@@ -245,6 +254,10 @@ export class PtyServer {
   private mouseTracking1002 = false; // button-motion tracking
   private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
+  // Session-owns-geometry. When set, negotiateSize() is inert and only
+  // setSessionSize() (an authoritative `pty resize`, or the initial --size
+  // pin) changes the PTY dimensions.
+  private pinnedGeometry: { rows: number; cols: number } | null = null;
   private eventWriter: EventWriter;
   private lastTitle = "";
   readonly ready: Promise<void>;
@@ -271,6 +284,13 @@ export class PtyServer {
     });
     this.serialize = new xtermSerialize.SerializeAddon();
     this.terminal.loadAddon(this.serialize);
+
+    // `--size` authored an authoritative geometry: record it so no attach can
+    // renegotiate the child away from it. Both the PTY and the terminal were
+    // already created at this size above, so nothing needs resizing here.
+    if (options.pinGeometry) {
+      this.pinnedGeometry = { rows: options.rows, cols: options.cols };
+    }
 
     // Track terminal modes not exposed by xterm's serialize addon
     this.terminal.parser.registerCsiHandler(
@@ -696,9 +716,19 @@ export class PtyServer {
           case MessageType.RESIZE: {
             if (!client.readonly && packet.payload.length >= 4) {
               const size = decodeSize(packet.payload);
+              // An authoritative RESIZE (`pty resize`) sets the session-owned
+              // size directly and pins it. It is not a vote, so it neither
+              // updates the client's own dimensions nor runs negotiation.
+              if (decodeAttachFlags(packet.payload) & RESIZE_FLAG_AUTHORITATIVE) {
+                this.setSessionSize(size.cols, size.rows);
+                break;
+              }
               client.rows = size.rows;
               client.cols = size.cols;
               client.attachSeq = ++this.attachCounter;
+              // negotiateSize() itself ignores neutral clients and pinned
+              // sessions, so the defense lives server-side rather than relying
+              // on a well-behaved client choosing not to send RESIZE.
               this.negotiateSize();
             }
             break;
@@ -797,8 +827,15 @@ export class PtyServer {
         readOnly,
         geometryNeutral,
       },
+      geometry: {
+        owner: this.pinnedGeometry ? "session" : "clients",
+        pinned: this.pinnedGeometry
+          ? { cols: this.pinnedGeometry.cols, rows: this.pinnedGeometry.rows }
+          : null,
+      },
       capabilities: {
         geometryNeutralAttach: true,
+        pinnedGeometry: true,
       },
       modes: {
         sgrMouse: this.sgrMouseMode,
@@ -814,6 +851,11 @@ export class PtyServer {
   /** Resize the PTY to the smallest dimensions across all connected writable clients.
    *  Returns true if the size actually changed. */
   private negotiateSize(): boolean {
+    // Session-owns-geometry: a pinned session ignores ALL client geometry,
+    // including plain (non-neutral) attachers. This is what actually protects
+    // a running TUI from being reflowed by whoever attaches next.
+    if (this.pinnedGeometry) return false;
+
     let rows = 0;
     let cols = 0;
 
@@ -833,6 +875,20 @@ export class PtyServer {
       }
     }
     return false;
+  }
+
+  /** Authoritatively set the session-owned size (`pty resize`, or the initial
+   *  `--size` pin) and pin it. Bypasses min-wins negotiation and does NOT
+   *  nudge: this SIGWINCH is legitimate, so the child gets exactly one and
+   *  adapts to it. A no-op resize (same dimensions) emits none at all. */
+  private setSessionSize(cols: number, rows: number): void {
+    if (rows <= 0 || cols <= 0) return;
+    this.pinnedGeometry = { rows, cols };
+    if (cols !== this.terminal.cols || rows !== this.terminal.rows) {
+      this.ptyProcess.resize(cols, rows);
+      this.terminal.resize(cols, rows);
+      this.lastResizeTime = Date.now();
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
@@ -1072,6 +1128,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     cwd: config.cwd ?? process.cwd(),
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
+    pinGeometry: config.pinGeometry === true,
     tags: config.tags,
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,

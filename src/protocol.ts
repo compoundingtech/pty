@@ -70,6 +70,13 @@ export function encodeAttach(
   return encodePacket(MessageType.ATTACH, payload);
 }
 
+/** Optional RESIZE flag: this resize is authoritative (from `pty resize`) and
+ * sets the session-owned geometry directly, bypassing min-wins negotiation.
+ * Shares byte 4 with the ATTACH flags — same layout, different message type. */
+export const RESIZE_FLAG_AUTHORITATIVE = 0x01;
+
+/** Read the optional flags byte from an ATTACH or RESIZE payload (0 if absent),
+ * so a legacy 4-byte frame decodes as "no flags" rather than throwing. */
 export function decodeAttachFlags(payload: Buffer): number {
   return payload.length >= 5 ? payload.readUInt8(4) : 0;
 }
@@ -82,6 +89,17 @@ export function encodeResize(rows: number, cols: number): Buffer {
   const payload = Buffer.alloc(4);
   payload.writeUInt16BE(rows, 0);
   payload.writeUInt16BE(cols, 2);
+  return encodePacket(MessageType.RESIZE, payload);
+}
+
+/** A RESIZE that sets the session-owned geometry (`pty resize`). Unlike a
+ * client RESIZE this is not a vote in min-wins negotiation — it pins the size
+ * and the child gets exactly one legitimate SIGWINCH. */
+export function encodeResizeAuthoritative(rows: number, cols: number): Buffer {
+  const payload = Buffer.alloc(5);
+  payload.writeUInt16BE(rows, 0);
+  payload.writeUInt16BE(cols, 2);
+  payload.writeUInt8(RESIZE_FLAG_AUTHORITATIVE, 4);
   return encodePacket(MessageType.RESIZE, payload);
 }
 

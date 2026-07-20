@@ -84,7 +84,7 @@ describe("pty completions <shell>", () => {
       encoding: "utf8",
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/usage: pty completions/);
+    expect(r.stdout).toMatch(/Usage: pty completions/);
   });
 
   it("fish output is syntactically valid", () => {

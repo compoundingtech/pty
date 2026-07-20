@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import * as net from "node:net";
 import { attach, peek, send, queryStats, resolveSeqDelayMs, type StatsResult } from "./client.ts";
 import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
@@ -27,10 +28,12 @@ import {
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  getSocketPath,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
   type SessionMetadata,
 } from "./sessions.ts";
+import { encodeResizeAuthoritative } from "./protocol.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
   EventFollower, EventWriter, EventType,
@@ -92,12 +95,14 @@ Flags:
   -e, --ephemeral      Auto-remove metadata on clean exit
   --tag key=value      Tag the session (repeatable)
   --cwd <path>         Working directory for the command
+  --size <cols>x<rows> Pin the session's geometry; attaching clients can no longer resize it
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
   --force              Create even from inside another pty session (bypass the nesting guard)
 
 Examples:
   pty run -- node server.js
-  pty run -d --name "API" --tag role=web -- node server.js`,
+  pty run -d --name "API" --tag role=web -- node server.js
+  pty run -d --size 160x48 --id agent -- claude`,
 
   attach: `Usage: pty attach [-r] [--no-resize] [--force] [--remote <peer>] <ref>
 
@@ -114,6 +119,19 @@ Examples:
   pty attach myserver
   pty attach -r myserver
   pty attach --remote hetzner myshell`,
+
+  resize: `Usage: pty resize <ref> <cols>x<rows>
+
+Set a session's authoritative geometry and pin it. The child gets exactly one
+SIGWINCH. Once pinned, attaching clients no longer renegotiate the size — the
+session owns its geometry until the next resize.
+
+Use this to give a headless/no-tty session a fixed render size, so a plain
+attach from a small terminal can't reflow a running TUI.
+
+Examples:
+  pty resize myagent 160x48
+  pty stats myagent --json    # inspect geometry.owner / geometry.pinned`,
 
   exec: `Usage: pty exec -- <command> [args...]
 
@@ -395,6 +413,7 @@ Create sessions:
   pty run -e -- <command>                 Ephemeral: auto-remove metadata on clean exit
   pty run --tag key=value -- <command>    Tag a session (repeatable)
   pty run --cwd /path -- <command>        Run in a specific directory
+  pty run --size <cols>x<rows> -- <cmd>   Pin the session's geometry (clients can't resize it)
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
   pty run --force -- <command>            Create even from inside another pty session (nested)
@@ -405,6 +424,7 @@ Attach & interact:
   pty attach --force <ref>                Attach even from inside another pty session (nested)
   pty attach -r <ref>                     Attach, auto-restart if the session is exited
   pty attach --remote <peer> <ref>        Attach a session on a fabric peer (over fabric)
+  pty resize <ref> <cols>x<rows>          Set + pin the session's geometry (one SIGWINCH)
   pty exec -- <command> [args...]         Replace the current session's process (inside a session)
   pty send <ref> "text"                   Send raw text (no implicit newline)
   pty send <ref> --seq "text" --seq key:return   Send an ordered sequence of chunks / key events
@@ -481,6 +501,7 @@ Global:
   pty help | pty --help | pty -h          Show this usage
   pty version | pty --version | pty -v    Print the version (<semver>+<short-sha>)
   pty test [watch | -t "pattern"]         Run the pty test suite (vitest passthrough)
+  pty completions <shell>                 Print a fish/bash/zsh completion script to stdout
 
 Session references (<ref>): the on-disk id (validated: [A-Za-z0-9._-], ≤ 255 chars,
 socket path ≤ 104 bytes), or a displayName. Inside a session, most commands default
@@ -675,6 +696,7 @@ async function main(): Promise<void> {
       let explicitId: string | null = null;
       let explicitDisplayName: string | null = null;
       let cwd: string | null = null;
+      let size: { cols: number; rows: number } | null = null;
       const tags: Record<string, string> = {};
       let i = 1;
       while (i < args.length && args[i] !== "--") {
@@ -687,6 +709,15 @@ async function main(): Promise<void> {
         else if (args[i] === "--id" && i + 1 < args.length) { explicitId = args[i + 1]; i += 2; }
         else if (args[i] === "--name" && i + 1 < args.length) { explicitDisplayName = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
+        else if (args[i] === "--size" && i + 1 < args.length) {
+          const m = /^(\d+)x(\d+)$/.exec(args[i + 1]);
+          if (!m) {
+            console.error(`Invalid --size "${args[i + 1]}". Use --size <cols>x<rows>, e.g. --size 160x48`);
+            process.exit(1);
+          }
+          size = { cols: parseInt(m[1], 10), rows: parseInt(m[2], 10) };
+          i += 2;
+        }
         else if (args[i] === "--tag" && i + 1 < args.length) {
           const eq = args[i + 1].indexOf("=");
           if (eq === -1) {
@@ -847,7 +878,7 @@ async function main(): Promise<void> {
         }
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName);
+      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName, size);
       break;
     }
 
@@ -897,6 +928,22 @@ async function main(): Promise<void> {
         const resolvedAttachName = await resolveRef(attachName);
         await cmdAttach(resolvedAttachName, autoRestart, force, geometryNeutral);
       }
+      break;
+    }
+
+    case "resize": {
+      // `pty resize <name> <cols>x<rows>` — set the authoritative session-owned
+      // geometry. Works on any running session and pins it going forward, so
+      // subsequent attaches (neutral or not) can no longer reflow the child.
+      const resizeName = args[1];
+      const spec = args[2];
+      const m = spec ? /^(\d+)x(\d+)$/.exec(spec) : null;
+      if (!resizeName || !m) {
+        console.error("Usage: pty resize <ref> <cols>x<rows>");
+        process.exit(1);
+      }
+      const resolvedResizeName = await resolveRef(resizeName);
+      await cmdResize(resolvedResizeName, parseInt(m[1], 10), parseInt(m[2], 10));
       break;
     }
 
@@ -1494,6 +1541,7 @@ async function cmdRun(
   explicitCwd: string | null = null,
   isolateEnv = false,
   displayName: string | null = null,
+  size: { cols: number; rows: number } | null = null,
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -1535,6 +1583,9 @@ async function cmdRun(
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
+      // `--size` authors an authoritative, pinned session geometry: the child
+      // renders at a fixed size regardless of who attaches later.
+      ...(size ? { rows: size.rows, cols: size.cols, pinGeometry: true } : {}),
     });
   } finally {
     releaseLock(name);
@@ -1638,6 +1689,34 @@ async function handleDeadSession(
   console.log(`Session "${session.name}" restarted.`);
   if (geometryNeutral) await requireGeometryNeutralAttach(session.name);
   doAttach(session.name, geometryNeutral);
+}
+
+/** Send an authoritative RESIZE to a running session, pinning its geometry.
+ *  Goes straight to the session socket rather than through attach() — this is
+ *  a one-shot control message, not a client joining the session. */
+async function cmdResize(name: string, cols: number, rows: number): Promise<void> {
+  if (cols <= 0 || rows <= 0) {
+    console.error(`Invalid size ${cols}x${rows}.`);
+    process.exit(1);
+  }
+  const socketPath = getSocketPath(name);
+  await new Promise<void>((resolve) => {
+    const socket = net.createConnection(socketPath);
+    socket.on("connect", () => {
+      socket.write(encodeResizeAuthoritative(rows, cols));
+      socket.end();
+    });
+    socket.on("finish", () => resolve());
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
+        console.error(`Session "${name}" not found or not running.`);
+      } else {
+        console.error(`Connection error: ${err.message}`);
+      }
+      process.exit(1);
+    });
+  });
+  console.log(`Session "${name}" resized to ${cols}x${rows} (session-owned).`);
 }
 
 function doAttach(name: string, geometryNeutral = false): void {

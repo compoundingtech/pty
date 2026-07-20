@@ -44,6 +44,7 @@ complete -c pty -n __pty_needs_command -l filter-tag -x -d 'TUI: filter to k=v (
 complete -c pty -n __pty_needs_command -a run -d 'Create a session and attach'
 complete -c pty -n __pty_needs_command -a attach -d 'Attach to an existing session'
 complete -c pty -n __pty_needs_command -a a -d 'Attach to an existing session'
+complete -c pty -n __pty_needs_command -a resize -d 'Set + pin a session\'s geometry'
 complete -c pty -n __pty_needs_command -a exec -d 'Replace the current session process'
 complete -c pty -n __pty_needs_command -a peek -d 'Print current screen (or follow / wait-for-text)'
 complete -c pty -n __pty_needs_command -a send -d 'Send text or key events'
@@ -72,6 +73,7 @@ complete -c pty -n '__pty_using_command run' -l name -d 'Display label (any prin
 complete -c pty -n '__pty_using_command run' -l no-display-name -d 'Skip the auto-generated label'
 complete -c pty -n '__pty_using_command run' -l tag -d 'Tag session (k=v, repeatable)'
 complete -c pty -n '__pty_using_command run' -l cwd -d 'Working directory'
+complete -c pty -n '__pty_using_command run' -l size -d 'Pin session geometry (<cols>x<rows>)'
 complete -c pty -n '__pty_using_command run' -l isolate-env -d 'Scrub env to a safe allow-list'
 complete -c pty -n '__pty_using_command run' -l force -d 'Create even from inside another pty'
 complete -c pty -n '__pty_using_command attach a' -l auto-restart -s r -d 'Auto-restart if the session is exited'
@@ -79,6 +81,7 @@ complete -c pty -n '__pty_using_command attach a' -l no-resize -d 'Preserve shar
 complete -c pty -n '__pty_using_command attach a' -l force -d 'Attach even from inside another pty'
 complete -c pty -n '__pty_using_command attach a' -l remote -d 'Attach a session on a fabric peer'
 complete -c pty -n '__pty_using_command attach a' -a '(__pty_sessions)' -d 'Session'
+complete -c pty -n '__pty_using_command resize' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command exec' -F
 complete -c pty -n '__pty_using_command peek' -l follow -s f -d 'Follow output read-only'
 complete -c pty -n '__pty_using_command peek' -l plain -d 'Plain text (no ANSI)'

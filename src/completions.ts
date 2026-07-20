@@ -73,6 +73,7 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "no-display-name", desc: "Skip the auto-generated label" },
       { name: "tag", desc: "Tag session (k=v, repeatable)" },
       { name: "cwd", desc: "Working directory" },
+      { name: "size", desc: "Pin session geometry (<cols>x<rows>)" },
       { name: "isolate-env", desc: "Scrub env to a safe allow-list" },
       { name: "force", desc: "Create even from inside another pty" },
     ],
@@ -88,6 +89,11 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "force", desc: "Attach even from inside another pty" },
       { name: "remote", desc: "Attach a session on a fabric peer" },
     ],
+  },
+  {
+    name: "resize",
+    desc: "Set + pin a session's geometry",
+    dynamic: "sessions",
   },
   {
     name: "exec",
@@ -522,7 +528,7 @@ const SHELLS = Object.keys(GENERATORS);
 
 function usageText(): string {
   return (
-    "usage: pty completions <shell>\n\n" +
+    "Usage: pty completions <shell>\n\n" +
     "Print a shell completion script to stdout.\n\n" +
     "Shells:\n" +
     SHELLS.map((s) => `  ${s}`).join("\n") +
