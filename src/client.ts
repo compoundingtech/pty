@@ -4,7 +4,6 @@ import {
   MessageType,
   PacketReader,
   encodeAttach,
-  ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
   encodePeek,
@@ -376,9 +375,6 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
 
 export interface AttachOptions {
   name: string;
-  /** Ask for the attach-time redraw nudge even when attaching at the session's
-   * current size, where it is otherwise skipped. */
-  forceResize?: boolean;
   onExit?: (code: number) => void;
   onDetach?: () => void;
   /** Attach over this ALREADY-CONNECTED socket instead of dialing the local
@@ -505,8 +501,7 @@ export function attach(options: AttachOptions): void {
     enterRawMode();
     const rows = (stdout as tty.WriteStream).rows ?? 24;
     const cols = (stdout as tty.WriteStream).columns ?? 80;
-    const flags = options.forceResize ? ATTACH_FLAG_FORCE_RESIZE : 0;
-    try { socket.write(encodeAttach(rows, cols, flags)); } catch {}
+    try { socket.write(encodeAttach(rows, cols)); } catch {}
     wireInput();
   }
 

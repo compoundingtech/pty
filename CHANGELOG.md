@@ -4,7 +4,7 @@
 
 ### Attach no longer nudges a child that is already at the right size
 
-- The attach-time redraw nudge (resize to `cols - 1` and back, to paper over serialize-replay artifacts) now fires only when the attaching client's geometry differs from the session's. Attaching at the size the session already has leaves the child alone, so connecting a viewer no longer delivers `SIGWINCH` to an idle process. `pty attach --force-resize` restores the nudge unconditionally for children whose replay needs it.
+- The attach-time redraw nudge (resize to `cols - 1` and back, to paper over serialize-replay artifacts) now fires only when the attaching client's geometry differs from the session's. Attaching at the size the session already has leaves the child alone, so connecting a viewer no longer delivers `SIGWINCH` to an idle process.
 
 ### Package renamed: `@myobie/pty` → `@compoundingtech/pty`
 

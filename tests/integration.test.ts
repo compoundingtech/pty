@@ -10,7 +10,6 @@ import {
   PacketReader,
   Packet,
   encodeAttach,
-  ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
   encodePeek,
@@ -340,7 +339,7 @@ describe("integration", () => {
     client2.destroy();
   });
 
-  it("skips the redraw SIGWINCH nudge at the session's current size unless --force-resize", async () => {
+  it("skips the redraw SIGWINCH nudge at the session's current size", async () => {
     const name = uniqueName();
     const marker = path.join(testCwd, `${name}-winch`);
     const reporter = [
@@ -361,16 +360,7 @@ describe("integration", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(fs.existsSync(marker)).toBe(false);
 
-    // --force-resize opts back in to the nudge at the current size.
-    const forced = await connect(name);
-    const forcedReader = new PacketReader();
-    forced.write(encodeAttach(40, 120, ATTACH_FLAG_FORCE_RESIZE));
-    await waitForType(forced, forcedReader, MessageType.SCREEN);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(fs.readFileSync(marker, "utf8")).toContain("WINCH");
-
     ordinary.destroy();
-    forced.destroy();
   });
 
   it("still nudges when the attaching client's size differs", async () => {

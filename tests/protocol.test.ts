@@ -14,8 +14,6 @@ import {
   encodeStatus,
   encodeStatusResponse,
   decodeSize,
-  decodeAttachFlags,
-  ATTACH_FLAG_FORCE_RESIZE,
   decodeExit,
 } from "../src/protocol.ts";
 import { Buffer } from "node:buffer";
@@ -45,24 +43,16 @@ describe("protocol", () => {
       expect(size.cols).toBe(80);
     });
 
-    it("keeps legacy ATTACH byte-identical and appends set flags as a flag byte", () => {
-      const legacy = encodeAttach(24, 80);
-      expect(legacy).toEqual(
+    it("encodes ATTACH as a plain 4-byte size payload", () => {
+      const attach = encodeAttach(24, 80);
+      expect(attach).toEqual(
         encodePacket(MessageType.ATTACH, Buffer.from([0, 24, 0, 80])),
       );
-      // An explicitly empty flag set stays on the legacy 4-byte frame.
-      expect(encodeAttach(24, 80, 0)).toEqual(legacy);
 
       const reader = new PacketReader();
-      const [forced] = reader.feed(
-        encodeAttach(24, 80, ATTACH_FLAG_FORCE_RESIZE),
-      );
-      expect(forced.payload).toEqual(Buffer.from([0, 24, 0, 80, 2]));
-      expect(decodeSize(forced.payload)).toEqual({ rows: 24, cols: 80 });
-      expect(decodeAttachFlags(forced.payload) & ATTACH_FLAG_FORCE_RESIZE).toBe(
-        ATTACH_FLAG_FORCE_RESIZE,
-      );
-      expect(decodeAttachFlags(Buffer.from([0, 24, 0, 80]))).toBe(0);
+      const [packet] = reader.feed(attach);
+      expect(packet.payload).toEqual(Buffer.from([0, 24, 0, 80]));
+      expect(decodeSize(packet.payload)).toEqual({ rows: 24, cols: 80 });
     });
 
     it("round-trips a DETACH packet", () => {

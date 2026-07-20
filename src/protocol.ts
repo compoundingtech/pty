@@ -51,23 +51,11 @@ export function encodeData(data: string): Buffer {
   return encodePacket(MessageType.DATA, Buffer.from(data));
 }
 
-/** Optional ATTACH flag: nudge the child into a full redraw even when this
- * client attaches at the size the session already has. */
-export const ATTACH_FLAG_FORCE_RESIZE = 0x02;
-
-export function encodeAttach(rows: number, cols: number, flags = 0): Buffer {
-  // Keep the legacy frame byte-for-byte identical. The optional flag byte is
-  // appended only when a flag is set; older servers already ignore bytes after
-  // the first four size bytes.
-  const payload = Buffer.alloc(flags === 0 ? 4 : 5);
+export function encodeAttach(rows: number, cols: number): Buffer {
+  const payload = Buffer.alloc(4);
   payload.writeUInt16BE(rows, 0);
   payload.writeUInt16BE(cols, 2);
-  if (flags !== 0) payload.writeUInt8(flags, 4);
   return encodePacket(MessageType.ATTACH, payload);
-}
-
-export function decodeAttachFlags(payload: Buffer): number {
-  return payload.length >= 5 ? payload.readUInt8(4) : 0;
 }
 
 export function encodeDetach(): Buffer {
