@@ -26,6 +26,7 @@ import {
   cleanupAll,
   writeMetadata,
   readMetadata,
+  shouldReapAtExit,
   type SessionMetadata,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
@@ -1016,6 +1017,41 @@ if (process.argv[1]?.endsWith("/server.js")) {
 
   const isEphemeral = config.ephemeral === true;
 
+  // Exit-time cleanup policy. Deliberately re-reads metadata at shutdown
+  // instead of trusting `config.tags` (the spawn-time snapshot): `pty tag
+  // <name> keep` and `pty tag <name> strategy=permanent` both mutate a
+  // RUNNING session's tags on disk, and pinning a session you are about to
+  // debug is the main reason anyone sets `keep` at all. A stale read here
+  // would reap exactly the session the operator asked us to preserve.
+  //
+  // Falls back to `config.tags` only if the metadata file is unreadable
+  // (already `pty rm`'d, or a truncated write) — a missing file means
+  // there is nothing left to reap anyway.
+  //
+  // `externalKill` scopes the policy to the case it is actually about: the
+  // session's own work ENDED. A daemon can shut down for two very different
+  // reasons, and only one of them is an "exit":
+  //
+  //   - the child process terminated on its own (cleanly or by crashing)
+  //     — the session is finished, and finished non-permanent sessions are
+  //     garbage. Reap.
+  //   - someone stopped the daemon from outside (`pty kill` → SIGTERM,
+  //     SIGINT, or the spawner watchdog reclaiming a leaked daemon) — the
+  //     child had not finished; an operator interrupted it, almost always
+  //     to go look at what it was doing. `pty kill` is documented as
+  //     stop-and-keep, deliberately distinct from `pty rm`. Collapsing the
+  //     two would delete the evidence the operator killed the session to
+  //     inspect. Keep.
+  //
+  // `--ephemeral` remains the pre-existing aggressive opt-in and reaps on
+  // either path, so no existing caller of it regresses.
+  let externalKill = false;
+  function reapAtExit(): boolean {
+    if (externalKill && !isEphemeral) return false;
+    const tags = readMetadata(config.name)?.tags ?? config.tags;
+    return shouldReapAtExit(tags, isEphemeral);
+  }
+
   // Hard deadline for a graceful shutdown before the daemon force-exits. The
   // graceful path (server.close()) is itself only internally bounded on the
   // child-exit wait (~2s); the outer promise can still hang indefinitely if
@@ -1044,14 +1080,18 @@ if (process.argv[1]?.endsWith("/server.js")) {
       // pointing at a daemon that's about to vanish.
       server.forceKillChild();
       try {
-        if (isEphemeral) cleanupAll(config.name);
+        if (reapAtExit()) cleanupAll(config.name);
         else cleanup(config.name);
       } catch {}
       process.exit(code);
     }, SHUTDOWN_DEADLINE_MS);
     shutdownPromise = server.close().then(() => {
       clearTimeout(deadline);
-      if (isEphemeral) cleanupAll(config.name);
+      // `close()` has already re-flushed exit metadata with the final
+      // `lastLines`, so this reads the same tags a `pty gc` sweep would
+      // have read one tick later — the decision is identical, only the
+      // latency changes.
+      if (reapAtExit()) cleanupAll(config.name);
       process.exit(code);
     });
     return shutdownPromise;
@@ -1076,8 +1116,17 @@ if (process.argv[1]?.endsWith("/server.js")) {
     },
   });
 
-  process.on("SIGTERM", () => cleanShutdown(0));
-  process.on("SIGINT", () => cleanShutdown(0));
+  // Set the flag BEFORE calling cleanShutdown: the child's own onExit will
+  // re-enter cleanShutdown moments later (we kill the child during close()),
+  // and cleanShutdown is idempotent, so whichever caller arrives first wins.
+  // Flagging first guarantees the external-kill verdict is the one in effect
+  // when the reap decision is finally made.
+  const killedExternally = (code: number) => {
+    externalKill = true;
+    return cleanShutdown(code);
+  };
+  process.on("SIGTERM", () => killedExternally(0));
+  process.on("SIGINT", () => killedExternally(0));
 
   // Spawner-PID watchdog (opt-in via PTY_SPAWNER_PID).
   //
@@ -1086,5 +1135,8 @@ if (process.argv[1]?.endsWith("/server.js")) {
   // init, surviving forever. When the spawner sets PTY_SPAWNER_PID, we poll
   // for its liveness and call cleanShutdown() once it's gone. Off when the
   // env var is absent, so existing callers see no behaviour change.
-  installSpawnerWatchdog(cleanShutdown);
+  // The watchdog reclaims a daemon whose spawner died. The child was still
+  // running, so this is a stop-from-outside like `pty kill`, not an exit —
+  // keep the metadata.
+  installSpawnerWatchdog(killedExternally);
 }

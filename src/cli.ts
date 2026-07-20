@@ -89,8 +89,10 @@ Flags:
   --no-display-name    Skip the auto cwd+command label — just the id
   -d, --detach         Create in the background; don't attach
   -a, --attach         Create, OR attach if a session with the same id already exists
-  -e, --ephemeral      Auto-remove metadata on clean exit
+  -e, --ephemeral      Force self-removal at exit even for strategy=permanent
+                       (non-permanent sessions already self-remove by default)
   --tag key=value      Tag the session (repeatable)
+  --tag keep=true      Exempt from reaping: keep metadata/logs after exit
   --cwd <path>         Working directory for the command
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
   --force              Create even from inside another pty session (bypass the nesting guard)
@@ -270,6 +272,10 @@ Examples:
 
 One reconciliation pass: sweep exited/vanished, orphan-kill \`parent=<name>\` children,
 reap abandoned permanents, respawn \`strategy=permanent\` sessions.
+
+Non-permanent sessions remove themselves as they exit, so the sweep is a backstop:
+it mainly catches \`vanished\` sessions, whose daemon was killed outright and so
+never ran its own cleanup. Sessions tagged \`keep\` are never swept.
 
 Flags:
   -n, --dry-run           Preview without changing anything
@@ -2591,6 +2597,12 @@ async function cmdGc(
   }
   for (const name of result.removed) {
     console.log(`${removeVerb}: ${name}`);
+  }
+  // Deliberately NOT counted as an action below: a kept session is a
+  // no-op. It is printed anyway so "why is this dead session still
+  // listed?" has a visible answer instead of looking like a gc bug.
+  for (const name of result.kept) {
+    console.log(`Kept (keep tag): ${name} — remove the keep tag to reap it`);
   }
   for (const { name, removedKeys } of prunedTags) {
     console.log(
