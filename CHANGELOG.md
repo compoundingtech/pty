@@ -49,10 +49,6 @@
 
 - New `badge(label, opts)` widget renders a small SRCL-style chip: an uppercase, padded label on a muted fill (mirroring SRCL's `Badge` — `text-transform: uppercase`, `padding: 0 1ch`, filled background). Status `variant`s (`neutral | ok | warn | error | accent | info`) color the label, or fill the chip when `solid: true`. `uppercase` and `bold` are configurable. Returns a `TextNode` styled with semantic color tokens only (no terminal-only escapes), so the same call can render under a non-terminal backend.
 
-### Geometry-neutral interactive attach
-
-- `pty attach --no-resize <ref>` receives the live screen and forwards input without contributing its terminal dimensions to the shared PTY's min-wins size negotiation. It also suppresses the attach-time redraw `SIGWINCH` nudge. This supports embedded interactive viewers whose stdio is piped (and would otherwise report the 80x24 fallback) while leaving ordinary multi-viewer behavior unchanged. The CLI refuses the flag against a daemon that does not advertise `capabilities.geometryNeutralAttach`, rather than silently degrading.
-
 ### `pty.toml` — per-session `cwd` field
 
 - Sessions in a `pty.toml` accept an optional `cwd = "..."` setting the working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the unchanged default).

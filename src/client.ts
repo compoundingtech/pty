@@ -4,7 +4,6 @@ import {
   MessageType,
   PacketReader,
   encodeAttach,
-  ATTACH_FLAG_GEOMETRY_NEUTRAL,
   ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
@@ -316,9 +315,7 @@ export interface StatsResult {
     total: number;
     attached: number;
     readOnly: number;
-    geometryNeutral?: number;
   };
-  capabilities?: { geometryNeutralAttach?: boolean };
   modes: {
     sgrMouse: boolean;
     cursorHidden: boolean;
@@ -379,10 +376,6 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
 
 export interface AttachOptions {
   name: string;
-  /** Receive output and send input without participating in PTY geometry or
-   * attach-time redraw nudges. Callers must first verify the daemon advertises
-   * `capabilities.geometryNeutralAttach` in stats. */
-  geometryNeutral?: boolean;
   /** Ask for the attach-time redraw nudge even when attaching at the session's
    * current size, where it is otherwise skipped. */
   forceResize?: boolean;
@@ -502,7 +495,7 @@ export function attach(options: AttachOptions): void {
     stdin.on("data", stdinDataHandler);
     // Explicitly resume stdin — see the note on readline leaving flowing=false.
     stdin.resume();
-    if (stdout instanceof tty.WriteStream && !options.geometryNeutral) {
+    if (stdout instanceof tty.WriteStream) {
       resizeHandler = () => { try { socket.write(encodeResize(stdout.rows, stdout.columns)); } catch {} };
       stdout.on("resize", resizeHandler);
     }
@@ -512,9 +505,7 @@ export function attach(options: AttachOptions): void {
     enterRawMode();
     const rows = (stdout as tty.WriteStream).rows ?? 24;
     const cols = (stdout as tty.WriteStream).columns ?? 80;
-    const flags =
-      (options.geometryNeutral ? ATTACH_FLAG_GEOMETRY_NEUTRAL : 0) |
-      (options.forceResize ? ATTACH_FLAG_FORCE_RESIZE : 0);
+    const flags = options.forceResize ? ATTACH_FLAG_FORCE_RESIZE : 0;
     try { socket.write(encodeAttach(rows, cols, flags)); } catch {}
     wireInput();
   }

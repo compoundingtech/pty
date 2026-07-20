@@ -15,7 +15,6 @@ import {
   encodeStatusResponse,
   decodeSize,
   decodeAttachFlags,
-  ATTACH_FLAG_GEOMETRY_NEUTRAL,
   ATTACH_FLAG_FORCE_RESIZE,
   decodeExit,
 } from "../src/protocol.ts";
@@ -55,21 +54,15 @@ describe("protocol", () => {
       expect(encodeAttach(24, 80, 0)).toEqual(legacy);
 
       const reader = new PacketReader();
-      const [neutral] = reader.feed(
-        encodeAttach(24, 80, ATTACH_FLAG_GEOMETRY_NEUTRAL),
+      const [forced] = reader.feed(
+        encodeAttach(24, 80, ATTACH_FLAG_FORCE_RESIZE),
       );
-      expect(neutral.payload).toEqual(Buffer.from([0, 24, 0, 80, 1]));
-      expect(decodeSize(neutral.payload)).toEqual({ rows: 24, cols: 80 });
-      expect(decodeAttachFlags(neutral.payload) & ATTACH_FLAG_GEOMETRY_NEUTRAL).toBe(1);
-      expect(decodeAttachFlags(Buffer.from([0, 24, 0, 80]))).toBe(0);
-
-      const [both] = new PacketReader().feed(
-        encodeAttach(24, 80, ATTACH_FLAG_GEOMETRY_NEUTRAL | ATTACH_FLAG_FORCE_RESIZE),
-      );
-      expect(both.payload).toEqual(Buffer.from([0, 24, 0, 80, 3]));
-      expect(decodeAttachFlags(both.payload) & ATTACH_FLAG_FORCE_RESIZE).toBe(
+      expect(forced.payload).toEqual(Buffer.from([0, 24, 0, 80, 2]));
+      expect(decodeSize(forced.payload)).toEqual({ rows: 24, cols: 80 });
+      expect(decodeAttachFlags(forced.payload) & ATTACH_FLAG_FORCE_RESIZE).toBe(
         ATTACH_FLAG_FORCE_RESIZE,
       );
+      expect(decodeAttachFlags(Buffer.from([0, 24, 0, 80]))).toBe(0);
     });
 
     it("round-trips a DETACH packet", () => {

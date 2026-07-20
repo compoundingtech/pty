@@ -28,7 +28,7 @@ _pty() {
       ;;
     attach|a)
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "-r --auto-restart --no-resize --force-resize --force --remote" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-r --auto-restart --force-resize --force --remote" -- "${cur}"))
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi

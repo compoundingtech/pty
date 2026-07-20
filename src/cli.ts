@@ -99,13 +99,12 @@ Examples:
   pty run -- node server.js
   pty run -d --name "API" --tag role=web -- node server.js`,
 
-  attach: `Usage: pty attach [-r] [--no-resize] [--force-resize] [--force] [--remote <peer>] <ref>
+  attach: `Usage: pty attach [-r] [--force-resize] [--force] [--remote <peer>] <ref>
 
 Reconnect to a session (alias: pty a). Detach again with Ctrl+\\.
 
 Flags:
   -r, --auto-restart   Auto-restart the session if it has exited
-  --no-resize          Send input and receive output without changing PTY geometry
   --force-resize       Nudge the child into a redraw even when attaching at its
                        current size (that nudge is skipped by default)
   --force              Attach even from inside another pty session (nested)
@@ -403,7 +402,6 @@ Create sessions:
 
 Attach & interact:
   pty attach <ref>                        Attach to an existing session (alias: pty a)
-  pty attach --no-resize <ref>            Attach without changing shared PTY geometry
   pty attach --force <ref>                Attach even from inside another pty session (nested)
   pty attach -r <ref>                     Attach, auto-restart if the session is exited
   pty attach --remote <peer> <ref>        Attach a session on a fabric peer (over fabric)
@@ -857,14 +855,12 @@ async function main(): Promise<void> {
     case "a": {
       let autoRestart = false;
       let force = false;
-      let geometryNeutral = false;
       let forceResize = false;
       let attachName: string | null = null;
       let attachRemotePeer: string | null = null;
       for (let ai = 1; ai < args.length; ai++) {
         const a = args[ai];
         if (a === "--auto-restart" || a === "-r") autoRestart = true;
-        else if (a === "--no-resize") geometryNeutral = true;
         else if (a === "--force-resize") forceResize = true;
         else if (a === "--force") force = true;
         else if (a === "--remote" && ai + 1 < args.length) { attachRemotePeer = args[++ai]; }
@@ -875,7 +871,7 @@ async function main(): Promise<void> {
         }
       }
       if (!attachName) {
-        console.error("Usage: pty attach [-r|--auto-restart] [--no-resize] [--force-resize] [--force] [--remote <peer>] <name>");
+        console.error("Usage: pty attach [-r|--auto-restart] [--force-resize] [--force] [--remote <peer>] <name>");
         process.exit(1);
       }
       // Nesting guard runs BEFORE name validation / ref resolution. A nested
@@ -891,15 +887,15 @@ async function main(): Promise<void> {
           "  Pass --force to attach anyway (nested clients are usually a mistake).",
       });
       if (attachRemotePeer) {
-        if (geometryNeutral || forceResize) {
-          console.error("pty attach: --no-resize/--force-resize are not yet supported with --remote");
+        if (forceResize) {
+          console.error("pty attach: --force-resize is not yet supported with --remote");
           process.exit(1);
         }
         // The name is the session's id ON THE REMOTE — don't resolve locally.
         await cmdAttachRemote(attachRemotePeer, attachName);
       } else {
         const resolvedAttachName = await resolveRef(attachName);
-        await cmdAttach(resolvedAttachName, autoRestart, force, { geometryNeutral, forceResize });
+        await cmdAttach(resolvedAttachName, autoRestart, force, { forceResize });
       }
       break;
     }
@@ -1555,7 +1551,6 @@ async function cmdRun(
 
 /** Per-attach client behaviour that the daemon reads off the ATTACH frame. */
 interface AttachModes {
-  geometryNeutral?: boolean;
   forceResize?: boolean;
 }
 
@@ -1578,27 +1573,12 @@ async function cmdAttach(
   }
 
   if (session.status === "running") {
-    if (modes.geometryNeutral) await requireGeometryNeutralAttach(name);
     doAttach(name, modes);
     return;
   }
 
   // Dead session — show last lines and offer to restart
   await handleDeadSession(session, autoRestart, modes);
-}
-
-async function requireGeometryNeutralAttach(name: string): Promise<void> {
-  let supported = false;
-  try {
-    const stats = await queryStats(name);
-    supported = stats.capabilities?.geometryNeutralAttach === true;
-  } catch {}
-  if (!supported) {
-    console.error(
-      `Session "${name}" does not support --no-resize. Upgrade its pty daemon or attach without the flag.`,
-    );
-    process.exit(1);
-  }
 }
 
 async function handleDeadSession(
@@ -1646,14 +1626,12 @@ async function handleDeadSession(
     scrubEnv: RESTART_SCRUBBED_ENV,
   });
   console.log(`Session "${session.name}" restarted.`);
-  if (modes.geometryNeutral) await requireGeometryNeutralAttach(session.name);
   doAttach(session.name, modes);
 }
 
 function doAttach(name: string, modes: AttachModes = {}): void {
   attach({
     name,
-    geometryNeutral: modes.geometryNeutral === true,
     forceResize: modes.forceResize === true,
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
