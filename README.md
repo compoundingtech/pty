@@ -55,6 +55,7 @@ pty run -a -- node server.js                       # create or attach if already
 pty run -e -- npm test                             # ephemeral: auto-remove on exit
 pty run --tag owner=forge -- node srv.js           # tag a session with metadata
 pty run --cwd /path -- node server.js              # run in a specific directory
+pty run -d --size 160x48 --id agent -- claude      # pin the session's geometry (clients can't resize it)
 
 pty rename my-label                       # inside a session: add/change its displayName
 pty rename <ref> my-label                 # outside: set displayName on <ref>
@@ -71,6 +72,7 @@ pty list --filter-tag role=web            # show only sessions with matching tag
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
 pty attach --no-resize myserver           # interactive viewer; preserve shared PTY geometry
+pty resize myserver 160x48                # set + pin the session's geometry (one SIGWINCH)
 pty exec -- codex                         # replace this session's process (inside a session)
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)
