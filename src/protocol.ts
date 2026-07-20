@@ -51,10 +51,6 @@ export function encodeData(data: string): Buffer {
   return encodePacket(MessageType.DATA, Buffer.from(data));
 }
 
-/** Optional ATTACH flag: this interactive client receives output and may send
- * input, but does not participate in PTY size negotiation or redraw nudges. */
-export const ATTACH_FLAG_GEOMETRY_NEUTRAL = 0x01;
-
 /** Optional ATTACH flag: nudge the child into a full redraw even when this
  * client attaches at the size the session already has. */
 export const ATTACH_FLAG_FORCE_RESIZE = 0x02;

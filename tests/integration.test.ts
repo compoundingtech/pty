@@ -10,7 +10,6 @@ import {
   PacketReader,
   Packet,
   encodeAttach,
-  ATTACH_FLAG_GEOMETRY_NEUTRAL,
   ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
@@ -341,42 +340,7 @@ describe("integration", () => {
     client2.destroy();
   });
 
-  it("geometry-neutral client sends input without changing the shared PTY size", async () => {
-    const name = uniqueName();
-    await startServer(name, "sh", [], { rows: 24, cols: 80 });
-
-    const primary = await connect(name);
-    const primaryReader = new PacketReader();
-    primary.write(encodeAttach(50, 200));
-    await waitForType(primary, primaryReader, MessageType.SCREEN);
-
-    const embedded = await connect(name);
-    const embeddedReader = new PacketReader();
-    embedded.write(encodeAttach(24, 80, ATTACH_FLAG_GEOMETRY_NEUTRAL));
-    await waitForType(embedded, embeddedReader, MessageType.SCREEN);
-
-    // Input remains duplex, but the embedded viewer's smaller geometry is inert.
-    embedded.write(encodeData("stty size\n"));
-    await waitForContent(embedded, embeddedReader, "50 200");
-
-    // Server-side enforcement: even a neutral client that sends RESIZE cannot
-    // move the shared child.
-    embedded.write(encodeResize(10, 40));
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    embedded.write(encodeData("stty size\n"));
-    await waitForContent(embedded, embeddedReader, "50 200");
-
-    primary.write(encodeStatus());
-    const status = await waitForType(primary, primaryReader, MessageType.STATUS);
-    const stats = JSON.parse(status.payload.toString());
-    expect(stats.capabilities.geometryNeutralAttach).toBe(true);
-    expect(stats.clients.geometryNeutral).toBe(1);
-
-    primary.destroy();
-    embedded.destroy();
-  });
-
-  it("geometry-neutral attach suppresses the redraw SIGWINCH nudge", async () => {
+  it("skips the redraw SIGWINCH nudge at the session's current size unless --force-resize", async () => {
     const name = uniqueName();
     const marker = path.join(testCwd, `${name}-winch`);
     const reporter = [
@@ -388,15 +352,8 @@ describe("integration", () => {
     await startServer(name, process.execPath, ["-e", reporter], { rows: 40, cols: 120 });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const neutral = await connect(name);
-    const neutralReader = new PacketReader();
-    neutral.write(encodeAttach(40, 120, ATTACH_FLAG_GEOMETRY_NEUTRAL));
-    await waitForType(neutral, neutralReader, MessageType.SCREEN);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(fs.existsSync(marker)).toBe(false);
-
-    // An ordinary attach at the session's current size is equally quiet: the
-    // child is already drawn for that geometry.
+    // An ordinary attach at the session's current size is quiet: the child is
+    // already drawn for that geometry.
     const ordinary = await connect(name);
     const ordinaryReader = new PacketReader();
     ordinary.write(encodeAttach(40, 120));
@@ -412,7 +369,6 @@ describe("integration", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(fs.readFileSync(marker, "utf8")).toContain("WINCH");
 
-    neutral.destroy();
     ordinary.destroy();
     forced.destroy();
   });
