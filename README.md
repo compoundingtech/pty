@@ -306,6 +306,8 @@ launchctl load ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist
 
 Default interval is 30 seconds; tune with `pty gc --print-launchd-plist --interval=15` etc. Output goes to `~/.local/state/pty/gc.log`.
 
+> **Upgrading from an older `@myobie/pty` install?** The gc-plist Label changed from `com.myobie.pty.gc` to `com.compoundingtech.pty.gc`. Unload the old service once so it doesn't linger orphaned: `launchctl unload ~/Library/LaunchAgents/com.myobie.pty.gc.plist && rm ~/Library/LaunchAgents/com.myobie.pty.gc.plist`, then install the new one above.
+
 Statelessness is the whole point of running it on a cron rather than as a long-lived daemon. At boot, if the volume containing the `pty` binary isn't mounted yet, the invocation fails — the next tick tries again. The historic long-running supervisor would burn through its 5-retry budget in the first 10 seconds of boot and never come back; this design just shrugs and reconciles on the next tick.
 
 For other systems:

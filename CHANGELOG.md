@@ -2,6 +2,12 @@
 
 ## 0.12.0
 
+### Package renamed: `@myobie/pty` → `@compoundingtech/pty`
+
+- The npm scope + GitHub org moved from `@myobie`/`myobie` to `@compoundingtech`/`compoundingtech`. The package is now **`@compoundingtech/pty`**; all subpaths (`/tui`, `/client`, `/server`, `/testing`, `/protocol`, `/keys`) and the CLI command (`pty`) are unchanged in shape. Update imports and any `@myobie/pty*` dependency specifiers.
+- The gc-plist launchd Label changed `com.myobie.pty.gc` → `com.compoundingtech.pty.gc`. **On upgrade**, unload the old service once so it doesn't linger: `launchctl unload ~/Library/LaunchAgents/com.myobie.pty.gc.plist && rm ~/Library/LaunchAgents/com.myobie.pty.gc.plist`, then reinstall via `pty gc --print-launchd-plist` (see README).
+- The package is `private` (unpublished) pending a coordinated `@compoundingtech` publish; consumers use a `file:` dependency in the meantime.
+
 ### `@compoundingtech/pty/tui` — semantic design-token layer (`tokens.ts`)
 
 - New `tokens` module is the single source of truth for semantic-color resolution: `SEMANTIC_SLOTS` (the one `SemanticColor`→theme-slot map), `resolveSemantic(color, theme)` (the canonical resolution `renderer.resolveColor` now delegates to — no behavior change), `semanticColorNames()`, and `themeTokens(theme)` — a serializer that emits a theme's tokens as a framework-neutral name→RGB map (e.g. for CSS custom properties), the foundation for driving the same palette on web as in the terminal. It's a leaf module (no dependency on the ANSI/render code), so the token vocabulary can be resolved and serialized without pulling in terminal rendering.

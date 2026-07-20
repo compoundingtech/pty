@@ -1,6 +1,7 @@
 {
   "name": "@compoundingtech/pty",
   "version": "0.12.0",
+  "private": true,
   "description": "Persistent terminal sessions with detach/attach, plus a Playwright-style testing library for TUI apps",
   "type": "module",
   "license": "MIT",
