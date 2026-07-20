@@ -580,15 +580,22 @@ function commandFingerprint(command: string, args: string[]): string {
  *    3.   Residual sweep: exited/vanished sessions that aren't permanent
  *         and aren't tagged `keep` get `cleanupAll`'d.
  *
- *  Step 3 is now a BACKSTOP rather than the primary path. A non-permanent
- *  session reaps itself as it shuts down (see `shouldReapAtExit`), so by
- *  the time gc runs there is usually nothing left for step 3 to do. What
- *  still reaches it:
+ *  Step 3 is now a BACKSTOP rather than the primary path: a non-permanent
+ *  session that runs to completion reaps itself as it shuts down (see
+ *  `shouldReapAtExit`). It is NOT redundant, though — everything below
+ *  still reaches it, so step 3 cannot simply be deleted:
  *
+ *    - `pty kill`'d sessions. This is the most common residual case, and
+ *      easy to miss: the exit path deliberately retains a session stopped
+ *      from outside, but the child's `onExit` still wrote an exit record,
+ *      so the session lands here as `status=exited` and gets swept. The
+ *      retention is until the next sweep, not forever — `keep` is what
+ *      makes it forever.
  *    - `status=vanished` sessions — the daemon was SIGKILL'd / OOM-killed
- *      / lost to a reboot, so the exit-time path never ran. This is the
- *      one case exit-time cleanup structurally cannot cover, and the
- *      reason step 3 cannot simply be deleted.
+ *      / lost to a reboot, so no exit-time code ran at all. This is the
+ *      case exit-time cleanup structurally *cannot* cover, since the
+ *      process that would do the cleaning is the one that died. Note a
+ *      reboot puts EVERY non-permanent session in this bucket at once.
  *    - sessions created before the exit-time policy existed, and any
  *      whose final `cleanupAll` lost a race with an external `pty rm`.
  *    - sessions demoted out of `strategy=permanent` after they died. */

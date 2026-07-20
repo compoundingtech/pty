@@ -334,6 +334,27 @@ describe("exit-time reap: what it structurally cannot cover", () => {
     expect(sessionFiles(dir, name)).toEqual([]);
   }, 25000);
 
+  it("still sweeps a `pty kill`'d session, so kill retains only until the next sweep", async () => {
+    // Easy to misread the exit-path exemption as "killed sessions are safe".
+    // They are not: the child's onExit still wrote an exit record, so the
+    // session lands in gc as `status=exited` and gets swept. `pty kill` buys
+    // you retention until the next sweep; `keep` is what buys you forever.
+    // This is also the most common duty gc's sweep still has, which is why
+    // the sweep cannot simply be deleted.
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const pid = await startDaemon(dir, name, "cat");
+
+    expect(runCli(dir, "kill", name).stdout).toContain("killed");
+    await waitForDaemonExit(pid);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(sessionFiles(dir, name).some((f) => f.endsWith(".json"))).toBe(true);
+
+    const gc = runCli(dir, "gc");
+    expect(gc.stdout).toContain(`Removed: ${name}`);
+    expect(sessionFiles(dir, name)).toEqual([]);
+  }, 25000);
+
   it("reports kept sessions from `pty gc` instead of silently skipping them", async () => {
     // gc must agree with the exit path about `keep`: if it did not, a kept
     // session would survive its own exit only to be swept by the next tick.
