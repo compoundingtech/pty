@@ -51,27 +51,11 @@ export function encodeData(data: string): Buffer {
   return encodePacket(MessageType.DATA, Buffer.from(data));
 }
 
-/** Optional ATTACH flag: this interactive client receives output and may send
- * input, but does not participate in PTY size negotiation or redraw nudges. */
-export const ATTACH_FLAG_GEOMETRY_NEUTRAL = 0x01;
-
-export function encodeAttach(
-  rows: number,
-  cols: number,
-  geometryNeutral = false,
-): Buffer {
-  // Keep the legacy frame byte-for-byte identical. The optional flag byte is
-  // appended only when needed; older servers already ignore bytes after the
-  // first four size bytes.
-  const payload = Buffer.alloc(geometryNeutral ? 5 : 4);
+export function encodeAttach(rows: number, cols: number): Buffer {
+  const payload = Buffer.alloc(4);
   payload.writeUInt16BE(rows, 0);
   payload.writeUInt16BE(cols, 2);
-  if (geometryNeutral) payload.writeUInt8(ATTACH_FLAG_GEOMETRY_NEUTRAL, 4);
   return encodePacket(MessageType.ATTACH, payload);
-}
-
-export function decodeAttachFlags(payload: Buffer): number {
-  return payload.length >= 5 ? payload.readUInt8(4) : 0;
 }
 
 export function encodeDetach(): Buffer {

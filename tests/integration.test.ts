@@ -339,42 +339,7 @@ describe("integration", () => {
     client2.destroy();
   });
 
-  it("geometry-neutral client sends input without changing the shared PTY size", async () => {
-    const name = uniqueName();
-    await startServer(name, "sh", [], { rows: 24, cols: 80 });
-
-    const primary = await connect(name);
-    const primaryReader = new PacketReader();
-    primary.write(encodeAttach(50, 200));
-    await waitForType(primary, primaryReader, MessageType.SCREEN);
-
-    const embedded = await connect(name);
-    const embeddedReader = new PacketReader();
-    embedded.write(encodeAttach(24, 80, true));
-    await waitForType(embedded, embeddedReader, MessageType.SCREEN);
-
-    // Input remains duplex, but the embedded viewer's smaller geometry is inert.
-    embedded.write(encodeData("stty size\n"));
-    await waitForContent(embedded, embeddedReader, "50 200");
-
-    // Server-side enforcement: even a neutral client that sends RESIZE cannot
-    // move the shared child.
-    embedded.write(encodeResize(10, 40));
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    embedded.write(encodeData("stty size\n"));
-    await waitForContent(embedded, embeddedReader, "50 200");
-
-    primary.write(encodeStatus());
-    const status = await waitForType(primary, primaryReader, MessageType.STATUS);
-    const stats = JSON.parse(status.payload.toString());
-    expect(stats.capabilities.geometryNeutralAttach).toBe(true);
-    expect(stats.clients.geometryNeutral).toBe(1);
-
-    primary.destroy();
-    embedded.destroy();
-  });
-
-  it("geometry-neutral attach suppresses the redraw SIGWINCH nudge", async () => {
+  it("skips the redraw SIGWINCH nudge at the session's current size", async () => {
     const name = uniqueName();
     const marker = path.join(testCwd, `${name}-winch`);
     const reporter = [
@@ -386,23 +351,38 @@ describe("integration", () => {
     await startServer(name, process.execPath, ["-e", reporter], { rows: 40, cols: 120 });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const neutral = await connect(name);
-    const neutralReader = new PacketReader();
-    neutral.write(encodeAttach(40, 120, true));
-    await waitForType(neutral, neutralReader, MessageType.SCREEN);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(fs.existsSync(marker)).toBe(false);
-
-    // The ordinary path remains unchanged and still nudges for redraw fidelity.
+    // An ordinary attach at the session's current size is quiet: the child is
+    // already drawn for that geometry.
     const ordinary = await connect(name);
     const ordinaryReader = new PacketReader();
     ordinary.write(encodeAttach(40, 120));
     await waitForType(ordinary, ordinaryReader, MessageType.SCREEN);
     await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(fs.existsSync(marker)).toBe(false);
+
+    ordinary.destroy();
+  });
+
+  it("still nudges when the attaching client's size differs", async () => {
+    const name = uniqueName();
+    const marker = path.join(testCwd, `${name}-winch`);
+    const reporter = [
+      "const fs = require('node:fs')",
+      `process.on('SIGWINCH', () => fs.appendFileSync(${JSON.stringify(marker)}, 'WINCH\\n'))`,
+      "console.log('READY')",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    await startServer(name, process.execPath, ["-e", reporter], { rows: 40, cols: 120 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const smaller = await connect(name);
+    const reader = new PacketReader();
+    smaller.write(encodeAttach(24, 80));
+    await waitForType(smaller, reader, MessageType.SCREEN);
+    await new Promise((resolve) => setTimeout(resolve, 250));
     expect(fs.readFileSync(marker, "utf8")).toContain("WINCH");
 
-    neutral.destroy();
-    ordinary.destroy();
+    smaller.destroy();
   });
 
   it("cleans up socket and pid files on close", async () => {

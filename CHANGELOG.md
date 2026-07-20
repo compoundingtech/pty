@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### Attach no longer nudges a child that is already at the right size
+
+- The attach-time redraw nudge (resize to `cols - 1` and back, to paper over serialize-replay artifacts) now fires only when the attaching client's geometry differs from the session's. Attaching at the size the session already has leaves the child alone, so connecting a viewer no longer delivers `SIGWINCH` to an idle process.
+
 ### Package renamed: `@myobie/pty` → `@compoundingtech/pty`
 
 - The npm scope + GitHub org moved from `@myobie`/`myobie` to `@compoundingtech`/`compoundingtech`. The package is now **`@compoundingtech/pty`**; all subpaths (`/tui`, `/client`, `/server`, `/testing`, `/protocol`, `/keys`) and the CLI command (`pty`) are unchanged in shape. Update imports and any `@myobie/pty*` dependency specifiers.
@@ -44,10 +48,6 @@
 ### `@compoundingtech/pty/tui` — `badge` SRCL-style status chip
 
 - New `badge(label, opts)` widget renders a small SRCL-style chip: an uppercase, padded label on a muted fill (mirroring SRCL's `Badge` — `text-transform: uppercase`, `padding: 0 1ch`, filled background). Status `variant`s (`neutral | ok | warn | error | accent | info`) color the label, or fill the chip when `solid: true`. `uppercase` and `bold` are configurable. Returns a `TextNode` styled with semantic color tokens only (no terminal-only escapes), so the same call can render under a non-terminal backend.
-
-### Geometry-neutral interactive attach
-
-- `pty attach --no-resize <ref>` receives the live screen and forwards input without contributing its terminal dimensions to the shared PTY's min-wins size negotiation. It also suppresses the attach-time redraw `SIGWINCH` nudge. This supports embedded interactive viewers whose stdio is piped (and would otherwise report the 80x24 fallback) while leaving ordinary multi-viewer behavior unchanged. The CLI refuses the flag against a daemon that does not advertise `capabilities.geometryNeutralAttach`, rather than silently degrading.
 
 ### `pty.toml` — per-session `cwd` field
 
