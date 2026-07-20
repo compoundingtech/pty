@@ -435,7 +435,7 @@ Run them with `node --experimental-strip-types demos/{name}/main.ts` (or `./demo
 
 ## Skill Reference
 
-For AI coding agents and automation, see **[docs/SKILL.md](docs/SKILL.md)** — a concise guide to running and managing background processes with pty, including session lifecycle, common patterns, and rules for well-behaved agents.
+For AI coding agents and automation, see **[SKILL.md](SKILL.md)** — a concise guide to running and managing background processes with pty, including session lifecycle, common patterns, and rules for well-behaved agents.
 
 ## Tab Completion
 
