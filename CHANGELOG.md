@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Non-permanent sessions clean themselves up at exit (BREAKING)
+
+A session that is not `strategy=permanent` now removes its own registry entry — metadata, events file, socket, pid — as its daemon shuts down, once its child process has terminated. Previously the entry lingered until an external `pty gc` sweep noticed it (or until the 24-hour dead-session TTL). Cleanup is now caused by the exit rather than discovered later, which removes both the sweep's polling interval and the window in which a finished session is still listed in `pty ls`.
+
+- **Applies to clean exits and crashes alike** — both mean the command is finished.
+- **New `keep` tag.** `keep=true` exempts a session from reaping, by both the exit-time path and `pty gc`'s sweep, so its metadata/`lastLines`/events survive for inspection until an explicit `pty rm`. Any value other than `false`/`0`/`no`/`off` counts as set. Settable at spawn (`--tag keep=true`) or on a running session (`pty tag <ref> keep=true`) — the exit path re-reads tags from disk, so pinning a session you are about to debug works.
+- **Exempt:** `keep`, `strategy=permanent` (its supervisor reconciles against the dead session's metadata), external `pty kill`/SIGTERM/SIGINT (stop-and-keep, still deliberately distinct from `pty rm`), and `vanished` sessions (the daemon was SIGKILLed, so no cleanup code ran).
+- **`pty gc`'s sweep becomes a backstop.** Its remaining prey is `vanished` sessions — the one case exit-time cleanup structurally cannot cover. `GcResult` gains `kept: string[]`, and `pty gc` prints `Kept (keep tag): <name>` so a retained dead session does not look like a gc bug. `pty gc`'s other duties (orphan-kill, abandoned-reap, permanent respawn) are unchanged.
+- **`--ephemeral` is now a narrower override**, not the only way to get cleanup: it reaps on *any* shutdown, including `pty kill` and including `strategy=permanent`. `keep` wins over it.
+
+**Migration.** Anything that touched a non-permanent session after it finished must now tag it `keep=true`. Previously such callers had until the next gc tick; they now have no window at all. Affected: `pty peek` (saved output), `pty stats`, `pty restart <ref>` and `pty attach`'s restart prompt (both now report `not found` for a session that reaped itself), `pty tag` on a dead session, and any reader of `<id>.json` / `<id>.events.jsonl` on disk. `strategy=permanent` sessions are unaffected.
+
 ## 0.12.0
 
 ### Attach no longer nudges a child that is already at the right size

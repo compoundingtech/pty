@@ -33,7 +33,7 @@ Returns the Unix socket path for a session.
 
 ### `gc(opts?: { dryRun?: boolean; idleDays?: number; fastFailWindowSec?: number; fastFailLimit?: number }): Promise<GcResult>`
 
-Run one reconciliation pass: remove exited/vanished non-permanent sessions, kill orphaned `parent=` children, reap abandoned permanents, and respawn (or flap-skip) `strategy=permanent` sessions. Returns a `GcResult` describing everything the pass did. Pass `{ dryRun: true }` to compute the same plan without mutating anything — useful for preview UIs.
+Run one reconciliation pass: sweep dead non-permanent sessions, kill orphaned `parent=` children, reap abandoned permanents, and respawn (or flap-skip) `strategy=permanent` sessions. The sweep is a backstop — a non-permanent session removes itself when its command finishes, so in practice it catches `vanished` sessions (SIGKILLed daemon, no cleanup code ran). Sessions tagged `keep` are never swept and are reported in `kept`. Returns a `GcResult` describing everything the pass did. Pass `{ dryRun: true }` to compute the same plan without mutating anything — useful for preview UIs.
 
 ```typescript
 const result = await gc();
@@ -45,7 +45,8 @@ console.log(`Would remove: ${plan.removed.join(", ")}`);
 
 ```typescript
 interface GcResult {
-  removed: string[];                                                              // exited/vanished non-permanent sessions cleaned up
+  removed: string[];                                                              // dead non-permanent sessions cleaned up (mostly vanished)
+  kept: string[];                                                                 // dead non-permanent sessions left alone because they are tagged `keep`
   killedOrphanChildren: { name: string; parent: string; reason: "missing" | "dead" }[];
   abandoned: { name: string; reason: "cwd-gone" | "idle"; idleDays?: number }[];  // live permanents reaped as abandoned
   respawned: { name: string; ptyfileReread: boolean }[];
@@ -73,6 +74,18 @@ interface PrunedTagResult {
 ### `isReservedTagKey(key: string): boolean`
 
 Returns `true` for pty's internal bookkeeping keys (`ptyfile`, `ptyfile.session`, `ptyfile.tags`, `strategy`) and for any key starting with `:` (the tool-owned-tag convention). Downstream tools should hide reserved keys from user-facing listings by default but still allow writes — set and unset them as needed.
+
+### `isKeepRequested(tags?: Record<string, string>): boolean`
+
+Returns `true` when `tags` carries the `keep` exemption — i.e. the session's metadata, `lastLines`, and events file must survive its death until an explicit `pty rm`. Any value other than `false` / `0` / `no` / `off` counts as set, so an unrecognized value errs toward retaining. The tag key itself is exported as `KEEP_TAG`.
+
+Read tags from the session's *current* metadata rather than from a spawn-time snapshot — `keep` is routinely applied to a session that is still running.
+
+### `shouldReapAtExit(tags: Record<string, string> | undefined, ephemeral: boolean): boolean`
+
+The policy the daemon applies to its own registry entry as it shuts down, exposed so supervisors can predict it. `keep` wins over everything; then `ephemeral`; then `strategy=permanent` is retained for its supervisor; everything else is reaped.
+
+Note this does not model the two cases decided outside the tag map: an external `pty kill` retains the session, and a `vanished` session (SIGKILLed daemon) never reaches this code at all.
 
 ### `cleanupSocket(name: string): void`
 
@@ -122,7 +135,9 @@ interface SpawnDaemonOptions {
   args: string[];
   displayCommand: string;
   cwd?: string;                      // defaults to process.cwd()
-  ephemeral?: boolean;               // auto-remove on exit
+  ephemeral?: boolean;               // reap on ANY shutdown, incl. `pty kill` and strategy=permanent
+                                     // (non-permanent sessions already self-reap when their command ends;
+                                     //  a `keep` tag overrides this)
   rows?: number;                     // defaults to process.stdout.rows ?? 24
   cols?: number;                     // defaults to process.stdout.columns ?? 80
   tags?: Record<string, string>;     // key-value metadata (e.g. { owner: "forge" })
