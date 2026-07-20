@@ -35,10 +35,10 @@ afterEach(() => {
 });
 
 /** Spawn the daemon as a real subprocess and return the child + an exit promise. */
-function startDaemonSubprocess(sessionDir: string, name: string, command: string, args: string[] = []) {
+function startDaemonSubprocess(sessionDir: string, name: string, command: string, args: string[] = [], tags?: Record<string, string>) {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
-    cwd: os.tmpdir(), rows: 24, cols: 80,
+    cwd: os.tmpdir(), rows: 24, cols: 80, tags,
   });
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
@@ -83,7 +83,9 @@ describe("session_exit event is flushed to disk before daemon exits", () => {
     const name = `x${Math.random().toString(36).slice(2, 6)}`;
 
     // `true` exits immediately, triggering the daemon's onExit path.
-    const { exitPromise } = startDaemonSubprocess(dir, name, "true");
+    // `keep=true` exempts the session from the exit-time self-reap so the
+    // events file it flushed is still on disk for us to read.
+    const { exitPromise } = startDaemonSubprocess(dir, name, "true", [], { keep: "true" });
 
     await waitForSocket(dir, name);
     // Wait for the daemon to fully exit (this is what pty kill races against).
@@ -122,7 +124,8 @@ describe("session_exit event is flushed to disk before daemon exits", () => {
     const dir = makeSessionDir();
     const name = `s${Math.random().toString(36).slice(2, 6)}`;
 
-    const { exitPromise } = startDaemonSubprocess(dir, name, "true");
+    // `keep=true`: retain the events file past the daemon's exit-time self-reap.
+    const { exitPromise } = startDaemonSubprocess(dir, name, "true", [], { keep: "true" });
     await waitForSocket(dir, name);
     await exitPromise;
 

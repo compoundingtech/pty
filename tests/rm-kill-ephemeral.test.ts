@@ -34,7 +34,7 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
-  opts: { ephemeral?: boolean } = {},
+  opts: { ephemeral?: boolean; tags?: Record<string, string> } = {},
 ): Promise<number> {
   const config = JSON.stringify({
     name,
@@ -45,6 +45,7 @@ async function startDaemon(
     rows: 24,
     cols: 80,
     ephemeral: opts.ephemeral ?? false,
+    tags: opts.tags,
   });
 
   const child = spawn(nodeBin, [serverModule], {
@@ -140,7 +141,9 @@ describe("pty kill", () => {
   it("refuses to kill an exited session", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits immediately
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so there is still an exited session for `kill` to refuse.
+    await startDaemon(dir, name, "true", [], { tags: { keep: "true" } }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000));
 
     const result = runCli(dir, "kill", name);
@@ -162,7 +165,9 @@ describe("pty rm", () => {
   it("removes metadata for an exited session", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits immediately
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so there is still metadata left for `rm` to remove.
+    await startDaemon(dir, name, "true", [], { tags: { keep: "true" } }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000));
 
     // Verify metadata exists

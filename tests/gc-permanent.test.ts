@@ -80,6 +80,20 @@ function readMeta(sessionDir: string, name: string) {
   return JSON.parse(fs.readFileSync(path.join(sessionDir, `${name}.json`), "utf-8"));
 }
 
+/** SIGKILL a daemon THIS test spawned (pid comes from `startDaemon`) and wait
+ *  for it to actually die. No shutdown code runs, so the `<id>.json` is left
+ *  behind with no exit record — status=vanished, which is what still reaches
+ *  gc STEP 3. (Cleanly-exited non-permanent sessions now self-reap at exit.) */
+async function killDaemonHard(pid: number): Promise<void> {
+  try { process.kill(pid, "SIGKILL"); } catch {}
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    try { process.kill(pid, 0); } catch { return; }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`Timeout waiting for daemon pid ${pid} to die`);
+}
+
 function readEvents(sessionDir: string, name: string): any[] {
   const filePath = path.join(sessionDir, `${name}.events.jsonl`);
   try {
@@ -140,11 +154,15 @@ describe("pty gc — strategy=permanent respawn", () => {
     }
   }, 20000);
 
-  it("does NOT respawn an exited session without strategy=permanent", async () => {
+  it("does NOT respawn a vanished session without strategy=permanent", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true");
-    await new Promise((r) => setTimeout(r, 800));
+    // A cleanly-exited non-permanent session now reaps itself at exit, so it
+    // never reaches gc. Use a vanished session (daemon SIGKILLed, no exit
+    // record) — that is the dead-but-still-on-disk case gc must sweep rather
+    // than respawn, since it carries no strategy=permanent.
+    const pid = await startDaemon(dir, name, "cat");
+    await killDaemonHard(pid);
 
     const result = runCli(dir, "gc");
     expect(result.status).toBe(0);

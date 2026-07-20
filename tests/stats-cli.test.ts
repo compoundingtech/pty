@@ -34,6 +34,7 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
+  tags?: Record<string, string>,
 ): Promise<number> {
   const config = JSON.stringify({
     name,
@@ -43,6 +44,7 @@ async function startDaemon(
     cwd: os.tmpdir(),
     rows: 24,
     cols: 80,
+    tags,
   });
 
   const child = spawn(nodeBin, [serverModule], {
@@ -176,7 +178,9 @@ describe("pty stats CLI", () => {
   it("shows exited message for dead session", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits immediately
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so `stats` still has a dead session to report on.
+    await startDaemon(dir, name, "true", [], { keep: "true" }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit
 
     const output = runStats(dir, name);
@@ -208,7 +212,8 @@ describe("pty stats CLI", () => {
   it("does not show CPU/Memory for exited sessions", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits immediately
+    // `keep=true`: retain the exited session past the exit-time self-reap.
+    await startDaemon(dir, name, "true", [], { keep: "true" }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit
 
     const output = runStats(dir, name);
