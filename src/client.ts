@@ -214,7 +214,7 @@ export interface SendOptions {
  *  input are processed differently by terminal programs — a trailing `key:return`
  *  fired with zero delay routinely lands before the program has parsed/rendered
  *  the typed text, submitting an empty or partial line. 0.3s lets each chunk be
- *  consumed. See docs/SKILL.md. This default lives in the CLI layer only; the
+ *  consumed. See SKILL.md. This default lives in the CLI layer only; the
  *  library `send()` still treats `delayMs` literally (undefined/0 = no spacing). */
 export const DEFAULT_SEQ_DELAY_MS = 300;
 
