@@ -85,6 +85,7 @@ const COMMANDS: readonly CommandSpec[] = [
     flags: [
       { name: "auto-restart", short: "r", desc: "Auto-restart if the session is exited" },
       { name: "no-resize", desc: "Preserve shared PTY geometry" },
+      { name: "force-resize", desc: "Redraw-nudge even at the current size" },
       { name: "force", desc: "Attach even from inside another pty" },
       { name: "remote", desc: "Attach a session on a fabric peer" },
     ],

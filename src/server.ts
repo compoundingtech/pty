@@ -18,6 +18,7 @@ import {
   decodeSize,
   decodeAttachFlags,
   ATTACH_FLAG_GEOMETRY_NEUTRAL,
+  ATTACH_FLAG_FORCE_RESIZE,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -606,8 +607,14 @@ export class PtyServer {
           case MessageType.ATTACH: {
             if (packet.payload.length < 4) break;
             const size = decodeSize(packet.payload);
+            const attachFlags = decodeAttachFlags(packet.payload);
             client.geometryNeutral =
-              (decodeAttachFlags(packet.payload) & ATTACH_FLAG_GEOMETRY_NEUTRAL) !== 0;
+              (attachFlags & ATTACH_FLAG_GEOMETRY_NEUTRAL) !== 0;
+            const forceResize = (attachFlags & ATTACH_FLAG_FORCE_RESIZE) !== 0;
+            // Read before negotiateSize(): a smaller client shrinks the session
+            // to its own size, which would then look like it had matched.
+            const sizeMatched =
+              size.rows === this.terminal.rows && size.cols === this.terminal.cols;
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
@@ -642,7 +649,14 @@ export class PtyServer {
                 // overwrites any serialize artifacts on the client.
                 // A geometry-neutral viewer accepts the serialized snapshot as
                 // is: nudging would perturb the shared child it came to observe.
-                if (!client.geometryNeutral) this.nudgeRedraw();
+                //
+                // Skipped too when the client attached at the size the session
+                // already has: the child is drawn for that geometry, so the
+                // nudge buys nothing and wakes an otherwise idle process every
+                // time someone connects. `--force-resize` opts back in for
+                // children whose serialize replay needs the redraw regardless.
+                const nudge = sizeMatched ? forceResize : true;
+                if (!client.geometryNeutral && nudge) this.nudgeRedraw();
               }
             };
 

@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### Attach no longer nudges a child that is already at the right size
+
+- The attach-time redraw nudge (resize to `cols - 1` and back, to paper over serialize-replay artifacts) now fires only when the attaching client's geometry differs from the session's. Attaching at the size the session already has leaves the child alone, so connecting a viewer no longer delivers `SIGWINCH` to an idle process. `pty attach --force-resize` restores the nudge unconditionally for children whose replay needs it.
+
 ### Package renamed: `@myobie/pty` → `@compoundingtech/pty`
 
 - The npm scope + GitHub org moved from `@myobie`/`myobie` to `@compoundingtech`/`compoundingtech`. The package is now **`@compoundingtech/pty`**; all subpaths (`/tui`, `/client`, `/server`, `/testing`, `/protocol`, `/keys`) and the CLI command (`pty`) are unchanged in shape. Update imports and any `@myobie/pty*` dependency specifiers.

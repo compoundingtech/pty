@@ -76,6 +76,7 @@ complete -c pty -n '__pty_using_command run' -l isolate-env -d 'Scrub env to a s
 complete -c pty -n '__pty_using_command run' -l force -d 'Create even from inside another pty'
 complete -c pty -n '__pty_using_command attach a' -l auto-restart -s r -d 'Auto-restart if the session is exited'
 complete -c pty -n '__pty_using_command attach a' -l no-resize -d 'Preserve shared PTY geometry'
+complete -c pty -n '__pty_using_command attach a' -l force-resize -d 'Redraw-nudge even at the current size'
 complete -c pty -n '__pty_using_command attach a' -l force -d 'Attach even from inside another pty'
 complete -c pty -n '__pty_using_command attach a' -l remote -d 'Attach a session on a fabric peer'
 complete -c pty -n '__pty_using_command attach a' -a '(__pty_sessions)' -d 'Session'

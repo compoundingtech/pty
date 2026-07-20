@@ -69,6 +69,7 @@ _pty() {
           _arguments \
             '(r --auto-restart){r,--auto-restart}[Auto-restart if the session is exited]' \
             '--no-resize[Preserve shared PTY geometry]' \
+            '--force-resize[Redraw-nudge even at the current size]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
             '1:session:_pty_sessions'

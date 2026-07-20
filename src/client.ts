@@ -4,6 +4,8 @@ import {
   MessageType,
   PacketReader,
   encodeAttach,
+  ATTACH_FLAG_GEOMETRY_NEUTRAL,
+  ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
   encodePeek,
@@ -381,6 +383,9 @@ export interface AttachOptions {
    * attach-time redraw nudges. Callers must first verify the daemon advertises
    * `capabilities.geometryNeutralAttach` in stats. */
   geometryNeutral?: boolean;
+  /** Ask for the attach-time redraw nudge even when attaching at the session's
+   * current size, where it is otherwise skipped. */
+  forceResize?: boolean;
   onExit?: (code: number) => void;
   onDetach?: () => void;
   /** Attach over this ALREADY-CONNECTED socket instead of dialing the local
@@ -507,7 +512,10 @@ export function attach(options: AttachOptions): void {
     enterRawMode();
     const rows = (stdout as tty.WriteStream).rows ?? 24;
     const cols = (stdout as tty.WriteStream).columns ?? 80;
-    try { socket.write(encodeAttach(rows, cols, options.geometryNeutral === true)); } catch {}
+    const flags =
+      (options.geometryNeutral ? ATTACH_FLAG_GEOMETRY_NEUTRAL : 0) |
+      (options.forceResize ? ATTACH_FLAG_FORCE_RESIZE : 0);
+    try { socket.write(encodeAttach(rows, cols, flags)); } catch {}
     wireInput();
   }
 

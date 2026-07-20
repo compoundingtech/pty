@@ -10,6 +10,8 @@ import {
   PacketReader,
   Packet,
   encodeAttach,
+  ATTACH_FLAG_GEOMETRY_NEUTRAL,
+  ATTACH_FLAG_FORCE_RESIZE,
   encodeData,
   encodeDetach,
   encodePeek,
@@ -350,7 +352,7 @@ describe("integration", () => {
 
     const embedded = await connect(name);
     const embeddedReader = new PacketReader();
-    embedded.write(encodeAttach(24, 80, true));
+    embedded.write(encodeAttach(24, 80, ATTACH_FLAG_GEOMETRY_NEUTRAL));
     await waitForType(embedded, embeddedReader, MessageType.SCREEN);
 
     // Input remains duplex, but the embedded viewer's smaller geometry is inert.
@@ -388,21 +390,53 @@ describe("integration", () => {
 
     const neutral = await connect(name);
     const neutralReader = new PacketReader();
-    neutral.write(encodeAttach(40, 120, true));
+    neutral.write(encodeAttach(40, 120, ATTACH_FLAG_GEOMETRY_NEUTRAL));
     await waitForType(neutral, neutralReader, MessageType.SCREEN);
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(fs.existsSync(marker)).toBe(false);
 
-    // The ordinary path remains unchanged and still nudges for redraw fidelity.
+    // An ordinary attach at the session's current size is equally quiet: the
+    // child is already drawn for that geometry.
     const ordinary = await connect(name);
     const ordinaryReader = new PacketReader();
     ordinary.write(encodeAttach(40, 120));
     await waitForType(ordinary, ordinaryReader, MessageType.SCREEN);
     await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(fs.existsSync(marker)).toBe(false);
+
+    // --force-resize opts back in to the nudge at the current size.
+    const forced = await connect(name);
+    const forcedReader = new PacketReader();
+    forced.write(encodeAttach(40, 120, ATTACH_FLAG_FORCE_RESIZE));
+    await waitForType(forced, forcedReader, MessageType.SCREEN);
+    await new Promise((resolve) => setTimeout(resolve, 150));
     expect(fs.readFileSync(marker, "utf8")).toContain("WINCH");
 
     neutral.destroy();
     ordinary.destroy();
+    forced.destroy();
+  });
+
+  it("still nudges when the attaching client's size differs", async () => {
+    const name = uniqueName();
+    const marker = path.join(testCwd, `${name}-winch`);
+    const reporter = [
+      "const fs = require('node:fs')",
+      `process.on('SIGWINCH', () => fs.appendFileSync(${JSON.stringify(marker)}, 'WINCH\\n'))`,
+      "console.log('READY')",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    await startServer(name, process.execPath, ["-e", reporter], { rows: 40, cols: 120 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const smaller = await connect(name);
+    const reader = new PacketReader();
+    smaller.write(encodeAttach(24, 80));
+    await waitForType(smaller, reader, MessageType.SCREEN);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(fs.readFileSync(marker, "utf8")).toContain("WINCH");
+
+    smaller.destroy();
   });
 
   it("cleans up socket and pid files on close", async () => {
