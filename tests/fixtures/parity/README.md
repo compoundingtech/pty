@@ -54,9 +54,26 @@ plain-screen kinds runs `peek --plain` and asserts `stdout.replace(/\n$/,"") ===
 expect.plainScreen`; for `reaped-after-exit` it asserts `peek` exits non-zero and
 `ls --json` has no entry. pty-rust does the equivalent against its own binary.
 
-**Seeds:** `idle-prompt-plain`, `post-exit-final-screen` (preserve),
-`post-exit-reaped` (reap) are landed in `screens.json`. Coming next (JSON-shape
-fixtures — captured example + per-field policy `exact | type:<t> |
-omit-when-unset`, asserted as shape + stable values, not raw bytes):
-`ls-json-shape` and `client-count-during-peek` (attached=0), in a sibling
-`shapes.json`.
+## `shapes.json`
+
+JSON-SHAPE fixtures (companion to `screens.json`, harness
+`tests/parity-shapes.test.ts`): run a scenario via the real `pty` CLI, then
+assert the machine-readable output **field-by-field per policy** rather than by
+raw bytes. Each field policy is one of `{exact:<v>}` (=== v, incl. `null`),
+`{type:'number'|'string'}` (present, non-null, that type), or
+`{omitWhenUnset:true}` (the key is absent). Seeds:
+
+- `ls-json-shape` — `pty list --json` entry shape for a running vs an exited
+  session (preserve mode, so the exited entry stays listed). status enum
+  `running|exited|vanished`. **pid policy:** ls `pid` is the DAEMON pid
+  (`type:number` while running, `exact:null` once exited) — distinct from
+  `stats.process.pid` (the child pid).
+- `client-count-during-peek` — after a transient `peek`, `stats --json`
+  `clients.attached === 0` (a peek/stats connection is not an attached
+  streaming client).
+
+## Seeds landed
+
+`screens.json`: `idle-prompt-plain`, `post-exit-final-screen` (preserve),
+`post-exit-reaped` (reap). `shapes.json`: `ls-json-shape`,
+`client-count-during-peek`.
