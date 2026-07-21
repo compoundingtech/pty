@@ -1,15 +1,17 @@
-// Exit-time cleanup of dead non-permanent sessions.
+// Exit-time cleanup of finished sessions — CONFIGURABLE.
 //
-// A non-permanent session that finishes is garbage the moment it finishes.
-// Rather than leaving its registry entry for a later `pty gc` sweep to
-// notice, the daemon removes it as part of its own shutdown — so removal is
-// CAUSED by the exit instead of discovered afterwards. That deletes both the
-// sweep's polling interval and the window in which a dead session is still
-// listed in `pty ls`.
+// Whether a finished non-permanent session reaps itself at exit, or is preserved
+// (kept listed + peekable until `pty gc` sweeps it), is the config default set
+// by the `PTY_REAP_ON_EXIT` network/global knob (see `reapOnExitDefault`). The
+// SHIPPED default is REAP. Two per-session flags override the default either
+// way: `keep=true` forces preserve (and also exempts from gc), `--ephemeral`
+// forces reap.
 //
-// This file pins the whole policy, including its deliberate exemptions. The
-// exemptions matter as much as the reap: each one is a case where the dead
-// session's metadata/scrollback is still load-bearing for somebody.
+// This file pins the whole policy: the reap default (the first describe runs
+// with PTY_REAP_ON_EXIT unset — the global test setup scrubs any ambient
+// value), the preserve mode (PTY_REAP_ON_EXIT=false), and every per-session
+// exemption — each a case where the dead session's metadata/scrollback is still
+// load-bearing for somebody.
 
 import { describe, it, expect, afterEach, afterAll } from "vitest";
 import * as fs from "node:fs";
@@ -47,7 +49,7 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
-  opts: { tags?: Record<string, string>; ephemeral?: boolean } = {},
+  opts: { tags?: Record<string, string>; ephemeral?: boolean; env?: Record<string, string> } = {},
 ): Promise<number> {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
@@ -58,7 +60,7 @@ async function startDaemon(
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, PTY_SERVER_CONFIG: config, PTY_SESSION_DIR: sessionDir },
+    env: { ...process.env, PTY_SERVER_CONFIG: config, PTY_SESSION_DIR: sessionDir, ...(opts.env ?? {}) },
   });
   let stderr = "";
   child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
@@ -191,6 +193,46 @@ describe("exit-time reap: sessions that clean themselves up", () => {
     const gc = runCli(dir, "gc");
     expect(gc.stdout).not.toContain(name);
     expect(gc.stdout).toContain("Nothing to clean up.");
+  }, 20000);
+});
+
+describe("config default = preserve (PTY_REAP_ON_EXIT=false)", () => {
+  const PRESERVE = { env: { PTY_REAP_ON_EXIT: "false" } };
+
+  it("preserves a finished non-permanent session (peekable until gc)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const pid = await startDaemon(dir, name, "true", [], PRESERVE);
+
+    await waitForDaemonExit(pid);
+    await new Promise((r) => setTimeout(r, 1000));
+    // With the preserve default the exit path does NOT reap: the metadata
+    // survives so the session stays listed + peekable.
+    expect(sessionFiles(dir, name).some((f) => f.endsWith(".json"))).toBe(true);
+  }, 20000);
+
+  it("still lets `pty gc` sweep the preserved session (gc owns cleanup)", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const pid = await startDaemon(dir, name, "true", [], PRESERVE);
+    await waitForDaemonExit(pid);
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(sessionFiles(dir, name).some((f) => f.endsWith(".json"))).toBe(true);
+
+    const gc = runCli(dir, "gc");
+    expect(gc.stdout).toContain(`Removed: ${name}`);
+    expect(sessionFiles(dir, name)).toEqual([]);
+  }, 25000);
+
+  it("--ephemeral still forces a reap even under the preserve default", async () => {
+    // The per-session override wins over the config default in the reap
+    // direction, mirroring how `keep` wins in the preserve direction.
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const pid = await startDaemon(dir, name, "true", [], { ...PRESERVE, ephemeral: true });
+
+    await waitForDaemonExit(pid);
+    expect(await waitForGone(dir, name)).toEqual([]);
   }, 20000);
 });
 

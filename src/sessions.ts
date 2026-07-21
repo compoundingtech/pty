@@ -430,36 +430,55 @@ export function isKeepRequested(tags?: Record<string, string>): boolean {
 
 /** Should the daemon remove its own registry entry as it shuts down?
  *
- *  This is the policy behind exit-time cleanup. A non-permanent session
- *  that dies is garbage the moment it dies — cleaning up as part of its own
- *  lifecycle removes both the polling interval of an external sweep and the
- *  window in which a dead session is still listed. Precedence, highest
- *  first:
+ *  Exit-time reaping is CONFIGURABLE. `defaultReap` is the config default (see
+ *  `reapOnExitDefault` — the `PTY_REAP_ON_EXIT` network/global knob), and two
+ *  per-session flags override it either way. Precedence, highest first:
  *
- *    1. `keep` — the explicit "don't reap me" exemption always wins, even
- *       over `--ephemeral`. Its entire purpose is retaining a dead
- *       session's logs and scrollback for debugging.
- *    2. `--ephemeral` — the historic explicit opt-in. Still forces a reap
- *       even for a permanent session, which is what it did before this
- *       policy existed; unchanged so no existing caller regresses.
- *    3. `strategy=permanent` — never self-reaps. Its supervisor (convoy,
- *       or `pty gc`'s respawn step) reads the metadata of the dead session
- *       to respawn it. Self-reaping would destroy the very record the
- *       supervisor reconciles against.
- *    4. Everything else — non-permanent, so reap.
+ *    1. `keep` — force PRESERVE. Always wins, even over `--ephemeral`, and also
+ *       exempts the session from `pty gc`'s sweep. Retains a dead session's
+ *       logs and scrollback for debugging past even a gc pass.
+ *    2. `--ephemeral` — force REAP. Reaps as the session shuts down (the
+ *       aggressive opt-in), even for a `strategy=permanent` session, so a
+ *       caller that wants no trace left gets it regardless of the config
+ *       default.
+ *    3. `strategy=permanent` — force PRESERVE. Its supervisor / `pty gc`'s
+ *       respawn step reconciles against the dead session's metadata, so
+ *       reaping it would destroy the record the respawn needs.
+ *    4. `defaultReap` — the config default when none of the above apply.
+ *       `true` reaps a finished non-permanent session at exit; `false`
+ *       PRESERVES it (its metadata lingers, peekable, until `pty gc`'s sweep
+ *       reclaims it).
  *
- *  Note what is *not* representable here: a session whose daemon was itself
- *  SIGKILL'd (`status=vanished`) never runs this code, because the process
- *  that would run it is the one that died. Vanished sessions still require
- *  an external sweep. */
+ *  A session whose daemon was SIGKILL'd (`status=vanished`) never runs this
+ *  code and is reclaimed by gc's sweep. */
 export function shouldReapAtExit(
   tags: Record<string, string> | undefined,
   ephemeral: boolean,
+  // Optional so existing 2-arg callers (relay/layout/supervisors read this to
+  // answer "is this session exempt from reaping?") keep working AND get the
+  // correct env-driven default without having to thread it themselves.
+  defaultReap: boolean = reapOnExitDefault(),
 ): boolean {
   if (isKeepRequested(tags)) return false;
   if (ephemeral) return true;
   if (tags?.strategy === "permanent") return false;
-  return true;
+  return defaultReap;
+}
+
+/** Resolve the config default for exit-time reaping from the environment.
+ *
+ *  `PTY_REAP_ON_EXIT` is the network/global config knob: the daemon reads its
+ *  own env (which the launching network sets), so setting it fleet-wide
+ *  configures the default for every session — mirroring the env-var config
+ *  style pty already uses for `PTY_SHUTDOWN_DEADLINE_MS`. `false`/`0`/`no`/`off`
+ *  → PRESERVE; unset or anything else → REAP (the shipped default). Per-session
+ *  `keep` / `--ephemeral` override this default either way. */
+export function reapOnExitDefault(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.PTY_REAP_ON_EXIT;
+  if (raw === undefined) return true;
+  return !KEEP_FALSEY.has(raw.trim().toLowerCase());
 }
 
 /** Look up a session by either its stable `name` (immutable id) or its
