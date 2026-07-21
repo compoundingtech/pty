@@ -55,6 +55,7 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
+  env: Record<string, string> = {},
 ): Promise<number> {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
@@ -63,7 +64,7 @@ async function startDaemon(
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, PTY_SERVER_CONFIG: config, PTY_SESSION_DIR: sessionDir },
+    env: { ...process.env, PTY_SERVER_CONFIG: config, PTY_SESSION_DIR: sessionDir, ...env },
   });
   let stderr = "";
   child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
@@ -115,14 +116,23 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// #1 — post-exit peek preserves the final screen
+// #1 — post-exit peek, under BOTH exit-behavior modes
 // ---------------------------------------------------------------------------
-describe("parity #1: post-exit peek preserves the final screen", () => {
-  it("returns the exact final viewport after the session exits, idempotently", async () => {
+// Exit-time reaping is configurable (`PTY_REAP_ON_EXIT`; shipped default REAP).
+// The parity contract for post-exit peek therefore has TWO reference modes both
+// implementations must match:
+//   * preserve (PTY_REAP_ON_EXIT=false): the finished session is kept, and peek
+//     returns the exact final viewport, idempotently.
+//   * reap (default): the finished session removes itself, and peek reports it
+//     is gone (exit non-zero / "not found"), with no registry entry left.
+const PRESERVE_ENV = { PTY_REAP_ON_EXIT: "false" };
+
+describe("parity #1: post-exit peek — preserve vs reap modes", () => {
+  it("preserve mode: returns the exact final viewport after exit, idempotently", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     // Three lines, DONE with no trailing newline, then exit 7.
-    await startDaemon(dir, name, "sh", ["-c", 'printf "LINE_A\\nLINE_B\\nDONE"; exit 7']);
+    await startDaemon(dir, name, "sh", ["-c", 'printf "LINE_A\\nLINE_B\\nDONE"; exit 7'], PRESERVE_ENV);
     await sleep(1200); // let it exit + persist the final screen
 
     const first = runCli(dir, ["peek", "--plain", name]);
@@ -145,16 +155,31 @@ describe("parity #1: post-exit peek preserves the final screen", () => {
     expect(found.exitCode).toBe(7);
   }, 20000);
 
-  it("non-plain (ANSI) peek preserves the same content after exit", async () => {
+  it("preserve mode: non-plain (ANSI) peek preserves the same content after exit", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "sh", ["-c", 'printf "ALPHA\\nBETA"; exit 0']);
+    await startDaemon(dir, name, "sh", ["-c", 'printf "ALPHA\\nBETA"; exit 0'], PRESERVE_ENV);
     await sleep(1200);
 
     const ansi = runCli(dir, ["peek", name]);
     expect(ansi.status).toBe(0);
     expect(ansi.stdout).toContain("ALPHA");
     expect(ansi.stdout).toContain("BETA");
+  }, 20000);
+
+  it("reap mode (default): the finished session reaps itself — peek reports it gone", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    // No PTY_REAP_ON_EXIT → shipped default REAP: the daemon removes its own
+    // registry entry as it exits, so there is nothing left to peek.
+    await startDaemon(dir, name, "sh", ["-c", 'printf "GONE"; exit 0']);
+    await sleep(1200);
+
+    const peek = runCli(dir, ["peek", "--plain", name]);
+    expect(peek.status).not.toBe(0);
+    // And the registry no longer lists it.
+    const list = JSON.parse(runCli(dir, ["list", "--json"]).stdout);
+    expect(list.find((s: any) => s.name === name)).toBeUndefined();
   }, 20000);
 });
 

@@ -17,10 +17,13 @@ const COMMANDS = [
 ];
 // Aliases that must resolve to the same help.
 const ALIASES = ["a", "ls", "remove"];
-// Dispatch `case` labels that are NOT per-subcommand commands (no focused help
-// expected): the interactive TUI, and the global help/version verbs+flags.
+// Dispatch `case` labels that are NOT per-subcommand commands (no focused
+// `Usage: pty …` + example help expected): the interactive TUI, the global
+// help/version verbs+flags, and utility generators that ship their own
+// lightweight usage (`completions` prints `usage: pty completions <shell>`).
 const NON_COMMAND_CASES = new Set([
   "interactive", "i", "help", "--help", "-h", "version", "--version", "-v", "-V",
+  "completions",
 ]);
 
 function help(cmd: string) {

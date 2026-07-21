@@ -19,3 +19,8 @@
 delete process.env.PTY_ROOT;
 delete process.env.PTY_SESSION;
 delete process.env.PTY_SESSION_DIR;
+// Also scrub the exit-reap config knob: the ambient network may set
+// PTY_REAP_ON_EXIT, and lifecycle tests must exercise a deterministic default
+// (unset → the shipped `reap` default). Tests that want the other mode pass
+// PTY_REAP_ON_EXIT explicitly per-child.
+delete process.env.PTY_REAP_ON_EXIT;

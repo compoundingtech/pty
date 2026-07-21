@@ -27,6 +27,7 @@ import {
   writeMetadata,
   readMetadata,
   shouldReapAtExit,
+  reapOnExitDefault,
   type SessionMetadata,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
@@ -1033,8 +1034,9 @@ if (process.argv[1]?.endsWith("/server.js")) {
   // reasons, and only one of them is an "exit":
   //
   //   - the child process terminated on its own (cleanly or by crashing)
-  //     — the session is finished, and finished non-permanent sessions are
-  //     garbage. Reap.
+  //     — the session is finished; whether it self-reaps is the config
+  //     default (`reapOnExitDefault`, via `PTY_REAP_ON_EXIT`), unless a
+  //     per-session `keep`/`--ephemeral` overrides it.
   //   - someone stopped the daemon from outside (`pty kill` → SIGTERM,
   //     SIGINT, or the spawner watchdog reclaiming a leaked daemon) — the
   //     child had not finished; an operator interrupted it, almost always
@@ -1049,7 +1051,9 @@ if (process.argv[1]?.endsWith("/server.js")) {
   function reapAtExit(): boolean {
     if (externalKill && !isEphemeral) return false;
     const tags = readMetadata(config.name)?.tags ?? config.tags;
-    return shouldReapAtExit(tags, isEphemeral);
+    // `PTY_REAP_ON_EXIT` (network/global config) sets the default when no
+    // per-session `keep`/`--ephemeral` override applies; shipped default reaps.
+    return shouldReapAtExit(tags, isEphemeral, reapOnExitDefault());
   }
 
   // Hard deadline for a graceful shutdown before the daemon force-exits. The
