@@ -243,12 +243,14 @@ describe("session tags", () => {
   it("tags survive process exit (persisted in exit metadata)", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true", [], { owner: "ci" }); // exits immediately
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so the exit metadata is still on disk to inspect.
+    await startDaemon(dir, name, "true", [], { owner: "ci", keep: "true" }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit + metadata write
 
     const metaPath = path.join(dir, `${name}.json`);
     const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
-    expect(meta.tags).toEqual({ owner: "ci" });
+    expect(meta.tags).toEqual({ owner: "ci", keep: "true" });
     expect(meta.exitCode).toBe(0);
   }, 15000);
 
@@ -282,13 +284,14 @@ describe("session tags", () => {
     const dir = makeSessionDir();
     const name = uniqueName();
 
-    // Create a session with tags that exits immediately
-    await startDaemon(dir, name, "true", [], { owner: "forge", env: "prod" });
+    // Create a session with tags that exits immediately. `keep=true` exempts
+    // it from the daemon's exit-time self-reap so there is something to restart.
+    await startDaemon(dir, name, "true", [], { owner: "forge", env: "prod", keep: "true" });
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit + metadata
 
     // Verify tags are on the exited session
     const metaBefore = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), "utf-8"));
-    expect(metaBefore.tags).toEqual({ owner: "forge", env: "prod" });
+    expect(metaBefore.tags).toEqual({ owner: "forge", env: "prod", keep: "true" });
     expect(metaBefore.exitCode).toBe(0);
 
     // Restart via CLI
@@ -304,7 +307,7 @@ describe("session tags", () => {
     await new Promise((r) => setTimeout(r, 500));
 
     const metaAfter = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), "utf-8"));
-    expect(metaAfter.tags).toEqual({ owner: "forge", env: "prod" });
+    expect(metaAfter.tags).toEqual({ owner: "forge", env: "prod", keep: "true" });
     // createdAt should differ from the original session (it was recreated)
     expect(metaAfter.createdAt).not.toBe(metaBefore.createdAt);
   }, 15000);
@@ -313,8 +316,9 @@ describe("session tags", () => {
     const dir = makeSessionDir();
     const name = uniqueName();
 
-    // Create a tagged session that exits immediately
-    await startDaemon(dir, name, "true", [], { owner: "ci" });
+    // Create a tagged session that exits immediately. `keep=true` exempts it
+    // from the daemon's exit-time self-reap so `run -a` has tags to carry over.
+    await startDaemon(dir, name, "true", [], { owner: "ci", keep: "true" });
     await new Promise((r) => setTimeout(r, 1000)); // wait for exit
 
     // Recreate with run -a (no new --tag flags)
@@ -327,7 +331,7 @@ describe("session tags", () => {
 
     // Verify tags carried over
     const meta = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), "utf-8"));
-    expect(meta.tags).toEqual({ owner: "ci" });
+    expect(meta.tags).toEqual({ owner: "ci", keep: "true" });
 
     // Clean up daemon
     const pidFile = path.join(dir, `${name}.pid`);

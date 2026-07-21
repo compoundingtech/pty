@@ -52,8 +52,9 @@ pty run --id api --name "My API" -- node server.js # pin both id and display lab
 pty run --no-display-name -- bash                  # random id, no friendly label
 pty run -d -- node server.js                       # start in the background
 pty run -a -- node server.js                       # create or attach if already running
-pty run -e -- npm test                             # ephemeral: auto-remove on exit
+pty run -e -- npm test                             # ephemeral: reap even on `pty kill` / permanent
 pty run --tag owner=forge -- node srv.js           # tag a session with metadata
+pty run --tag keep=true -- npm test                # keep the session listed after it exits
 pty run --cwd /path -- node server.js              # run in a specific directory
 
 pty rename my-label                       # inside a session: add/change its displayName
@@ -97,10 +98,10 @@ pty emit user.deploy.started              # emit a user event (inside a session)
 pty emit myserver user.build.finished --json '{"ok":true}'  # with JSON payload
 pty emit myserver user.note --text "checkpoint reached"     # with a text payload
 
-pty restart myserver                      # restart an exited session
+pty restart myserver                      # restart an exited session (needs `keep=true` if non-permanent)
 pty kill myserver                         # terminate a running session
 pty rm myserver                           # remove an exited session's metadata
-pty gc                                    # reconcile sessions: kill orphan children, respawn permanents, sweep exited
+pty gc                                    # reconcile: kill orphan children, respawn permanents, sweep vanished
 pty gc --dry-run                          # preview what gc would do without changing anything
 pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist   # install macOS auto-gc
 pty tag myserver role=web env=prod        # set one or more tags on a session
@@ -145,6 +146,38 @@ There is also a transitional **listening-daemon** form, `pty remote-serve --sock
 If you run `pty run` inside an existing pty session, pty detects the nesting via the `PTY_SESSION` environment variable and runs the command directly instead of creating a session-inside-a-session.
 
 Use `pty run -d` to explicitly create a background session from inside another session.
+
+### Session lifecycle and cleanup
+
+A session that is **not** `strategy=permanent` removes itself when its command
+finishes. The daemon deletes its own registry entry — metadata, events file,
+socket, pid — as the last thing it does before exiting. Cleanup is caused by the
+exit rather than discovered by a later sweep, so a finished session never sits in
+`pty ls` waiting to be noticed.
+
+This applies whether the command exited cleanly or crashed: both mean the session
+is finished. Four cases are deliberately exempt:
+
+| Case | Why it is kept |
+|---|---|
+| tag `keep=true` | You asked to inspect it. Metadata, `lastLines`, and events survive until you `pty rm` it. |
+| tag `strategy=permanent` | Its supervisor reconciles against the dead session's metadata to respawn it. |
+| `pty kill` (and any external SIGTERM/SIGINT) | The command did not finish — someone stopped it, nearly always to go look at it. `kill` is stop-and-keep; `rm` is the one that removes. |
+| `status=vanished` | The daemon itself was SIGKILLed/OOM-killed, so no cleanup code ever ran. Nothing inside the process can cover this case. |
+
+```sh
+pty run -d -- npm test                       # gone from `pty ls` the moment it finishes
+pty run -d --tag keep=true -- npm test       # sticks around afterwards so you can read it
+pty tag mybuild keep=true                    # ...or pin a session that is still running
+pty rm mybuild                               # explicit removal beats keep
+```
+
+Because of the `vanished` row, `pty gc`'s sweep is a **backstop, not the primary
+path** — see [Auto-running gc](#auto-running-gc). Vanished sessions are also
+reclaimed lazily by the 24-hour dead-session TTL on any `pty list`.
+
+To reap a session on *any* shutdown, including `pty kill` and including
+`strategy=permanent`, use `pty run -e` (`--ephemeral`). `keep` still wins over it.
 
 ### Events
 
@@ -297,6 +330,8 @@ Cycles (A→B, B→A) resolve deterministically by name-sorted iteration: whiche
 ### Auto-running gc
 
 `pty gc` is a one-shot reconciliation pass. The intended deployment is to run it on a short interval so permanent sessions come back quickly and orphans get cleaned promptly. The CLI ships an install helper for macOS:
+
+Sweeping finished sessions is **no longer** a reason to run gc on a timer — non-permanent sessions [reap themselves at exit](#session-lifecycle-and-cleanup). What is left for the sweep is `vanished` sessions, whose daemon was killed outright and so never ran its own cleanup; those are also reclaimed lazily by the 24-hour dead-session TTL on any `pty list`. The interval now buys you respawn latency for permanents and orphan-kill promptness, not `pty ls` hygiene.
 
 ```sh
 pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist

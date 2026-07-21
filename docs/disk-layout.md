@@ -54,6 +54,8 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   - `strategy.abandon-if-cwd-gone=false` — opts a permanent session OUT of the on-by-default cwd-gone reap in `pty gc` step 1.5. Only meaningful with `strategy=permanent`.
   - `strategy.idle-days=<N>` — opts a permanent session INTO idle-reap: `pty gc` reaps it when `lastAttachAt` is older than N days. Takes precedence over the global `--idle-days` flag.
   - `parent=<name>` — `pty gc` orphan-kills this session (SIGTERM + cleanup) when the referenced session's daemon is no longer alive. Combinator with `strategy=permanent` is well-defined: orphan-kill wins.
+  - `keep=true` — exempts the session from reaping, both the daemon's exit-time self-cleanup and `pty gc`'s sweep. Its metadata, `lastLines`, and events file survive its death until an explicit `pty rm`. Any value other than `false`/`0`/`no`/`off` counts as set, so a mis-spelled value errs toward retaining. Without this tag, a non-permanent session's files are gone the moment its command finishes.
+- Lifetime: a non-permanent session's files are removed by its own daemon during shutdown once the child process terminates. Files therefore outlive the process only for `keep`, `strategy=permanent`, external `pty kill`, and `vanished` sessions (SIGKILLed daemon — no cleanup code ran). Readers that poll these files after a session finishes must set `keep=true` or accept the race.
 - Concurrent writers: last-write-wins; readers never see torn files. Cross-process writers can lose updates to the read-modify-write window.
 
 ## `<name>.events.jsonl` (tier 1)

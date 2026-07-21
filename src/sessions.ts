@@ -397,6 +397,71 @@ export async function listSessions(): Promise<SessionInfo[]> {
   return sessions;
 }
 
+/** Tag key that exempts a session from every form of dead-session reaping:
+ *  the exit-time self-reap in the daemon AND `pty gc`'s sweep of exited
+ *  non-permanent sessions. Set it when you want a session's metadata,
+ *  `lastLines`, and events file to survive its own death so you can inspect
+ *  them afterwards. Mirrors the `keep` field in the agent spec. */
+export const KEEP_TAG = "keep";
+
+/** Values that read as "no" for the `keep` tag; everything else reads as
+ *  "yes". The CLI's tag grammar is strictly `key=value`, so the form an
+ *  operator types is `--tag keep=true` / `pty tag <ref> keep=true`.
+ *
+ *  Two deliberate choices. Presence-with-any-other-value counts as yes, so
+ *  a tool that writes `keep=1` or `keep=yes` straight into metadata (convoy
+ *  translating the agent spec's `keep #true`) gets the safe answer without
+ *  having to match our spelling — and the failure mode of a typo is
+ *  retaining a session, not destroying one. And `keep=false` explicitly
+ *  reads as no, so the exemption can be turned off in place rather than
+ *  only by removing the key. */
+const KEEP_FALSEY = new Set(["false", "0", "no", "off"]);
+
+/** Returns `true` when `tags` asks for this session to be retained after
+ *  death. Callers should read tags from the CURRENT on-disk metadata rather
+ *  than from a spawn-time config snapshot — `pty tag <ref> keep=true` on a
+ *  *running* session is exactly how an operator pins a session they are
+ *  about to debug, and that must be honoured at exit. */
+export function isKeepRequested(tags?: Record<string, string>): boolean {
+  const raw = tags?.[KEEP_TAG];
+  if (raw === undefined) return false;
+  return !KEEP_FALSEY.has(raw.trim().toLowerCase());
+}
+
+/** Should the daemon remove its own registry entry as it shuts down?
+ *
+ *  This is the policy behind exit-time cleanup. A non-permanent session
+ *  that dies is garbage the moment it dies — cleaning up as part of its own
+ *  lifecycle removes both the polling interval of an external sweep and the
+ *  window in which a dead session is still listed. Precedence, highest
+ *  first:
+ *
+ *    1. `keep` — the explicit "don't reap me" exemption always wins, even
+ *       over `--ephemeral`. Its entire purpose is retaining a dead
+ *       session's logs and scrollback for debugging.
+ *    2. `--ephemeral` — the historic explicit opt-in. Still forces a reap
+ *       even for a permanent session, which is what it did before this
+ *       policy existed; unchanged so no existing caller regresses.
+ *    3. `strategy=permanent` — never self-reaps. Its supervisor (convoy,
+ *       or `pty gc`'s respawn step) reads the metadata of the dead session
+ *       to respawn it. Self-reaping would destroy the very record the
+ *       supervisor reconciles against.
+ *    4. Everything else — non-permanent, so reap.
+ *
+ *  Note what is *not* representable here: a session whose daemon was itself
+ *  SIGKILL'd (`status=vanished`) never runs this code, because the process
+ *  that would run it is the one that died. Vanished sessions still require
+ *  an external sweep. */
+export function shouldReapAtExit(
+  tags: Record<string, string> | undefined,
+  ephemeral: boolean,
+): boolean {
+  if (isKeepRequested(tags)) return false;
+  if (ephemeral) return true;
+  if (tags?.strategy === "permanent") return false;
+  return true;
+}
+
 /** Look up a session by either its stable `name` (immutable id) or its
  *  mutable `displayName` alias. Name match takes precedence over displayName
  *  match so the stable id always wins in case both happen to resolve. */
@@ -429,6 +494,10 @@ export interface GcResult {
    *  removed. Empty under `dryRun: true` callers should treat the same
    *  list as the preview. */
   removed: string[];
+  /** Dead non-permanent sessions left in place because they carry the
+   *  `keep` tag. Reported rather than silently skipped so an operator can
+   *  see why `pty ls` still shows a dead session after a gc pass. */
+  kept: string[];
   /** Children killed because their `parent=` referent is dead or missing. */
   killedOrphanChildren: { name: string; parent: string; reason: "missing" | "dead" }[];
   /** Live `strategy=permanent` sessions reaped because they've been
@@ -508,8 +577,28 @@ function commandFingerprint(command: string, args: string[]): string {
  *         seconds flip the session to `strategy.status=flapping` and
  *         skip it on subsequent ticks. Auto-reset when the stored command
  *         changes; manual reset via `pty tag <name> --rm strategy.status`.
- *    3.   Existing sweep: the historic behavior — exited/vanished sessions
- *         that aren't permanent get `cleanupAll`'d. */
+ *    3.   Residual sweep: exited/vanished sessions that aren't permanent
+ *         and aren't tagged `keep` get `cleanupAll`'d.
+ *
+ *  Step 3 is now a BACKSTOP rather than the primary path: a non-permanent
+ *  session that runs to completion reaps itself as it shuts down (see
+ *  `shouldReapAtExit`). It is NOT redundant, though — everything below
+ *  still reaches it, so step 3 cannot simply be deleted:
+ *
+ *    - `pty kill`'d sessions. This is the most common residual case, and
+ *      easy to miss: the exit path deliberately retains a session stopped
+ *      from outside, but the child's `onExit` still wrote an exit record,
+ *      so the session lands here as `status=exited` and gets swept. The
+ *      retention is until the next sweep, not forever — `keep` is what
+ *      makes it forever.
+ *    - `status=vanished` sessions — the daemon was SIGKILL'd / OOM-killed
+ *      / lost to a reboot, so no exit-time code ran at all. This is the
+ *      case exit-time cleanup structurally *cannot* cover, since the
+ *      process that would do the cleaning is the one that died. Note a
+ *      reboot puts EVERY non-permanent session in this bucket at once.
+ *    - sessions created before the exit-time policy existed, and any
+ *      whose final `cleanupAll` lost a race with an external `pty rm`.
+ *    - sessions demoted out of `strategy=permanent` after they died. */
 export async function gc(
   opts: {
     dryRun?: boolean;
@@ -707,15 +796,25 @@ export async function gc(
   // again.
   const finalList = dryRun ? initial : await listSessions();
   const removed: string[] = [];
+  const kept: string[] = [];
   for (const s of finalList) {
     if (!isGone(s.status)) continue;
     if (s.metadata?.tags?.strategy === "permanent") continue;
+    // `keep` must mean the same thing to both reapers. The daemon's
+    // exit-time cleanup already honours it; if gc did not, a `keep`
+    // session would merely survive its own exit only to be swept moments
+    // later by the next tick — which is not "keep" in any useful sense.
+    if (isKeepRequested(s.metadata?.tags)) {
+      kept.push(s.name);
+      continue;
+    }
     if (!dryRun) cleanupAll(s.name);
     removed.push(s.name);
   }
 
   return {
     removed,
+    kept,
     killedOrphanChildren,
     abandoned,
     respawned,

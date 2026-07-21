@@ -161,14 +161,16 @@ describe("pty tag (mutable tags)", () => {
   it("works on exited sessions", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits immediately
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so there is still an exited session left to tag.
+    await startDaemon(dir, name, "true", [], { keep: "true" }); // exits immediately
     await new Promise((r) => setTimeout(r, 1000));
 
     const result = runCli(dir, "tag", name, "strategy=permanent");
     expect(result.status).toBe(0);
 
     const meta = readMeta(dir, name);
-    expect(meta.tags).toEqual({ strategy: "permanent" });
+    expect(meta.tags).toEqual({ keep: "true", strategy: "permanent" });
   }, 15000);
 
   it("errors on nonexistent session", () => {

@@ -34,10 +34,11 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
+  tags?: Record<string, string>,
 ): Promise<number> {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
-    cwd: os.tmpdir(), rows: 24, cols: 80,
+    cwd: os.tmpdir(), rows: 24, cols: 80, tags,
   });
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
@@ -160,7 +161,9 @@ describe("pty peek --wait", () => {
   it("peek --wait reads saved output from exited session", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "sh", ["-c", "echo TEST_PASSED; exit 0"]);
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so its saved output survives for peek to read.
+    await startDaemon(dir, name, "sh", ["-c", "echo TEST_PASSED; exit 0"], { keep: "true" });
     await new Promise((r) => setTimeout(r, 1500)); // wait for exit + metadata
 
     const result = runCli(dir, "peek", "--wait", "TEST_PASSED", "-t", "5", "--plain", name);
@@ -172,7 +175,8 @@ describe("pty peek --wait", () => {
   it("peek --wait on exited session shows error when pattern not found", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "sh", ["-c", "echo nope; exit 0"]);
+    // `keep=true`: retain the exited session past the exit-time self-reap.
+    await startDaemon(dir, name, "sh", ["-c", "echo nope; exit 0"], { keep: "true" });
     await new Promise((r) => setTimeout(r, 1500));
 
     const result = runCli(dir, "peek", "--wait", "MISSING", "-t", "5", "--plain", name);
@@ -185,7 +189,8 @@ describe("pty peek --wait", () => {
   it("peek --plain on exited session shows saved output", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "sh", ["-c", "echo SAVED_OUTPUT; exit 0"]);
+    // `keep=true`: retain the exited session past the exit-time self-reap.
+    await startDaemon(dir, name, "sh", ["-c", "echo SAVED_OUTPUT; exit 0"], { keep: "true" });
     await new Promise((r) => setTimeout(r, 1500));
 
     const result = runCli(dir, "peek", "--plain", name);

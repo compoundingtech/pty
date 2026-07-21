@@ -79,6 +79,22 @@ function readMeta(sessionDir: string, name: string) {
   return JSON.parse(fs.readFileSync(path.join(sessionDir, `${name}.json`), "utf-8"));
 }
 
+/** SIGKILL a daemon THIS test spawned (pid comes from `startDaemon`) and wait
+ *  for it to actually die. A SIGKILLed daemon runs no shutdown code, so its
+ *  `<id>.json` is left behind with no exit record — `listSessions` infers
+ *  status=vanished, which is the prey gc STEP 3 still legitimately has.
+ *  (Cleanly-exited non-permanent sessions now reap themselves at exit and
+ *  never reach gc at all.) */
+async function killDaemonHard(pid: number): Promise<void> {
+  try { process.kill(pid, "SIGKILL"); } catch {}
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    try { process.kill(pid, 0); } catch { return; }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`Timeout waiting for daemon pid ${pid} to die`);
+}
+
 /** Find an unused PID so ESRCH is deterministic. We probe from 999999
  *  downward since typical systems reuse low PIDs. */
 function findDeadPid(): number {
@@ -100,11 +116,12 @@ afterEach(() => {
 });
 
 describe("pty gc", () => {
-  it("removes exited sessions", async () => {
+  it("removes vanished sessions", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true");
-    await new Promise((r) => setTimeout(r, 1000));
+    // SIGKILL the daemon so no self-reap runs and the record is left behind.
+    const pid = await startDaemon(dir, name, "cat");
+    await killDaemonHard(pid);
 
     const before = fs.existsSync(path.join(dir, `${name}.json`));
     expect(before).toBe(true);
@@ -186,11 +203,12 @@ describe("pty gc", () => {
     expect(result.stdout).toContain("Nothing to clean up.");
   }, 15000);
 
-  it("--dry-run previews exited-session removal without deleting", async () => {
+  it("--dry-run previews vanished-session removal without deleting", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true");
-    await new Promise((r) => setTimeout(r, 1000));
+    // SIGKILL the daemon so no self-reap runs and the record is left behind.
+    const pid = await startDaemon(dir, name, "cat");
+    await killDaemonHard(pid);
 
     expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
 
@@ -235,8 +253,9 @@ describe("pty gc", () => {
   it("-n is accepted as an alias for --dry-run", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true");
-    await new Promise((r) => setTimeout(r, 1000));
+    // SIGKILL the daemon so no self-reap runs and the record is left behind.
+    const pid = await startDaemon(dir, name, "cat");
+    await killDaemonHard(pid);
 
     const result = runCli(dir, "gc", "-n");
     expect(result.status).toBe(0);

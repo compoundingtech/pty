@@ -40,10 +40,11 @@ async function startDaemon(
   name: string,
   command: string,
   args: string[] = [],
+  tags?: Record<string, string>,
 ): Promise<number> {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
-    cwd: os.tmpdir(), rows: 24, cols: 80,
+    cwd: os.tmpdir(), rows: 24, cols: 80, tags,
   });
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
@@ -143,7 +144,9 @@ describe("vanished status", () => {
   it("cleanly-exited sessions keep status=exited, not vanished", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
-    await startDaemon(dir, name, "true"); // exits cleanly
+    // `keep=true` exempts the session from the daemon's exit-time self-reap,
+    // so there is still a record on disk to inspect after it exits cleanly.
+    await startDaemon(dir, name, "true", [], { keep: "true" }); // exits cleanly
     await new Promise((r) => setTimeout(r, 1000));
 
     const r = runCli(dir, "list", "--json");

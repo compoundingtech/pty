@@ -7,6 +7,10 @@ export {
   validateName, updateTags, setDisplayName,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
+  // Exposed for the same reason as `isReservedTagKey`: downstream tools
+  // (relay, layout, supervisors) need to answer "is this session exempt
+  // from reaping?" without re-deriving which tag values count as set.
+  KEEP_TAG, isKeepRequested, shouldReapAtExit,
   type SessionInfo, type SessionMetadata, type PrunedTagResult, type GcResult,
 } from "./sessions.ts";
 
