@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "note": "CANONICAL, language-neutral parity fixtures. Node (this repo) OWNS this file; pty-rust vendors a synced mirror. BOTH suites load this exact JSON and assert their implementation reproduces each fixture. Plain-screen bytes are asserted EXACTLY; ANSI is asserted as a mode-set (never raw bytes). Exit-time behavior is CONFIGURABLE (PTY_REAP_ON_EXIT; shipped default=reap): the per-fixture `env` overlay pins the mode a fixture needs. Keep the two mirrors byte-identical.",
+  "fixtures": [
+    {
+      "id": "idle-prompt-plain",
+      "kind": "plain-screen",
+      "description": "A written shell-style prompt with a trailing space (the cell the cursor sits on). The plain screen preserves the explicitly-written trailing space and trims only never-written cells — it is NOT blanket right-trimmed and NOT padded to full width. printf is used (not a live shell prompt) so the bytes are shell-version independent. The session stays running (exec cat), so exit-time behavior is irrelevant here.",
+      "spawn": { "command": "sh", "args": ["-c", "printf 'READY> '; exec cat"], "rows": 24, "cols": 80 },
+      "settleMs": 700,
+      "expect": {
+        "plainScreen": "READY> ",
+        "plainScreenLength": 7
+      }
+    },
+    {
+      "id": "post-exit-final-screen",
+      "kind": "plain-screen-after-exit",
+      "description": "PRESERVE mode (PTY_REAP_ON_EXIT=false). Three lines, DONE with no trailing newline, then exit 7. The finished session is preserved, so the final rendered viewport survives verbatim and peeking is idempotent (does not consume/clear it). The registry records status=exited with the real exit code.",
+      "spawn": { "command": "sh", "args": ["-c", "printf 'LINE_A\\nLINE_B\\nDONE'; exit 7"], "rows": 24, "cols": 80 },
+      "env": { "PTY_REAP_ON_EXIT": "false" },
+      "settleMs": 1200,
+      "expect": {
+        "plainScreen": "LINE_A\nLINE_B\nDONE",
+        "status": "exited",
+        "exitCode": 7
+      }
+    },
+    {
+      "id": "post-exit-reaped",
+      "kind": "reaped-after-exit",
+      "description": "REAP mode (shipped default, no PTY_REAP_ON_EXIT). A finished non-permanent session removes its own registry entry as it exits, so there is nothing left to peek and ls no longer lists it.",
+      "spawn": { "command": "sh", "args": ["-c", "printf 'GONE'; exit 0"], "rows": 24, "cols": 80 },
+      "settleMs": 1200,
+      "expect": {
+        "reaped": true
+      }
+    }
+  ]
+}
