@@ -746,15 +746,24 @@ async function main(): Promise<void> {
       }
 
       // Nesting prevention: if inside a pty session and not detaching, exec
-      // directly. The -a branch is narrower: if the caller asked to attach-
-      // if-running and the target IS running, attaching would nest a client —
-      // error with a clear message unless --force. If the target isn't
-      // running, the original "exec directly" behavior still makes sense
-      // (there's no session to attach to anyway).
-      if (process.env.PTY_SESSION && !detach) {
-        // Nested-attach check: target by either the explicit id or display name
+      // directly — a plain nested `run` runs the command in-place rather than
+      // spawning a background session the caller can't see. Two escape hatches
+      // bypass this and create a real (nested) session:
+      //   * -d/--detach — create a background session and return.
+      //   * --force     — create a nested session and attach to it. This is the
+      //                   documented `--force` contract ("Create even from
+      //                   inside another pty session") and mirrors attach's /
+      //                   restart's --force symmetry. Nested clients tangle
+      //                   detach keys, so it's opt-in, but when explicitly
+      //                   asked for we honor it instead of silently running
+      //                   in-place.
+      if (process.env.PTY_SESSION && !detach && !force) {
+        // Nested + no --force: a plain `run` execs directly. The narrower -a
+        // branch refuses instead when the caller asked to attach-if-running
+        // and the target IS running (attaching would nest a client) — the
+        // --force path above is the documented way to override that.
         const lookupRef = explicitId ?? explicitDisplayName;
-        if (attachExisting && lookupRef && !force) {
+        if (attachExisting && lookupRef) {
           const existing = await getSession(lookupRef);
           if (existing && existing.status === "running") {
             ensureNotNested("run -a", {
