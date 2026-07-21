@@ -1,0 +1,23 @@
+name: Test
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  vitest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Match flake.nix (nodejs_22) so the CI test runtime tracks the
+          # Nix-built runtime and versions don't skew.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The vitest suite exercises the compiled CLI/daemon (dist/cli.js,
+      # dist/server.js), so build before running the tests.
+      - run: npm run build
+      - run: npm test
