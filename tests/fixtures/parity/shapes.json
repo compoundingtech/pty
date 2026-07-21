@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "note": "CANONICAL, language-neutral JSON-SHAPE parity fixtures (companion to screens.json). Node (this repo) OWNS this file; pty-rust vendors a byte-identical mirror. Both suites run the scenario, then assert the machine-readable output FIELD-BY-FIELD per policy — NOT raw bytes. Field policy is one of: {exact:<v>} (=== v, incl. null); {type:'number'|'string'} (present, non-null, that type); {omitWhenUnset:true} (the key is ABSENT). Sessions are created via the real `pty` CLI args in `run`, so the two suites drive identical commands.",
+  "fixtures": [
+    {
+      "id": "ls-json-shape",
+      "kind": "ls-json-shape",
+      "description": "`pty list --json` entry shape for a running vs an exited session. Runs in PRESERVE mode (PTY_REAP_ON_EXIT=false) so the exited entry stays listed. status enum is running|exited|vanished. Note the pid policy: ls --json pid is the DAEMON pid (a number while running, null once exited) — distinct from stats.process.pid, which is the CHILD pid.",
+      "env": { "PTY_REAP_ON_EXIT": "false" },
+      "settleMs": 1500,
+      "statusEnum": ["running", "exited", "vanished"],
+      "sessions": [
+        {
+          "id": "runsess",
+          "run": ["run", "-d", "--id", "runsess", "--no-display-name", "--", "cat"],
+          "expect": {
+            "name": { "exact": "runsess" },
+            "status": { "exact": "running" },
+            "pid": { "type": "number", "note": "daemon pid; != stats.process.pid (child)" },
+            "command": { "exact": "cat" },
+            "cwd": { "type": "string" },
+            "createdAt": { "type": "string" },
+            "exitCode": { "exact": null },
+            "exitedAt": { "exact": null },
+            "displayName": { "omitWhenUnset": true }
+          }
+        },
+        {
+          "id": "exsess",
+          "run": ["run", "-d", "--id", "exsess", "--name", "my-label", "--", "sh", "-c", "exit 3"],
+          "expect": {
+            "name": { "exact": "exsess" },
+            "status": { "exact": "exited" },
+            "pid": { "exact": null },
+            "command": { "exact": "sh -c exit 3" },
+            "cwd": { "type": "string" },
+            "createdAt": { "type": "string" },
+            "exitCode": { "exact": 3 },
+            "exitedAt": { "type": "string" },
+            "displayName": { "exact": "my-label" }
+          }
+        }
+      ]
+    },
+    {
+      "id": "client-count-during-peek",
+      "kind": "stats-clients",
+      "description": "A transient `peek` (and the `stats` query itself) does NOT count as an attached streaming client. After peeking a running session, `stats --json` reports clients.attached === 0.",
+      "settleMs": 700,
+      "run": ["run", "-d", "--id", "peeksess", "--no-display-name", "--", "cat"],
+      "peekFirst": true,
+      "expect": {
+        "clients": {
+          "attached": { "exact": 0 }
+        }
+      }
+    }
+  ]
+}
