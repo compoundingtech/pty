@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { describe, it, expect, afterEach, afterAll, vi } from "vitest";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,6 +14,15 @@ import {
   encodeResize,
 } from "../src/protocol.ts";
 import { getSocketPath, cleanupAll } from "../src/sessions.ts";
+
+// Every test here spawns a real pty session and polls the rendered screen
+// (createSession + waitForText). The default 5000ms per-test timeout is too
+// tight for that under CI load — the vitest gate flaked once on main when
+// "preserves true color" timed out at 5s (it passed on re-run). Raise the whole
+// file to the 15000ms already used by this file's known-slower tests so a
+// loaded runner can't false-red a real-pty screenshot test. (A per-test
+// timeout arg still overrides this.)
+vi.setConfig({ testTimeout: 15000 });
 
 // All tests run in a tmp directory to avoid polluting the project
 const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pty-ss-"));
