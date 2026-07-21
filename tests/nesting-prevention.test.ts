@@ -263,17 +263,36 @@ describe("pty run -a", () => {
     expect(r.stderr).toContain("running directly");
   }, 10000);
 
-  it("--force overrides when nested + target running", async () => {
+  it("--force (nested) bypasses run's guard and CREATES a session instead of running in-place", async () => {
     const dir = makeSessionDir();
     const target = uniqueName();
-    await startDaemon(dir, target);
+    // Old behavior: --force was a no-op on `run`, so a nested `run --force` ran
+    // the command directly in-place and created NO session. New behavior
+    // (parity decision a, 2026-07-21): --force bypasses run's nesting guard the
+    // same way it bypasses attach's/restart's, creating a real (nested) session
+    // and attaching to it. Launch detached and poll until it appears running —
+    // the old in-place path never produced a session at all.
+    const child = spawn(nodeBin, [cliPath, "run", "--force", "--id", target, "--", "cat"], {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: "outer-session" },
+    });
+    child.unref();
+    bgPids.push(child.pid!);
 
-    const r = runCliNested(dir, "outer-session", "run", "-a", "--force", "--id", target, "--", "cat");
-    // With --force we fall through past the nesting guard. The child run
-    // command will likely fail for a different reason (no daemon spawn in
-    // the nested-exec path) — just confirm the nesting error didn't fire.
-    expect(r.stderr).not.toMatch(/attaching would nest/);
-  }, 15000);
+    let found: any;
+    const start = Date.now();
+    while (Date.now() - start < 8000) {
+      const list = JSON.parse(runCliNested(dir, "outer-session", "list", "--json").stdout);
+      found = list.find((s: any) => s.name === target);
+      if (found && found.status === "running") break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    expect(found).toBeDefined();
+    expect(found.status).toBe("running");
+
+    if (found?.pid) { bgPids.push(found.pid); try { process.kill(found.pid, "SIGTERM"); } catch {} }
+  }, 20000);
 
   it("plain `pty run` (no -a) unchanged when nested: runs directly", async () => {
     const dir = makeSessionDir();
