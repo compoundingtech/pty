@@ -25,7 +25,7 @@ const shapes = JSON.parse(fs.readFileSync(shapesPath, "utf-8")) as {
 
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-shapes-"));
 afterAll(() => {
-  fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 let sessionDirs: string[] = [];
@@ -45,14 +45,38 @@ function runCli(dir: string, args: string[], env: Record<string, string> = {}) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-afterEach(() => {
+/** Wait (bounded) for every pid to leave the process table. */
+async function waitForPidsGone(pids: number[], budgetMs = 5000): Promise<void> {
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline && pids.some(alive)) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+afterEach(async () => {
+  // Kill every daemon this test spawned (found via its .pid file), then WAIT
+  // for it to actually leave the process table before removing files. A
+  // SIGTERM'd daemon keeps writing as it shuts down (exit metadata via
+  // tmp+rename, socket/pid cleanup); letting that race afterAll's recursive
+  // rmSync re-creates a file into a just-emptied dir → ENOTEMPTY, a false-red
+  // teardown flake. Waiting here means nothing is writing during teardown.
+  const pids: number[] = [];
   for (const dir of sessionDirs) {
     try {
       for (const e of fs.readdirSync(dir)) {
         if (e.endsWith(".pid")) {
-          try { process.kill(Number(fs.readFileSync(path.join(dir, e), "utf8").trim()), "SIGTERM"); } catch {}
+          const p = Number(fs.readFileSync(path.join(dir, e), "utf8").trim());
+          if (p > 0) pids.push(p);
         }
       }
+    } catch {}
+  }
+  for (const p of pids) { try { process.kill(p, "SIGTERM"); } catch {} }
+  await waitForPidsGone(pids);
+  for (const dir of sessionDirs) {
+    try {
+      for (const e of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, e)); } catch {} }
     } catch {}
   }
   sessionDirs = [];
