@@ -47,8 +47,17 @@ const fixtures = JSON.parse(fs.readFileSync(fixturesPath, "utf-8")) as {
 
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-parityfx-"));
 afterAll(() => {
-  fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
+
+/** Wait (bounded) for every pid to leave the process table. */
+async function waitForPidsGone(pids: number[], budgetMs = 5000): Promise<void> {
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline && pids.some(alive)) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 let bgPids: number[] = [];
 let sessionDirs: string[] = [];
@@ -114,8 +123,13 @@ function runCli(sessionDir: string, args: string[]) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-afterEach(() => {
+afterEach(async () => {
+  // Kill the spawned daemons, then WAIT for them to leave the process table
+  // before removing files — a daemon still shutting down keeps writing (exit
+  // metadata via tmp+rename, socket/pid cleanup), and letting that race the
+  // dir teardown re-creates a file into a just-emptied dir → ENOTEMPTY.
   for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  await waitForPidsGone(bgPids);
   bgPids = [];
   for (const dir of sessionDirs) {
     try {
