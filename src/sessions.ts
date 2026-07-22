@@ -335,8 +335,12 @@ export async function listSessions(): Promise<SessionInfo[]> {
     const pid = readPid(name);
     const pidAlive = pid !== null && isProcessAlive(pid);
     // A reachable control socket proves the daemon is alive INDEPENDENTLY of
-    // whether we could read the pidfile this instant.
-    const socketReachable = await isSocketReachable(socketPath);
+    // whether we could read the pidfile this instant. Probe it ONLY when the
+    // pid doesn't already prove life: for a live pid the probe result is
+    // ignored (running either way), so skipping it avoids a per-session connect
+    // on the hot path and cuts the socket-connect contention that a `pty list`
+    // under concurrent multi-agent load would otherwise add.
+    const socketReachable = pidAlive ? true : await isSocketReachable(socketPath);
 
     if (pidAlive || socketReachable) {
       // Alive: a live process, or a reachable control socket (busy/mid-startup
