@@ -287,8 +287,17 @@ export class Session {
 
   // ── Waiting ──
 
+  // Default poll-wait budget. Terminal render under CI load routinely exceeds
+  // the old 5000ms — it caused two screenshot render flakes (true-color, then
+  // 256-color) that false-red the required vitest gate. 10000ms matches the
+  // explicit timeouts render-heavy tests already pass (see
+  // scrollback-fidelity.test.ts) and stays under screenshot.test.ts's 15000ms
+  // vitest testTimeout, so a slow wait fails HERE with the useful "waiting for
+  // X" message rather than as a blunt vitest test-timeout. Only affects
+  // failure/slow-wait latency; a wait that matches returns immediately.
+
   /** Poll until the terminal contains the given text. Returns the matching screenshot. */
-  async waitForText(text: string, timeoutMs = 5000): Promise<Screenshot> {
+  async waitForText(text: string, timeoutMs = 10000): Promise<Screenshot> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       await new Promise((r) => setTimeout(r, 50));
@@ -302,7 +311,7 @@ export class Session {
   }
 
   /** Poll until the terminal no longer contains the given text. */
-  async waitForAbsent(text: string, timeoutMs = 5000): Promise<Screenshot> {
+  async waitForAbsent(text: string, timeoutMs = 10000): Promise<Screenshot> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       await new Promise((r) => setTimeout(r, 50));
@@ -318,7 +327,7 @@ export class Session {
   /** Poll until a custom predicate returns true. The `description` is used in timeout error messages. */
   async waitFor(
     predicate: (ss: Screenshot) => boolean,
-    timeoutMs = 5000,
+    timeoutMs = 10000,
     description = "predicate"
   ): Promise<Screenshot> {
     const start = Date.now();
