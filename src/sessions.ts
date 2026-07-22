@@ -318,35 +318,48 @@ export async function listSessions(): Promise<SessionInfo[]> {
   const sessions: SessionInfo[] = [];
   const seen = new Set<string>();
 
-  // Find running sessions (have .sock files)
+  // Find running sessions (have .sock files). A live session is destroyed here
+  // ONLY on POSITIVE proof of death — a readable pid whose process is gone AND
+  // an unreachable socket. A transiently-unreadable pid must NOT be mistaken
+  // for a dead process: the daemon creates its .sock (listen) BEFORE it writes
+  // its .pid, and the plain pidfile write can be caught mid-flight, so under
+  // concurrent multi-agent load a `pty list` can momentarily read a null pid
+  // for a perfectly healthy session. Reaping on that (the old behavior) deleted
+  // a live daemon's socket/pid out from under it, making it invisible and
+  // getting it GC'd + re-launched by consumers that reconcile on not-running.
   const sockFiles = entries.filter((e) => e.endsWith(".sock"));
   for (const sockFile of sockFiles) {
     const name = sockFile.replace(/\.sock$/, "");
     seen.add(name);
     const socketPath = getSocketPath(name);
     const pid = readPid(name);
-    const alive =
-      pid !== null &&
-      isProcessAlive(pid) &&
-      (await isSocketReachable(socketPath));
+    const pidAlive = pid !== null && isProcessAlive(pid);
+    // A reachable control socket proves the daemon is alive INDEPENDENTLY of
+    // whether we could read the pidfile this instant.
+    const socketReachable = await isSocketReachable(socketPath);
 
-    if (alive) {
-      const metadata = readMetadata(name);
-      // The daemon writes exit metadata before its cleanup delay, so a
-      // reachable socket can briefly coexist with exitedAt being set.
-      const status = metadata?.exitedAt ? "exited" : "running";
-      sessions.push({ name, socketPath, pid, status, metadata });
-    } else if (pid !== null && isProcessAlive(pid)) {
-      // Pid is still alive but the socket isn't reachable right now (busy
-      // daemon, transient EAGAIN, race with a service restart). Keep the
-      // socket on disk and report the session as running — deleting the
-      // socket would render the still-alive daemon permanently invisible.
+    if (pidAlive || socketReachable) {
+      // Alive: a live process, or a reachable control socket (busy/mid-startup
+      // daemon whose pid we couldn't read). The daemon writes exit metadata
+      // before its cleanup delay, so a reachable socket can briefly coexist
+      // with exitedAt being set.
       const metadata = readMetadata(name);
       const status = metadata?.exitedAt ? "exited" : "running";
       sessions.push({ name, socketPath, pid, status, metadata });
-    } else {
-      // Process really died — clean up socket/pid but keep metadata
+    } else if (pid !== null) {
+      // Positively dead: the pid read SUCCEEDED and its process is gone, and
+      // the socket is unreachable. Safe to reap the stale socket/pid (keep
+      // metadata so the session stays addressable as exited/vanished below).
       cleanupSocket(name);
+    } else {
+      // pid UNREADABLE and socket unreachable — we can prove neither life nor
+      // death (most likely a daemon mid-startup, or a pidfile write that raced
+      // our read under load). Do NOT destroy it; report it running defensively
+      // (a .sock exists). A later read resolves the true state once the pidfile
+      // settles or the socket comes up.
+      const metadata = readMetadata(name);
+      const status = metadata?.exitedAt ? "exited" : "running";
+      sessions.push({ name, socketPath, pid, status, metadata });
     }
   }
 
