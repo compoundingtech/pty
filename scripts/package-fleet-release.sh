@@ -64,7 +64,8 @@ git diff --exit-code
 # package-lock.json (0.11.0) to package.json's exact 0.12.0. Permit only that
 # known packaging-only lockfile mutation; package-lock.json is not shipped.
 npm prune --omit=dev --ignore-scripts
-[[ "$(git diff --name-only)" == "package-lock.json" ]]
+packaging_changes=$(git diff --name-only)
+[[ -z "$packaging_changes" || "$packaging_changes" == "package-lock.json" ]]
 
 if [[ "$platform" == "linux" ]]; then
   native_dir="$source_dir/node_modules/node-pty/build/Release"
