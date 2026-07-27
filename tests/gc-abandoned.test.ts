@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { terminateAndWait } from "./setup/processes.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -102,8 +103,8 @@ function readEvents(sessionDir: string, name: string): any[] {
   }
 }
 
-afterEach(() => {
-  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+afterEach(async () => {
+  await terminateAndWait(bgPids);
   bgPids = [];
   for (const dir of sessionDirs) {
     try {

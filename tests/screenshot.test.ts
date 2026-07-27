@@ -14,6 +14,7 @@ import {
   encodeResize,
 } from "../src/protocol.ts";
 import { getSocketPath, cleanupAll } from "../src/sessions.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 // Every test here spawns a real pty session and polls the rendered screen
 // (createSession + waitForText). The default 5000ms per-test timeout is too
@@ -70,11 +71,7 @@ afterEach(async () => {
     await session.close();
   }
   sessions = [];
-  for (const pid of daemonPids) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {}
-  }
+  await terminateAndWait(daemonPids);
   daemonPids = [];
   for (const name of sessionNames) {
     cleanupAll(name);

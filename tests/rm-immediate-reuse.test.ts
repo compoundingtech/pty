@@ -8,6 +8,7 @@ import {
   cleanupOwnedAll,
   cleanupOwnedSocket,
 } from "../src/sessions.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -15,10 +16,8 @@ const cliPath = path.join(__dirname, "..", "dist", "cli.js");
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-rm-reuse-"));
 const liveDaemons = new Set<number>();
 
-afterAll(() => {
-  for (const pid of liveDaemons) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
-  }
+afterAll(async () => {
+  await terminateAndWait(liveDaemons);
   fs.rmSync(testRoot, {
     recursive: true,
     force: true,

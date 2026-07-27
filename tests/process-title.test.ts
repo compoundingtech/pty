@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { terminateAndWait } from "./setup/processes.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,10 +29,8 @@ function readComm(pid: number): string {
   return fs.readFileSync(`/proc/${pid}/comm`, "utf-8").trim();
 }
 
-afterEach(() => {
-  for (const pid of bgPids) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
-  }
+afterEach(async () => {
+  await terminateAndWait(bgPids);
   bgPids = [];
 });
 

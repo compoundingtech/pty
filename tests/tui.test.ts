@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { Session } from "../src/testing/index.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -32,11 +33,7 @@ afterEach(async () => {
     await s.close();
   }
   tuiSessions = [];
-  for (const pid of bgPids) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {}
-  }
+  await terminateAndWait(bgPids);
   bgPids = [];
   // Clean up session dir contents
   for (const dir of sessionDirs) {

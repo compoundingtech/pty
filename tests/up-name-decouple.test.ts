@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -47,7 +48,8 @@ function listJson(sessionDir: string): any[] {
   return JSON.parse(r.stdout);
 }
 
-afterEach(() => {
+afterEach(async () => {
+  const pids: number[] = [];
   for (const dir of sessionDirs) {
     if (!fs.existsSync(dir)) continue;
     try {
@@ -55,9 +57,16 @@ afterEach(() => {
       for (const e of entries) {
         if (e.endsWith(".pid")) {
           const pid = parseInt(fs.readFileSync(path.join(dir, e), "utf-8").trim(), 10);
-          if (!isNaN(pid)) { try { process.kill(pid, "SIGTERM"); } catch {} }
+          if (!isNaN(pid)) pids.push(pid);
         }
       }
+    } catch {}
+  }
+  await terminateAndWait(pids);
+  for (const dir of sessionDirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const entries = fs.readdirSync(dir);
       for (const e of entries) { try { fs.unlinkSync(path.join(dir, e)); } catch {} }
     } catch {}
   }

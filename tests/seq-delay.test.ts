@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { resolveSeqDelayMs, DEFAULT_SEQ_DELAY_MS } from "../src/client.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 // (a) default (no --with-delay) inserts 0.3s between --seq items;
 // (b) --with-delay 0 = straight stream, NO spacing (the escape hatch);
@@ -36,8 +37,8 @@ const cliPath = path.join(__dirname, "..", "dist", "cli.js");
 const serverModule = path.join(__dirname, "..", "dist", "server.js");
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-seq-"));
 const bgPids: number[] = [];
-afterAll(() => {
-  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+afterAll(async () => {
+  await terminateAndWait(bgPids);
   fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 

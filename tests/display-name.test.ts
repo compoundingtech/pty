@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -51,8 +52,8 @@ function collectPid(dir: string, name: string) {
   } catch {}
 }
 
-afterEach(() => {
-  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+afterEach(async () => {
+  await terminateAndWait(bgPids);
   bgPids = [];
   for (const dir of sessionDirs) {
     try {

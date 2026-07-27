@@ -9,6 +9,7 @@ import {
   sendData,
   peekScreen,
 } from "../src/connection.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -83,10 +84,8 @@ async function startDaemon(
   throw new Error(`Timeout waiting for daemon socket: ${socketPath}`);
 }
 
-afterEach(() => {
-  for (const pid of bgPids) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
-  }
+afterEach(async () => {
+  await terminateAndWait(bgPids);
   bgPids = [];
   for (const dir of sessionDirs) {
     try {

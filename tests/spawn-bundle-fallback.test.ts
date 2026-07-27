@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { queryStats } from "../src/client.ts";
 import { spawnDaemon, setServerModulePath } from "../src/spawn.ts";
-import { waitForProcessExit } from "../src/sessions.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.join(__dirname, "..");
@@ -19,10 +19,7 @@ afterAll(() => {
 
 let bgPids: number[] = [];
 afterEach(async () => {
-  for (const pid of bgPids) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
-  }
-  await Promise.all(bgPids.map((pid) => waitForProcessExit(pid, 7_000)));
+  await terminateAndWait(bgPids);
   bgPids = [];
   // Reset the override between cases so each test exercises its intended
   // strategy.

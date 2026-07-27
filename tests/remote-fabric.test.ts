@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { Session } from "../src/testing/index.ts";
+import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -149,7 +150,7 @@ describe("pty ls --remote over fabric", () => {
     const resp = await rawList(sock);
     expect(resp.sessions.map((s) => s.name)).toContain("demo");
 
-    try { process.kill(proc.pid!, "SIGTERM"); } catch {}
+    await terminateAndWait([proc.pid!]);
     try { fs.rmSync(sock, { force: true }); } catch {}
   }, 15000);
 
@@ -174,7 +175,7 @@ describe("pty ls --remote over fabric", () => {
     const resp = await rawList(sock); // and still functional
     expect(resp.sessions.map((s) => s.name)).toContain("demo");
 
-    try { process.kill(proc.pid!, "SIGTERM"); } catch {}
+    await terminateAndWait([proc.pid!]);
     try { fs.rmSync(sock, { force: true }); } catch {}
   }, 15000);
 });

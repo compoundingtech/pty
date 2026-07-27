@@ -1,4 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
+import { terminateAndWait } from "./setup/processes.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,8 +11,8 @@ const nodeBin = process.execPath;
 const cliPath = path.join(__dirname, "..", "dist", "cli.js");
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-killw-"));
 const bgPids: number[] = [];
-afterAll(() => {
-  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+afterAll(async () => {
+  await terminateAndWait(bgPids);
   fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 

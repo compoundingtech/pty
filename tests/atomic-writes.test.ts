@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { terminateAndWait } from "./setup/processes.ts";
 import {
   atomicWriteFileSync, atomicWriteFile,
   updateTags, readMetadata,
@@ -77,8 +78,8 @@ async function startDaemon(sessionDir: string, name: string): Promise<number> {
   throw new Error("Timeout waiting for daemon");
 }
 
-afterEach(() => {
-  for (const pid of bgPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+afterEach(async () => {
+  await terminateAndWait(bgPids);
   bgPids = [];
   for (const dir of sessionDirs) {
     try {
