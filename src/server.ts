@@ -49,6 +49,7 @@ export interface ServerOptions {
   cwd: string;
   rows: number;
   cols: number;
+  ephemeral?: boolean;
   tags?: Record<string, string>;
   /** Optional human-friendly alias recorded in SessionMetadata.displayName.
    *  Mutable via `pty rename`; `name` stays the immutable stable id. */
@@ -60,8 +61,8 @@ export interface ServerOptions {
    *  shouldn't leak into the session (e.g., a daemon launched by pty-relay
    *  for a remote client). See BUG-4. */
   isolateEnv?: boolean;
-  /** Additional `KEY=VALUE` env entries to add on top of the isolation
-   *  allow-list. Only consulted when `isolateEnv` is true. */
+  /** Additional `KEY=VALUE` env entries overlaid on the inherited child
+   *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
   /** Use this env dict verbatim for the spawned child — no inheritance from
    *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
@@ -128,6 +129,9 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     // Legacy behaviour: full inheritance, minus the server-config handoff.
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
+    if (options.extraEnv) {
+      for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
+    }
     env.PTY_SESSION = options.name;
     ensureChildTerm(env);
     return env;
@@ -555,9 +559,15 @@ export class PtyServer {
           args: options.args,
           displayCommand: options.displayCommand,
           cwd: options.cwd,
+          rows: options.rows,
+          cols: options.cols,
+          ephemeral: options.ephemeral === true,
           createdAt: new Date().toISOString(),
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
           ...(options.displayName ? { displayName: options.displayName } : {}),
+          ...(options.isolateEnv ? { isolateEnv: true } : {}),
+          ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+          ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
           ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
@@ -911,12 +921,18 @@ export class PtyServer {
       args: this.options.args,
       displayCommand: this.options.displayCommand,
       cwd: this.options.cwd,
+      rows: this.options.rows,
+      cols: this.options.cols,
+      ephemeral: this.options.ephemeral === true,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       exitCode,
       exitedAt: new Date().toISOString(),
       lastLines: this.getLastLines(),
       ...(existing?.tags ? { tags: existing.tags } : {}),
       ...(existing?.displayName ? { displayName: existing.displayName } : {}),
+      ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
+      ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
+      ...(this.options.env ? { env: this.options.env } : {}),
     });
   }
 
@@ -1109,6 +1125,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     cwd: config.cwd ?? process.cwd(),
     rows: config.rows ?? 24,
     cols: config.cols ?? 80,
+    ephemeral: config.ephemeral === true,
     tags: config.tags,
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,

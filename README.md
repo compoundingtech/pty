@@ -54,6 +54,7 @@ pty run -d -- node server.js                       # start in the background
 pty run -a -- node server.js                       # create or attach if already running
 pty run -e -- npm test                             # ephemeral: reap even on `pty kill` / permanent
 pty run --tag owner=forge -- node srv.js           # tag a session with metadata
+pty run --env PORT=3000 --env MODE=dev -- node srv.js # persisted child env overlay
 pty run --tag keep=true -- npm test                # keep it even past a gc sweep, until you rm it
 pty run --cwd /path -- node server.js              # run in a specific directory
 
@@ -261,7 +262,7 @@ cwd = "packages/web"             # working directory (default: the manifest's di
 
 `id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` is permissive (≤ 500 chars, any printable text); omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
 
-`cwd` sets the session's working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the default). This decouples where a session runs from where its `pty.toml` lives — so a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can still run its sessions in the repo root with `cwd = ".."`. The declared `cwd` is honored on the initial `pty up` and preserved across `strategy=permanent` respawns.
+`cwd` sets the session's working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the default). This decouples where a session runs from where its `pty.toml` lives — so a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can still run its sessions in the repo root with `cwd = ".."`. The declared `cwd` is honored on the initial `pty up` and preserved across manual and `strategy=permanent` respawns.
 
 Sessions can also declare per-session environment variables:
 
@@ -274,7 +275,7 @@ PORT = "8080"
 LOG_LEVEL = "debug"
 ```
 
-The values are exported into the session's shell before the command runs — `pty up` wraps every toml-managed session in `/bin/sh -c` so the `export K='V'; …` prefix is honored. They take effect on the next `pty up` after the session has stopped — restarting a still-running session via `pty restart` reuses the existing spawn args, so `pty kill <name>` followed by `pty up` is the way to pick up a changed env block on an already-running session.
+The values are overlaid on the session child's inherited environment before its `/bin/sh -c` command runs. The effective overlay is stored with the other launch settings, so `pty restart` preserves it exactly; `strategy=permanent` respawns re-read the manifest and pick up edits. The equivalent direct-launch flag is repeatable `pty run --env KEY=VALUE` (later entries for the same key win). Ambient process-environment inheritance remains unchanged.
 
 ### Permanent sessions
 

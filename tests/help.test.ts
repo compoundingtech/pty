@@ -52,6 +52,13 @@ describe("pty --help — per-subcommand help", () => {
 });
 
 describe("pty --help — no drift", () => {
+  it("documents the repeatable persisted environment overlay", () => {
+    const r = help("run");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("--env KEY=VALUE");
+    expect(r.stdout).toMatch(/environment variable \(repeatable\)/);
+  });
+
   it("every dispatch `case` is either a documented command or a known non-command", () => {
     // Extract every `case "X":` label from the dispatcher.
     const cases = [...cliSource.matchAll(/case\s+"([^"]+)":/g)].map((m) => m[1]);

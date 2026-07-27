@@ -61,6 +61,7 @@ _pty() {
             '--name[Display label (any printable, ≤ 500 chars)]' \
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
+            '--env[Overlay child environment (KEY=VALUE, repeatable)]' \
             '--cwd[Working directory]' \
             '--isolate-env[Scrub env to a safe allow-list]' \
             '--force[Create even from inside another pty]'

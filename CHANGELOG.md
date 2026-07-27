@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Restartable launch parity and bounded fleet listing
+
+- `pty run --env KEY=VALUE` adds a repeatable child-environment overlay (last
+  duplicate wins). It covers the remaining `pty.toml` launch field on the
+  direct CLI and is included in generated fish/bash/zsh completions and help.
+- Session metadata now persists the complete restart-relevant launch settings:
+  terminal rows/columns, ephemeral mode, isolation mode, explicit environment
+  overlay, and programmatic exact environment. Manual restart and permanent
+  respawn reapply them instead of inheriting the restarter's launch shape.
+  Existing metadata remains compatible and uses historical defaults.
+- On POSIX, `kill(pid, 0)` returning `EPERM` now proves that the process is
+  present. Necessary socket fallbacks run concurrently under one shared
+  fleet-wide budget, and `listSessions()` returns deterministic name order.
+
+### Storage format
+
+`<name>.json` gains optional `rows`, `cols`, `ephemeral`, `isolateEnv`,
+`extraEnv`, and `env` fields recording restart-relevant launch settings.
+
 ### Configurable exit-time cleanup for finished sessions
 
 Whether a finished non-permanent session reaps itself at exit, or is preserved

@@ -71,6 +71,7 @@ complete -c pty -n '__pty_using_command run' -l id -d 'Pin on-disk id (charset-v
 complete -c pty -n '__pty_using_command run' -l name -d 'Display label (any printable, ≤ 500 chars)'
 complete -c pty -n '__pty_using_command run' -l no-display-name -d 'Skip the auto-generated label'
 complete -c pty -n '__pty_using_command run' -l tag -d 'Tag session (k=v, repeatable)'
+complete -c pty -n '__pty_using_command run' -l env -d 'Overlay child environment (KEY=VALUE, repeatable)'
 complete -c pty -n '__pty_using_command run' -l cwd -d 'Working directory'
 complete -c pty -n '__pty_using_command run' -l isolate-env -d 'Scrub env to a safe allow-list'
 complete -c pty -n '__pty_using_command run' -l force -d 'Create even from inside another pty'

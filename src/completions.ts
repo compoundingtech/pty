@@ -72,6 +72,7 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "name", desc: "Display label (any printable, ≤ 500 chars)" },
       { name: "no-display-name", desc: "Skip the auto-generated label" },
       { name: "tag", desc: "Tag session (k=v, repeatable)" },
+      { name: "env", desc: "Overlay child environment (KEY=VALUE, repeatable)" },
       { name: "cwd", desc: "Working directory" },
       { name: "isolate-env", desc: "Scrub env to a safe allow-list" },
       { name: "force", desc: "Create even from inside another pty" },

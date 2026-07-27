@@ -33,8 +33,8 @@ export interface SpawnDaemonOptions {
    *  vars from leaking into a session that may be reached via pty-relay.
    *  See BUG-4. */
   isolateEnv?: boolean;
-  /** Additional `KEY=VALUE` env entries to add on top of the isolation
-   *  allow-list. Ignored unless `isolateEnv` is true. */
+  /** Additional `KEY=VALUE` env entries overlaid on the inherited child
+   *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
   /** Use this env dict verbatim for the spawned child — no inheritance from
    *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
@@ -201,13 +201,11 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
 /**
  * Bundled-context fallback: shell out to `pty run -d ...` on PATH.
  *
- * Only the inputs that the CLI surface today supports are passed through.
- * Options without a CLI-level equivalent (`rows`, `cols`, `displayCommand`,
- * `displayName`, `ephemeral`, `extraEnv`, `env`, `launcher`) are silently
- * ignored on this path — they're either non-load-bearing for typical
- * consumers (initial size; clients resize after attach) or rarely used
- * (`launcher`, advanced env shaping). Add CLI flags upstream as concrete
- * needs surface.
+ * Only the inputs that the CLI surface supports are passed through. Initial
+ * size, an alternate display command, an exact replacement env, and a custom
+ * launcher remain Node-path-only; the restart-relevant CLI settings
+ * (ephemeral, cwd, display name, tags, isolation, and env overlay) all have
+ * lossless flag equivalents.
  *
  * `isolateEnv` maps to `--isolate-env`. `cwd` to `--cwd`. `tags` to
  * repeated `--tag k=v`. `name` to `--id` (the on-disk identifier under the
@@ -224,7 +222,13 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
     cliArgs.push("--no-display-name");
   }
   if (options.cwd) cliArgs.push("--cwd", options.cwd);
+  if (options.ephemeral) cliArgs.push("--ephemeral");
   if (options.isolateEnv) cliArgs.push("--isolate-env");
+  if (options.extraEnv) {
+    for (const [k, v] of Object.entries(options.extraEnv)) {
+      cliArgs.push("--env", `${k}=${v}`);
+    }
+  }
   if (options.tags) {
     for (const [k, v] of Object.entries(options.tags)) {
       cliArgs.push("--tag", `${k}=${v}`);

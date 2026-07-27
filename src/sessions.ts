@@ -129,6 +129,17 @@ export interface SessionMetadata {
   args: string[];
   displayCommand: string; // original command as the user typed it
   cwd: string;
+  /** Initial terminal geometry used to create the daemon. Persisted so an
+   *  operator restart recreates the same launch rather than inheriting the
+   *  restarter's terminal size. */
+  rows?: number;
+  cols?: number;
+  /** Launch-time child lifetime/environment settings. Older metadata omits
+   *  these fields and therefore retains the historical defaults. */
+  ephemeral?: boolean;
+  isolateEnv?: boolean;
+  extraEnv?: Record<string, string>;
+  env?: Record<string, string>;
   createdAt: string;
   exitCode?: number;
   exitedAt?: string;
@@ -305,7 +316,16 @@ export function readMetadata(name: string): SessionMetadata | null {
   }
 }
 
-export async function listSessions(): Promise<SessionInfo[]> {
+export interface ListSessionsOptions {
+  /** Overall budget shared by every fallback socket probe in this listing. */
+  socketProbeBudgetMs?: number;
+  /** Test seam for simulating slow or permission-denied socket probes. */
+  socketProbe?: (socketPath: string) => Promise<boolean>;
+}
+
+const DEFAULT_SOCKET_PROBE_BUDGET_MS = 500;
+
+export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionInfo[]> {
   ensureSessionDir();
 
   let entries: string[];
@@ -327,20 +347,29 @@ export async function listSessions(): Promise<SessionInfo[]> {
   // for a perfectly healthy session. Reaping on that (the old behavior) deleted
   // a live daemon's socket/pid out from under it, making it invisible and
   // getting it GC'd + re-launched by consumers that reconcile on not-running.
-  const sockFiles = entries.filter((e) => e.endsWith(".sock"));
-  for (const sockFile of sockFiles) {
+  const sockFiles = entries.filter((e) => e.endsWith(".sock")).sort();
+  const socketCandidates = sockFiles.map((sockFile) => {
     const name = sockFile.replace(/\.sock$/, "");
-    seen.add(name);
     const socketPath = getSocketPath(name);
     const pid = readPid(name);
     const pidAlive = pid !== null && isProcessAlive(pid);
-    // A reachable control socket proves the daemon is alive INDEPENDENTLY of
-    // whether we could read the pidfile this instant. Probe it ONLY when the
-    // pid doesn't already prove life: for a live pid the probe result is
-    // ignored (running either way), so skipping it avoids a per-session connect
-    // on the hot path and cuts the socket-connect contention that a `pty list`
-    // under concurrent multi-agent load would otherwise add.
-    const socketReachable = pidAlive ? true : await isSocketReachable(socketPath);
+    return { name, socketPath, pid, pidAlive };
+  });
+
+  // A reachable control socket proves the daemon is alive independently of
+  // the pidfile. Start every necessary fallback concurrently and give the
+  // entire fleet one shared deadline: N inaccessible sessions must not cost
+  // N × 500ms before `pty list --json` emits anything.
+  const needsProbe = socketCandidates.filter((candidate) => !candidate.pidAlive);
+  const socketReachability = await probeSocketsWithinBudget(
+    needsProbe.map((candidate) => candidate.socketPath),
+    options.socketProbeBudgetMs ?? DEFAULT_SOCKET_PROBE_BUDGET_MS,
+    options.socketProbe ?? isSocketReachable,
+  );
+
+  for (const { name, socketPath, pid, pidAlive } of socketCandidates) {
+    seen.add(name);
+    const socketReachable = pidAlive || socketReachability.get(socketPath) === true;
 
     if (pidAlive || socketReachable) {
       // Alive: a live process, or a reachable control socket (busy/mid-startup
@@ -368,7 +397,7 @@ export async function listSessions(): Promise<SessionInfo[]> {
   }
 
   // Find dead sessions (have .json but no running process)
-  const jsonFiles = entries.filter((e) => e.endsWith(".json"));
+  const jsonFiles = entries.filter((e) => e.endsWith(".json")).sort();
   for (const jsonFile of jsonFiles) {
     const name = jsonFile.replace(/\.json$/, "");
     if (seen.has(name)) continue; // already handled above
@@ -411,7 +440,7 @@ export async function listSessions(): Promise<SessionInfo[]> {
     });
   }
 
-  return sessions;
+  return sessions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 /** Tag key that exempts a session from every form of dead-session reaping:
@@ -1057,20 +1086,24 @@ async function respawnPermanent(
   let cwd = metadata.cwd;
   let tags: Record<string, string> | undefined = metadata.tags;
   const displayName = metadata.displayName;
+  let extraEnv = metadata.extraEnv;
+  let exactEnv = metadata.env;
 
   const ptyfilePath = metadata.tags?.ptyfile;
   const ptyfileSession = metadata.tags?.["ptyfile.session"];
   if (ptyfilePath && ptyfileSession) {
     try {
-      const { readPtyFile, commandWithEnvExports } = await import("./ptyfile.ts");
+      const { readPtyFile } = await import("./ptyfile.ts");
       const dir = path.dirname(ptyfilePath);
       const ptyFile = readPtyFile(dir);
       const sessDef = ptyFile.sessions.find((s) => s.shortName === ptyfileSession);
       if (sessDef) {
         command = "/bin/sh";
-        args = ["-c", commandWithEnvExports(sessDef)];
+        args = ["-c", sessDef.command];
         displayCommand = sessDef.command;
         cwd = sessDef.cwd ?? ptyFile.dir;
+        extraEnv = sessDef.env;
+        exactEnv = undefined;
         tags = {
           ...sessDef.tags,
           ptyfile: ptyfilePath,
@@ -1104,6 +1137,12 @@ async function respawnPermanent(
   await spawnDaemon({
     name, command, args, displayCommand, cwd, tags,
     ...(displayName ? { displayName } : {}),
+    ...(metadata.rows !== undefined ? { rows: metadata.rows } : {}),
+    ...(metadata.cols !== undefined ? { cols: metadata.cols } : {}),
+    ...(metadata.ephemeral !== undefined ? { ephemeral: metadata.ephemeral } : {}),
+    ...(metadata.isolateEnv ? { isolateEnv: true } : {}),
+    ...(extraEnv && Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
+    ...(exactEnv ? { env: exactEnv } : {}),
   });
 
   // Best-effort event; respawn already succeeded if we got here.
@@ -1186,7 +1225,17 @@ export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (error) {
+    // POSIX reserves EPERM for "the process exists, but this caller may not
+    // signal it." Sandboxed seats routinely hit this for peer-owned daemons;
+    // treating it as death both lies about status and triggers slow socket
+    // fallbacks for every session in the fleet.
+    if (
+      process.platform !== "win32" &&
+      (error as NodeJS.ErrnoException | undefined)?.code === "EPERM"
+    ) {
+      return true;
+    }
     return false;
   }
 }
@@ -1202,6 +1251,35 @@ export async function waitForProcessExit(pid: number, timeoutMs: number): Promis
     await new Promise((r) => setTimeout(r, 50));
   }
   return !isProcessAlive(pid);
+}
+
+async function probeSocketsWithinBudget(
+  socketPaths: string[],
+  budgetMs: number,
+  probe: (socketPath: string) => Promise<boolean>,
+): Promise<Map<string, boolean>> {
+  const results = new Map<string, boolean>();
+  if (socketPaths.length === 0) return results;
+
+  const probes = socketPaths.map(async (socketPath) => {
+    try {
+      results.set(socketPath, await probe(socketPath));
+    } catch {
+      results.set(socketPath, false);
+    }
+  });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.all(probes),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, budgetMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return results;
 }
 
 function isSocketReachable(socketPath: string): Promise<boolean> {

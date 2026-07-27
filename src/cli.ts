@@ -37,7 +37,7 @@ import {
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
-import { readPtyFile, commandWithEnvExports, type PtySessionDef } from "./ptyfile.ts";
+import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
@@ -92,6 +92,7 @@ Flags:
   -e, --ephemeral      Force self-removal at exit even for strategy=permanent
                        (non-permanent sessions already self-remove by default)
   --tag key=value      Tag the session (repeatable)
+  --env KEY=VALUE      Overlay a child environment variable (repeatable)
   --tag keep=true      Exempt from reaping: keep metadata/logs after exit
   --cwd <path>         Working directory for the command
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
@@ -99,7 +100,7 @@ Flags:
 
 Examples:
   pty run -- node server.js
-  pty run -d --name "API" --tag role=web -- node server.js`,
+  pty run -d --name "API" --tag role=web --env PORT=3000 -- node server.js`,
 
   attach: `Usage: pty attach [-r] [--force] [--remote <peer>] <ref>
 
@@ -399,6 +400,7 @@ Create sessions:
   pty run -a -- <command>                 Create OR attach if a session with the same id already exists
   pty run -e -- <command>                 Ephemeral: auto-remove metadata on clean exit
   pty run --tag key=value -- <command>    Tag a session (repeatable)
+  pty run --env KEY=VALUE -- <command>    Overlay child environment (repeatable; persisted for restart)
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
@@ -680,6 +682,7 @@ async function main(): Promise<void> {
       let explicitDisplayName: string | null = null;
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
+      const extraEnv: Record<string, string> = {};
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
@@ -698,6 +701,16 @@ async function main(): Promise<void> {
             process.exit(1);
           }
           tags[args[i + 1].slice(0, eq)] = args[i + 1].slice(eq + 1);
+          i += 2;
+        }
+        else if (args[i] === "--env" && i + 1 < args.length) {
+          const assignment = args[i + 1];
+          const eq = assignment.indexOf("=");
+          if (eq <= 0) {
+            console.error(`Invalid env format: "${assignment}". Use --env KEY=VALUE`);
+            process.exit(1);
+          }
+          extraEnv[assignment.slice(0, eq)] = assignment.slice(eq + 1);
           i += 2;
         }
         else break;
@@ -783,7 +796,7 @@ async function main(): Promise<void> {
         );
         const result = spawnSync(cmd, cmdArgs, {
           stdio: "inherit",
-          env: process.env,
+          env: { ...process.env, ...extraEnv },
         });
         process.exit(result.status ?? 1);
       }
@@ -860,7 +873,10 @@ async function main(): Promise<void> {
         }
       }
 
-      await cmdRun(name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral, tags, cwd, isolateEnv, displayName);
+      await cmdRun(
+        name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral,
+        tags, cwd, isolateEnv, displayName, extraEnv,
+      );
       break;
     }
 
@@ -1501,6 +1517,7 @@ async function cmdRun(
   explicitCwd: string | null = null,
   isolateEnv = false,
   displayName: string | null = null,
+  extraEnv: Record<string, string> = {},
 ): Promise<void> {
   const session = await getSession(name);
   if (session?.status === "running") {
@@ -1526,6 +1543,7 @@ async function cmdRun(
   // so that `run -a` re-creates the session in the original directory with original tags.
   const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
   const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
+  const previousExtraEnv = session && isGone(session.status) ? session.metadata?.extraEnv : undefined;
   if (session && isGone(session.status)) {
     cleanupAll(name);
   }
@@ -1538,10 +1556,12 @@ async function cmdRun(
     // `pty run -a` re-creates the session feeling-identical to the last one.
     const prevDisplayName = session && isGone(session.status) ? session.metadata?.displayName : undefined;
     const displayNameOpt = displayName ?? prevDisplayName;
+    const extraEnvOpt = Object.keys(extraEnv).length > 0 ? extraEnv : previousExtraEnv;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
+      ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
     });
   } finally {
     releaseLock(name);
@@ -1623,6 +1643,7 @@ async function handleDeadSession(
   await spawnDaemon({
     name: session.name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: meta.tags,
     ...(meta.displayName ? { displayName: meta.displayName } : {}),
+    ...persistedLaunchOptions(meta),
     scrubEnv: RESTART_SCRUBBED_ENV,
   });
   console.log(`Session "${session.name}" restarted.`);
@@ -3211,11 +3232,12 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
       await spawnDaemon({
         name,
         command: "/bin/sh",
-        args: ["-c", commandWithEnvExports(sess)],
+        args: ["-c", sess.command],
         displayCommand: sess.command,
         cwd: sess.cwd ?? ptyFile.dir,
         tags: tomlTags,
         displayName: sess.displayName,
+        ...(sess.env && Object.keys(sess.env).length > 0 ? { extraEnv: sess.env } : {}),
       });
       console.log(`  ● ${sess.displayName} (started)`);
       started++;
@@ -3322,6 +3344,20 @@ function statefulAgentReason(meta: SessionMetadata): string | null {
  *  convoy-launched create legitimately inherits its own identity. */
 const RESTART_SCRUBBED_ENV = ["ST_AGENT", "ST_ROOT"];
 
+/** Recover the launch-time settings that are not part of the command/cwd/tag
+ *  compatibility surface. Older metadata simply falls back to historical
+ *  defaults because all fields are optional. */
+function persistedLaunchOptions(meta: SessionMetadata) {
+  return {
+    ...(meta.rows !== undefined ? { rows: meta.rows } : {}),
+    ...(meta.cols !== undefined ? { cols: meta.cols } : {}),
+    ...(meta.ephemeral !== undefined ? { ephemeral: meta.ephemeral } : {}),
+    ...(meta.isolateEnv ? { isolateEnv: true } : {}),
+    ...(meta.extraEnv && Object.keys(meta.extraEnv).length > 0 ? { extraEnv: meta.extraEnv } : {}),
+    ...(meta.env ? { env: meta.env } : {}),
+  };
+}
+
 async function cmdRestart(
   name: string,
   yes = false,
@@ -3385,6 +3421,7 @@ async function cmdRestart(
   await spawnDaemon({
     name, command: meta.command, args: meta.args, displayCommand: meta.displayCommand, cwd: meta.cwd, tags: restartTags,
     ...(meta.displayName ? { displayName: meta.displayName } : {}),
+    ...persistedLaunchOptions(meta),
     scrubEnv: RESTART_SCRUBBED_ENV,
   });
   console.log(`Session "${name}" restarted.`);

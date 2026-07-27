@@ -37,6 +37,12 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   args: string[];
   displayCommand: string;     // command as the user typed it
   cwd: string;
+  rows?: number;              // initial terminal rows, persisted for restart
+  cols?: number;              // initial terminal columns
+  ephemeral?: boolean;
+  isolateEnv?: boolean;
+  extraEnv?: { [k: string]: string }; // explicit inherited-env overlay (`--env`)
+  env?: { [k: string]: string };      // exact child env for programmatic callers
   createdAt: string;          // ISO 8601
   exitCode?: number;          // present after clean exit
   exitedAt?: string;

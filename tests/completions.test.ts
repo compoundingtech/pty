@@ -63,6 +63,13 @@ describe("completion spec parity with COMMAND_HELP", () => {
 });
 
 describe("pty completions <shell>", () => {
+  it("offers pty run --env in every generated shell", () => {
+    const markers = { fish: "-l env", bash: "--env", zsh: "--env" } as const;
+    for (const shell of ["fish", "bash", "zsh"] as const) {
+      expect(gen(shell)).toContain(markers[shell]);
+    }
+  });
+
   it("prints fish, bash, zsh to stdout", () => {
     for (const shell of ["fish", "bash", "zsh"] as const) {
       const out = gen(shell);
