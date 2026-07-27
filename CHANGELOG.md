@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Generation-safe removal and immediate same-name reuse
+
+- `pty rm` now returns success only after the removed session's daemon has
+  completed its bounded deferred shutdown. An immediate same-name `pty run`
+  can no longer have its socket or pidfile unlinked by cleanup from the old
+  daemon generation.
+- Daemon exit-metadata writes and cleanup are generation-owned and serialized
+  with session creation. Stale cleanup skips files published by a replacement
+  generation.
+
+### Storage format
+
+`<name>.json` gains optional `generation` and `daemonPid` lifecycle fields.
+The generation is an opaque cleanup-ownership token; the daemon PID lets
+`pty rm` wait for deferred shutdown after the child has exited.
+
 ### Restartable launch parity and bounded fleet listing
 
 - `pty run --env KEY=VALUE` adds a repeatable child-environment overlay (last

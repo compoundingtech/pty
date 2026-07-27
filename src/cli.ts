@@ -15,6 +15,7 @@ import {
   isGone,
   cleanupAll,
   cleanupSocket,
+  cleanupOwnedAll,
   waitForProcessExit,
   validateName,
   validateDisplayName,
@@ -24,6 +25,7 @@ import {
   setDisplayName,
   allRefs,
   readMetadata,
+  readSessionPid,
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
@@ -2579,7 +2581,43 @@ async function cmdRm(name: string): Promise<void> {
     process.exit(1);
   }
 
-  cleanupAll(name);
+  // `exited` means the child is gone, not necessarily the daemon: the daemon
+  // deliberately keeps its socket alive for 500ms so attached clients receive
+  // the exit packet, then performs deferred cleanup. Returning success before
+  // that process exits lets an immediate same-name `pty run` publish a new
+  // socket/pid which the old daemon can unlink. Wait on the old generation's
+  // recorded daemon PID; the 5s shutdown backstop makes 7s a real bound rather
+  // than an arbitrary sleep. On timeout, do not claim removal succeeded.
+  const generation = session.metadata?.generation;
+  const daemonPid =
+    session.pid ??
+    session.metadata?.daemonPid ??
+    readSessionPid(name);
+  if (daemonPid !== null && daemonPid !== undefined) {
+    const exited = await waitForProcessExit(daemonPid, 7000);
+    if (!exited) {
+      console.error(
+        `Session "${name}" daemon did not exit within 7s; not removed. Try again.`,
+      );
+      process.exit(1);
+    }
+  }
+
+  // Take the creation lock and re-check generation ownership in the same
+  // critical section as the unlink. This closes both sides of the race: a
+  // replacement already published is rejected, and a replacement cannot
+  // publish between our check and cleanup. The empty generation / -1 PID
+  // fallbacks keep pre-generation metadata removable while still refusing a
+  // newly published generation.
+  const removed = cleanupOwnedAll(name, {
+    generation: generation ?? "",
+    pid: daemonPid ?? -1,
+  });
+  if (!removed) {
+    console.error(`Session "${name}" was replaced while waiting; new generation was not removed.`);
+    process.exit(1);
+  }
+
   console.log(`Session "${name}" removed.`);
 }
 

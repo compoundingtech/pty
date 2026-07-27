@@ -33,6 +33,8 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 
 ```ts
 {
+  generation?: string;       // opaque daemon generation; guards cleanup ownership
+  daemonPid?: number;        // daemon owning this generation, retained after child exit
   command: string;            // resolved binary path
   args: string[];
   displayCommand: string;     // command as the user typed it
@@ -54,6 +56,10 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 ```
 
 - Status (`running` / `exited` / `vanished`) is *derived* from socket + pid, not stored.
+- `generation` and `daemonPid` are internal lifecycle guards. A daemon only
+  removes files still owned by its generation, and `pty rm` waits for that
+  daemon to finish deferred shutdown before it reports success. Readers should
+  treat the generation token as opaque.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).

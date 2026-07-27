@@ -125,6 +125,13 @@ export function getEventsPath(name: string): string {
 // next CHANGELOG entry. A smoke test (`tests/disk-layout-docs.test.ts`)
 // asserts every field name on this interface appears in the docs.
 export interface SessionMetadata {
+  /** Opaque daemon-generation token. Cleanup from an older process must not
+   *  delete files whose metadata carries a different generation. */
+  generation?: string;
+  /** PID of the daemon that owns this metadata generation. Unlike the
+   *  sidecar pidfile, this survives socket cleanup long enough for `pty rm`
+   *  to wait until deferred daemon shutdown is complete. */
+  daemonPid?: number;
   command: string;
   args: string[];
   displayCommand: string; // original command as the user typed it
@@ -1211,7 +1218,7 @@ export async function pruneOrphanLayoutTags(
   return results;
 }
 
-function readPid(name: string): number | null {
+export function readSessionPid(name: string): number | null {
   try {
     const content = fs.readFileSync(getPidPath(name), "utf-8").trim();
     const pid = parseInt(content, 10);
@@ -1220,6 +1227,8 @@ function readPid(name: string): number | null {
     return null;
   }
 }
+
+const readPid = readSessionPid;
 
 export function isProcessAlive(pid: number): boolean {
   try {
@@ -1323,6 +1332,62 @@ export function cleanupAll(name: string): void {
   releaseLock(name);
 }
 
+export interface SessionGenerationOwner {
+  generation: string;
+  pid: number;
+}
+
+/** Does the current registry entry still belong to `owner`?
+ *
+ * Call only while holding the per-name creation lock. Metadata is the primary
+ * generation marker; the pidfile closes the startup window before metadata is
+ * published. Older metadata without a generation falls back to PID ownership. */
+function isCurrentGenerationOwner(name: string, owner: SessionGenerationOwner): boolean {
+  const metadata = readMetadata(name);
+  if (metadata?.generation !== undefined && metadata.generation !== owner.generation) {
+    return false;
+  }
+  const pid = readSessionPid(name);
+  if (pid !== null && pid !== owner.pid) {
+    return false;
+  }
+  return true;
+}
+
+/** Generation-safe daemon cleanup.
+ *
+ * The creation lock makes the ownership check + unlink sequence atomic with
+ * respect to `pty run`. If a replacement is currently starting, cleanup skips
+ * rather than unlinking its socket/pid. */
+export function cleanupOwnedSocket(name: string, owner: SessionGenerationOwner): boolean {
+  if (!acquireLock(name)) return false;
+  try {
+    if (!isCurrentGenerationOwner(name, owner)) return false;
+    cleanupSocket(name);
+    return true;
+  } finally {
+    releaseLock(name);
+  }
+}
+
+/** Generation-safe full cleanup used by a daemon reaping its own session. */
+export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): boolean {
+  if (!acquireLock(name)) return false;
+  try {
+    if (!isCurrentGenerationOwner(name, owner)) return false;
+    cleanupSocket(name);
+    try {
+      fs.unlinkSync(getMetadataPath(name));
+    } catch {}
+    try {
+      fs.unlinkSync(getEventsPath(name));
+    } catch {}
+    return true;
+  } finally {
+    releaseLock(name);
+  }
+}
+
 function getLockPath(name: string): string {
   return path.join(getSessionDir(), `${name}.lock`);
 }
@@ -1364,8 +1429,7 @@ export function acquireLock(name: string): boolean {
   try {
     const pid = parseInt(fs.readFileSync(lockPath, "utf-8").trim(), 10);
     if (!isNaN(pid)) {
-      process.kill(pid, 0); // throws if process is dead
-      holderAlive = true;
+      holderAlive = isProcessAlive(pid);
     }
   } catch {
     // Garbage content, unreadable, or holder dead → treat as stale.

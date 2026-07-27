@@ -1,6 +1,7 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as pty from "node-pty";
 // @xterm/headless is CJS-only, so keep its default import. The serialize addon
 // ships native ESM with named exports, so import its runtime namespace.
@@ -22,8 +23,8 @@ import {
   getPidPath,
   getMetadataPath,
   ensureSessionDir,
-  cleanup,
-  cleanupAll,
+  cleanupOwnedSocket,
+  cleanupOwnedAll,
   writeMetadata,
   readMetadata,
   shouldReapAtExit,
@@ -43,6 +44,7 @@ interface Client {
 
 export interface ServerOptions {
   name: string;
+  generation?: string;
   command: string;
   args: string[];
   displayCommand: string;
@@ -249,6 +251,7 @@ export class PtyServer {
   private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
+  private generation: string;
   private lastTitle = "";
   readonly ready: Promise<void>;
   // Resolves when the child process's onExit has fired — used by close() to
@@ -260,6 +263,7 @@ export class PtyServer {
   constructor(options: ServerOptions) {
     this.name = options.name;
     this.options = options;
+    this.generation = options.generation ?? randomBytes(16).toString("hex");
     this.eventWriter = new EventWriter(options.name);
     this.childExited = new Promise<void>((resolve) => {
       this.resolveChildExited = resolve;
@@ -555,6 +559,8 @@ export class PtyServer {
         try { fs.chmodSync(socketPath, 0o600); } catch {}
         fs.writeFileSync(getPidPath(this.name), process.pid.toString());
         writeMetadata(this.name, {
+          generation: this.generation,
+          daemonPid: process.pid,
           command: options.command,
           args: options.args,
           displayCommand: options.displayCommand,
@@ -916,7 +922,15 @@ export class PtyServer {
     // `.json` here would leave a stray registry file (and its atomic tmp) behind.
     if (!fs.existsSync(getMetadataPath(this.name))) return;
     const existing = readMetadata(this.name);
+    if (
+      existing?.generation !== undefined &&
+      existing.generation !== this.generation
+    ) {
+      return;
+    }
     writeMetadata(this.name, {
+      generation: this.generation,
+      daemonPid: process.pid,
       command: this.options.command,
       args: this.options.args,
       displayCommand: this.options.displayCommand,
@@ -950,7 +964,10 @@ export class PtyServer {
         client.socket.destroy();
       }
       this.socketServer.close(async () => {
-        cleanup(this.name);
+        cleanupOwnedSocket(this.name, {
+          generation: this.generation,
+          pid: process.pid,
+        });
         try {
           this.ptyProcess.kill();
         } catch {}
@@ -1033,6 +1050,11 @@ if (process.argv[1]?.endsWith("/server.js")) {
   }
 
   const isEphemeral = config.ephemeral === true;
+  const generation =
+    typeof config.generation === "string" && config.generation.length > 0
+      ? config.generation
+      : randomBytes(16).toString("hex");
+  const cleanupOwner = { generation, pid: process.pid };
 
   // Exit-time cleanup policy. Deliberately re-reads metadata at shutdown
   // instead of trusting `config.tags` (the spawn-time snapshot): `pty tag
@@ -1065,8 +1087,15 @@ if (process.argv[1]?.endsWith("/server.js")) {
   // either path, so no existing caller of it regresses.
   let externalKill = false;
   function reapAtExit(): boolean {
+    const metadata = readMetadata(config.name);
+    if (
+      metadata?.generation !== undefined &&
+      metadata.generation !== generation
+    ) {
+      return false;
+    }
     if (externalKill && !isEphemeral) return false;
-    const tags = readMetadata(config.name)?.tags ?? config.tags;
+    const tags = metadata?.tags ?? config.tags;
     // `PTY_REAP_ON_EXIT` (network/global config) sets the default when no
     // per-session `keep`/`--ephemeral` override applies; shipped default reaps.
     return shouldReapAtExit(tags, isEphemeral, reapOnExitDefault());
@@ -1100,8 +1129,8 @@ if (process.argv[1]?.endsWith("/server.js")) {
       // pointing at a daemon that's about to vanish.
       server.forceKillChild();
       try {
-        if (reapAtExit()) cleanupAll(config.name);
-        else cleanup(config.name);
+        if (reapAtExit()) cleanupOwnedAll(config.name, cleanupOwner);
+        else cleanupOwnedSocket(config.name, cleanupOwner);
       } catch {}
       process.exit(code);
     }, SHUTDOWN_DEADLINE_MS);
@@ -1111,7 +1140,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
       // `lastLines`, so this reads the same tags a `pty gc` sweep would
       // have read one tick later — the decision is identical, only the
       // latency changes.
-      if (reapAtExit()) cleanupAll(config.name);
+      if (reapAtExit()) cleanupOwnedAll(config.name, cleanupOwner);
       process.exit(code);
     });
     return shutdownPromise;
@@ -1119,6 +1148,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
 
   const server = new PtyServer({
     name: config.name,
+    generation,
     command: config.command,
     args: config.args ?? [],
     displayCommand: config.displayCommand,
