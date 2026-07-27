@@ -52,12 +52,17 @@ cd "$source_dir"
 npm ci
 npm run typecheck
 npm run build
-npm prune --omit=dev --ignore-scripts
 
 # npm/build must reproduce tracked face607 sources exactly. The release tooling
 # lives on a separate branch and is never copied into the product payload.
 git diff --exit-code
 [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+
+# Pruning dev dependencies normalizes the stale root version recorded in
+# package-lock.json (0.11.0) to package.json's exact 0.12.0. Permit only that
+# known packaging-only lockfile mutation; package-lock.json is not shipped.
+npm prune --omit=dev --ignore-scripts
+[[ "$(git diff --name-only)" == "package-lock.json" ]]
 
 if [[ "$platform" == "linux" ]]; then
   native_dir="$source_dir/node_modules/node-pty/build/Release"
