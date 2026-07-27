@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { waitForProcessExit } from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const cliPath = path.join(__dirname, "..", "dist", "cli.js");
@@ -11,10 +12,13 @@ const nodeBin = process.execPath;
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-restart-launch-"));
 const daemonPids = new Map<string, number>();
 
-afterAll(() => {
+afterAll(async () => {
   for (const pid of daemonPids.values()) {
     try { process.kill(pid, "SIGTERM"); } catch {}
   }
+  await Promise.all(
+    Array.from(daemonPids.values(), (pid) => waitForProcessExit(pid, 7_000)),
+  );
   fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
