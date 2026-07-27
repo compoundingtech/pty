@@ -1,0 +1,113 @@
+name: Release exact face607 fleet assets
+
+on:
+  push:
+    branches:
+      - release/face607-assets
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_SHA: face607b443b3ff35e934434a28f575822392aa8
+  RELEASE_TAG: fleet-face607
+  NODE_VERSION: 22.17.1
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 20
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          path: release-tools
+      - name: Check out exact PTY source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Build, package, and smoke Linux x86_64
+        run: bash release-tools/scripts/package-fleet-release.sh source assets linux x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pty-face607-linux-x86_64
+          path: assets/*
+          if-no-files-found: error
+
+  darwin-arm64:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          path: release-tools
+      - name: Check out exact PTY source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Build, package, and smoke Darwin arm64
+        run: bash release-tools/scripts/package-fleet-release.sh source assets darwin arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pty-face607-darwin-arm64
+          path: assets/*
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - linux-x86_64
+      - darwin-arm64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          path: release-tools
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pty-face607-*
+          path: assets
+          merge-multiple: true
+      - name: Assemble checksums
+        run: |
+          cd assets
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+          cat *.launcher.sha256 | sort -k2 > LAUNCHER-SHA256SUMS
+          rm ./*.launcher.sha256
+          test "$(wc -l < SHA256SUMS)" -eq 2
+          test "$(wc -l < LAUNCHER-SHA256SUMS)" -eq 2
+      - name: Publish immutable exact-source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "${GITHUB_SHA}" != "${SOURCE_SHA}"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "PTY fleet release face607" \
+            --notes-file release-tools/docs/release-face607.md \
+            assets/*
+          test "$(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+              --jq .object.sha
+          )" = "$SOURCE_SHA"

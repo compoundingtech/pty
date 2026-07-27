@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$bin_dir/node" "$bin_dir/../lib/pty/bin/pty" "$@"
