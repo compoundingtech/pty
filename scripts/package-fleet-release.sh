@@ -10,6 +10,8 @@ source_dir=$(cd "$1" && pwd)
 output_dir=$2
 platform=$3
 arch=$4
+mkdir -p "$output_dir"
+output_dir=$(cd "$output_dir" && pwd)
 
 source_sha=face607b443b3ff35e934434a28f575822392aa8
 source_version=0.12.0
@@ -160,7 +162,6 @@ if grep -R -a -F "$GITHUB_WORKSPACE" "$stage" >/dev/null; then
   exit 1
 fi
 
-mkdir -p "$output_dir"
 archive="$output_dir/$asset_stem.tar.gz"
 tar -C "$stage_parent" -czf "$archive" "$asset_stem"
 
