@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
@@ -117,6 +118,12 @@ export function getEventsPath(name: string): string {
   return path.join(getSessionDir(), `${name}.events.jsonl`);
 }
 
+/** Out-of-band request consumed by a live daemon whose ordinary pathname
+ * socket was unlinked. Deliberately does not use a scanned registry suffix. */
+export function getRecoveryRequestPath(name: string): string {
+  return path.join(getSessionDir(), `${name}.recover-request`);
+}
+
 // PUBLIC FORMAT — this is the on-disk shape of `<name>.json`. Any change
 // to fields here (add / rename / remove / type change) MUST be reflected in
 // `docs/disk-layout.md` and called out under `### Storage format` in the
@@ -130,6 +137,11 @@ export interface SessionMetadata {
    *  sidecar pidfile, this survives socket cleanup long enough for `pty rm`
    *  to wait until deferred daemon shutdown is complete. */
   daemonPid?: number;
+  /** Recovery protocol marker. Presence proves the daemon watches for
+   * authenticated, non-destructive registry-rebind requests. */
+  recoveryProtocol?: 1;
+  /** OS process-start identity captured by the daemon when available. */
+  daemonStartToken?: string;
   command: string;
   args: string[];
   displayCommand: string; // original command as the user typed it
@@ -162,6 +174,75 @@ export interface SessionMetadata {
    *  client attach — those are excluded from idle-reap (a session that
    *  was just spawned but not yet attached to isn't "idle"). */
   lastAttachAt?: string;
+}
+
+export interface LiveRecoveryRequest {
+  protocol: 1;
+  name: string;
+  nonce: string;
+  createdAt: string;
+  expectedPid: number;
+  expectedGeneration: string;
+  expectedStartToken: string;
+  snapshot: SessionMetadata;
+}
+
+export const LIVE_RECOVERY_REQUEST_TTL_MS = 30_000;
+
+export function readLiveRecoveryRequest(name: string): LiveRecoveryRequest | null {
+  try {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(getRecoveryRequestPath(name), "utf-8"),
+    );
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const request = parsed as Partial<LiveRecoveryRequest>;
+    if (
+      request.protocol !== 1 ||
+      request.name !== name ||
+      typeof request.nonce !== "string" ||
+      typeof request.createdAt !== "string" ||
+      !Number.isInteger(request.expectedPid) ||
+      typeof request.expectedGeneration !== "string" ||
+      typeof request.expectedStartToken !== "string" ||
+      request.expectedStartToken.length === 0 ||
+      typeof request.snapshot !== "object" ||
+      request.snapshot === null ||
+      request.snapshot.recoveryProtocol !== 1 ||
+      typeof request.snapshot.daemonStartToken !== "string" ||
+      request.snapshot.daemonStartToken.length === 0
+    ) {
+      return null;
+    }
+    return request as LiveRecoveryRequest;
+  } catch {
+    return null;
+  }
+}
+
+/** Atomically publish the latest recovery request.
+ *
+ * This intentionally replaces a stale/crash-left request rather than wedging
+ * recovery behind a permanent wx file. Concurrent callers are safe: the
+ * daemon validates every snapshot against its own immutable identity, and each
+ * caller removes only its nonce. */
+export function createLiveRecoveryRequest(request: LiveRecoveryRequest): void {
+  ensureSessionDir();
+  atomicWriteFileSync(
+    getRecoveryRequestPath(request.name),
+    JSON.stringify(request, null, 2),
+  );
+}
+
+/** Remove only the request this caller created; never erase a newer request. */
+export function removeLiveRecoveryRequest(name: string, nonce: string): boolean {
+  const current = readLiveRecoveryRequest(name);
+  if (current?.nonce !== nonce) return false;
+  try {
+    fs.unlinkSync(getRecoveryRequestPath(name));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export interface SessionInfo {
@@ -1483,6 +1564,35 @@ async function probeSocketsWithinBudget(
   return results;
 }
 
+/** Stable process identity when the host exposes one. Linux starttime is the
+ * kernel clock-tick value from /proc/<pid>/stat field 22; unlike wall time it
+ * cannot collide merely because a PID was reused within the same second. */
+export function readProcessStartToken(pid: number): string | null {
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      const commEnd = stat.lastIndexOf(")");
+      if (commEnd < 0) return null;
+      const fieldsFromState = stat.slice(commEnd + 2).trim().split(/\s+/);
+      const startTicks = fieldsFromState[19];
+      return startTicks ? `linux:${startTicks}` : null;
+    } catch {
+      return null;
+    }
+  }
+  if (process.platform === "win32") return null;
+  try {
+    const started = execFileSync(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf-8", timeout: 1000 },
+    ).trim();
+    return started ? `${process.platform}:${started}` : null;
+  } catch {
+    return null;
+  }
+}
+
 function isSocketReachable(socketPath: string): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.createConnection(socketPath);
@@ -1509,6 +1619,9 @@ export function cleanupSocket(name: string): void {
   } catch {}
   try {
     fs.unlinkSync(getPidPath(name));
+  } catch {}
+  try {
+    fs.unlinkSync(getRecoveryRequestPath(name));
   } catch {}
 }
 

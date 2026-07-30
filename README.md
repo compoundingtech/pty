@@ -187,6 +187,22 @@ sessions — see [Auto-running gc](#auto-running-gc). `pty list` is strictly
 observational and never removes registry state. `keep=true` and
 `strategy=permanent` are exempt from the gc sweep.
 
+If a live daemon's socket, pid, and metadata path are accidentally unlinked,
+do not rerun its launch command: that can create a second writer while the
+original child is still alive. A metadata snapshot captured from a supporting
+daemon can ask that exact process to rebind its listener without restarting:
+
+```sh
+pty recover-live --metadata ./backups/myserver.json myserver
+```
+
+Recovery validates the daemon PID, generation, process-start identity, name,
+and launch definition. It refuses snapshots from older daemons, leaves a
+foreign replacement socket untouched, and preserves existing attached clients.
+An already-running daemon that predates this protocol cannot be upgraded
+in-place; keep it alive and use an existing attachment or provider transcript
+fallback.
+
 ### Events
 
 Sessions automatically log terminal events — bell, title changes, desktop notifications (OSC 9/99/777), focus requests, and cursor visibility transitions — plus metadata mutations: `display_name_change` on rename, `tags_change` on tag updates, and any `user.*` events published via `pty emit`. Everything goes into per-session JSONL files.

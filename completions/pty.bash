@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test remote-serve"
+  commands="run attach a exec peek send events list ls stats restart recover-live kill rm remove gc tag tag-multi emit rename up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -73,6 +73,9 @@ _pty() {
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
+      ;;
+    recover-live)
+      COMPREPLY=($(compgen -W "--metadata --timeout-ms" -- "${cur}"))
       ;;
     kill)
       if [[ "${cur}" == -* ]]; then

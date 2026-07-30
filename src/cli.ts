@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as net from "node:net";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -27,9 +28,13 @@ import {
   allRefs,
   readMetadata,
   readSessionPid,
+  readProcessStartToken,
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  getSocketPath,
+  createLiveRecoveryRequest,
+  removeLiveRecoveryRequest,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
   type SessionMetadata,
@@ -259,6 +264,18 @@ Examples:
   pty restart myserver
   pty restart -y myserver`,
 
+  "recover-live": `Usage: pty recover-live --metadata <snapshot.json> [--timeout-ms <ms>] <name>
+
+Ask the original live daemon to republish a lost pathname socket and registry.
+The daemon and its child are not restarted. The snapshot must have been
+captured while the same daemon generation was live.
+
+This command fails closed unless the snapshot proves that the daemon supports
+the recovery protocol; older daemons are never poked or restarted.
+
+Examples:
+  pty recover-live --metadata ./myserver.json myserver`,
+
   kill: `Usage: pty kill <ref>
 
 SIGTERM a running session's daemon. Metadata is kept — restart or \`pty rm\` it later.
@@ -465,6 +482,7 @@ Modify:
   pty emit <ref> user.<type> [...]        Same, targeting a specific session
 
 Lifecycle:
+  pty recover-live --metadata <file> <name>  Rebind a stranded live daemon without restarting it
   pty restart <ref>                       SIGTERM + respawn using stored metadata (prompts if running)
   pty restart -y <ref>                    Same, no prompt
   pty kill <ref>                          SIGTERM a running session's daemon
@@ -1264,6 +1282,35 @@ async function main(): Promise<void> {
       }
       const resolvedRestartName = await resolveRef(restartName);
       await cmdRestart(resolvedRestartName, yes, force);
+      break;
+    }
+
+    case "recover-live": {
+      let metadataPath: string | null = null;
+      let recoveryName: string | null = null;
+      let timeoutMs = 5000;
+      for (let ai = 1; ai < args.length; ai++) {
+        const a = args[ai];
+        if (a === "--metadata" && ai + 1 < args.length) {
+          metadataPath = args[++ai];
+        } else if (a === "--timeout-ms" && ai + 1 < args.length) {
+          timeoutMs = Number(args[++ai]);
+        } else if (!recoveryName) {
+          recoveryName = a;
+        } else {
+          console.error(`pty recover-live: unexpected argument "${a}"`);
+          process.exit(1);
+        }
+      }
+      if (!metadataPath || !recoveryName) {
+        console.error("Usage: pty recover-live --metadata <snapshot.json> [--timeout-ms <ms>] <name>");
+        process.exit(1);
+      }
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
+        console.error("pty recover-live: --timeout-ms must be between 100 and 60000");
+        process.exit(1);
+      }
+      await cmdRecoverLive(recoveryName, metadataPath, timeoutMs);
       break;
     }
 
@@ -2472,6 +2519,121 @@ function renameUsage(): void {
   // Single source of truth: the same text `pty rename --help` prints, to stderr
   // for the error paths.
   console.error(COMMAND_HELP.rename);
+}
+
+function probeLocalSocket(socketPath: string, timeoutMs = 250): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(socketPath);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, timeoutMs);
+    socket.on("connect", () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+async function cmdRecoverLive(
+  name: string,
+  metadataPath: string,
+  timeoutMs: number,
+): Promise<void> {
+  validateName(name);
+
+  let snapshot: SessionMetadata;
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(metadataPath, "utf-8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("snapshot must be a JSON object");
+    }
+    snapshot = parsed as SessionMetadata;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cannot read recovery snapshot "${metadataPath}": ${message}`);
+  }
+
+  // This marker is written only after the supporting daemon has installed its
+  // request watcher. Its absence is a hard stop: old daemons cannot be upgraded
+  // in place, and recovery must never infer permission to relaunch them.
+  if (snapshot.recoveryProtocol !== 1) {
+    throw new Error(
+      "Snapshot predates live recovery support; refusing recovery. " +
+      "Keep the process alive and use an already-attached client or transcript fallback.",
+    );
+  }
+  if (
+    !Number.isInteger(snapshot.daemonPid) ||
+    Number(snapshot.daemonPid) <= 1 ||
+    typeof snapshot.generation !== "string" ||
+    snapshot.generation.length === 0
+  ) {
+    throw new Error("Snapshot must contain a daemonPid and generation");
+  }
+  if (
+    typeof snapshot.daemonStartToken !== "string" ||
+    snapshot.daemonStartToken.length === 0
+  ) {
+    throw new Error("Snapshot lacks a stable daemonStartToken; refusing recovery");
+  }
+
+  const daemonPid = Number(snapshot.daemonPid);
+  const observedStartToken = readProcessStartToken(daemonPid);
+  if (observedStartToken !== snapshot.daemonStartToken) {
+    throw new Error(
+      `Daemon PID ${daemonPid} no longer has the captured process-start identity`,
+    );
+  }
+  try {
+    process.kill(daemonPid, 0);
+  } catch {
+    throw new Error(`Daemon PID ${daemonPid} is not alive`);
+  }
+
+  const nonce = randomBytes(16).toString("hex");
+  createLiveRecoveryRequest({
+    protocol: 1,
+    name,
+    nonce,
+    createdAt: new Date().toISOString(),
+    expectedPid: daemonPid,
+    expectedGeneration: snapshot.generation,
+    expectedStartToken: snapshot.daemonStartToken,
+    snapshot,
+  });
+
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const metadata = readMetadata(name);
+      const pid = readSessionPid(name);
+      if (
+        metadata?.generation === snapshot.generation &&
+        metadata.daemonPid === daemonPid &&
+        metadata.daemonStartToken === snapshot.daemonStartToken &&
+        pid === daemonPid &&
+        await probeLocalSocket(getSocketPath(name))
+      ) {
+        console.log(
+          `Session "${name}" recovered in daemon PID ${daemonPid} ` +
+          `(generation ${snapshot.generation}).`,
+        );
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(
+      `Live daemon ${daemonPid} did not republish session "${name}" within ${timeoutMs}ms`,
+    );
+  } finally {
+    removeLiveRecoveryRequest(name, nonce);
+  }
 }
 
 async function cmdRename(rawArgs: string[]): Promise<void> {

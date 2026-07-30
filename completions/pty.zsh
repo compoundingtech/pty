@@ -25,6 +25,7 @@ _pty() {
     'ls:Alias for list'
     'stats:Live CPU / memory / PIDs'
     'restart:SIGTERM + respawn'
+    'recover-live:Rebind a stranded live daemon without restarting it'
     'kill:SIGTERM a running session'
     'rm:Remove exited metadata'
     'remove:Alias for rm'
@@ -127,6 +128,11 @@ _pty() {
             '(y --yes){y,--yes}[Skip confirmation]' \
             '--force[Attach after restart even from inside another pty]' \
             '1:session:_pty_sessions'
+          ;;
+        recover-live)
+          _arguments \
+            '--metadata[Captured live metadata snapshot]' \
+            '--timeout-ms[Recovery timeout in milliseconds]'
           ;;
         kill)
           _arguments \

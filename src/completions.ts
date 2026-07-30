@@ -162,6 +162,14 @@ const COMMANDS: readonly CommandSpec[] = [
     ],
   },
   {
+    name: "recover-live",
+    desc: "Rebind a stranded live daemon without restarting it",
+    flags: [
+      { name: "metadata", desc: "Captured live metadata snapshot" },
+      { name: "timeout-ms", desc: "Recovery timeout in milliseconds" },
+    ],
+  },
+  {
     name: "kill",
     desc: "SIGTERM a running session",
     dynamic: "sessions",

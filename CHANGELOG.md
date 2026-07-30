@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Live daemon registry recovery
+
+- `pty recover-live --metadata <snapshot.json> <name>` lets the original live
+  daemon rebind an accidentally unlinked pathname socket and republish its
+  pid/metadata sidecars without restarting the daemon, its child, or existing
+  clients. Recovery validates PID, generation, OS process-start identity, and
+  launch identity; it refuses conflicting registry owners.
+- Recovery uses a short-lived authenticated request watched by the daemon; it
+  sends no process signal. Supporting daemons explicitly stamp
+  `recoveryProtocol: 1` and `daemonStartToken`; an unsupported snapshot fails
+  closed with transcript/existing-attachment guidance.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no
@@ -45,9 +57,12 @@
 
 ### Storage format
 
-`<name>.json` gains optional `generation` and `daemonPid` lifecycle fields.
+`<name>.json` gains optional `generation`, `daemonPid`, `recoveryProtocol`, and
+`daemonStartToken` lifecycle fields.
 The generation is an opaque cleanup-ownership token; the daemon PID lets
-`pty rm` wait for deferred shutdown after the child has exited.
+`pty rm` wait for deferred shutdown after the child has exited. The recovery
+fields prove the daemon can safely handle a live rebind request and bind the
+snapshot to the same OS process start.
 
 ### Restartable launch parity and bounded fleet listing
 

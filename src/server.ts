@@ -27,9 +27,17 @@ import {
   cleanupOwnedAll,
   writeMetadata,
   readMetadata,
+  readSessionPid,
+  readProcessStartToken,
+  acquireLock,
+  releaseLock,
+  readLiveRecoveryRequest,
+  removeLiveRecoveryRequest,
+  LIVE_RECOVERY_REQUEST_TTL_MS,
   shouldReapAtExit,
   reapOnExitDefault,
   type SessionMetadata,
+  type LiveRecoveryRequest,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
 
@@ -223,7 +231,7 @@ export class PtyServer {
   private terminal: Terminal;
   private serialize: SerializeAddon;
   private ptyProcess: pty.IPty;
-  private socketServer: net.Server;
+  private socketServer: net.Server | null;
   private clients = new Map<net.Socket, Client>();
   private exited = false;
   private exitCode = 0;
@@ -252,6 +260,8 @@ export class PtyServer {
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private generation: string;
+  private daemonStartToken: string | undefined;
+  private socketIdentity: { dev: bigint; ino: bigint } | null = null;
   private lastTitle = "";
   readonly ready: Promise<void>;
   // Resolves when the child process's onExit has fired — used by close() to
@@ -264,6 +274,7 @@ export class PtyServer {
     this.name = options.name;
     this.options = options;
     this.generation = options.generation ?? randomBytes(16).toString("hex");
+    this.daemonStartToken = readProcessStartToken(process.pid) ?? undefined;
     this.eventWriter = new EventWriter(options.name);
     this.childExited = new Promise<void>((resolve) => {
       this.resolveChildExited = resolve;
@@ -541,26 +552,29 @@ export class PtyServer {
       fs.unlinkSync(socketPath);
     } catch {}
 
-    this.socketServer = net.createServer((socket) =>
-      this.handleClient(socket)
-    );
+    const initialSocketServer = this.createSocketServer();
+    this.socketServer = initialSocketServer;
     // Tighten umask around listen() so the socket inode is never transiently
     // group/world-readable (BUG-5). The chmodSync below is kept as
     // belt-and-suspenders for good measure.
     const prevUmask = process.umask(0o077);
     this.ready = new Promise((resolve, reject) => {
       let settled = false;
-      this.socketServer.once("error", (err) => {
+      initialSocketServer.once("error", (err) => {
         if (settled) return;
         settled = true;
         reject(err);
       });
-      this.socketServer.listen(socketPath, () => {
+      initialSocketServer.listen(socketPath, () => {
         try { fs.chmodSync(socketPath, 0o600); } catch {}
+        this.socketIdentity = this.readSocketIdentity(socketPath);
         fs.writeFileSync(getPidPath(this.name), process.pid.toString());
         writeMetadata(this.name, {
           generation: this.generation,
           daemonPid: process.pid,
+          ...(this.daemonStartToken
+            ? { recoveryProtocol: 1 as const, daemonStartToken: this.daemonStartToken }
+            : {}),
           command: options.command,
           args: options.args,
           displayCommand: options.displayCommand,
@@ -585,12 +599,168 @@ export class PtyServer {
     });
     process.umask(prevUmask);
 
-    // Post-listen errors (e.g., socket file unlinked out from under us) must
-    // not crash the process, but they also mustn't interfere with the
-    // initial ready resolution above.
-    this.socketServer.on("error", (err) => {
+  }
+
+  private createSocketServer(): net.Server {
+    const server = net.createServer((socket) => this.handleClient(socket));
+    server.on("error", (err) => {
       console.error(`Socket server error: ${err.message}`);
     });
+    return server;
+  }
+
+  private readSocketIdentity(socketPath: string): { dev: bigint; ino: bigint } | null {
+    try {
+      const stat = fs.statSync(socketPath, { bigint: true });
+      return { dev: stat.dev, ino: stat.ino };
+    } catch {
+      return null;
+    }
+  }
+
+  private socketIdentityMatchesCurrentPath(socketPath: string): boolean {
+    const current = this.readSocketIdentity(socketPath);
+    return current !== null &&
+      this.socketIdentity !== null &&
+      current.dev === this.socketIdentity.dev &&
+      current.ino === this.socketIdentity.ino;
+  }
+
+  private listenReplacement(server: net.Server, socketPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const onError = (error: Error) => {
+        server.off("listening", onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        server.off("error", onError);
+        try { fs.chmodSync(socketPath, 0o600); } catch {}
+        resolve();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(socketPath);
+    });
+  }
+
+  /** Restore a listener and registry sidecars inside the original daemon.
+   *
+   * This is the only safe way to recover an unlinked pathname socket: an
+   * external process cannot relink the listener inode. Identity checks happen
+   * while holding the ordinary per-name creation lock so a replacement launch
+   * cannot race the rebind. Existing client sockets stay on the old server and
+   * are not disconnected. */
+  async recoverLiveRegistry(request: LiveRecoveryRequest): Promise<void> {
+    const requestAgeMs = Date.now() - Date.parse(request.createdAt);
+    if (
+      !Number.isFinite(requestAgeMs) ||
+      requestAgeMs < -5000 ||
+      requestAgeMs > LIVE_RECOVERY_REQUEST_TTL_MS
+    ) {
+      throw new Error("recovery request is stale or has an invalid timestamp");
+    }
+    if (
+      request.protocol !== 1 ||
+      request.name !== this.name ||
+      request.expectedPid !== process.pid ||
+      request.expectedGeneration !== this.generation
+    ) {
+      throw new Error("recovery request does not identify this daemon");
+    }
+    if (
+      this.daemonStartToken === undefined ||
+      request.expectedStartToken !== this.daemonStartToken
+    ) {
+      throw new Error("recovery request process-start token does not match");
+    }
+
+    const snapshot = request.snapshot;
+    if (
+      snapshot.recoveryProtocol !== 1 ||
+      typeof snapshot.daemonStartToken !== "string" ||
+      snapshot.daemonPid !== process.pid ||
+      snapshot.generation !== this.generation ||
+      snapshot.command !== this.options.command ||
+      snapshot.displayCommand !== this.options.displayCommand ||
+      snapshot.cwd !== this.options.cwd ||
+      JSON.stringify(snapshot.args) !== JSON.stringify(this.options.args) ||
+      snapshot.rows !== this.options.rows ||
+      snapshot.cols !== this.options.cols ||
+      (snapshot.ephemeral === true) !== (this.options.ephemeral === true) ||
+      (snapshot.isolateEnv === true) !== (this.options.isolateEnv === true) ||
+      JSON.stringify(snapshot.extraEnv ?? null) !==
+        JSON.stringify(this.options.extraEnv ?? null) ||
+      JSON.stringify(snapshot.env ?? null) !==
+        JSON.stringify(this.options.env ?? null)
+    ) {
+      throw new Error("recovery snapshot does not match the live launch identity");
+    }
+    if (snapshot.daemonStartToken !== this.daemonStartToken) {
+      throw new Error("recovery snapshot process-start token does not match");
+    }
+
+    if (!acquireLock(this.name)) {
+      throw new Error("session creation lock is held; refusing recovery");
+    }
+    try {
+      const existingMetadata = readMetadata(this.name);
+      if (
+        existingMetadata?.generation !== undefined &&
+        existingMetadata.generation !== this.generation
+      ) {
+        throw new Error("registry metadata belongs to another generation");
+      }
+      const existingPid = readSessionPid(this.name);
+      if (existingPid !== null && existingPid !== process.pid) {
+        throw new Error("registry pid belongs to another daemon");
+      }
+
+      const socketPath = getSocketPath(this.name);
+      const socketExists = this.readSocketIdentity(socketPath) !== null;
+      if (socketExists && !this.socketIdentityMatchesCurrentPath(socketPath)) {
+        throw new Error("socket pathname belongs to another listener");
+      }
+
+      if (!socketExists) {
+        const previousServer = this.socketServer;
+        this.socketServer = null;
+        // Stop accepts on the unlinked listener before publishing the
+        // replacement. Node unlinks a pathname as part of server.close(); if
+        // this happened after listenReplacement, that deferred cleanup could
+        // erase the new socket. Existing client connections remain valid.
+        if (previousServer?.listening) previousServer.close();
+        const replacementServer = this.createSocketServer();
+        try {
+          await this.listenReplacement(replacementServer, socketPath);
+        } catch (error) {
+          try { replacementServer.close(); } catch {}
+          throw error;
+        }
+        this.socketServer = replacementServer;
+        this.socketIdentity = this.readSocketIdentity(socketPath);
+      }
+
+      fs.writeFileSync(getPidPath(this.name), process.pid.toString(), { mode: 0o600 });
+      writeMetadata(this.name, {
+        ...snapshot,
+        generation: this.generation,
+        daemonPid: process.pid,
+        recoveryProtocol: 1,
+        daemonStartToken: this.daemonStartToken,
+        command: this.options.command,
+        args: this.options.args,
+        displayCommand: this.options.displayCommand,
+        cwd: this.options.cwd,
+        rows: this.options.rows,
+        cols: this.options.cols,
+        ephemeral: this.options.ephemeral === true,
+        ...(this.options.isolateEnv ? { isolateEnv: true } : { isolateEnv: undefined }),
+        ...(this.options.extraEnv ? { extraEnv: this.options.extraEnv } : { extraEnv: undefined }),
+        ...(this.options.env ? { env: this.options.env } : { env: undefined }),
+      });
+    } finally {
+      releaseLock(this.name);
+    }
   }
 
   private handleClient(socket: net.Socket): void {
@@ -931,6 +1101,9 @@ export class PtyServer {
     writeMetadata(this.name, {
       generation: this.generation,
       daemonPid: process.pid,
+      ...(this.daemonStartToken
+        ? { recoveryProtocol: 1 as const, daemonStartToken: this.daemonStartToken }
+        : {}),
       command: this.options.command,
       args: this.options.args,
       displayCommand: this.options.displayCommand,
@@ -963,7 +1136,9 @@ export class PtyServer {
       for (const client of this.clients.values()) {
         client.socket.destroy();
       }
-      this.socketServer.close(async () => {
+      const listener = this.socketServer;
+      this.socketServer = null;
+      const finish = async () => {
         cleanupOwnedSocket(this.name, {
           generation: this.generation,
           pid: process.pid,
@@ -982,7 +1157,12 @@ export class PtyServer {
         ]);
         try { await this.eventWriter.flush(); } catch {}
         resolve();
-      });
+      };
+      if (listener?.listening) {
+        listener.close(() => void finish());
+      } else {
+        void finish();
+      }
     });
   }
 
@@ -1118,8 +1298,14 @@ if (process.argv[1]?.endsWith("/server.js")) {
   // can all trigger shutdown, sometimes overlapping. Only the first arms the
   // deadline and drives close(); later callers get the same in-flight promise.
   let shutdownPromise: Promise<never> | null = null;
+  let recoveryPromise: Promise<void> | null = null;
+  let recoveryPoll: NodeJS.Timeout | null = null;
   function cleanShutdown(code: number): Promise<never> {
     if (shutdownPromise) return shutdownPromise;
+    if (recoveryPoll) {
+      clearInterval(recoveryPoll);
+      recoveryPoll = null;
+    }
     const deadline = setTimeout(() => {
       console.error(
         `pty daemon "${config.name}": graceful shutdown exceeded ` +
@@ -1134,7 +1320,14 @@ if (process.argv[1]?.endsWith("/server.js")) {
       } catch {}
       process.exit(code);
     }, SHUTDOWN_DEADLINE_MS);
-    shutdownPromise = server.close().then(() => {
+    // If a registry rebind is already inside its lock/listen critical section,
+    // let it settle before closing whichever listener it published. A shutdown
+    // that starts first clears the poll and therefore wins without a recovery
+    // being admitted behind it.
+    shutdownPromise = (recoveryPromise ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => server.close())
+      .then(() => {
       clearTimeout(deadline);
       // `close()` has already re-flushed exit metadata with the final
       // `lastLines`, so this reads the same tags a `pty gc` sweep would
@@ -1178,6 +1371,25 @@ if (process.argv[1]?.endsWith("/server.js")) {
   };
   process.on("SIGTERM", () => killedExternally(0));
   process.on("SIGINT", () => killedExternally(0));
+  // Recovery is exceptional, so keep the steady-state cost modest: one file
+  // read attempt per daemon every 500ms, with no long-lived shared supervisor.
+  recoveryPoll = setInterval(() => {
+    if (recoveryPromise || shutdownPromise) return;
+    const request = readLiveRecoveryRequest(config.name);
+    if (!request) return;
+    const operation = server.recoverLiveRegistry(request);
+    recoveryPromise = operation;
+    void operation.then(() => {
+      removeLiveRecoveryRequest(config.name, request.nonce);
+    }).catch(() => {
+      // The CLI observes refusal through its bounded registry/socket wait. Do
+      // not write to the daemon's launch-time stderr pipe: detached spawners
+      // have already exited and that pipe may no longer have a reader.
+    }).finally(() => {
+      if (recoveryPromise === operation) recoveryPromise = null;
+    });
+  }, 500);
+  recoveryPoll.unref?.();
 
   // Spawner-PID watchdog (opt-in via PTY_SPAWNER_PID).
   //
