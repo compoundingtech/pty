@@ -20,6 +20,7 @@ import {
   validateName,
   validateDisplayName,
   acquireLock,
+  isLockOwnedByPid,
   releaseLock,
   updateTags,
   setDisplayName,
@@ -1546,7 +1547,13 @@ async function cmdRun(
     process.exit(1);
   }
 
-  if (!acquireLock(name)) {
+  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
+  const inheritedCreationLock =
+    Number.isSafeInteger(delegatedOwner) &&
+    isLockOwnedByPid(name, delegatedOwner);
+  // This is a one-hop control value for the CLI process, not session env.
+  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
+  if (!inheritedCreationLock && !acquireLock(name)) {
     console.error(
       `Session "${name}" is being created by another process. Try again.`
     );
@@ -1578,7 +1585,7 @@ async function cmdRun(
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
     });
   } finally {
-    releaseLock(name);
+    if (!inheritedCreationLock) releaseLock(name);
   }
 
   console.log(`Session "${name}" created.`);

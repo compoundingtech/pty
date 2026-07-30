@@ -16,6 +16,16 @@
   when metadata is missing or malformed, and revalidates it while holding the
   per-name creation lock before removal.
 
+### Generation-guarded gc cleanup and respawn
+
+- Residual sweep and permanent respawn now compare the generation observed by
+  gc with the current metadata while holding the per-name creation lock.
+  Cleanup is skipped when another process replaced or edited the record after
+  gc's snapshot, preventing a stale pass from unlinking or respawning over the
+  replacement. Legacy generation-less records use exact metadata equality as a
+  conservative fallback. Bundled CLI respawns inherit the already-held
+  creation lock until the replacement publishes its socket.
+
 ### Attach-only CLI policy
 
 - `pty attach --no-restart <ref>` attaches only to a currently running

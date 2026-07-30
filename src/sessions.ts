@@ -449,6 +449,50 @@ export async function cleanupRawCandidateGuarded(
   }
 }
 
+function metadataMatchesObservation(
+  observed: SessionMetadata,
+  current: SessionMetadata,
+): boolean {
+  if (observed.generation !== undefined || current.generation !== undefined) {
+    return observed.generation !== undefined &&
+      observed.generation === current.generation;
+  }
+  // Legacy records have no generation token. Exact structural equality is a
+  // conservative fallback: any intervening tag/launch/exit update makes the
+  // observation stale and suppresses cleanup.
+  return JSON.stringify(observed) === JSON.stringify(current);
+}
+
+function cleanupAllWhileLocked(name: string): void {
+  cleanupSocket(name);
+  try {
+    fs.unlinkSync(getMetadataPath(name));
+  } catch {}
+  try {
+    fs.unlinkSync(getEventsPath(name));
+  } catch {}
+}
+
+/** @internal Generation-CAS cleanup primitive; not part of client-api. */
+export async function cleanupObservedSession(
+  session: SessionInfo,
+): Promise<boolean> {
+  if (!session.metadata || !acquireLock(session.name)) return false;
+  try {
+    const current = readMetadata(session.name);
+    if (
+      !current ||
+      !metadataMatchesObservation(session.metadata, current)
+    ) {
+      return false;
+    }
+    cleanupAllWhileLocked(session.name);
+    return true;
+  } finally {
+    releaseLock(session.name);
+  }
+}
+
 /** Return one bounded, read-only observation of the session registry.
  *
  * This function deliberately performs no lifecycle work: it does not create
@@ -981,8 +1025,9 @@ export async function gc(
     }
 
     try {
-      await respawnPermanent(s.name, s.metadata!, decision.newBookkeeping);
-      respawned.push({ name: s.name, ptyfileReread });
+      if (await respawnPermanent(s.name, s.metadata!, decision.newBookkeeping)) {
+        respawned.push({ name: s.name, ptyfileReread });
+      }
     } catch (err: any) {
       respawnFailed.push({ name: s.name, error: err?.message ?? String(err) });
     }
@@ -1007,8 +1052,11 @@ export async function gc(
       kept.push(s.name);
       continue;
     }
-    if (!dryRun) cleanupAll(s.name);
-    removed.push(s.name);
+    if (dryRun) {
+      removed.push(s.name);
+    } else if (await cleanupObservedSession(s)) {
+      removed.push(s.name);
+    }
   }
 
   return {
@@ -1208,12 +1256,14 @@ function classifyFlapping(
  *
  *  Lazy-imports `spawn.ts` so the `sessions.ts ↔ spawn.ts` cycle doesn't
  *  bite at module-init time. After spawn, appends a `session_respawn`
- *  event to the session's event log so consumers see the restart. */
-async function respawnPermanent(
+ *  event to the session's event log so consumers see the restart.
+ *
+ *  @internal Generation-CAS primitive; not part of client-api. */
+export async function respawnPermanent(
   name: string,
   metadata: SessionMetadata,
   bookkeepingOverlay: Record<string, string> = {},
-): Promise<void> {
+): Promise<boolean> {
   let command = metadata.command;
   let args = metadata.args;
   let displayCommand = metadata.displayCommand;
@@ -1262,22 +1312,36 @@ async function respawnPermanent(
     delete tags["strategy.status"];
   }
 
-  // Wipe stale socket/pid/events before respawn so spawnDaemon doesn't
-  // trip over leftovers from the dead daemon. Metadata is recreated by
-  // spawnDaemon.
-  cleanupAll(name);
+  // Serialize compare-and-swap cleanup + replacement creation under the same
+  // per-name lock. If the observed generation changed while gc was planning,
+  // this tick is stale and must not touch the replacement.
+  if (!acquireLock(name)) return false;
+  try {
+    const current = readMetadata(name);
+    if (!current || !metadataMatchesObservation(metadata, current)) {
+      return false;
+    }
 
-  const { spawnDaemon } = await import("./spawn.ts");
-  await spawnDaemon({
-    name, command, args, displayCommand, cwd, tags,
-    ...(displayName ? { displayName } : {}),
-    ...(metadata.rows !== undefined ? { rows: metadata.rows } : {}),
-    ...(metadata.cols !== undefined ? { cols: metadata.cols } : {}),
-    ...(metadata.ephemeral !== undefined ? { ephemeral: metadata.ephemeral } : {}),
-    ...(metadata.isolateEnv ? { isolateEnv: true } : {}),
-    ...(extraEnv && Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
-    ...(exactEnv ? { env: exactEnv } : {}),
-  });
+    // Wipe stale socket/pid/events before respawn so spawnDaemon doesn't trip
+    // over leftovers from the dead daemon. Keep the creation lock held until
+    // the replacement has published its socket.
+    cleanupAllWhileLocked(name);
+
+    const { spawnDaemon } = await import("./spawn.ts");
+    await spawnDaemon({
+      name, command, args, displayCommand, cwd, tags,
+      creationLockOwnerPid: process.pid,
+      ...(displayName ? { displayName } : {}),
+      ...(metadata.rows !== undefined ? { rows: metadata.rows } : {}),
+      ...(metadata.cols !== undefined ? { cols: metadata.cols } : {}),
+      ...(metadata.ephemeral !== undefined ? { ephemeral: metadata.ephemeral } : {}),
+      ...(metadata.isolateEnv ? { isolateEnv: true } : {}),
+      ...(extraEnv && Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
+      ...(exactEnv ? { env: exactEnv } : {}),
+    });
+  } finally {
+    releaseLock(name);
+  }
 
   // Best-effort event; respawn already succeeded if we got here.
   try {
@@ -1287,6 +1351,7 @@ async function respawnPermanent(
       ts: new Date().toISOString(),
     });
   } catch {}
+  return true;
 }
 
 /**
@@ -1517,6 +1582,17 @@ export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): bo
 
 function getLockPath(name: string): string {
   return path.join(getSessionDir(), `${name}.lock`);
+}
+
+/** @internal Verify an explicitly delegated creation lock without acquiring it. */
+export function isLockOwnedByPid(name: string, ownerPid: number): boolean {
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false;
+  try {
+    return parseInt(fs.readFileSync(getLockPath(name), "utf-8").trim(), 10) === ownerPid &&
+      isProcessAlive(ownerPid);
+  } catch {
+    return false;
+  }
 }
 
 /**

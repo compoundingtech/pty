@@ -93,6 +93,9 @@ export interface SpawnDaemonOptions {
    *  path can't express it (a bundled consumer that hits the fallback also
    *  isn't the operator-restart context this guards). */
   scrubEnv?: string[];
+  /** @internal PID owning an already-held per-name creation lock. Used only
+   *  when a lifecycle operation must keep its CAS lock across CLI fallback. */
+  creationLockOwnerPid?: number;
 }
 
 /** Default time we wait for a daemon's Unix socket to appear after
@@ -236,9 +239,17 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
   }
   cliArgs.push("--", options.command, ...options.args);
 
+  const env = { ...process.env };
+  if (options.creationLockOwnerPid !== undefined) {
+    env.PTY_CREATION_LOCK_OWNER_PID = String(options.creationLockOwnerPid);
+  } else {
+    delete env.PTY_CREATION_LOCK_OWNER_PID;
+  }
+
   const result = spawnSync("pty", cliArgs, {
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf-8",
+    env,
   });
   if (result.error !== undefined) {
     const err = result.error as NodeJS.ErrnoException;
