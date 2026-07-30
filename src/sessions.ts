@@ -14,8 +14,6 @@ export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "p
 let hasWarnedLegacyRootEnv = false;
 let hasWarnedRootMasksLegacy = false;
 
-const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 const VALID_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 
 // Maximum bytes available to `sockaddr_un.sun_path`. Darwin/BSD = 104,
@@ -332,9 +330,13 @@ export interface ListSessionsOptions {
 
 const DEFAULT_SOCKET_PROBE_BUDGET_MS = 500;
 
+/** Return one bounded, read-only observation of the session registry.
+ *
+ * This function deliberately performs no lifecycle work: it does not create
+ * the registry, unlink stale runtime files, repair malformed records, or reap
+ * old sessions. Callers that intend to mutate lifecycle state must use an
+ * explicit operation such as `gc()` or `cleanupAll()`. */
 export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionInfo[]> {
-  ensureSessionDir();
-
   let entries: string[];
   try {
     entries = fs.readdirSync(getSessionDir());
@@ -387,10 +389,19 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
       const status = metadata?.exitedAt ? "exited" : "running";
       sessions.push({ name, socketPath, pid, status, metadata });
     } else if (pid !== null) {
-      // Positively dead: the pid read SUCCEEDED and its process is gone, and
-      // the socket is unreachable. Safe to reap the stale socket/pid (keep
-      // metadata so the session stays addressable as exited/vanished below).
-      cleanupSocket(name);
+      // Positively dead: report the retained record in this same snapshot.
+      // Listing is observational; explicit gc/rm owns artifact cleanup.
+      const metadata = readMetadata(name);
+      if (metadata) {
+        const vanished = metadata.exitedAt == null && metadata.exitCode == null;
+        sessions.push({
+          name,
+          socketPath,
+          pid: null,
+          status: vanished ? "vanished" : "exited",
+          metadata,
+        });
+      }
     } else {
       // pid UNREADABLE and socket unreachable — we can prove neither life nor
       // death (most likely a daemon mid-startup, or a pidfile write that raced
@@ -403,7 +414,7 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
     }
   }
 
-  // Find dead sessions (have .json but no running process)
+  // Find retained sessions (have .json but no socket observed above).
   const jsonFiles = entries.filter((e) => e.endsWith(".json")).sort();
   for (const jsonFile of jsonFiles) {
     const name = jsonFile.replace(/\.json$/, "");
@@ -411,27 +422,21 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
 
     const metadata = readMetadata(name);
     if (!metadata) {
-      cleanupAll(name);
       continue;
     }
 
-    // Auto-clean dead sessions older than 24h. For cleanly-exited sessions
-    // this keys off exitedAt; for vanished sessions (no exit record written)
-    // fall back to createdAt so they don't accumulate indefinitely. A session
-    // with a missing daemon and a metadata file older than 24h is not coming
-    // back regardless of why it died — *unless* the recorded pid is still
-    // alive, in which case the daemon outlived its socket and we must keep
-    // metadata around so the session stays addressable.
-    const ageAnchor = metadata.exitedAt ?? metadata.createdAt;
-    if (ageAnchor) {
-      const anchoredAt = new Date(ageAnchor).getTime();
-      if (Date.now() - anchoredAt > DEAD_SESSION_TTL_MS) {
-        const pid = readPid(name);
-        if (pid === null || !isProcessAlive(pid)) {
-          cleanupAll(name);
-          continue;
-        }
-      }
+    // A live pid remains authoritative even if its socket inode is temporarily
+    // absent. Listing observes that mismatch; it never "repairs" it.
+    const pid = readPid(name);
+    if (pid !== null && isProcessAlive(pid)) {
+      sessions.push({
+        name,
+        socketPath: getSocketPath(name),
+        pid,
+        status: metadata.exitedAt ? "exited" : "running",
+        metadata,
+      });
+      continue;
     }
 
     // Vanished = dead daemon with no exit record. SIGKILL / OOM / crash.
@@ -683,15 +688,6 @@ export async function gc(
   const globalIdleDays = opts.idleDays;
   const globalFastFailWindow = opts.fastFailWindowSec;
   const globalFastFailLimit = opts.fastFailLimit;
-  // First call to `listSessions` is intentionally throwaway — it has a
-  // side effect (`cleanupSocket`) on sessions whose daemon SIGKILL'd
-  // without writing an exit record, and those sessions are then *missing*
-  // from the returned array (their entry is dropped because `seen` set
-  // contained the name but the alive checks failed). A second call sees
-  // them via the `.json` files loop as `status=vanished`. Without this
-  // priming pass, step 1's orphan-kill misses vanished sessions whose
-  // sockets were still on disk when gc started.
-  await listSessions();
   const initial = await listSessions();
 
   // STEP 1: orphan-children. Sort by name so cycles (A→B, B→A) resolve

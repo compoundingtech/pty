@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Read-only session listing
+
+- `listSessions()` and `pty list` are now strictly observational: they no
+  longer create an absent registry, unlink stale socket/pid files, remove
+  malformed metadata, or reap old dead sessions. A dead daemon with a stale
+  socket is reported as exited/vanished in the first listing instead of
+  requiring a mutating priming pass.
+- Read-only APIs no longer perform lifecycle cleanup. Stale registry cleanup
+  belongs to explicit operations such as `pty gc` and `pty rm`; normal daemon
+  self-reaping is unchanged. In particular, `pty gc --dry-run` now performs no
+  registry writes or removals.
+
 ### Attach-only CLI policy
 
 - `pty attach --no-restart <ref>` attaches only to a currently running

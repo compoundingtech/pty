@@ -159,13 +159,11 @@ describe("vanished status", () => {
   }, 15000);
 });
 
-describe("listSessions guards against deleting state for live daemons", () => {
+describe("listSessions is observational", () => {
   // Refs https://github.com/compoundingtech/pty/issues/34. listSessions used to
   // unconditionally `cleanupSocket` whenever the socket-reachable probe
-  // failed and `cleanupAll` whenever metadata was older than 24h. Both
-  // ran even if the recorded pid was still alive — once the .sock or
-  // .json was gone, the still-running daemon became invisible to every
-  // future scan. These tests pin the new behaviour: live pid wins.
+  // failed and `cleanupAll` whenever metadata was older than 24h. A read path
+  // must never mutate either case; these tests pin that boundary.
   it("keeps a session whose socket file is missing but recorded pid is still alive", () => {
     const dir = makeSessionDir();
     const name = uniqueName();
@@ -175,8 +173,7 @@ describe("listSessions guards against deleting state for live daemons", () => {
       command: "cat", args: [], displayCommand: "cat", cwd: os.tmpdir(),
       createdAt: new Date().toISOString(),
     }));
-    // Note: no .sock file written. Without the guard, scan-and-cleanup paths
-    // would fall into the .json branch and delete metadata-on-age.
+    // Note: no .sock file written. The pid still proves that the daemon lives.
 
     // Force the .json into the >24h bucket so the second guard is exercised.
     const old = new Date(Date.now() - 48 * 3600_000).toISOString();
@@ -188,12 +185,12 @@ describe("listSessions guards against deleting state for live daemons", () => {
     const r = runCli(dir, "list", "--json");
     expect(r.status).toBe(0);
     const found = JSON.parse(r.stdout).find((s: any) => s.name === name);
-    expect(found, "session should still be listed because its pid is alive").toBeDefined();
+    expect(found?.status, "session should be running because its pid is alive").toBe("running");
     // Metadata file must survive the call so the next scan also sees it.
     expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
   }, 10000);
 
-  it("does delete metadata older than 24h when the pid is dead", () => {
+  it("reports old dead metadata without deleting it", () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     // Pid 0x7fffffff is "guaranteed dead" on Linux/macOS in practice.
@@ -206,8 +203,10 @@ describe("listSessions guards against deleting state for live daemons", () => {
 
     const r = runCli(dir, "list", "--json");
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout).find((s: any) => s.name === name)).toBeUndefined();
-    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(false);
+    const found = JSON.parse(r.stdout).find((s: any) => s.name === name);
+    expect(found?.status).toBe("vanished");
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
   }, 10000);
 });
 
