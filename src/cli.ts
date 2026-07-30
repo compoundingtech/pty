@@ -104,12 +104,14 @@ Examples:
   pty run -- node server.js
   pty run -d --name "API" --tag role=web --env PORT=3000 -- node server.js`,
 
-  attach: `Usage: pty attach [-r] [--force] [--remote <peer>] <ref>
+  attach: `Usage: pty attach [-r|--no-restart] [--force] [--remote <peer>] <ref>
 
 Reconnect to a session (alias: pty a). Detach again with Ctrl+\\.
 
 Flags:
   -r, --auto-restart   Auto-restart the session if it has exited
+  --no-restart         Attach only while the session is running; never prompt
+                       or execute its stored command
   --force              Attach even from inside another pty session (nested)
   --remote <peer>      Attach a session on a fabric peer (over fabric); <ref> is
                        the session's name/id ON THE REMOTE
@@ -117,6 +119,7 @@ Flags:
 Examples:
   pty attach myserver
   pty attach -r myserver
+  pty attach --no-restart myserver
   pty attach --remote hetzner myshell`,
 
   exec: `Usage: pty exec -- <command> [args...]
@@ -412,6 +415,7 @@ Attach & interact:
   pty attach <ref>                        Attach to an existing session (alias: pty a)
   pty attach --force <ref>                Attach even from inside another pty session (nested)
   pty attach -r <ref>                     Attach, auto-restart if the session is exited
+  pty attach --no-restart <ref>            Attach only; fail if the session is not running
   pty attach --remote <peer> <ref>        Attach a session on a fabric peer (over fabric)
   pty exec -- <command> [args...]         Replace the current session's process (inside a session)
   pty send <ref> "text"                   Send raw text (no implicit newline)
@@ -885,12 +889,14 @@ async function main(): Promise<void> {
     case "attach":
     case "a": {
       let autoRestart = false;
+      let noRestart = false;
       let force = false;
       let attachName: string | null = null;
       let attachRemotePeer: string | null = null;
       for (let ai = 1; ai < args.length; ai++) {
         const a = args[ai];
         if (a === "--auto-restart" || a === "-r") autoRestart = true;
+        else if (a === "--no-restart") noRestart = true;
         else if (a === "--force") force = true;
         else if (a === "--remote" && ai + 1 < args.length) { attachRemotePeer = args[++ai]; }
         else if (!attachName) attachName = a;
@@ -900,7 +906,11 @@ async function main(): Promise<void> {
         }
       }
       if (!attachName) {
-        console.error("Usage: pty attach [-r|--auto-restart] [--force] [--remote <peer>] <name>");
+        console.error("Usage: pty attach [-r|--auto-restart|--no-restart] [--force] [--remote <peer>] <name>");
+        process.exit(1);
+      }
+      if (autoRestart && noRestart) {
+        console.error("pty attach: --auto-restart and --no-restart are mutually exclusive");
         process.exit(1);
       }
       // Nesting guard runs BEFORE name validation / ref resolution. A nested
@@ -920,7 +930,9 @@ async function main(): Promise<void> {
         await cmdAttachRemote(attachRemotePeer, attachName);
       } else {
         const resolvedAttachName = await resolveRef(attachName);
-        await cmdAttach(resolvedAttachName, autoRestart, force);
+        const restartPolicy: AttachRestartPolicy =
+          noRestart ? "never" : autoRestart ? "always" : "prompt";
+        await cmdAttach(resolvedAttachName, restartPolicy, force);
       }
       break;
     }
@@ -1578,9 +1590,11 @@ async function cmdRun(
   doAttach(name);
 }
 
+type AttachRestartPolicy = "prompt" | "always" | "never";
+
 async function cmdAttach(
   name: string,
-  autoRestart = false,
+  restartPolicy: AttachRestartPolicy = "prompt",
   _force = false,
 ): Promise<void> {
   // Nesting guard runs in the dispatcher (before name resolution) so the
@@ -1600,8 +1614,16 @@ async function cmdAttach(
     return;
   }
 
+  // Attach-only callers are relays/supervisors that must never turn future
+  // input into permission to execute retained launch metadata. Refuse before
+  // entering the dead-session presentation/restart path.
+  if (restartPolicy === "never") {
+    console.error(`Session "${name}" is not running (status: ${session.status}).`);
+    process.exit(1);
+  }
+
   // Dead session — show last lines and offer to restart
-  await handleDeadSession(session, autoRestart);
+  await handleDeadSession(session, restartPolicy === "always");
 }
 
 async function handleDeadSession(
