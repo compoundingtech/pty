@@ -201,6 +201,47 @@ describe("live daemon registry recovery", () => {
     expect(metadata(root, name).lastAttachAt).toBe(mutated.lastAttachAt);
   });
 
+  it("fails closed when metadata publication stops after revision advancement", () => {
+    const root = makeRoot();
+    const name = "interrupted-revision";
+    startProvider(root, name);
+    const before = metadata(root, name);
+    const snapshot = writeSnapshot(root, name, before);
+    const mutated: SessionMetadata = {
+      ...before,
+      tags: { role: "must-not-publish" },
+    };
+
+    expect(() => writeMetadata(name, mutated, {
+      afterRecoveryRevisionPublished: () => {
+        throw new Error("stop before metadata publication");
+      },
+    })).toThrow("stop before metadata publication");
+
+    // Publication stopped in the exact revision-before-metadata window: the
+    // old metadata remains visible, but its signed revision is no longer
+    // authoritative.
+    expect(metadata(root, name)).toEqual(before);
+    const advanced = readBoundedJson<RecoveryRevision>(
+      recoveryRevisionPath(root, name),
+    );
+    expect(verifyRecoveryRevision(before.recovery!.secret, advanced)).toBe(true);
+    expect(advanced.metadataRevision).toBe(metadataRevision(mutated));
+    expect(advanced.metadataRevision).not.toBe(before.recovery!.metadataRevision);
+
+    unlinkRegistry(root, name);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const refused = run(root, ["recover", name, "--snapshot", snapshot]);
+      expect(refused.status).not.toBe(0);
+      expect(fs.existsSync(path.join(root, `${name}.sock`))).toBe(false);
+      expect(fs.existsSync(path.join(root, `${name}.pid`))).toBe(false);
+      expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(false);
+      expect(readBoundedJson<RecoveryRevision>(
+        recoveryRevisionPath(root, name),
+      )).toEqual(advanced);
+    }
+  }, 20_000);
+
   it("rebinds the original daemon while preserving provider and attached client", async () => {
     const root = makeRoot();
     const name = "positive";
