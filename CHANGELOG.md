@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Harness-neutral live activity status
+
+- Add a single generation-bound activity lease with ordered `unknown`,
+  `active`, `child_command`, and `idle` transitions. Live status exposes the
+  accepted state and resets it to `unknown` when the publisher disconnects or
+  the daemon generation changes; stale epochs, skipped updates, malformed
+  commands, and competing publishers are rejected.
+- Export `connectActivityPublisher()` for harness-specific adapters while
+  keeping hook and log interpretation outside pty. `pty stats` and
+  `queryStats()` now also expose `modes.alternateScreen` as a diagnostic only;
+  terminal modes do not imply semantic activity or idleness.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no

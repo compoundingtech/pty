@@ -31,6 +31,17 @@ export {
   type StatsResult, type ProcessResources,
 } from "./client.ts";
 
+// Harness-neutral activity lease. Codex/Claude-specific adapters live outside
+// pty and publish only these generic states.
+export {
+  ActivityPublisher, connectActivityPublisher,
+  type ActivityPublisherOptions, type ActivityPublishOptions,
+} from "./activity-client.ts";
+export {
+  ACTIVITY_STATES,
+  type ActivityState, type ActivityStatus,
+} from "./activity.ts";
+
 // Events
 export {
   EventType,
@@ -61,6 +72,6 @@ export { resolveKey, parseSeqValue } from "./keys.ts";
 
 // Protocol (advanced)
 export {
-  PacketReader, MessageType,
+  PacketReader, MessageType, encodeActivity,
   type Packet,
 } from "./protocol.ts";

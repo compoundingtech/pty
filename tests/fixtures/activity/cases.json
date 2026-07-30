@@ -1,0 +1,84 @@
+{
+  "cases": [
+    {
+      "name": "active-turn",
+      "screen": "Working\n",
+      "activity": "active",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": false
+    },
+    {
+      "name": "idle-prompt",
+      "screen": "> ",
+      "activity": "idle",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": true
+    },
+    {
+      "name": "long-child-command",
+      "screen": "Running command\n",
+      "activity": "child_command",
+      "alternateScreen": false,
+      "inputMode": "canonical",
+      "eligible": false
+    },
+    {
+      "name": "alternate-screen",
+      "screen": "-- INSERT --\n",
+      "activity": "unknown",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": false
+    },
+    {
+      "name": "terminal-restored",
+      "screen": "$ ",
+      "activity": "idle",
+      "alternateScreen": false,
+      "inputMode": "canonical",
+      "eligible": true
+    },
+    {
+      "name": "compaction",
+      "screen": "Conversation compacted\n",
+      "activity": "unknown",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": false
+    },
+    {
+      "name": "clear",
+      "screen": "",
+      "activity": "unknown",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": false
+    },
+    {
+      "name": "adapter-crash",
+      "screen": "> ",
+      "activity": "unknown",
+      "alternateScreen": true,
+      "inputMode": "raw",
+      "eligible": false
+    },
+    {
+      "name": "stale-log-idle",
+      "screen": "> ",
+      "activity": "unknown",
+      "alternateScreen": false,
+      "inputMode": "canonical",
+      "eligible": false
+    },
+    {
+      "name": "daemon-restart",
+      "screen": "> ",
+      "activity": "unknown",
+      "alternateScreen": false,
+      "inputMode": "unknown",
+      "eligible": false
+    }
+  ]
+}

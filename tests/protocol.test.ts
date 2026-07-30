@@ -13,6 +13,7 @@ import {
   encodeScreen,
   encodeStatus,
   encodeStatusResponse,
+  encodeActivity,
   decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
@@ -266,6 +267,23 @@ describe("protocol", () => {
       expect(JSON.parse(packets[0].payload.toString())).toEqual({
         name: "test",
         terminal: { cols: 80, rows: 24 },
+      });
+    });
+  });
+
+  describe("ACTIVITY", () => {
+    it("round-trips bounded JSON commands and responses", () => {
+      const reader = new PacketReader();
+      const encoded = encodeActivity({
+        op: "claim",
+        producerEpoch: "epoch-a",
+      });
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.ACTIVITY);
+      expect(JSON.parse(packets[0].payload.toString())).toEqual({
+        op: "claim",
+        producerEpoch: "epoch-a",
       });
     });
   });

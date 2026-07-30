@@ -15,6 +15,7 @@ import {
   encodePeek,
   encodeResize,
   encodeStatus,
+  encodeActivity,
   decodeExit,
 } from "../src/protocol.ts";
 import {
@@ -26,6 +27,8 @@ import {
   acquireLock,
   releaseLock,
 } from "../src/sessions.ts";
+import { queryStats } from "../src/client.ts";
+import { connectActivityPublisher } from "../src/activity-client.ts";
 
 // All tests run in a tmp directory to avoid polluting the project
 const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pty-int-"));
@@ -73,6 +76,19 @@ function connect(name: string): Promise<net.Socket> {
     socket.on("connect", () => resolve(socket));
     socket.on("error", reject);
   });
+}
+
+async function waitForActivityState(
+  name: string,
+  state: "unknown" | "active" | "child_command" | "idle",
+): Promise<Awaited<ReturnType<typeof queryStats>>["activity"]> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const activity = (await queryStats(name)).activity;
+    if (activity.state === state) return activity;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for activity state ${state}`);
 }
 
 /** Collect packets from a socket until we have at least `count`, or timeout. */
@@ -1421,5 +1437,130 @@ describe("STATUS message", () => {
     expect(stats.modes.cursorHidden).toBe(true);
 
     client.destroy();
+  });
+
+  it("reports alternate-screen without treating it as semantic activity", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [
+      "-c",
+      "printf '\\033[?1049hALT'; sleep 30",
+    ]);
+    await new Promise((r) => setTimeout(r, 300));
+
+    const client = await connect(name);
+    const reader = new PacketReader();
+    client.write(encodeStatus());
+    const packet = await waitForType(client, reader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.modes.alternateScreen).toBe(true);
+    expect(stats.activity.state).toBe("unknown");
+    client.destroy();
+  });
+
+  it("holds a live activity lease and resets unknown when its socket closes", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+    const publisher = await connect(name);
+    const publisherReader = new PacketReader();
+
+    publisher.write(encodeActivity({
+      op: "claim",
+      producerEpoch: "epoch-a",
+      source: "codex",
+    }));
+    const claimed = JSON.parse(
+      (await waitForType(publisher, publisherReader, MessageType.ACTIVITY))
+        .payload.toString(),
+    );
+    expect(claimed).toMatchObject({
+      ok: true,
+      activity: {
+        state: "unknown",
+        producerEpoch: "epoch-a",
+        sequence: 0,
+      },
+    });
+
+    publisher.write(encodeActivity({
+      op: "set",
+      producerEpoch: "epoch-a",
+      sequence: 1,
+      state: "active",
+      turnId: "turn-1",
+    }));
+    const active = JSON.parse(
+      (await waitForType(publisher, publisherReader, MessageType.ACTIVITY))
+        .payload.toString(),
+    );
+    expect(active).toMatchObject({
+      ok: true,
+      activity: { state: "active", sequence: 1, turnId: "turn-1" },
+    });
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+    const live = JSON.parse(
+      (await waitForType(statsClient, statsReader, MessageType.STATUS))
+        .payload.toString(),
+    );
+    expect(live.activity).toEqual(active.activity);
+    statsClient.destroy();
+
+    publisher.write(encodeActivity({
+      op: "set",
+      producerEpoch: "epoch-a",
+      sequence: 3,
+      state: "idle",
+    }));
+    const rejected = JSON.parse(
+      (await waitForType(publisher, publisherReader, MessageType.ACTIVITY))
+        .payload.toString(),
+    );
+    expect(rejected).toMatchObject({
+      ok: false,
+      activity: { state: "unknown", producerEpoch: null, sequence: 0 },
+    });
+
+    publisher.destroy();
+    expect(await waitForActivityState(name, "unknown")).toMatchObject({
+      state: "unknown",
+      producerEpoch: null,
+      sequence: 0,
+    });
+  });
+
+  it("publishes ordered activity through the public API and rejects competition", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+    const publisher = await connectActivityPublisher(name, {
+      producerEpoch: "epoch-public",
+      source: "codex",
+    });
+
+    await publisher.publish("active", { turnId: "turn-public" });
+    await publisher.publish("child_command", { turnId: "turn-public" });
+    const idle = await publisher.publish("idle", { turnId: "turn-public" });
+    expect(idle).toMatchObject({
+      state: "idle",
+      producerEpoch: "epoch-public",
+      sequence: 3,
+      turnId: "turn-public",
+      source: "codex",
+    });
+
+    await expect(connectActivityPublisher(name, {
+      producerEpoch: "epoch-competing",
+      source: "claude",
+    })).rejects.toThrow("activity lease already held");
+    expect((await queryStats(name)).activity).toEqual(idle);
+
+    publisher.close();
+    expect(await waitForActivityState(name, "unknown")).toMatchObject({
+      state: "unknown",
+      producerEpoch: null,
+      sequence: 0,
+    });
   });
 });

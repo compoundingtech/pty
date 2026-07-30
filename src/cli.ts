@@ -2395,10 +2395,15 @@ function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   console.log(`  Clients:    ${stats.clients.total} (${stats.clients.attached} attached, ${stats.clients.readOnly} readonly)`);
 
   const modes: string[] = [];
+  if (stats.modes.alternateScreen) modes.push("alternate screen");
   if (stats.modes.sgrMouse) modes.push("SGR mouse");
   if (stats.modes.cursorHidden) modes.push("cursor hidden");
   if (stats.modes.kittyKeyboard) modes.push(`kitty keyboard (flags: ${stats.modes.kittyKeyboardFlags.join(",")})`);
   console.log(`  Modes:      ${modes.length > 0 ? modes.join(", ") : "none"}`);
+  console.log(
+    `  Activity:   ${stats.activity.state}` +
+    (stats.activity.source ? ` (${stats.activity.source})` : ""),
+  );
 }
 
 function formatMemory(rssKb: number): string {

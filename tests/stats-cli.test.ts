@@ -118,6 +118,7 @@ describe("pty stats CLI", () => {
     expect(output).toContain("Clients:");
     expect(output).toContain("Process:");
     expect(output).toContain("Modes:");
+    expect(output).toContain("Activity:   unknown");
     expect(output).toContain("running");
     expect(output).toContain("CPU:");
     expect(output).toContain("Memory:");
@@ -147,7 +148,13 @@ describe("pty stats CLI", () => {
     expect(stats.daemon.resources).toBeDefined();
     expect(stats.daemon.resources.rssKb).toBeTypeOf("number");
     expect(stats.clients).toBeDefined();
-    expect(stats.modes).toBeDefined();
+    expect(stats.modes.alternateScreen).toBe(false);
+    expect(stats.activity).toMatchObject({
+      state: "unknown",
+      producerEpoch: null,
+      sequence: 0,
+    });
+    expect(stats.activity.generation).toBeTypeOf("string");
   }, 15000);
 
   it("queries all running sessions when no name given", async () => {

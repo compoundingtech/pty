@@ -254,8 +254,17 @@ interface StatsResult {
   };
   clients: { total: number; attached: number; readOnly: number };
   modes: {
+    alternateScreen: boolean;
     sgrMouse: boolean; cursorHidden: boolean;
     kittyKeyboard: boolean; kittyKeyboardFlags: number[];
+  };
+  activity: {
+    state: "unknown" | "active" | "child_command" | "idle";
+    generation: string;
+    producerEpoch: string | null;
+    sequence: number;
+    turnId?: string;
+    source?: string;
   };
   uptimeSeconds: number | null;
   createdAt: string | null;
@@ -266,6 +275,36 @@ interface ProcessResources {
   cpuPercent: number;
 }
 ```
+
+`activity` is an explicitly published, generation-bound live fact. It starts
+as `unknown` and returns to `unknown` when the publisher disconnects or the
+daemon generation changes. Terminal modes such as `alternateScreen` are
+diagnostics only and do not imply activity or idleness.
+
+### `connectActivityPublisher(name, options?): Promise<ActivityPublisher>`
+
+Claim the session's single live activity lease and publish harness-neutral
+state transitions. Harness-specific hook or log parsing belongs in the caller.
+
+```typescript
+import { connectActivityPublisher } from "@compoundingtech/pty/client";
+
+const activity = await connectActivityPublisher("myserver", {
+  source: "codex",
+});
+
+await activity.publish("active", { turnId: "turn-42" });
+await activity.publish("child_command", { turnId: "turn-42" });
+await activity.publish("idle", { turnId: "turn-42" });
+
+activity.close(); // STATUS immediately falls back to unknown
+```
+
+Updates are strictly sequenced within a random producer epoch. A competing
+publisher is rejected while the lease is held. Publisher failure, socket loss,
+malformed updates, skipped sequences, stale epochs, and daemon replacement all
+fail closed to `unknown`. Rejected competing sockets do not disturb the current
+publisher.
 
 ## Session Interaction (CLI-oriented)
 
@@ -384,6 +423,7 @@ const MessageType = {
   SCREEN: 5,   // Screen replay
   PEEK: 6,     // Read-only peek request
   STATUS: 7,   // Stats query/response
+  ACTIVITY: 8, // Generic activity lease commands/responses
 };
 ```
 

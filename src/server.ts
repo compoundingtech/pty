@@ -16,8 +16,10 @@ import {
   encodeExit,
   encodeScreen,
   encodeStatusResponse,
+  encodeActivity,
   decodeSize,
 } from "./protocol.ts";
+import { ActivityLease, parseActivityCommand } from "./activity.ts";
 import {
   getSocketPath,
   getPidPath,
@@ -253,6 +255,7 @@ export class PtyServer {
   private eventWriter: EventWriter;
   private generation: string;
   private lastTitle = "";
+  private activity: ActivityLease<net.Socket>;
   readonly ready: Promise<void>;
   // Resolves when the child process's onExit has fired — used by close() to
   // make sure session_exit has been queued to the event chain before we
@@ -264,6 +267,7 @@ export class PtyServer {
     this.name = options.name;
     this.options = options;
     this.generation = options.generation ?? randomBytes(16).toString("hex");
+    this.activity = new ActivityLease(this.generation);
     this.eventWriter = new EventWriter(options.name);
     this.childExited = new Promise<void>((resolve) => {
       this.resolveChildExited = resolve;
@@ -733,16 +737,32 @@ export class PtyServer {
             socket.write(encodeStatusResponse(JSON.stringify(stats)));
             break;
           }
+
+          case MessageType.ACTIVITY: {
+            const command = parseActivityCommand(packet.payload);
+            if (command === null) this.activity.release(socket);
+            const response = command === null
+              ? {
+                  ok: false,
+                  error: "invalid activity command",
+                  activity: this.activity.snapshot(),
+                }
+              : this.activity.apply(socket, command);
+            socket.write(encodeActivity(response));
+            break;
+          }
         }
       }
     });
 
     socket.on("close", () => {
+      this.activity.release(socket);
       this.clients.delete(socket);
       this.negotiateSize();
     });
 
     socket.on("error", () => {
+      this.activity.release(socket);
       this.clients.delete(socket);
       this.negotiateSize();
     });
@@ -812,11 +832,13 @@ export class PtyServer {
         readOnly,
       },
       modes: {
+        alternateScreen: this.altScreenActive,
         sgrMouse: this.sgrMouseMode,
         cursorHidden: this.cursorHidden,
         kittyKeyboard: this.kittyKeyboardStack.length > 0,
         kittyKeyboardFlags: [...this.kittyKeyboardStack],
       },
+      activity: this.activity.snapshot(),
       uptimeSeconds,
       createdAt,
     };
