@@ -1,8 +1,14 @@
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { gc, listSessions } from "../src/sessions.ts";
+import {
+  cleanupRawCandidateGuarded,
+  gc,
+  inventoryRawCleanupCandidates,
+  listSessions,
+} from "../src/sessions.ts";
 
 const roots: string[] = [];
 
@@ -128,5 +134,52 @@ describe("listSessions is observational", () => {
     expect(fs.existsSync(path.join(root, "locked.sock"))).toBe(true);
     expect(fs.existsSync(path.join(root, "locked.pid"))).toBe(true);
     expect(fs.existsSync(path.join(root, "locked.json"))).toBe(true);
+  });
+
+  it.each([
+    ["live pid", (root: string) => {
+      fs.writeFileSync(path.join(root, "changed.pid"), String(process.pid));
+    }],
+    ["ambiguous missing pid", (root: string) => {
+      fs.unlinkSync(path.join(root, "changed.pid"));
+    }],
+  ])("revalidates an initially reclaimable candidate that becomes %s", async (
+    _label,
+    makeNonReclaimable,
+  ) => {
+    const root = withRoot();
+    writeRawDebris(root, "changed", { corruptMetadata: false });
+    const [candidate] = await inventoryRawCleanupCandidates();
+    expect(candidate?.name).toBe("changed");
+    if (!candidate) throw new Error("Expected raw cleanup candidate.");
+
+    makeNonReclaimable(root);
+    const cleaned = await cleanupRawCandidateGuarded(candidate);
+
+    expect(cleaned).toBe(false);
+    expect(fs.existsSync(path.join(root, "changed.sock"))).toBe(true);
+  });
+
+  it("preserves dead-pid debris when its socket is reachable", async () => {
+    const root = withRoot();
+    fs.writeFileSync(path.join(root, "reachable.pid"), "2147483647");
+    const socketPath = path.join(root, "reachable.sock");
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+
+    try {
+      const preview = await gc({ dryRun: true });
+      const applied = await gc();
+
+      expect(preview.removed).toEqual([]);
+      expect(applied.removed).toEqual([]);
+      expect(fs.existsSync(socketPath)).toBe(true);
+      expect(fs.existsSync(path.join(root, "reachable.pid"))).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

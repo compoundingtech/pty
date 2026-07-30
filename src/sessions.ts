@@ -330,7 +330,8 @@ export interface ListSessionsOptions {
 
 const DEFAULT_SOCKET_PROBE_BUDGET_MS = 500;
 
-interface RawCleanupCandidate {
+/** @internal Testable gc observation/apply token; not part of client-api. */
+export interface RawCleanupCandidate {
   name: string;
 }
 
@@ -359,7 +360,7 @@ function inspectMetadataArtifact(
  * associated socket is stale; malformed metadata without any runtime files is
  * also reclaimable. Ambiguous startup shapes (socket + missing/invalid pid) are
  * retained. */
-async function inventoryRawCleanupCandidates(
+export async function inventoryRawCleanupCandidates(
   options: ListSessionsOptions = {},
   onlyNames?: ReadonlySet<string>,
 ): Promise<RawCleanupCandidate[]> {
@@ -423,7 +424,7 @@ async function inventoryRawCleanupCandidates(
  *
  * Re-inventorying under the lock closes the observation/apply race: if a live
  * generation appeared, or the evidence became ambiguous, cleanup is skipped. */
-async function cleanupRawCandidateGuarded(
+export async function cleanupRawCandidateGuarded(
   candidate: RawCleanupCandidate,
   options: ListSessionsOptions = {},
 ): Promise<boolean> {
