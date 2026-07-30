@@ -14,6 +14,7 @@ import {
   encodeStatus,
   encodeStatusResponse,
   encodeActivity,
+  encodeGuardedData,
   decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
@@ -284,6 +285,25 @@ describe("protocol", () => {
       expect(JSON.parse(packets[0].payload.toString())).toEqual({
         op: "claim",
         producerEpoch: "epoch-a",
+      });
+    });
+  });
+
+  describe("GUARDED_DATA", () => {
+    it("round-trips compare-and-send commands and responses", () => {
+      const reader = new PacketReader();
+      const encoded = encodeGuardedData({
+        generation: "generation-a",
+        ioRevision: 7,
+        data: "x",
+      });
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.GUARDED_DATA);
+      expect(JSON.parse(packets[0].payload.toString())).toEqual({
+        generation: "generation-a",
+        ioRevision: 7,
+        data: "x",
       });
     });
   });

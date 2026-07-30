@@ -41,6 +41,14 @@ export {
   ACTIVITY_STATES,
   type ActivityState, type ActivityStatus,
 } from "./activity.ts";
+export {
+  compareAndSend,
+  type CompareAndSendOptions,
+} from "./guarded-send-client.ts";
+export {
+  MAX_GUARDED_DATA_BYTES,
+  type GuardedSendCommand, type GuardedSendResponse,
+} from "./guarded-send.ts";
 
 // Events
 export {
@@ -72,6 +80,6 @@ export { resolveKey, parseSeqValue } from "./keys.ts";
 
 // Protocol (advanced)
 export {
-  PacketReader, MessageType, encodeActivity,
+  PacketReader, MessageType, encodeActivity, encodeGuardedData,
   type Packet,
 } from "./protocol.ts";

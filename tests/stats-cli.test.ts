@@ -113,6 +113,8 @@ describe("pty stats CLI", () => {
     const output = runStats(dir, name);
 
     expect(output).toContain(`Session: ${name}`);
+    expect(output).toContain("Generation:");
+    expect(output).toContain("I/O rev:");
     expect(output).toContain("Terminal:");
     expect(output).toContain("Scrollback:");
     expect(output).toContain("Clients:");
@@ -134,6 +136,8 @@ describe("pty stats CLI", () => {
     const stats = JSON.parse(output);
 
     expect(stats.name).toBe(name);
+    expect(stats.generation).toBeTypeOf("string");
+    expect(stats.ioRevision).toBeTypeOf("number");
     expect(stats.terminal).toBeDefined();
     expect(stats.terminal.cols).toBe(80);
     expect(stats.terminal.rows).toBe(24);

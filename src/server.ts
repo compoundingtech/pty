@@ -17,9 +17,14 @@ import {
   encodeScreen,
   encodeStatusResponse,
   encodeActivity,
+  encodeGuardedData,
   decodeSize,
 } from "./protocol.ts";
 import { ActivityLease, parseActivityCommand } from "./activity.ts";
+import {
+  parseGuardedSendCommand,
+  type GuardedSendResponse,
+} from "./guarded-send.ts";
 import {
   getSocketPath,
   getPidPath,
@@ -254,6 +259,7 @@ export class PtyServer {
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private generation: string;
+  private ioRevision = 0;
   private lastTitle = "";
   private activity: ActivityLease<net.Socket>;
   readonly ready: Promise<void>;
@@ -342,7 +348,7 @@ export class PtyServer {
       { final: "c" },
       (params) => {
         if (params.length === 0 || params[0] === 0) {
-          this.ptyProcess.write("\x1b[?62;22c");
+          this.writeToPty("\x1b[?62;22c");
         }
         return false;
       }
@@ -407,7 +413,7 @@ export class PtyServer {
     // Return true to consume the sequence so it doesn't leak to clients.
     this.terminal.parser.registerOscHandler(10, (data: string) => {
       if (data === "?") {
-        this.ptyProcess.write("\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\");
+        this.writeToPty("\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\");
         return true; // consume — don't pass to client
       }
       return false;
@@ -415,7 +421,7 @@ export class PtyServer {
     // OSC 11: background color query (less, vim)
     this.terminal.parser.registerOscHandler(11, (data: string) => {
       if (data === "?") {
-        this.ptyProcess.write("\x1b]11;rgb:0000/0000/0000\x1b\\");
+        this.writeToPty("\x1b]11;rgb:0000/0000/0000\x1b\\");
         return true;
       }
       return false;
@@ -425,7 +431,7 @@ export class PtyServer {
       if (data.includes("?")) {
         const idx = parseInt(data, 10);
         if (!isNaN(idx)) {
-          this.ptyProcess.write(`\x1b]4;${idx};rgb:0000/0000/0000\x1b\\`);
+          this.writeToPty(`\x1b]4;${idx};rgb:0000/0000/0000\x1b\\`);
         }
         return true;
       }
@@ -436,7 +442,7 @@ export class PtyServer {
       { prefix: ">", final: "c" },
       (_params) => {
         // Respond as xterm version 382
-        this.ptyProcess.write("\x1b[>0;382;0c");
+        this.writeToPty("\x1b[>0;382;0c");
         return false;
       }
     );
@@ -446,7 +452,7 @@ export class PtyServer {
       (params) => {
         if (params.length === 1 && params[0] === 6) {
           const buf = this.terminal.buffer.active;
-          this.ptyProcess.write(`\x1b[${buf.cursorY + 1};${buf.cursorX + 1}R`);
+          this.writeToPty(`\x1b[${buf.cursorY + 1};${buf.cursorX + 1}R`);
         }
         return false;
       }
@@ -455,7 +461,7 @@ export class PtyServer {
     this.terminal.parser.registerCsiHandler(
       { prefix: ">", final: "q" },
       (_params) => {
-        this.ptyProcess.write("\x1bP>|pty(0.8)\x1b\\");
+        this.writeToPty("\x1bP>|pty(0.8)\x1b\\");
         return false;
       }
     );
@@ -505,6 +511,7 @@ export class PtyServer {
     // handlers above and must NOT be forwarded to clients — otherwise the
     // client's terminal responds and its response appears as garbage input.
     this.ptyProcess.onData((data: string) => {
+      this.bumpIoRevision();
       this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
@@ -514,6 +521,7 @@ export class PtyServer {
 
     this.ptyProcess.onExit(({ exitCode, signal }) => {
       this.exited = true;
+      this.bumpIoRevision();
       // A signal death (e.g. an OS OOM SIGKILL) arrives from node-pty with a
       // nonzero `signal` and often exitCode 0 — if we recorded only the raw
       // exitCode, a killed process would look like a clean finish and any
@@ -711,7 +719,7 @@ export class PtyServer {
 
           case MessageType.DATA: {
             if (!this.exited && !client.readonly) {
-              this.ptyProcess.write(packet.payload.toString());
+              this.writeToPty(packet.payload.toString());
             }
             break;
           }
@@ -740,6 +748,7 @@ export class PtyServer {
 
           case MessageType.ACTIVITY: {
             const command = parseActivityCommand(packet.payload);
+            const before = this.activity.snapshot();
             if (command === null) this.activity.release(socket);
             const response = command === null
               ? {
@@ -748,7 +757,34 @@ export class PtyServer {
                   activity: this.activity.snapshot(),
                 }
               : this.activity.apply(socket, command);
+            if (JSON.stringify(before) !== JSON.stringify(response.activity)) {
+              this.bumpIoRevision();
+            }
             socket.write(encodeActivity(response));
+            break;
+          }
+
+          case MessageType.GUARDED_DATA: {
+            const command = parseGuardedSendCommand(packet.payload);
+            let response: GuardedSendResponse;
+            if (command === null) {
+              response = this.guardedFailure("invalid guarded send");
+            } else if (client.readonly || this.exited) {
+              response = this.guardedFailure("session is not writable");
+            } else if (command.generation !== this.generation) {
+              response = this.guardedFailure("daemon generation mismatch");
+            } else if (command.ioRevision !== this.ioRevision) {
+              response = this.guardedFailure("I/O revision mismatch");
+            } else if (!this.writeToPty(command.data)) {
+              response = this.guardedFailure("PTY write failed");
+            } else {
+              response = {
+                ok: true,
+                generation: this.generation,
+                ioRevision: this.ioRevision,
+              };
+            }
+            socket.write(encodeGuardedData(response));
             break;
           }
         }
@@ -756,13 +792,13 @@ export class PtyServer {
     });
 
     socket.on("close", () => {
-      this.activity.release(socket);
+      this.releaseActivity(socket);
       this.clients.delete(socket);
       this.negotiateSize();
     });
 
     socket.on("error", () => {
-      this.activity.release(socket);
+      this.releaseActivity(socket);
       this.clients.delete(socket);
       this.negotiateSize();
     });
@@ -808,6 +844,8 @@ export class PtyServer {
 
     return {
       name: this.name,
+      generation: this.generation,
+      ioRevision: this.ioRevision,
       terminal: {
         cols: this.terminal.cols,
         rows: this.terminal.rows,
@@ -859,8 +897,7 @@ export class PtyServer {
 
     if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
-        this.ptyProcess.resize(cols, rows);
-        this.terminal.resize(cols, rows);
+        this.resizePty(cols, rows);
         this.lastResizeTime = Date.now();
         return true;
       }
@@ -874,10 +911,45 @@ export class PtyServer {
   private nudgeRedraw(): void {
     const cols = this.terminal.cols;
     const rows = this.terminal.rows;
-    this.ptyProcess.resize(cols - 1, rows);
-    this.terminal.resize(cols - 1, rows);
+    this.resizePty(cols - 1, rows);
+    this.resizePty(cols, rows);
+  }
+
+  private bumpIoRevision(): void {
+    this.ioRevision += 1;
+  }
+
+  private writeToPty(data: string): boolean {
+    try {
+      this.ptyProcess.write(data);
+      this.bumpIoRevision();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private resizePty(cols: number, rows: number): void {
     this.ptyProcess.resize(cols, rows);
     this.terminal.resize(cols, rows);
+    this.bumpIoRevision();
+  }
+
+  private releaseActivity(socket: net.Socket): void {
+    const before = this.activity.snapshot();
+    this.activity.release(socket);
+    if (JSON.stringify(before) !== JSON.stringify(this.activity.snapshot())) {
+      this.bumpIoRevision();
+    }
+  }
+
+  private guardedFailure(error: string): GuardedSendResponse {
+    return {
+      ok: false,
+      generation: this.generation,
+      ioRevision: this.ioRevision,
+      error,
+    };
   }
 
   private emitEvent(type: EventType, fields?: Record<string, unknown>): void {
