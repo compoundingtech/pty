@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Storage format
+
+- Supporting live daemons now advertise a `recovery` capability in session
+  metadata. `pty recover <name> --snapshot <file>` uses that captured
+  capability to authenticate a signal-free listener/registry rebind after an
+  external unlink. Recovery preserves the daemon, PTY child, existing clients,
+  generation, and launch identity; stale, tampered, legacy, or foreign-path
+  attempts fail closed without relaunching.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no

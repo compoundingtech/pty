@@ -12,7 +12,7 @@ const cliSource = fs.readFileSync(path.join(__dirname, "..", "src", "cli.ts"), "
 // Canonical subcommands that must each ship focused `--help`.
 const COMMANDS = [
   "run", "attach", "exec", "peek", "send", "events", "list", "stats",
-  "restart", "kill", "rm", "gc", "tag", "tag-multi", "emit", "rename",
+  "restart", "kill", "recover", "rm", "gc", "tag", "tag-multi", "emit", "rename",
   "up", "down", "test", "remote-serve",
 ];
 // Aliases that must resolve to the same help.

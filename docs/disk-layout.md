@@ -15,6 +15,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
+| `.recovery/` | authenticated request/result exchange for supported live daemons | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |
@@ -35,6 +36,14 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 {
   generation?: string;       // opaque daemon generation; guards cleanup ownership
   daemonPid?: number;        // daemon owning this generation, retained after child exit
+  recovery?: {               // signal-free live-registry recovery capability
+    protocol: 1;
+    secret: string;          // opaque request-authentication key
+    processStartToken: string;
+    launchIdentity: string;
+    rootDevice: number;
+    rootInode: number;
+  };
   command: string;            // resolved binary path
   args: string[];
   displayCommand: string;     // command as the user typed it
@@ -60,6 +69,12 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   removes files still owned by its generation, and `pty rm` waits for that
   daemon to finish deferred shutdown before it reports success. Readers should
   treat the generation token as opaque.
+- `recovery` is present only when the daemon can prove its OS process-start
+  identity and the selected root is owned by the daemon user with no
+  group/other permissions. A snapshot containing this capability can authenticate
+  `pty recover` after the socket, pid, and metadata paths are externally
+  unlinked. The root is mode `0700`; treat the embedded secret as opaque and
+  do not publish snapshots. Successful recovery rotates the secret.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).

@@ -26,6 +26,7 @@ _pty() {
     'stats:Live CPU / memory / PIDs'
     'restart:SIGTERM + respawn'
     'kill:SIGTERM a running session'
+    'recover:Rebind a supporting live daemon after registry unlink'
     'rm:Remove exited metadata'
     'remove:Alias for rm'
     'gc:Reconciliation pass'
@@ -131,6 +132,10 @@ _pty() {
         kill)
           _arguments \
             '1:session:_pty_sessions'
+          ;;
+        recover)
+          _arguments \
+            '--snapshot[Captured capability-bearing metadata file]'
           ;;
         rm|remove)
           _arguments \

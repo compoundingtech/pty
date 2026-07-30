@@ -130,6 +130,9 @@ export interface SessionMetadata {
    *  sidecar pidfile, this survives socket cleanup long enough for `pty rm`
    *  to wait until deferred daemon shutdown is complete. */
   daemonPid?: number;
+  /** Capability advertised only by daemons that support authenticated,
+   *  signal-free recovery of an unlinked registry. Treat `secret` as opaque. */
+  recovery?: import("./recovery.ts").RecoveryCapability;
   command: string;
   args: string[];
   displayCommand: string; // original command as the user typed it
@@ -1650,6 +1653,36 @@ export function acquireLock(name: string): boolean {
     if (e.code !== "ENOENT") return false;
   }
   return tryCreate();
+}
+
+/** Fail-closed lock acquisition for recovery.
+ *
+ * Unlike normal creation, recovery must not probe or steal an existing lock:
+ * any competing owner is grounds to refuse, and the recovery path promises no
+ * process signal (including a liveness-only signal 0 probe). */
+export function acquireRecoveryLock(name: string): boolean {
+  ensureSessionDir();
+  try {
+    const fd = fs.openSync(getLockPath(name), "wx", 0o600);
+    try {
+      fs.writeSync(fd, process.pid.toString());
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+/** Release only the recovery lock still owned by the expected PID. */
+export function releaseRecoveryLock(name: string, ownerPid: number): void {
+  try {
+    if (fs.readFileSync(getLockPath(name), "utf8").trim() === String(ownerPid)) {
+      fs.unlinkSync(getLockPath(name));
+    }
+  } catch {}
 }
 
 export function releaseLock(name: string): void {
