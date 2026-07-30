@@ -470,8 +470,10 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
   // A live pid or reachable socket proves the daemon is alive. A readable dead
   // pid plus an unreachable socket lets retained metadata report the session as
   // exited/vanished below. An unreadable pid plus an unreachable socket remains
-  // ambiguous and is omitted: the daemon creates its .sock (listen) BEFORE it
-  // writes its .pid, and the plain pidfile write can be caught mid-flight.
+  // ambiguous and stays in the snapshot, reported running defensively unless
+  // retained metadata already records exit. The daemon creates its .sock
+  // (listen) BEFORE it writes its .pid, and the plain pidfile write can be
+  // caught mid-flight.
   // Artifact cleanup belongs exclusively to explicit lifecycle operations such
   // as gc/rm.
   const sockFiles = entries.filter((e) => e.endsWith(".sock")).sort();
