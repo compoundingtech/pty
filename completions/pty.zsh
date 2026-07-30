@@ -69,6 +69,7 @@ _pty() {
         attach|a)
           _arguments \
             '(r --auto-restart){r,--auto-restart}[Auto-restart if the session is exited]' \
+            '--no-restart[Attach only; never prompt or restart an exited session]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
             '1:session:_pty_sessions'
