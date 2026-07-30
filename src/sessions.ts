@@ -330,6 +330,124 @@ export interface ListSessionsOptions {
 
 const DEFAULT_SOCKET_PROBE_BUDGET_MS = 500;
 
+interface RawCleanupCandidate {
+  name: string;
+}
+
+type MetadataArtifactState = "absent" | "valid" | "malformed" | "unreadable";
+
+function inspectMetadataArtifact(
+  name: string,
+  hasMetadata: boolean,
+): MetadataArtifactState {
+  if (!hasMetadata) return "absent";
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(getMetadataPath(name), "utf-8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? "valid"
+      : "malformed";
+  } catch (error) {
+    return error instanceof SyntaxError ? "malformed" : "unreadable";
+  }
+}
+
+/** Inventory registry debris that cannot be represented as a SessionInfo.
+ *
+ * This is deliberately separate from listSessions: observation never mutates,
+ * while gc still needs to discover stale runtime artifacts whose metadata is
+ * missing or malformed. A readable dead pid is positive proof that an
+ * associated socket is stale; malformed metadata without any runtime files is
+ * also reclaimable. Ambiguous startup shapes (socket + missing/invalid pid) are
+ * retained. */
+async function inventoryRawCleanupCandidates(
+  options: ListSessionsOptions = {},
+  onlyNames?: ReadonlySet<string>,
+): Promise<RawCleanupCandidate[]> {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(getSessionDir());
+  } catch {
+    return [];
+  }
+
+  const names = new Set<string>();
+  for (const entry of entries) {
+    let name: string | undefined;
+    if (entry.endsWith(".events.jsonl")) name = entry.slice(0, -".events.jsonl".length);
+    else if (entry.endsWith(".sock")) name = entry.slice(0, -".sock".length);
+    else if (entry.endsWith(".pid")) name = entry.slice(0, -".pid".length);
+    else if (entry.endsWith(".json")) name = entry.slice(0, -".json".length);
+    if (name && (!onlyNames || onlyNames.has(name))) names.add(name);
+  }
+
+  const entrySet = new Set(entries);
+  const candidates = [...names].sort().map((name) => {
+    const hasSocket = entrySet.has(`${name}.sock`);
+    const hasPid = entrySet.has(`${name}.pid`);
+    const hasMetadata = entrySet.has(`${name}.json`);
+    const metadataState = inspectMetadataArtifact(name, hasMetadata);
+    const pid = hasPid ? readPid(name) : null;
+    const pidDead = pid !== null && !isProcessAlive(pid);
+    return { name, hasSocket, hasPid, hasMetadata, metadataState, pidDead };
+  }).filter(({ metadataState }) =>
+    metadataState === "absent" || metadataState === "malformed"
+  );
+
+  const socketsToProbe = candidates
+    .filter(({ hasSocket, pidDead }) => hasSocket && pidDead)
+    .map(({ name }) => getSocketPath(name));
+  const reachability = await probeSocketsWithinBudget(
+    socketsToProbe,
+    options.socketProbeBudgetMs ?? DEFAULT_SOCKET_PROBE_BUDGET_MS,
+    options.socketProbe ?? isSocketReachable,
+  );
+
+  return candidates.flatMap((candidate) => {
+    if (candidate.pidDead) {
+      if (
+        !candidate.hasSocket ||
+        reachability.get(getSocketPath(candidate.name)) === false
+      ) {
+        return [{ name: candidate.name }];
+      }
+      return [];
+    }
+    if (candidate.hasMetadata && !candidate.hasPid && !candidate.hasSocket) {
+      return [{ name: candidate.name }];
+    }
+    return [];
+  });
+}
+
+/** Apply one raw-artifact cleanup only while owning the per-name creation lock.
+ *
+ * Re-inventorying under the lock closes the observation/apply race: if a live
+ * generation appeared, or the evidence became ambiguous, cleanup is skipped. */
+async function cleanupRawCandidateGuarded(
+  candidate: RawCleanupCandidate,
+  options: ListSessionsOptions = {},
+): Promise<boolean> {
+  if (!acquireLock(candidate.name)) return false;
+  try {
+    const current = await inventoryRawCleanupCandidates(
+      options,
+      new Set([candidate.name]),
+    );
+    if (!current.some(({ name }) => name === candidate.name)) return false;
+
+    cleanupSocket(candidate.name);
+    try {
+      fs.unlinkSync(getMetadataPath(candidate.name));
+    } catch {}
+    try {
+      fs.unlinkSync(getEventsPath(candidate.name));
+    } catch {}
+    return true;
+  } finally {
+    releaseLock(candidate.name);
+  }
+}
+
 /** Return one bounded, read-only observation of the session registry.
  *
  * This function deliberately performs no lifecycle work: it does not create
@@ -688,6 +806,17 @@ export async function gc(
   const globalIdleDays = opts.idleDays;
   const globalFastFailWindow = opts.fastFailWindowSec;
   const globalFastFailLimit = opts.fastFailLimit;
+  const rawCandidates = await inventoryRawCleanupCandidates();
+  const rawRemoved: string[] = [];
+  if (dryRun) {
+    rawRemoved.push(...rawCandidates.map(({ name }) => name));
+  } else {
+    for (const candidate of rawCandidates) {
+      if (await cleanupRawCandidateGuarded(candidate)) {
+        rawRemoved.push(candidate.name);
+      }
+    }
+  }
   const initial = await listSessions();
 
   // STEP 1: orphan-children. Sort by name so cycles (A→B, B→A) resolve
@@ -863,7 +992,7 @@ export async function gc(
   // if it failed we leave the metadata around so the next tick can try
   // again.
   const finalList = dryRun ? initial : await listSessions();
-  const removed: string[] = [];
+  const removed: string[] = [...rawRemoved];
   const kept: string[] = [];
   for (const s of finalList) {
     if (!isGone(s.status)) continue;

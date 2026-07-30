@@ -12,7 +12,9 @@
 - Read-only APIs no longer perform lifecycle cleanup. Stale registry cleanup
   belongs to explicit operations such as `pty gc` and `pty rm`; normal daemon
   self-reaping is unchanged. In particular, `pty gc --dry-run` now performs no
-  registry writes or removals.
+  registry writes or removals. `pty gc` inventories dead socket/pid debris even
+  when metadata is missing or malformed, and revalidates it while holding the
+  per-name creation lock before removal.
 
 ### Attach-only CLI policy
 

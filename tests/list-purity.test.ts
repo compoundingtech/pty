@@ -25,6 +25,16 @@ const writeStaleSession = (root: string, name: string) => {
   }));
 };
 
+const writeRawDebris = (
+  root: string,
+  name: string,
+  { corruptMetadata }: { corruptMetadata: boolean },
+) => {
+  fs.writeFileSync(path.join(root, `${name}.sock`), "");
+  fs.writeFileSync(path.join(root, `${name}.pid`), "2147483647");
+  if (corruptMetadata) fs.writeFileSync(path.join(root, `${name}.json`), "{");
+};
+
 afterEach(() => {
   delete process.env.PTY_ROOT;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -79,5 +89,44 @@ describe("listSessions is observational", () => {
     expect(fs.existsSync(path.join(root, "dry.sock"))).toBe(false);
     expect(fs.existsSync(path.join(root, "dry.pid"))).toBe(false);
     expect(fs.existsSync(path.join(root, "dry.json"))).toBe(false);
+  });
+
+  it.each([
+    ["corrupt metadata", true],
+    ["missing metadata", false],
+  ])("previews and applies guarded cleanup for raw debris with %s", async (
+    _label,
+    corruptMetadata,
+  ) => {
+    const root = withRoot();
+    writeRawDebris(root, "debris", { corruptMetadata });
+
+    expect(await listSessions()).toEqual([]);
+    const preview = await gc({ dryRun: true });
+
+    expect(preview.removed).toEqual(["debris"]);
+    expect(fs.existsSync(path.join(root, "debris.sock"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "debris.pid"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "debris.json"))).toBe(corruptMetadata);
+
+    const applied = await gc();
+
+    expect(applied.removed).toEqual(["debris"]);
+    expect(fs.existsSync(path.join(root, "debris.sock"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "debris.pid"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "debris.json"))).toBe(false);
+  });
+
+  it("does not clean raw debris while another creator owns the name", async () => {
+    const root = withRoot();
+    writeRawDebris(root, "locked", { corruptMetadata: true });
+    fs.writeFileSync(path.join(root, "locked.lock"), String(process.pid));
+
+    const result = await gc();
+
+    expect(result.removed).toEqual([]);
+    expect(fs.existsSync(path.join(root, "locked.sock"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "locked.pid"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "locked.json"))).toBe(true);
   });
 });
