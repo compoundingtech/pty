@@ -184,6 +184,11 @@ against the same `PTY_ROOT`. Recovery authenticates the original daemon and
 rebinds its listener without signaling, restarting, or disconnecting existing
 clients. Missing, legacy, stale, tampered, wrong-root, and occupied-path
 snapshots fail closed.
+Recovery also rejects a snapshot captured before any later metadata mutation,
+and rechecks that both the root and its recovery directory are still private
+before exchanging authenticated state. An interrupted recover command can be
+resumed with the same valid snapshot; it never probes, signals, or relaunches
+the supporting daemon.
 
 ```sh
 pty run -d -- npm test                          # shipped default: reaped when it finishes

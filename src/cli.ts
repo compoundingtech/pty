@@ -51,9 +51,12 @@ import { parseDuration, formatDuration } from "./duration.ts";
 import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 import {
   RECOVERY_PROTOCOL,
+  assertPrivateRecoveryPaths,
   atomicWritePrivate,
   readBoundedJson,
   readProcessStartToken,
+  recoveryLockContents,
+  recoveryLockIdentity,
   recoveryRequestPath,
   recoveryResultPath,
   signRecoveryRequest,
@@ -2521,34 +2524,59 @@ async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
   if (
     capability?.protocol !== RECOVERY_PROTOCOL ||
     typeof capability.secret !== "string" ||
+    typeof capability.metadataRevision !== "string" ||
+    capability.metadataRevision.length === 0 ||
     !snapshot.generation ||
     !snapshot.daemonPid
   ) {
     throw new Error("snapshot does not advertise supported recovery");
   }
-  const rootStat = fs.statSync(root);
-  if (rootStat.dev !== capability.rootDevice || rootStat.ino !== capability.rootInode) {
-    throw new Error("selected PTY_ROOT does not match the captured snapshot");
-  }
+  assertPrivateRecoveryPaths(root, capability);
   if (readProcessStartToken(snapshot.daemonPid) !== capability.processStartToken) {
     throw new Error("daemon PID/start identity no longer matches the snapshot");
   }
-  if (!acquireRecoveryLock(name)) {
+  const lockIdentity = recoveryLockIdentity({
+    name,
+    daemonPid: snapshot.daemonPid,
+    processStartToken: capability.processStartToken,
+    rootDevice: capability.rootDevice,
+    rootInode: capability.rootInode,
+    recoveryDirDevice: capability.recoveryDirDevice,
+    recoveryDirInode: capability.recoveryDirInode,
+  });
+  const lockContents = recoveryLockContents(snapshot.daemonPid, lockIdentity);
+  if (!acquireRecoveryLock(name, lockContents)) {
     throw new Error(`session "${name}" is being created by another process`);
   }
 
   const requestPath = recoveryRequestPath(root, name);
   const resultPath = recoveryResultPath(root, name);
   try {
-    for (const target of [
+    const targets = [
       getSocketPath(name),
       getPidPath(name),
       getMetadataPath(name),
-    ]) {
-      if (fs.existsSync(target)) {
+    ];
+    if (targets.some((target) => fs.existsSync(target))) {
+      const current = readMetadata(name);
+      if (
+        !targets.every((target) => fs.existsSync(target)) ||
+        !current ||
+        current.daemonPid !== snapshot.daemonPid ||
+        current.generation !== snapshot.generation ||
+        current.recovery?.processStartToken !== capability.processStartToken ||
+        current.recovery.launchIdentity !== capability.launchIdentity
+      ) {
         throw new Error("recovery target is no longer empty");
       }
+      const stats = await queryStats(name);
+      if (stats.daemon.pid !== snapshot.daemonPid) {
+        throw new Error("republished socket reached a different daemon");
+      }
+      console.log(`Session "${name}" registry recovered without restart.`);
+      return;
     }
+    assertPrivateRecoveryPaths(root, capability);
     try { fs.unlinkSync(resultPath); } catch {}
     const nonce = randomBytes(16).toString("hex");
     const request = signRecoveryRequest(capability.secret, {
@@ -2560,10 +2588,11 @@ async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
       launchIdentity: capability.launchIdentity,
       rootDevice: capability.rootDevice,
       rootInode: capability.rootInode,
-      lockOwnerPid: process.pid,
+      lockIdentity,
       nonce,
       metadata: snapshot,
     });
+    assertPrivateRecoveryPaths(root, capability);
     atomicWritePrivate(requestPath, request);
 
     const deadline = Date.now() + 7000;
@@ -2578,6 +2607,7 @@ async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
         }
       } catch {}
       if (Date.now() >= nextNotify) {
+        assertPrivateRecoveryPaths(root, capability);
         atomicWritePrivate(requestPath, request);
         nextNotify = Date.now() + 250;
       }
@@ -2613,9 +2643,12 @@ async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
     }
     console.log(`Session "${name}" registry recovered without restart.`);
   } finally {
-    try { fs.unlinkSync(requestPath); } catch {}
-    try { fs.unlinkSync(resultPath); } catch {}
-    releaseRecoveryLock(name, process.pid);
+    try {
+      assertPrivateRecoveryPaths(root, capability);
+      try { fs.unlinkSync(requestPath); } catch {}
+      try { fs.unlinkSync(resultPath); } catch {}
+    } catch {}
+    releaseRecoveryLock(name, lockContents);
   }
 }
 

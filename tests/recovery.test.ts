@@ -2,14 +2,19 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { PacketReader, MessageType, encodeAttach } from "../src/protocol.ts";
 import { queryStats } from "../src/client.ts";
 import { acquireRecoveryLock, type SessionMetadata } from "../src/sessions.ts";
 import {
+  RECOVERY_PROTOCOL,
   RECOVERY_MAX_BYTES,
   readProcessStartToken,
+  recoveryLockContents,
+  recoveryLockIdentity,
+  recoveryResultPath,
   recoveryRequestPath,
 } from "../src/recovery.ts";
 import { terminateAndWait } from "./setup/processes.ts";
@@ -115,7 +120,7 @@ describe("live daemon registry recovery", () => {
       throw new Error("recovery must not signal");
     }) as typeof process.kill;
     try {
-      expect(acquireRecoveryLock("locked")).toBe(false);
+      expect(acquireRecoveryLock("locked", "recovery-owner")).toBe(false);
       expect(calls).toBe(0);
     } finally {
       process.kill = originalKill;
@@ -133,10 +138,10 @@ describe("live daemon registry recovery", () => {
     const root = makeRoot();
     const name = "positive";
     const { marker, pid } = startProvider(root, name);
-    const before = metadata(root, name);
-    const snapshot = writeSnapshot(root, name, before);
     const clientA = await attachCollector(path.join(root, `${name}.sock`));
     await waitFor(() => clientA.output().includes("tick:2"));
+    const before = metadata(root, name);
+    const snapshot = writeSnapshot(root, name, before);
 
     unlinkRegistry(root, name);
     const outputBefore = clientA.output().length;
@@ -153,6 +158,7 @@ describe("live daemon registry recovery", () => {
     expect(after.recovery?.processStartToken).toBe(before.recovery?.processStartToken);
     expect(after.recovery?.launchIdentity).toBe(before.recovery?.launchIdentity);
     expect(after.recovery?.secret).not.toBe(before.recovery?.secret);
+    expect(after.recovery?.metadataRevision).not.toBe(before.recovery?.metadataRevision);
     expect(fs.readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(1);
     const starts = fs.readFileSync(path.join(root, `${name}.events.jsonl`), "utf8")
       .split("\n").filter((line) => line.includes('"session_start"'));
@@ -163,6 +169,112 @@ describe("live daemon registry recovery", () => {
     await waitFor(() => clientA.output().length > preservedAt);
     clientA.socket.destroy();
     clientB.socket.destroy();
+  }, 20_000);
+
+  it("refuses a stale metadata snapshot instead of rolling back live mutations", async () => {
+    const root = makeRoot();
+    const name = "stale-metadata";
+    startProvider(root, name);
+    const stale = metadata(root, name);
+    const staleSnapshot = writeSnapshot(root, "stale", stale);
+
+    expect(run(root, ["tag", name, "role=current", "strategy=permanent"]).status).toBe(0);
+    expect(run(root, ["rename", name, "Current Display"]).status).toBe(0);
+    const client = await attachCollector(path.join(root, `${name}.sock`));
+    await waitFor(() => metadata(root, name).lastAttachAt !== undefined);
+    const current = metadata(root, name);
+    const currentSnapshot = writeSnapshot(root, "current", current);
+    expect(current.recovery?.metadataRevision).not.toBe(stale.recovery?.metadataRevision);
+
+    unlinkRegistry(root, name);
+    const refused = run(root, ["recover", name, "--snapshot", staleSnapshot]);
+    expect(refused.status).not.toBe(0);
+    expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(false);
+
+    const recovered = run(root, ["recover", name, "--snapshot", currentSnapshot]);
+    expect(recovered.status, recovered.stderr || recovered.stdout).toBe(0);
+    const after = metadata(root, name);
+    expect(after.tags).toEqual(current.tags);
+    expect(after.displayName).toBe(current.displayName);
+    expect(after.lastAttachAt).toBe(current.lastAttachAt);
+    client.socket.destroy();
+  }, 20_000);
+
+  it("resumes an authenticated lock after its recoverer is killed", async () => {
+    const root = makeRoot();
+    const name = "interrupted-lock";
+    const { marker, pid } = startProvider(root, name);
+    const client = await attachCollector(path.join(root, `${name}.sock`));
+    await waitFor(() => client.output().includes("tick:2"));
+    const before = metadata(root, name);
+    const snapshot = writeSnapshot(root, name, before);
+    unlinkRegistry(root, name);
+
+    const capability = before.recovery!;
+    const identity = recoveryLockIdentity({
+      name,
+      daemonPid: pid,
+      processStartToken: capability.processStartToken,
+      rootDevice: capability.rootDevice,
+      rootInode: capability.rootInode,
+      recoveryDirDevice: capability.recoveryDirDevice,
+      recoveryDirInode: capability.recoveryDirInode,
+    });
+    const contents = recoveryLockContents(pid, identity);
+    const sessionsModule = pathToFileURL(path.join(projectRoot, "dist", "sessions.js")).href;
+    const lockHolder = spawn(process.execPath, [
+      "-e",
+      "import(process.argv[1]).then(m=>{process.env.PTY_ROOT=process.argv[2];if(!m.acquireRecoveryLock(process.argv[3],process.argv[4]))process.exit(2);process.stdout.write('locked\\n');setInterval(()=>{},1000)})",
+      sessionsModule,
+      root,
+      name,
+      contents,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      lockHolder.stdout!.once("data", () => resolve());
+      lockHolder.once("error", reject);
+      lockHolder.once("exit", (code) => {
+        if (code !== null) reject(new Error(`lock holder exited ${code}`));
+      });
+    });
+    lockHolder.kill("SIGKILL");
+    await new Promise<void>((resolve) => lockHolder.once("exit", () => resolve()));
+    expect(fs.readFileSync(path.join(root, `${name}.lock`), "utf8")).toBe(contents);
+
+    const outputBefore = client.output().length;
+    const recovered = run(root, ["recover", name, "--snapshot", snapshot]);
+    expect(recovered.status, recovered.stderr || recovered.stdout).toBe(0);
+    await waitFor(() => client.output().length > outputBefore);
+    expect((await queryStats(name)).daemon.pid).toBe(pid);
+    expect(fs.readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, `${name}.lock`))).toBe(false);
+    client.socket.destroy();
+  }, 20_000);
+
+  it("refuses permission downgrades before writing secret-bearing recovery state", () => {
+    for (const downgraded of ["root", "recovery-dir"] as const) {
+      const root = makeRoot();
+      const name = `privacy-${downgraded}`;
+      startProvider(root, name);
+      const snapshot = writeSnapshot(root, name, metadata(root, name));
+      unlinkRegistry(root, name);
+      const recoveryDir = path.join(root, ".recovery");
+      const before = fs.readdirSync(recoveryDir).sort();
+      fs.chmodSync(downgraded === "root" ? root : recoveryDir, 0o755);
+      try {
+        const refused = run(root, ["recover", name, "--snapshot", snapshot]);
+        expect(refused.status).not.toBe(0);
+        expect(fs.readdirSync(recoveryDir).sort()).toEqual(before);
+        expect(fs.existsSync(recoveryRequestPath(root, name))).toBe(false);
+        expect(fs.existsSync(recoveryResultPath(root, name))).toBe(false);
+        expect(fs.existsSync(path.join(root, `${name}.lock`))).toBe(false);
+        expect(fs.existsSync(path.join(root, `${name}.sock`))).toBe(false);
+        expect(fs.existsSync(path.join(root, `${name}.pid`))).toBe(false);
+        expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(false);
+      } finally {
+        fs.chmodSync(downgraded === "root" ? root : recoveryDir, 0o700);
+      }
+    }
   }, 20_000);
 
   it("refuses malformed, unsupported, locked, wrong-root, and tampered requests", async () => {

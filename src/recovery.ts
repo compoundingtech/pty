@@ -14,6 +14,9 @@ export interface RecoveryCapability {
   launchIdentity: string;
   rootDevice: number;
   rootInode: number;
+  recoveryDirDevice: number;
+  recoveryDirInode: number;
+  metadataRevision: string;
 }
 
 export interface RecoveryRequestPayload {
@@ -25,7 +28,7 @@ export interface RecoveryRequestPayload {
   launchIdentity: string;
   rootDevice: number;
   rootInode: number;
-  lockOwnerPid: number;
+  lockIdentity: string;
   nonce: string;
   metadata: SessionMetadata;
 }
@@ -50,6 +53,30 @@ export interface RecoveryResult extends RecoveryResultPayload {
   auth: string;
 }
 
+export interface RecoveryRevisionPayload {
+  protocol: 1;
+  name: string;
+  generation: string;
+  metadataRevision: string;
+}
+
+export interface RecoveryRevision extends RecoveryRevisionPayload {
+  auth: string;
+}
+
+export interface RecoveryPathIdentity {
+  rootDevice: number;
+  rootInode: number;
+  recoveryDirDevice: number;
+  recoveryDirInode: number;
+}
+
+export interface RecoveryLockIdentityPayload extends RecoveryPathIdentity {
+  name: string;
+  daemonPid: number;
+  processStartToken: string;
+}
+
 export function recoveryDir(root: string): string {
   return path.join(root, ".recovery");
 }
@@ -62,8 +89,49 @@ export function recoveryResultPath(root: string, name: string): string {
   return path.join(recoveryDir(root), `${name}.result.json`);
 }
 
+export function recoveryRevisionPath(root: string, name: string): string {
+  return path.join(recoveryDir(root), `${name}.revision.json`);
+}
+
 export function ensureRecoveryDir(root: string): void {
   fs.mkdirSync(recoveryDir(root), { recursive: true, mode: 0o700 });
+}
+
+function requirePrivateOwnedDirectory(target: string, label: string): fs.Stats {
+  const stat = fs.lstatSync(target);
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isDirectory() ||
+    (stat.mode & 0o077) !== 0 ||
+    (typeof process.getuid === "function" && stat.uid !== process.getuid())
+  ) {
+    throw new Error(`${label} must be an owned private non-symlink directory`);
+  }
+  return stat;
+}
+
+export function assertPrivateRecoveryPaths(
+  root: string,
+  expected?: RecoveryPathIdentity,
+): RecoveryPathIdentity {
+  const rootStat = requirePrivateOwnedDirectory(root, "PTY_ROOT");
+  const recoveryStat = requirePrivateOwnedDirectory(recoveryDir(root), "PTY_ROOT recovery directory");
+  const actual = {
+    rootDevice: rootStat.dev,
+    rootInode: rootStat.ino,
+    recoveryDirDevice: recoveryStat.dev,
+    recoveryDirInode: recoveryStat.ino,
+  };
+  if (
+    expected &&
+    (actual.rootDevice !== expected.rootDevice ||
+      actual.rootInode !== expected.rootInode ||
+      actual.recoveryDirDevice !== expected.recoveryDirDevice ||
+      actual.recoveryDirInode !== expected.recoveryDirInode)
+  ) {
+    throw new Error("recovery root identity changed");
+  }
+  return actual;
 }
 
 export function readProcessStartToken(pid: number): string | null {
@@ -114,6 +182,26 @@ export function launchIdentity(metadata: Pick<
   })).digest("hex");
 }
 
+export function metadataRevision(metadata: SessionMetadata): string {
+  const recovery = metadata.recovery
+    ? { ...metadata.recovery, metadataRevision: undefined }
+    : undefined;
+  return createHash("sha256").update(stableStringify({
+    ...metadata,
+    recovery,
+  })).digest("hex");
+}
+
+export function stampRecoveryMetadata(metadata: SessionMetadata): SessionMetadata {
+  if (!metadata.recovery) return metadata;
+  const stamped: SessionMetadata = {
+    ...metadata,
+    recovery: { ...metadata.recovery, metadataRevision: "" },
+  };
+  stamped.recovery!.metadataRevision = metadataRevision(stamped);
+  return stamped;
+}
+
 function mac(secret: string, payload: unknown): string {
   return createHmac("sha256", Buffer.from(secret, "hex"))
     .update(stableStringify(payload))
@@ -146,6 +234,32 @@ export function verifyRecoveryResult(secret: string, result: RecoveryResult): bo
   const expected = Buffer.from(mac(secret, payload), "hex");
   const actual = Buffer.from(typeof auth === "string" ? auth : "", "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function signRecoveryRevision(
+  secret: string,
+  payload: RecoveryRevisionPayload,
+): RecoveryRevision {
+  return { ...payload, auth: mac(secret, payload) };
+}
+
+export function verifyRecoveryRevision(secret: string, revision: RecoveryRevision): boolean {
+  const { auth, ...payload } = revision;
+  const expected = Buffer.from(mac(secret, payload), "hex");
+  const actual = Buffer.from(typeof auth === "string" ? auth : "", "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function recoveryLockIdentity(
+  payload: RecoveryLockIdentityPayload,
+): string {
+  return createHash("sha256")
+    .update(stableStringify({ purpose: "recovery-lock", ...payload }))
+    .digest("hex");
+}
+
+export function recoveryLockContents(daemonPid: number, identity: string): string {
+  return `${daemonPid}\nrecovery:${identity}\n`;
 }
 
 export function readBoundedJson<T>(file: string): T {

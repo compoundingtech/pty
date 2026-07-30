@@ -36,19 +36,28 @@ import {
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
 import {
   RECOVERY_PROTOCOL,
+  assertPrivateRecoveryPaths,
   atomicWritePrivate,
   ensureRecoveryDir,
   launchIdentity,
+  metadataRevision,
   publishPrivateNoReplace,
   readBoundedJson,
   readProcessStartToken,
   recoveryDir,
+  recoveryLockContents,
+  recoveryLockIdentity,
   recoveryRequestPath,
+  recoveryRevisionPath,
   recoveryResultPath,
+  signRecoveryRevision,
   signRecoveryResult,
+  stampRecoveryMetadata,
   verifyRecoveryRequest,
+  verifyRecoveryRevision,
   type RecoveryCapability,
   type RecoveryRequest,
+  type RecoveryRevision,
   type RecoveryResultPayload,
 } from "./recovery.ts";
 
@@ -558,12 +567,11 @@ export class PtyServer {
     // Create Unix socket server
     ensureSessionDir();
     this.recoveryRoot = path.resolve(getSessionDir());
-    const rootStat = fs.statSync(this.recoveryRoot);
     const processStartToken = readProcessStartToken(process.pid);
-    const rootIsPrivate =
-      (rootStat.mode & 0o077) === 0 &&
-      (typeof process.getuid !== "function" || rootStat.uid === process.getuid());
-    if (processStartToken !== null && rootIsPrivate) {
+    try {
+      ensureRecoveryDir(this.recoveryRoot);
+      const paths = assertPrivateRecoveryPaths(this.recoveryRoot);
+      if (processStartToken === null) throw new Error("process start identity unavailable");
       const identity = launchIdentity({
         command: options.command,
         args: options.args,
@@ -581,12 +589,11 @@ export class PtyServer {
         secret: randomBytes(32).toString("hex"),
         processStartToken,
         launchIdentity: identity,
-        rootDevice: rootStat.dev,
-        rootInode: rootStat.ino,
+        ...paths,
+        metadataRevision: "",
       };
-      ensureRecoveryDir(this.recoveryRoot);
       this.startRecoveryWatcher();
-    }
+    } catch {}
     clearEvents(this.name);
     const socketPath = getSocketPath(this.name);
 
@@ -669,12 +676,12 @@ export class PtyServer {
     observed: SessionMetadata,
     capability: RecoveryCapability,
   ): SessionMetadata {
-    return {
+    return stampRecoveryMetadata({
       ...observed,
       generation: this.generation,
       daemonPid: process.pid,
       recovery: capability,
-    };
+    });
   }
 
   private async handleRecoveryRequest(): Promise<void> {
@@ -686,12 +693,24 @@ export class PtyServer {
     let request: RecoveryRequest | null = null;
     let result: RecoveryResultPayload | null = null;
     try {
+      assertPrivateRecoveryPaths(this.recoveryRoot, capability);
       request = readBoundedJson<RecoveryRequest>(requestPath);
-      const currentRoot = fs.statSync(this.recoveryRoot);
       const currentStart = readProcessStartToken(process.pid);
       const metadataCapability = request.metadata?.recovery;
       const lockPath = path.join(this.recoveryRoot, `${this.name}.lock`);
-      const lockOwner = Number(fs.readFileSync(lockPath, "utf8").trim());
+      const lockContents = recoveryLockContents(process.pid, request.lockIdentity);
+      const expectedLockIdentity = recoveryLockIdentity({
+        name: request.name,
+        daemonPid: request.daemonPid,
+        processStartToken: request.processStartToken,
+        rootDevice: request.rootDevice,
+        rootInode: request.rootInode,
+        recoveryDirDevice: capability.recoveryDirDevice,
+        recoveryDirInode: capability.recoveryDirInode,
+      });
+      const revision = readBoundedJson<RecoveryRevision>(
+        recoveryRevisionPath(this.recoveryRoot, this.name),
+      );
       const exact =
         request.protocol === RECOVERY_PROTOCOL &&
         request.name === this.name &&
@@ -701,14 +720,23 @@ export class PtyServer {
         request.launchIdentity === capability.launchIdentity &&
         request.rootDevice === capability.rootDevice &&
         request.rootInode === capability.rootInode &&
-        currentRoot.dev === capability.rootDevice &&
-        currentRoot.ino === capability.rootInode &&
         currentStart === capability.processStartToken &&
-        request.lockOwnerPid === lockOwner &&
+        request.lockIdentity === expectedLockIdentity &&
+        fs.readFileSync(lockPath, "utf8") === lockContents &&
         metadataCapability?.protocol === capability.protocol &&
         metadataCapability.secret === capability.secret &&
         metadataCapability.processStartToken === capability.processStartToken &&
         metadataCapability.launchIdentity === capability.launchIdentity &&
+        metadataCapability.rootDevice === capability.rootDevice &&
+        metadataCapability.rootInode === capability.rootInode &&
+        metadataCapability.recoveryDirDevice === capability.recoveryDirDevice &&
+        metadataCapability.recoveryDirInode === capability.recoveryDirInode &&
+        metadataCapability.metadataRevision === metadataRevision(request.metadata) &&
+        revision.protocol === RECOVERY_PROTOCOL &&
+        revision.name === this.name &&
+        revision.generation === this.generation &&
+        revision.metadataRevision === metadataCapability.metadataRevision &&
+        verifyRecoveryRevision(capability.secret, revision) &&
         verifyRecoveryRequest(capability.secret, request);
       if (!exact) throw new Error("recovery identity or authentication mismatch");
 
@@ -722,6 +750,7 @@ export class PtyServer {
       const replacement = net.createServer((socket) => this.handleClient(socket));
       await new Promise<void>((resolve, reject) => {
         replacement.once("error", reject);
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
         replacement.listen(socketPath, resolve);
       });
       replacement.on("error", (error) => {
@@ -738,12 +767,14 @@ export class PtyServer {
         if (fs.existsSync(pidPath) || fs.existsSync(metadataPath)) {
           throw new Error("recovery sidecar appeared during publication");
         }
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
         const rotated: RecoveryCapability = {
           ...capability,
           secret: randomBytes(32).toString("hex"),
+          metadataRevision: "",
         };
-        rotatedCapability = rotated;
         const recoveredMetadata = this.recoveryMetadata(request.metadata, rotated);
+        rotatedCapability = recoveredMetadata.recovery!;
         publishPrivateNoReplace(pidPath, process.pid.toString());
         publishedPid = true;
         publishPrivateNoReplace(metadataPath, JSON.stringify(recoveredMetadata, null, 2));
@@ -752,10 +783,20 @@ export class PtyServer {
         if (finalSocket.dev !== socketIdentity.dev || finalSocket.ino !== socketIdentity.ino) {
           throw new Error("recovery pathname was replaced during publication");
         }
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+        atomicWritePrivate(
+          recoveryRevisionPath(this.recoveryRoot, this.name),
+          signRecoveryRevision(rotatedCapability.secret, {
+            protocol: RECOVERY_PROTOCOL,
+            name: this.name,
+            generation: this.generation,
+            metadataRevision: rotatedCapability.metadataRevision,
+          }),
+        );
 
         const previous = this.socketServer;
         this.socketServer = replacement;
-        this.recoveryCapability = rotated;
+        this.recoveryCapability = rotatedCapability;
         // Node remembers a Unix server's pathname and unlinks it on close.
         // The old listener still remembers the same string even though its
         // inode was externally unlinked; closing it now would unlink the new
@@ -809,14 +850,15 @@ export class PtyServer {
       };
     } finally {
       try {
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
         if (result) {
           atomicWritePrivate(
             resultPath,
             signRecoveryResult(capability.secret, result),
           );
         }
+        fs.unlinkSync(requestPath);
       } catch {}
-      try { fs.unlinkSync(requestPath); } catch {}
       this.recoveryInFlight = false;
     }
   }

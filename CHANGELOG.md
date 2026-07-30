@@ -9,7 +9,12 @@
   capability to authenticate a signal-free listener/registry rebind after an
   external unlink. Recovery preserves the daemon, PTY child, existing clients,
   generation, and launch identity; stale, tampered, legacy, or foreign-path
-  attempts fail closed without relaunching.
+  attempts fail closed without relaunching. A retained signed metadata revision
+  prevents older snapshots from rolling back later tags, display names, attach
+  state, or lifecycle metadata. Recovery locks are resumable only by the same
+  authenticated daemon identity after an interrupted CLI, and both the root and
+  `.recovery` directory are identity/permission checked immediately before
+  authenticated request exchange.
 
 ### Read-only session listing
 
