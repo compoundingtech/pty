@@ -13,7 +13,8 @@ import { PacketReader, MessageType } from "@compoundingtech/pty/protocol";
 
 ### `listSessions(): Promise<SessionInfo[]>`
 
-List all sessions (running + exited within 24h).
+List all retained sessions without mutating the registry. Cleanup is owned by
+explicit lifecycle operations such as `gc()` and `cleanupAll()`.
 
 ### `getSession(name: string): Promise<SessionInfo | null>`
 

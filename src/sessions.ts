@@ -14,8 +14,6 @@ export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "p
 let hasWarnedLegacyRootEnv = false;
 let hasWarnedRootMasksLegacy = false;
 
-const DEAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 const VALID_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 
 // Maximum bytes available to `sockaddr_un.sun_path`. Darwin/BSD = 104,
@@ -332,9 +330,132 @@ export interface ListSessionsOptions {
 
 const DEFAULT_SOCKET_PROBE_BUDGET_MS = 500;
 
-export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionInfo[]> {
-  ensureSessionDir();
+/** @internal Testable gc observation/apply token; not part of client-api. */
+export interface RawCleanupCandidate {
+  name: string;
+}
 
+type MetadataArtifactState = "absent" | "valid" | "malformed" | "unreadable";
+
+function inspectMetadataArtifact(
+  name: string,
+  hasMetadata: boolean,
+): MetadataArtifactState {
+  if (!hasMetadata) return "absent";
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(getMetadataPath(name), "utf-8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? "valid"
+      : "malformed";
+  } catch (error) {
+    return error instanceof SyntaxError ? "malformed" : "unreadable";
+  }
+}
+
+/** Inventory registry debris that cannot be represented as a SessionInfo.
+ *
+ * This is deliberately separate from listSessions: observation never mutates,
+ * while gc still needs to discover stale runtime artifacts whose metadata is
+ * missing or malformed. A readable dead pid is positive proof that an
+ * associated socket is stale; malformed metadata without any runtime files is
+ * also reclaimable. Ambiguous startup shapes (socket + missing/invalid pid) are
+ * retained. */
+export async function inventoryRawCleanupCandidates(
+  options: ListSessionsOptions = {},
+  onlyNames?: ReadonlySet<string>,
+): Promise<RawCleanupCandidate[]> {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(getSessionDir());
+  } catch {
+    return [];
+  }
+
+  const names = new Set<string>();
+  for (const entry of entries) {
+    let name: string | undefined;
+    if (entry.endsWith(".events.jsonl")) name = entry.slice(0, -".events.jsonl".length);
+    else if (entry.endsWith(".sock")) name = entry.slice(0, -".sock".length);
+    else if (entry.endsWith(".pid")) name = entry.slice(0, -".pid".length);
+    else if (entry.endsWith(".json")) name = entry.slice(0, -".json".length);
+    if (name && (!onlyNames || onlyNames.has(name))) names.add(name);
+  }
+
+  const entrySet = new Set(entries);
+  const candidates = [...names].sort().map((name) => {
+    const hasSocket = entrySet.has(`${name}.sock`);
+    const hasPid = entrySet.has(`${name}.pid`);
+    const hasMetadata = entrySet.has(`${name}.json`);
+    const metadataState = inspectMetadataArtifact(name, hasMetadata);
+    const pid = hasPid ? readPid(name) : null;
+    const pidDead = pid !== null && !isProcessAlive(pid);
+    return { name, hasSocket, hasPid, hasMetadata, metadataState, pidDead };
+  }).filter(({ metadataState }) =>
+    metadataState === "absent" || metadataState === "malformed"
+  );
+
+  const socketsToProbe = candidates
+    .filter(({ hasSocket, pidDead }) => hasSocket && pidDead)
+    .map(({ name }) => getSocketPath(name));
+  const reachability = await probeSocketsWithinBudget(
+    socketsToProbe,
+    options.socketProbeBudgetMs ?? DEFAULT_SOCKET_PROBE_BUDGET_MS,
+    options.socketProbe ?? isSocketReachable,
+  );
+
+  return candidates.flatMap((candidate) => {
+    if (candidate.pidDead) {
+      if (
+        !candidate.hasSocket ||
+        reachability.get(getSocketPath(candidate.name)) === false
+      ) {
+        return [{ name: candidate.name }];
+      }
+      return [];
+    }
+    if (candidate.hasMetadata && !candidate.hasPid && !candidate.hasSocket) {
+      return [{ name: candidate.name }];
+    }
+    return [];
+  });
+}
+
+/** Apply one raw-artifact cleanup only while owning the per-name creation lock.
+ *
+ * Re-inventorying under the lock closes the observation/apply race: if a live
+ * generation appeared, or the evidence became ambiguous, cleanup is skipped. */
+export async function cleanupRawCandidateGuarded(
+  candidate: RawCleanupCandidate,
+  options: ListSessionsOptions = {},
+): Promise<boolean> {
+  if (!acquireLock(candidate.name)) return false;
+  try {
+    const current = await inventoryRawCleanupCandidates(
+      options,
+      new Set([candidate.name]),
+    );
+    if (!current.some(({ name }) => name === candidate.name)) return false;
+
+    cleanupSocket(candidate.name);
+    try {
+      fs.unlinkSync(getMetadataPath(candidate.name));
+    } catch {}
+    try {
+      fs.unlinkSync(getEventsPath(candidate.name));
+    } catch {}
+    return true;
+  } finally {
+    releaseLock(candidate.name);
+  }
+}
+
+/** Return one bounded, read-only observation of the session registry.
+ *
+ * This function deliberately performs no lifecycle work: it does not create
+ * the registry, unlink stale runtime files, repair malformed records, or reap
+ * old sessions. Callers that intend to mutate lifecycle state must use an
+ * explicit operation such as `gc()` or `cleanupAll()`. */
+export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionInfo[]> {
   let entries: string[];
   try {
     entries = fs.readdirSync(getSessionDir());
@@ -345,15 +466,16 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
   const sessions: SessionInfo[] = [];
   const seen = new Set<string>();
 
-  // Find running sessions (have .sock files). A live session is destroyed here
-  // ONLY on POSITIVE proof of death — a readable pid whose process is gone AND
-  // an unreachable socket. A transiently-unreadable pid must NOT be mistaken
-  // for a dead process: the daemon creates its .sock (listen) BEFORE it writes
-  // its .pid, and the plain pidfile write can be caught mid-flight, so under
-  // concurrent multi-agent load a `pty list` can momentarily read a null pid
-  // for a perfectly healthy session. Reaping on that (the old behavior) deleted
-  // a live daemon's socket/pid out from under it, making it invisible and
-  // getting it GC'd + re-launched by consumers that reconcile on not-running.
+  // Classify sessions that have .sock files without changing registry state.
+  // A live pid or reachable socket proves the daemon is alive. A readable dead
+  // pid plus an unreachable socket lets retained metadata report the session as
+  // exited/vanished below. An unreadable pid plus an unreachable socket remains
+  // ambiguous and stays in the snapshot, reported running defensively unless
+  // retained metadata already records exit. The daemon creates its .sock
+  // (listen) BEFORE it writes its .pid, and the plain pidfile write can be
+  // caught mid-flight.
+  // Artifact cleanup belongs exclusively to explicit lifecycle operations such
+  // as gc/rm.
   const sockFiles = entries.filter((e) => e.endsWith(".sock")).sort();
   const socketCandidates = sockFiles.map((sockFile) => {
     const name = sockFile.replace(/\.sock$/, "");
@@ -387,10 +509,19 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
       const status = metadata?.exitedAt ? "exited" : "running";
       sessions.push({ name, socketPath, pid, status, metadata });
     } else if (pid !== null) {
-      // Positively dead: the pid read SUCCEEDED and its process is gone, and
-      // the socket is unreachable. Safe to reap the stale socket/pid (keep
-      // metadata so the session stays addressable as exited/vanished below).
-      cleanupSocket(name);
+      // Positively dead: report the retained record in this same snapshot.
+      // Listing is observational; explicit gc/rm owns artifact cleanup.
+      const metadata = readMetadata(name);
+      if (metadata) {
+        const vanished = metadata.exitedAt == null && metadata.exitCode == null;
+        sessions.push({
+          name,
+          socketPath,
+          pid: null,
+          status: vanished ? "vanished" : "exited",
+          metadata,
+        });
+      }
     } else {
       // pid UNREADABLE and socket unreachable — we can prove neither life nor
       // death (most likely a daemon mid-startup, or a pidfile write that raced
@@ -403,7 +534,7 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
     }
   }
 
-  // Find dead sessions (have .json but no running process)
+  // Find retained sessions (have .json but no socket observed above).
   const jsonFiles = entries.filter((e) => e.endsWith(".json")).sort();
   for (const jsonFile of jsonFiles) {
     const name = jsonFile.replace(/\.json$/, "");
@@ -411,27 +542,21 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
 
     const metadata = readMetadata(name);
     if (!metadata) {
-      cleanupAll(name);
       continue;
     }
 
-    // Auto-clean dead sessions older than 24h. For cleanly-exited sessions
-    // this keys off exitedAt; for vanished sessions (no exit record written)
-    // fall back to createdAt so they don't accumulate indefinitely. A session
-    // with a missing daemon and a metadata file older than 24h is not coming
-    // back regardless of why it died — *unless* the recorded pid is still
-    // alive, in which case the daemon outlived its socket and we must keep
-    // metadata around so the session stays addressable.
-    const ageAnchor = metadata.exitedAt ?? metadata.createdAt;
-    if (ageAnchor) {
-      const anchoredAt = new Date(ageAnchor).getTime();
-      if (Date.now() - anchoredAt > DEAD_SESSION_TTL_MS) {
-        const pid = readPid(name);
-        if (pid === null || !isProcessAlive(pid)) {
-          cleanupAll(name);
-          continue;
-        }
-      }
+    // A live pid remains authoritative even if its socket inode is temporarily
+    // absent. Listing observes that mismatch; it never "repairs" it.
+    const pid = readPid(name);
+    if (pid !== null && isProcessAlive(pid)) {
+      sessions.push({
+        name,
+        socketPath: getSocketPath(name),
+        pid,
+        status: metadata.exitedAt ? "exited" : "running",
+        metadata,
+      });
+      continue;
     }
 
     // Vanished = dead daemon with no exit record. SIGKILL / OOM / crash.
@@ -683,15 +808,17 @@ export async function gc(
   const globalIdleDays = opts.idleDays;
   const globalFastFailWindow = opts.fastFailWindowSec;
   const globalFastFailLimit = opts.fastFailLimit;
-  // First call to `listSessions` is intentionally throwaway — it has a
-  // side effect (`cleanupSocket`) on sessions whose daemon SIGKILL'd
-  // without writing an exit record, and those sessions are then *missing*
-  // from the returned array (their entry is dropped because `seen` set
-  // contained the name but the alive checks failed). A second call sees
-  // them via the `.json` files loop as `status=vanished`. Without this
-  // priming pass, step 1's orphan-kill misses vanished sessions whose
-  // sockets were still on disk when gc started.
-  await listSessions();
+  const rawCandidates = await inventoryRawCleanupCandidates();
+  const rawRemoved: string[] = [];
+  if (dryRun) {
+    rawRemoved.push(...rawCandidates.map(({ name }) => name));
+  } else {
+    for (const candidate of rawCandidates) {
+      if (await cleanupRawCandidateGuarded(candidate)) {
+        rawRemoved.push(candidate.name);
+      }
+    }
+  }
   const initial = await listSessions();
 
   // STEP 1: orphan-children. Sort by name so cycles (A→B, B→A) resolve
@@ -867,7 +994,7 @@ export async function gc(
   // if it failed we leave the metadata around so the next tick can try
   // again.
   const finalList = dryRun ? initial : await listSessions();
-  const removed: string[] = [];
+  const removed: string[] = [...rawRemoved];
   const kept: string[] = [];
   for (const s of finalList) {
     if (!isGone(s.status)) continue;

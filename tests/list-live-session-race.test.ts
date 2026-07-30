@@ -108,7 +108,7 @@ describe("pty list: concurrency robustness (do not reap a live session on a tran
     expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
   }, 20000);
 
-  it("still reaps a genuinely dead session's stale socket (positive proof of death)", async () => {
+  it("reports a genuinely dead session without reaping during list", async () => {
     const dir = makeSessionDir();
     const name = "dead-reap";
     const pid = await startDaemon(dir, name);
@@ -123,15 +123,12 @@ describe("pty list: concurrency robustness (do not reap a live session on a tran
       await new Promise((r) => setTimeout(r, 50));
     }
 
-    // First list has positive proof of death (readable dead pid + unreachable
-    // socket) → it reaps the stale socket/pid.
-    runCli(dir, ["list", "--json"]);
-    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(false);
-
-    // The session stays addressable as vanished (a SIGKILLed daemon wrote no
-    // exit record) once only its metadata remains.
-    const list2 = JSON.parse(runCli(dir, ["list", "--json"]).stdout);
-    const found = list2.find((s: any) => s.name === name);
+    // Positive proof of death affects the observation, not registry contents.
+    // Cleanup is owned by the explicit gc/rm path.
+    const list = JSON.parse(runCli(dir, ["list", "--json"]).stdout);
+    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    const found = list.find((s: any) => s.name === name);
     expect(found).toBeDefined();
     expect(found.status).toBe("vanished");
   }, 20000);

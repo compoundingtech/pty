@@ -183,9 +183,9 @@ pty rm mybuild                                  # explicit removal beats keep
 ```
 
 `pty gc`'s sweep reclaims preserved-and-finished (and `vanished`) non-permanent
-sessions — see [Auto-running gc](#auto-running-gc). Dead sessions are also
-reclaimed lazily by the 24-hour dead-session TTL on any `pty list`. `keep=true`
-and `strategy=permanent` are exempt from both.
+sessions — see [Auto-running gc](#auto-running-gc). `pty list` is strictly
+observational and never removes registry state. `keep=true` and
+`strategy=permanent` are exempt from the gc sweep.
 
 ### Events
 
@@ -198,7 +198,8 @@ pty events --recent myserver     # dump recent events and exit
 pty events --json myserver       # raw JSONL output
 ```
 
-Event files auto-truncate at 1,000 lines and are cleaned up with the 24-hour dead session TTL.
+Event files auto-truncate at 1,000 lines and are removed with their session by
+lifecycle cleanup (daemon self-reap, `pty gc`, or `pty rm`).
 
 ### On-disk format
 
@@ -339,7 +340,7 @@ Cycles (A→B, B→A) resolve deterministically by name-sorted iteration: whiche
 
 `pty gc` is a one-shot reconciliation pass. The intended deployment is to run it on a short interval so permanent sessions come back quickly and orphans get cleaned promptly. The CLI ships an install helper for macOS:
 
-Whether finished sessions need the sweep depends on [`PTY_REAP_ON_EXIT`](#session-lifecycle-and-cleanup): under the shipped `reap` default they self-clean at exit, so the sweep's finished-session duty is mostly `vanished` sessions (daemon killed outright, so it never ran its own cleanup) plus anything left listed by `preserve` mode. Those are also reclaimed lazily by the 24-hour dead-session TTL on any `pty list`. So the interval primarily buys you respawn latency for permanents and orphan-kill promptness — and, in `preserve` mode, `pty ls` hygiene. `keep=true` and `strategy=permanent` sessions are exempt.
+Whether finished sessions need the sweep depends on [`PTY_REAP_ON_EXIT`](#session-lifecycle-and-cleanup): under the shipped `reap` default they self-clean at exit, so the sweep's finished-session duty is mostly `vanished` sessions (daemon killed outright, so it never ran its own cleanup) plus anything left listed by `preserve` mode. `pty list` only observes this state; it never cleans it up. So the interval primarily buys you respawn latency for permanents and orphan-kill promptness — and, in `preserve` mode, `pty ls` hygiene. `keep=true` and `strategy=permanent` sessions are exempt.
 
 ```sh
 pty gc --print-launchd-plist > ~/Library/LaunchAgents/com.compoundingtech.pty.gc.plist
