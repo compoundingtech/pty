@@ -119,9 +119,13 @@ export function getEventsPath(name: string): string {
 }
 
 /** Out-of-band request consumed by a live daemon whose ordinary pathname
- * socket was unlinked. Deliberately does not use a scanned registry suffix. */
-export function getRecoveryRequestPath(name: string): string {
-  return path.join(getSessionDir(), `${name}.recover-request`);
+ * socket was unlinked. Nonce-specific paths make concurrent publish/removal
+ * linearizable: one caller can never unlink another caller's request. */
+export function getRecoveryRequestPath(name: string, nonce: string): string {
+  if (!/^[a-f0-9]{32}$/.test(nonce)) {
+    throw new Error("Recovery request nonce must be 32 lowercase hex characters");
+  }
+  return path.join(getSessionDir(), `${name}.recover-request.${nonce}`);
 }
 
 // PUBLIC FORMAT — this is the on-disk shape of `<name>.json`. Any change
@@ -189,10 +193,13 @@ export interface LiveRecoveryRequest {
 
 export const LIVE_RECOVERY_REQUEST_TTL_MS = 30_000;
 
-export function readLiveRecoveryRequest(name: string): LiveRecoveryRequest | null {
+export function readLiveRecoveryRequest(
+  name: string,
+  nonce: string,
+): LiveRecoveryRequest | null {
   try {
     const parsed: unknown = JSON.parse(
-      fs.readFileSync(getRecoveryRequestPath(name), "utf-8"),
+      fs.readFileSync(getRecoveryRequestPath(name, nonce), "utf-8"),
     );
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
     const request = parsed as Partial<LiveRecoveryRequest>;
@@ -219,26 +226,41 @@ export function readLiveRecoveryRequest(name: string): LiveRecoveryRequest | nul
   }
 }
 
+/** Read every syntactically valid request for one name, newest first. */
+export function listLiveRecoveryRequests(name: string): LiveRecoveryRequest[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(getSessionDir());
+  } catch {
+    return [];
+  }
+  const prefix = `${name}.recover-request.`;
+  return entries
+    .filter((entry) => entry.startsWith(prefix))
+    .map((entry) => entry.slice(prefix.length))
+    .filter((nonce) => /^[a-f0-9]{32}$/.test(nonce))
+    .map((nonce) => readLiveRecoveryRequest(name, nonce))
+    .filter((request): request is LiveRecoveryRequest => request !== null)
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
 /** Atomically publish the latest recovery request.
  *
- * This intentionally replaces a stale/crash-left request rather than wedging
- * recovery behind a permanent wx file. Concurrent callers are safe: the
- * daemon validates every snapshot against its own immutable identity, and each
- * caller removes only its nonce. */
+ * Nonce-specific files mean a crash-left request never blocks a fresh caller,
+ * and each caller can remove only its own inode. */
 export function createLiveRecoveryRequest(request: LiveRecoveryRequest): void {
   ensureSessionDir();
-  atomicWriteFileSync(
-    getRecoveryRequestPath(request.name),
+  fs.writeFileSync(
+    getRecoveryRequestPath(request.name, request.nonce),
     JSON.stringify(request, null, 2),
+    { flag: "wx", mode: 0o600 },
   );
 }
 
-/** Remove only the request this caller created; never erase a newer request. */
+/** Remove exactly this nonce's file; concurrent requests have different paths. */
 export function removeLiveRecoveryRequest(name: string, nonce: string): boolean {
-  const current = readLiveRecoveryRequest(name);
-  if (current?.nonce !== nonce) return false;
   try {
-    fs.unlinkSync(getRecoveryRequestPath(name));
+    fs.unlinkSync(getRecoveryRequestPath(name, nonce));
     return true;
   } catch {
     return false;
@@ -1621,7 +1643,12 @@ export function cleanupSocket(name: string): void {
     fs.unlinkSync(getPidPath(name));
   } catch {}
   try {
-    fs.unlinkSync(getRecoveryRequestPath(name));
+    const prefix = `${name}.recover-request.`;
+    for (const entry of fs.readdirSync(getSessionDir())) {
+      if (entry.startsWith(prefix)) {
+        try { fs.unlinkSync(path.join(getSessionDir(), entry)); } catch {}
+      }
+    }
   } catch {}
 }
 

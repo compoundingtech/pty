@@ -7,6 +7,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { terminateAndWait } from "./setup/processes.ts";
 import { encodeAttach, encodeData } from "../src/protocol.ts";
+import { PtyServer } from "../src/server.ts";
+import {
+  getRecoveryRequestPath,
+  removeLiveRecoveryRequest,
+} from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -227,10 +232,16 @@ describe("live daemon registry recovery", () => {
       foreign.listen(socketPath, () => resolve());
     });
 
-    const result = runRecover(root, name, snapshotPath, 200);
+    const beforeIdentity = fs.statSync(socketPath, { bigint: true });
+    const result = runRecover(root, name, snapshotPath, 1200);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("did not republish");
     expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(fs.existsSync(path.join(root, `${name}.pid`))).toBe(false);
+    expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(false);
+    const afterIdentity = fs.statSync(socketPath, { bigint: true });
+    expect(afterIdentity.dev).toBe(beforeIdentity.dev);
+    expect(afterIdentity.ino).toBe(beforeIdentity.ino);
     const probe = await connect(socketPath);
     clients.push(probe);
     expect(probe.destroyed).toBe(false);
@@ -250,11 +261,11 @@ describe("live daemon registry recovery", () => {
     unlinkRegistry(root, name);
 
     fs.writeFileSync(
-      path.join(root, `${name}.recover-request`),
+      path.join(root, `${name}.recover-request.00000000000000000000000000000000`),
       JSON.stringify({
         protocol: 1,
         name,
-        nonce: "stale-request",
+        nonce: "00000000000000000000000000000000",
         createdAt: new Date(Date.now() - 60_000).toISOString(),
         expectedPid: pid,
         expectedGeneration: snapshot.generation,
@@ -269,5 +280,94 @@ describe("live daemon registry recovery", () => {
     const fresh = runRecover(root, name, snapshotPath);
     expect(fresh.status, fresh.stderr).toBe(0);
     expect(Number(fs.readFileSync(path.join(root, `${name}.pid`), "utf-8"))).toBe(pid);
+  });
+
+  it("recovers on retry after a bind race fails after listener close", async () => {
+    const root = fs.mkdtempSync(path.join(testBase, "direct-root-"));
+    const previousRoot = process.env.PTY_ROOT;
+    const previousLegacyRoot = process.env.PTY_SESSION_DIR;
+    process.env.PTY_ROOT = root;
+    delete process.env.PTY_SESSION_DIR;
+    const name = "recover-bind-race";
+    const server = new PtyServer({
+      name,
+      command: "/bin/sh",
+      args: ["-c", "while :; do sleep 1; done"],
+      displayCommand: "synthetic-bind-race",
+      cwd: os.tmpdir(),
+      rows: 24,
+      cols: 80,
+    });
+    let foreign: net.Server | null = null;
+    let recoveredClient: net.Socket | null = null;
+    try {
+      await server.ready;
+      const socketPath = path.join(root, `${name}.sock`);
+      const snapshot = JSON.parse(
+        fs.readFileSync(path.join(root, `${name}.json`), "utf-8"),
+      );
+      const request = {
+        protocol: 1 as const,
+        name,
+        nonce: "11111111111111111111111111111111",
+        createdAt: new Date().toISOString(),
+        expectedPid: process.pid,
+        expectedGeneration: snapshot.generation,
+        expectedStartToken: snapshot.daemonStartToken,
+        snapshot,
+      };
+      unlinkRegistry(root, name);
+
+      await expect(server.recoverLiveRegistry(request, {
+        beforeReplacementListen: async () => {
+          foreign = net.createServer();
+          await new Promise<void>((resolve, reject) => {
+            foreign!.once("error", reject);
+            foreign!.listen(socketPath, () => resolve());
+          });
+        },
+      })).rejects.toMatchObject({ code: "EADDRINUSE" });
+      expect(fs.existsSync(path.join(root, `${name}.pid`))).toBe(false);
+
+      await new Promise<void>((resolve) => foreign!.close(() => resolve()));
+      foreign = null;
+      await server.recoverLiveRegistry({
+        ...request,
+        nonce: "22222222222222222222222222222222",
+        createdAt: new Date().toISOString(),
+      });
+      recoveredClient = await connect(socketPath);
+      expect(Number(fs.readFileSync(path.join(root, `${name}.pid`), "utf-8")))
+        .toBe(process.pid);
+    } finally {
+      recoveredClient?.destroy();
+      if (foreign) {
+        await new Promise<void>((resolve) => foreign!.close(() => resolve()));
+      }
+      await server.close();
+      if (previousRoot === undefined) delete process.env.PTY_ROOT;
+      else process.env.PTY_ROOT = previousRoot;
+      if (previousLegacyRoot === undefined) delete process.env.PTY_SESSION_DIR;
+      else process.env.PTY_SESSION_DIR = previousLegacyRoot;
+    }
+  });
+
+  it("removing one nonce can never delete a concurrently published request", () => {
+    const root = fs.mkdtempSync(path.join(testBase, "nonce-root-"));
+    const previousRoot = process.env.PTY_ROOT;
+    process.env.PTY_ROOT = root;
+    const name = "recover-concurrent";
+    const nonceA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const nonceB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try {
+      fs.writeFileSync(getRecoveryRequestPath(name, nonceA), "{}");
+      fs.writeFileSync(getRecoveryRequestPath(name, nonceB), "{}");
+      expect(removeLiveRecoveryRequest(name, nonceA)).toBe(true);
+      expect(fs.existsSync(getRecoveryRequestPath(name, nonceA))).toBe(false);
+      expect(fs.existsSync(getRecoveryRequestPath(name, nonceB))).toBe(true);
+    } finally {
+      if (previousRoot === undefined) delete process.env.PTY_ROOT;
+      else process.env.PTY_ROOT = previousRoot;
+    }
   });
 });

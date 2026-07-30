@@ -15,7 +15,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
-| `<name>.recover-request` | authenticated one-shot live-daemon recovery request | 2 |
+| `<name>.recover-request.<nonce>` | authenticated one-shot live-daemon recovery request | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |

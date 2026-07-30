@@ -31,7 +31,7 @@ import {
   readProcessStartToken,
   acquireLock,
   releaseLock,
-  readLiveRecoveryRequest,
+  listLiveRecoveryRequests,
   removeLiveRecoveryRequest,
   LIVE_RECOVERY_REQUEST_TTL_MS,
   shouldReapAtExit,
@@ -601,10 +601,10 @@ export class PtyServer {
 
   }
 
-  private createSocketServer(): net.Server {
+  private createSocketServer(logErrors = true): net.Server {
     const server = net.createServer((socket) => this.handleClient(socket));
     server.on("error", (err) => {
-      console.error(`Socket server error: ${err.message}`);
+      if (logErrors) console.error(`Socket server error: ${err.message}`);
     });
     return server;
   }
@@ -650,7 +650,10 @@ export class PtyServer {
    * while holding the ordinary per-name creation lock so a replacement launch
    * cannot race the rebind. Existing client sockets stay on the old server and
    * are not disconnected. */
-  async recoverLiveRegistry(request: LiveRecoveryRequest): Promise<void> {
+  async recoverLiveRegistry(
+    request: LiveRecoveryRequest,
+    testHooks: { beforeReplacementListen?: () => void | Promise<void> } = {},
+  ): Promise<void> {
     const requestAgeMs = Date.now() - Date.parse(request.createdAt);
     if (
       !Number.isFinite(requestAgeMs) ||
@@ -729,7 +732,8 @@ export class PtyServer {
         // this happened after listenReplacement, that deferred cleanup could
         // erase the new socket. Existing client connections remain valid.
         if (previousServer?.listening) previousServer.close();
-        const replacementServer = this.createSocketServer();
+        await testHooks.beforeReplacementListen?.();
+        const replacementServer = this.createSocketServer(false);
         try {
           await this.listenReplacement(replacementServer, socketPath);
         } catch (error) {
@@ -1375,7 +1379,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
   // read attempt per daemon every 500ms, with no long-lived shared supervisor.
   recoveryPoll = setInterval(() => {
     if (recoveryPromise || shutdownPromise) return;
-    const request = readLiveRecoveryRequest(config.name);
+    const request = listLiveRecoveryRequests(config.name)[0];
     if (!request) return;
     const operation = server.recoverLiveRegistry(request);
     recoveryPromise = operation;
@@ -1385,6 +1389,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
       // The CLI observes refusal through its bounded registry/socket wait. Do
       // not write to the daemon's launch-time stderr pipe: detached spawners
       // have already exited and that pipe may no longer have a reader.
+      removeLiveRecoveryRequest(config.name, request.nonce);
     }).finally(() => {
       if (recoveryPromise === operation) recoveryPromise = null;
     });
