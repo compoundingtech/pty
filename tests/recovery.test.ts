@@ -7,15 +7,24 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { PacketReader, MessageType, encodeAttach } from "../src/protocol.ts";
 import { queryStats } from "../src/client.ts";
-import { acquireRecoveryLock, type SessionMetadata } from "../src/sessions.ts";
+import {
+  acquireRecoveryLock,
+  writeMetadata,
+  type SessionMetadata,
+} from "../src/sessions.ts";
 import {
   RECOVERY_PROTOCOL,
   RECOVERY_MAX_BYTES,
+  metadataRevision,
   readProcessStartToken,
+  readBoundedJson,
   recoveryLockContents,
   recoveryLockIdentity,
+  recoveryRevisionPath,
   recoveryResultPath,
   recoveryRequestPath,
+  verifyRecoveryRevision,
+  type RecoveryRevision,
 } from "../src/recovery.ts";
 import { terminateAndWait } from "./setup/processes.ts";
 
@@ -132,6 +141,64 @@ describe("live daemon registry recovery", () => {
     fs.chmodSync(root, 0o755);
     startProvider(root, "public-root");
     expect(metadata(root, "public-root").recovery).toBeUndefined();
+  });
+
+  it("advances the signed revision before publishing mutated metadata", () => {
+    const root = makeRoot();
+    const name = "ordered-revision";
+    const recoveryDir = path.join(root, ".recovery");
+    fs.mkdirSync(recoveryDir, { mode: 0o700 });
+    const rootStat = fs.lstatSync(root);
+    const recoveryStat = fs.lstatSync(recoveryDir);
+    const initial: SessionMetadata = {
+      generation: "ordered-generation",
+      daemonPid: process.pid,
+      recovery: {
+        protocol: RECOVERY_PROTOCOL,
+        secret: "11".repeat(32),
+        processStartToken: "test-start",
+        launchIdentity: "22".repeat(32),
+        rootDevice: rootStat.dev,
+        rootInode: rootStat.ino,
+        recoveryDirDevice: recoveryStat.dev,
+        recoveryDirInode: recoveryStat.ino,
+        metadataRevision: "",
+      },
+      command: "/bin/sh",
+      args: [],
+      displayCommand: "sh",
+      cwd: root,
+      createdAt: new Date().toISOString(),
+    };
+    writeMetadata(name, initial);
+    const before = metadata(root, name);
+    const mutated: SessionMetadata = {
+      ...before,
+      tags: { role: "current", strategy: "permanent" },
+      displayName: "Current Display",
+      lastAttachAt: new Date().toISOString(),
+    };
+    let seamObserved = false;
+
+    writeMetadata(name, mutated, {
+      afterRecoveryRevisionPublished: () => {
+        seamObserved = true;
+        // The old metadata is still the only visible snapshot at this exact
+        // seam, but its revision has already stopped being authoritative.
+        expect(metadata(root, name)).toEqual(before);
+        const revision = readBoundedJson<RecoveryRevision>(
+          recoveryRevisionPath(root, name),
+        );
+        expect(verifyRecoveryRevision(initial.recovery!.secret, revision)).toBe(true);
+        expect(revision.metadataRevision).toBe(metadataRevision(mutated));
+        expect(revision.metadataRevision).not.toBe(before.recovery!.metadataRevision);
+      },
+    });
+
+    expect(seamObserved).toBe(true);
+    expect(metadata(root, name).tags).toEqual(mutated.tags);
+    expect(metadata(root, name).displayName).toBe(mutated.displayName);
+    expect(metadata(root, name).lastAttachAt).toBe(mutated.lastAttachAt);
   });
 
   it("rebinds the original daemon while preserving provider and attached client", async () => {

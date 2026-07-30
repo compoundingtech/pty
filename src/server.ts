@@ -775,14 +775,10 @@ export class PtyServer {
         };
         const recoveredMetadata = this.recoveryMetadata(request.metadata, rotated);
         rotatedCapability = recoveredMetadata.recovery!;
-        publishPrivateNoReplace(pidPath, process.pid.toString());
-        publishedPid = true;
-        publishPrivateNoReplace(metadataPath, JSON.stringify(recoveredMetadata, null, 2));
-        publishedMetadata = true;
-        const finalSocket = fs.lstatSync(socketPath);
-        if (finalSocket.dev !== socketIdentity.dev || finalSocket.ino !== socketIdentity.ino) {
-          throw new Error("recovery pathname was replaced during publication");
-        }
+        // Advance the authoritative signed revision before any rotated
+        // capability-bearing metadata becomes visible. A later publication
+        // failure intentionally leaves recovery unavailable rather than
+        // allowing the old snapshot/secret to roll metadata back.
         assertPrivateRecoveryPaths(this.recoveryRoot, capability);
         atomicWritePrivate(
           recoveryRevisionPath(this.recoveryRoot, this.name),
@@ -793,6 +789,14 @@ export class PtyServer {
             metadataRevision: rotatedCapability.metadataRevision,
           }),
         );
+        publishPrivateNoReplace(pidPath, process.pid.toString());
+        publishedPid = true;
+        publishPrivateNoReplace(metadataPath, JSON.stringify(recoveredMetadata, null, 2));
+        publishedMetadata = true;
+        const finalSocket = fs.lstatSync(socketPath);
+        if (finalSocket.dev !== socketIdentity.dev || finalSocket.ino !== socketIdentity.ino) {
+          throw new Error("recovery pathname was replaced during publication");
+        }
 
         const previous = this.socketServer;
         this.socketServer = replacement;

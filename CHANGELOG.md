@@ -14,7 +14,9 @@
   state, or lifecycle metadata. Recovery locks are resumable only by the same
   authenticated daemon identity after an interrupted CLI, and both the root and
   `.recovery` directory are identity/permission checked immediately before
-  authenticated request exchange.
+  authenticated request exchange. Metadata mutations advance their signed
+  recovery revision before publishing the new metadata, so an unlink during
+  publication can deny recovery but cannot authorize an older snapshot.
 
 ### Read-only session listing
 

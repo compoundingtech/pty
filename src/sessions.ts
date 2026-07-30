@@ -241,13 +241,21 @@ function randomHex(bytes: number): string {
   return out;
 }
 
-export function writeMetadata(name: string, metadata: SessionMetadata): void {
+export interface WriteMetadataHooks {
+  /** @internal Deterministic seam for proving recovery revision publication
+   *  precedes the metadata rename. */
+  afterRecoveryRevisionPublished?: () => void;
+}
+
+export function writeMetadata(
+  name: string,
+  metadata: SessionMetadata,
+  hooks: WriteMetadataHooks = {},
+): void {
   ensureSessionDir();
   const stamped = stampRecoveryMetadata(metadata);
-  atomicWriteFileSync(getMetadataPath(name), JSON.stringify(stamped, null, 2));
   const capability = stamped.recovery;
-  if (!capability || !stamped.generation) return;
-  try {
+  if (capability && stamped.generation) {
     const root = path.resolve(getSessionDir());
     assertPrivateRecoveryPaths(root, capability);
     atomicWritePrivate(
@@ -259,11 +267,12 @@ export function writeMetadata(name: string, metadata: SessionMetadata): void {
         metadataRevision: capability.metadataRevision,
       }),
     );
-  } catch {
-    // Metadata remains usable if recovery storage is no longer trustworthy.
-    // The retained old/missing signed revision makes any later recovery fail
-    // closed rather than accepting this untracked mutation.
+    hooks.afterRecoveryRevisionPublished?.();
   }
+  // For capability-bearing metadata the signed revision is authoritative
+  // first. If this rename fails, the advanced revision intentionally makes the
+  // old visible metadata unrecoverable rather than authorizing stale rollback.
+  atomicWriteFileSync(getMetadataPath(name), JSON.stringify(stamped, null, 2));
 }
 
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.

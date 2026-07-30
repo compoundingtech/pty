@@ -80,7 +80,10 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   do not publish snapshots. The root and `.recovery` directory identities and
   permissions are revalidated before recovery state is exchanged. A signed
   retained revision rejects older snapshots after tags, display name, attach
-  state, or other metadata changes. Successful recovery rotates the secret.
+  state, or other metadata changes. The signed revision advances before changed
+  metadata is renamed into place: a partial publication may disable recovery,
+  but never re-authorizes the previous snapshot. Successful recovery rotates
+  the secret.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).
