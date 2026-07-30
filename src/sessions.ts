@@ -466,15 +466,14 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
   const sessions: SessionInfo[] = [];
   const seen = new Set<string>();
 
-  // Find running sessions (have .sock files). A live session is destroyed here
-  // ONLY on POSITIVE proof of death — a readable pid whose process is gone AND
-  // an unreachable socket. A transiently-unreadable pid must NOT be mistaken
-  // for a dead process: the daemon creates its .sock (listen) BEFORE it writes
-  // its .pid, and the plain pidfile write can be caught mid-flight, so under
-  // concurrent multi-agent load a `pty list` can momentarily read a null pid
-  // for a perfectly healthy session. Reaping on that (the old behavior) deleted
-  // a live daemon's socket/pid out from under it, making it invisible and
-  // getting it GC'd + re-launched by consumers that reconcile on not-running.
+  // Classify sessions that have .sock files without changing registry state.
+  // A live pid or reachable socket proves the daemon is alive. A readable dead
+  // pid plus an unreachable socket lets retained metadata report the session as
+  // exited/vanished below. An unreadable pid plus an unreachable socket remains
+  // ambiguous and is omitted: the daemon creates its .sock (listen) BEFORE it
+  // writes its .pid, and the plain pidfile write can be caught mid-flight.
+  // Artifact cleanup belongs exclusively to explicit lifecycle operations such
+  // as gc/rm.
   const sockFiles = entries.filter((e) => e.endsWith(".sock")).sort();
   const socketCandidates = sockFiles.map((sockFile) => {
     const name = sockFile.replace(/\.sock$/, "");
