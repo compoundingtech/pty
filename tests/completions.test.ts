@@ -63,6 +63,16 @@ describe("completion spec parity with COMMAND_HELP", () => {
 });
 
 describe("pty completions <shell>", () => {
+  it("matches every checked-in completion artifact", () => {
+    for (const shell of ["fish", "bash", "zsh"]) {
+      const checkedIn = fs.readFileSync(
+        path.join(__dirname, "..", "completions", `pty.${shell}`),
+        "utf8",
+      );
+      expect(gen(shell), `completions/pty.${shell} is stale`).toBe(checkedIn);
+    }
+  });
+
   it("offers pty run --env in every generated shell", () => {
     const markers = { fish: "-l env", bash: "--env", zsh: "--env" } as const;
     for (const shell of ["fish", "bash", "zsh"] as const) {

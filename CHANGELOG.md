@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Attach-only CLI policy
+
+- `pty attach --no-restart <ref>` attaches only to a currently running
+  session. Missing, exited, or vanished sessions fail without prompting or
+  executing retained launch metadata. Existing interactive prompting and
+  `--auto-restart` behavior are unchanged.
+
 ### Generation-safe removal and immediate same-name reuse
 
 - `pty rm` now returns success only after the removed session's daemon has

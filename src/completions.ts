@@ -85,6 +85,7 @@ const COMMANDS: readonly CommandSpec[] = [
     dynamic: "sessions",
     flags: [
       { name: "auto-restart", short: "r", desc: "Auto-restart if the session is exited" },
+      { name: "no-restart", desc: "Attach only; never prompt or restart an exited session" },
       { name: "force", desc: "Attach even from inside another pty" },
       { name: "remote", desc: "Attach a session on a fabric peer" },
     ],
