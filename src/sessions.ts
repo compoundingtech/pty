@@ -206,7 +206,7 @@ export function readLiveRecoveryRequest(
     if (
       request.protocol !== 1 ||
       request.name !== name ||
-      typeof request.nonce !== "string" ||
+      request.nonce !== nonce ||
       typeof request.createdAt !== "string" ||
       !Number.isInteger(request.expectedPid) ||
       typeof request.expectedGeneration !== "string" ||
@@ -1645,7 +1645,8 @@ export function cleanupSocket(name: string): void {
   try {
     const prefix = `${name}.recover-request.`;
     for (const entry of fs.readdirSync(getSessionDir())) {
-      if (entry.startsWith(prefix)) {
+      const nonce = entry.slice(prefix.length);
+      if (entry.startsWith(prefix) && /^[a-f0-9]{32}$/.test(nonce)) {
         try { fs.unlinkSync(path.join(getSessionDir(), entry)); } catch {}
       }
     }

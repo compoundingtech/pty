@@ -9,7 +9,9 @@ import { terminateAndWait } from "./setup/processes.ts";
 import { encodeAttach, encodeData } from "../src/protocol.ts";
 import { PtyServer } from "../src/server.ts";
 import {
+  cleanupSocket,
   getRecoveryRequestPath,
+  readLiveRecoveryRequest,
   removeLiveRecoveryRequest,
 } from "../src/sessions.ts";
 
@@ -365,6 +367,61 @@ describe("live daemon registry recovery", () => {
       expect(removeLiveRecoveryRequest(name, nonceA)).toBe(true);
       expect(fs.existsSync(getRecoveryRequestPath(name, nonceA))).toBe(false);
       expect(fs.existsSync(getRecoveryRequestPath(name, nonceB))).toBe(true);
+    } finally {
+      if (previousRoot === undefined) delete process.env.PTY_ROOT;
+      else process.env.PTY_ROOT = previousRoot;
+    }
+  });
+
+  it("rejects a request whose payload nonce differs from its filename", () => {
+    const root = fs.mkdtempSync(path.join(testBase, "nonce-mismatch-root-"));
+    const previousRoot = process.env.PTY_ROOT;
+    process.env.PTY_ROOT = root;
+    const name = "recover-nonce-mismatch";
+    const nonceA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const nonceB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try {
+      fs.writeFileSync(
+        getRecoveryRequestPath(name, nonceA),
+        JSON.stringify({
+          protocol: 1,
+          name,
+          nonce: nonceB,
+          createdAt: new Date().toISOString(),
+          expectedPid: process.pid,
+          expectedGeneration: "generation",
+          expectedStartToken: "start-token",
+          snapshot: {
+            recoveryProtocol: 1,
+            daemonStartToken: "start-token",
+          },
+        }),
+      );
+      fs.writeFileSync(getRecoveryRequestPath(name, nonceB), "{}");
+
+      expect(readLiveRecoveryRequest(name, nonceA)).toBeNull();
+      expect(fs.existsSync(getRecoveryRequestPath(name, nonceB))).toBe(true);
+    } finally {
+      if (previousRoot === undefined) delete process.env.PTY_ROOT;
+      else process.env.PTY_ROOT = previousRoot;
+    }
+  });
+
+  it("cleanup cannot delete another legal session name's request", () => {
+    const root = fs.mkdtempSync(path.join(testBase, "cleanup-isolation-root-"));
+    const previousRoot = process.env.PTY_ROOT;
+    process.env.PTY_ROOT = root;
+    const name = "recover-cleanup";
+    const otherName = `${name}.recover-request.child`;
+    const nonce = "cccccccccccccccccccccccccccccccc";
+    try {
+      fs.writeFileSync(getRecoveryRequestPath(name, nonce), "{}");
+      fs.writeFileSync(getRecoveryRequestPath(otherName, nonce), "{}");
+
+      cleanupSocket(name);
+
+      expect(fs.existsSync(getRecoveryRequestPath(name, nonce))).toBe(false);
+      expect(fs.existsSync(getRecoveryRequestPath(otherName, nonce))).toBe(true);
     } finally {
       if (previousRoot === undefined) delete process.env.PTY_ROOT;
       else process.env.PTY_ROOT = previousRoot;
