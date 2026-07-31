@@ -37,6 +37,9 @@
 - Metadata publication acquires the event lock before the metadata lock, so a
   busy event log fails before either file changes. Event appends and retention
   rewrites are serialized without a per-record byte-size assumption.
+- `pty exec` now carries an opaque generation owner token in session children
+  and refuses stale same-id replacements. Sessions started by an older build
+  must be restarted once before they can use `pty exec`.
 - The current display-name contract supersedes the permissive limits described
   in earlier release notes: values must be nonempty, already trimmed,
   single-line, free of Unicode control characters, and at most 160 Unicode

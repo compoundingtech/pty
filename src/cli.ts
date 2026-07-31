@@ -27,6 +27,7 @@ import {
   updateTags,
   setDisplayName,
   patchMetadataById,
+  mutateMetadataUnderLock,
   allSessionNames,
   readMetadata,
   readSessionPid,
@@ -39,7 +40,7 @@ import {
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
-  acquireEventLock, EventFollower, EventWriter, EventType, releaseEventLock,
+  acquireEventLock, appendEventSyncLocked, EventFollower, EventWriter, EventType, releaseEventLock,
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
@@ -1778,16 +1779,16 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     console.error("pty exec: not inside a pty session (PTY_SESSION not set).");
     process.exit(1);
   }
+  const ownerGeneration = process.env.PTY_SESSION_GENERATION;
+  if (!ownerGeneration) {
+    throw new Error(
+      "pty exec: current session has no generation owner token; restart it before using pty exec.",
+    );
+  }
 
   const meta = readMetadata(sessionName);
   if (!meta) {
     console.error(`pty exec: session "${sessionName}" metadata not found.`);
-    process.exit(1);
-  }
-
-  if (meta.tags?.ptyfile) {
-    console.error(`pty exec: session "${sessionName}" is managed by ${meta.tags.ptyfile}`);
-    console.error("Edit the pty.toml to change the command instead.");
     process.exit(1);
   }
 
@@ -1800,26 +1801,45 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Update metadata with the new command
-  const previousCommand = meta.displayCommand ?? [meta.command, ...(meta.args ?? [])].join(" ");
   const displayCommand = [command, ...cmdArgs].join(" ");
-  writeMetadata(sessionName, {
-    ...meta,
-    command: resolved,
-    args: cmdArgs,
-    displayCommand,
-  });
+  if (!acquireEventLock(sessionName)) {
+    throw new Error(`pty exec: session "${sessionName}" event log is busy; retry the operation.`);
+  }
+  try {
+    let previousCommand = "";
+    const result = mutateMetadataUnderLock(sessionName, (current) => {
+      if (current.tags?.ptyfile) {
+        throw new Error(
+          `pty exec: session "${sessionName}" is managed by ${current.tags.ptyfile}. ` +
+          "Edit the pty.toml to change the command instead.",
+        );
+      }
+      previousCommand = current.displayCommand ??
+        [current.command, ...(current.args ?? [])].join(" ");
+      current.command = resolved;
+      current.args = cmdArgs;
+      current.displayCommand = displayCommand;
+      return true;
+    }, {
+      expectedGeneration: ownerGeneration,
+      onPublished: () => appendEventSyncLocked(sessionName, {
+        session: sessionName,
+        type: EventType.SESSION_EXEC,
+        ts: new Date().toISOString(),
+        previousCommand,
+        command: displayCommand,
+      }),
+    });
 
-  // Emit exec event
-  const writer = new EventWriter(sessionName);
-  writer.append({
-    session: sessionName,
-    type: EventType.SESSION_EXEC,
-    ts: new Date().toISOString(),
-    previousCommand,
-    command: displayCommand,
-  } as any);
-  await writer.flush();
+    if (result.status !== "changed") {
+      const reason = result.status === "generation-mismatch"
+        ? "belongs to a replacement generation"
+        : `could not be updated (${result.status})`;
+      throw new Error(`pty exec: session "${sessionName}" ${reason}; command was not run.`);
+    }
+  } finally {
+    releaseEventLock(sessionName);
+  }
 
   // Replace this process with the new command
   const result = spawnSync(resolved, cmdArgs, {
@@ -2806,6 +2826,12 @@ async function cmdGc(
       : a.reason;
     console.log(`${abandonVerb}: ${a.name} (${detail})`);
   }
+  for (const skipped of result.reapSkipped) {
+    const phase = skipped.signalled ? "after signalling" : "before signalling";
+    console.log(
+      `Skipped ${skipped.operation} reap: ${skipped.name} (${skipped.reason}, ${phase})`,
+    );
+  }
   for (const r of result.respawned) {
     const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
     console.log(`${respawnVerb}: ${r.name}${note}`);
@@ -2842,6 +2868,7 @@ async function cmdGc(
   const totalActions =
     result.killedOrphanChildren.length +
     result.abandoned.length +
+    result.reapSkipped.length +
     result.respawned.length +
     result.respawnFailed.length +
     result.flapped.length +
@@ -2860,6 +2887,9 @@ async function cmdGc(
   }
   if (result.abandoned.length > 0) {
     parts.push(`${result.abandoned.length} abandoned`);
+  }
+  if (result.reapSkipped.length > 0) {
+    parts.push(`${result.reapSkipped.length} reap skip${result.reapSkipped.length === 1 ? "" : "s"}`);
   }
   if (result.respawned.length > 0) {
     parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);

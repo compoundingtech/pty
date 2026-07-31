@@ -455,8 +455,9 @@ describe("spawnDaemon options", () => {
     expect(dumped).toContain("PTY_VERBATIM_MARKER=from-verbatim-env");
     expect(dumped).not.toContain("PTY_VERBATIM_LEAK_CANARY");
     expect(dumped).not.toContain("leaked");
-    // PTY_SESSION is always injected on top so nesting/exec keep working
+    // Stable identity and generation ownership are always injected on top.
     expect(dumped).toContain(`PTY_SESSION=${name}`);
+    expect(dumped).toMatch(/^PTY_SESSION_GENERATION=[0-9a-f]{32}$/m);
   }, 15000);
 
   it("env option combined with isolateEnv fails daemon startup", async () => {

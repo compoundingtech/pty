@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { acquireLock, gc, isProcessAlive, releaseLock } from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -119,6 +120,36 @@ afterEach(async () => {
 });
 
 describe("pty gc — abandoned-reap step 1.5", () => {
+  it("does not signal an abandoned session when its metadata lease is busy", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const cwd = makeCwd();
+    const pid = await startDaemon(dir, name, cwd, "sleep", ["60"], {
+      strategy: "permanent",
+    });
+    fs.rmSync(cwd, { recursive: true, force: true });
+    const previousRoot = process.env.PTY_SESSION_DIR;
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireLock(name)).toBe(true);
+    try {
+      const result = await gc();
+      expect(result.abandoned).toHaveLength(0);
+      expect(result.reapSkipped).toContainEqual({
+        name,
+        operation: "abandoned",
+        reason: "busy",
+        signalled: false,
+      });
+      expect(isProcessAlive(pid)).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    } finally {
+      releaseLock(name);
+      if (previousRoot === undefined) delete process.env.PTY_SESSION_DIR;
+      else process.env.PTY_SESSION_DIR = previousRoot;
+    }
+  }, 15000);
+
   it("reaps a running permanent session whose cwd has been deleted", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

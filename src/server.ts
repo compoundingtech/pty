@@ -81,8 +81,9 @@ export interface ServerOptions {
    *  before `extraEnv`, so an explicit assignment wins when both mention a key. */
   unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
-   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
-   *  injected on top so nesting detection and `pty exec` keep working.
+   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` and the opaque
+   *  `PTY_SESSION_GENERATION` owner token are always injected on top so
+   *  nesting detection and generation-safe `pty exec` keep working.
    *
    *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
    *  `env` together with inherited-environment policy throws. Use this when
@@ -130,11 +131,12 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     );
   }
 
-  // Explicit verbatim env. No inheritance. Only PTY_SESSION is forced on
-  // top so internal pty tooling (nesting prevention, `pty exec`) works.
+  // Explicit verbatim env. No inheritance. PTY's identity and owner token are
+  // forced on top so internal tooling can fail closed across same-id reuse.
   if (options.env) {
     const env = { ...options.env };
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -150,6 +152,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
       for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
     }
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -164,6 +167,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
   env.PTY_SESSION = options.name;
+  if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
   ensureChildTerm(env);
   return env;
 }
@@ -475,7 +479,7 @@ export class PtyServer {
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
-    const childEnv = buildChildEnv(options);
+    const childEnv = buildChildEnv({ ...options, generation: this.generation });
 
     const invalidCwd = describeInvalidCwd(options.cwd);
     if (invalidCwd !== undefined) {

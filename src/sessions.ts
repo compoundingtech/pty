@@ -4,11 +4,13 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
 import {
   acquireEventLock, appendEventSync, appendEventSyncLocked, releaseEventLock,
+  type EventRecord,
 } from "./events.ts";
 
 export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
@@ -267,6 +269,7 @@ export function mutateMetadataUnderLock(
   mutate: (metadata: SessionMetadata) => boolean,
   options: {
     expectedGeneration?: string;
+    expectedMetadata?: SessionMetadata;
     onPublished?: (metadata: SessionMetadata) => void;
   } = {},
 ): MetadataMutationResult {
@@ -275,6 +278,12 @@ export function mutateMetadataUnderLock(
   try {
     const metadata = readMetadata(name);
     if (!metadata) return { status: "missing" };
+    if (
+      options.expectedMetadata !== undefined &&
+      !metadataMatchesObservation(options.expectedMetadata, metadata)
+    ) {
+      return { status: "generation-mismatch" };
+    }
     if (
       options.expectedGeneration !== undefined &&
       metadata.generation !== options.expectedGeneration
@@ -287,6 +296,12 @@ export function mutateMetadataUnderLock(
 
     const latest = readMetadata(name);
     if (!latest || JSON.stringify(latest) !== observed) return { status: "stale" };
+    if (
+      options.expectedMetadata !== undefined &&
+      !metadataMatchesObservation(options.expectedMetadata, latest)
+    ) {
+      return { status: "generation-mismatch" };
+    }
     if (
       options.expectedGeneration !== undefined &&
       latest.generation !== options.expectedGeneration
@@ -689,6 +704,102 @@ export async function cleanupObservedSession(
   }
 }
 
+type ReapObservedResult =
+  | { status: "reaped" }
+  | {
+    status: "skipped";
+    reason: "busy" | "stale" | "signal-failed" | "shutdown-timeout";
+    signalled: boolean;
+  };
+
+function hasProcessExitedForReap(pid: number): boolean {
+  if (!isProcessAlive(pid)) return true;
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const stateOffset = stat.lastIndexOf(") ") + 2;
+      return stateOffset >= 2 && stat[stateOffset] === "Z";
+    }
+    const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 1000,
+    }).trim();
+    return state === "" || state.startsWith("Z");
+  } catch {
+    return !isProcessAlive(pid);
+  }
+}
+
+/** Signal only after proving ownership, then reacquire after daemon shutdown
+ *  so its final event/metadata flush cannot recreate artifacts after cleanup. */
+async function reapObservedSession(
+  session: SessionInfo,
+  event?: Extract<EventRecord, { type: "session_abandoned" }>,
+): Promise<ReapObservedResult> {
+  if (!session.metadata) return { status: "skipped", reason: "stale", signalled: false };
+  if (!acquireEventLock(session.name)) {
+    return { status: "skipped", reason: "busy", signalled: false };
+  }
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return { status: "skipped", reason: "busy", signalled: false };
+  }
+  let signalled = false;
+  let signalFailed = false;
+  try {
+    const current = readMetadata(session.name);
+    if (!current || !metadataMatchesObservation(session.metadata, current)) {
+      return { status: "skipped", reason: "stale", signalled: false };
+    }
+
+    if (session.status === "running" && session.pid != null) {
+      try {
+        process.kill(session.pid, "SIGTERM");
+        signalled = true;
+      } catch {
+        signalFailed = isProcessAlive(session.pid);
+      }
+    }
+  } finally {
+    releaseLock(session.name);
+    releaseEventLock(session.name);
+  }
+
+  if (signalFailed) {
+    return { status: "skipped", reason: "signal-failed", signalled: false };
+  }
+
+  if (signalled && session.pid != null) {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline && !hasProcessExitedForReap(session.pid)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!hasProcessExitedForReap(session.pid)) {
+      return { status: "skipped", reason: "shutdown-timeout", signalled: true };
+    }
+  }
+
+  if (!acquireEventLock(session.name)) {
+    return { status: "skipped", reason: "busy", signalled };
+  }
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return { status: "skipped", reason: "busy", signalled };
+  }
+  try {
+    const current = readMetadata(session.name);
+    if (!current || !metadataMatchesObservation(session.metadata, current)) {
+      return { status: "skipped", reason: "stale", signalled };
+    }
+    if (event) appendEventSyncLocked(session.name, event);
+    cleanupAllWhileLocked(session.name);
+    return { status: "reaped" };
+  } finally {
+    releaseLock(session.name);
+    releaseEventLock(session.name);
+  }
+}
+
 /** Return one bounded, read-only observation of the session registry.
  *
  * This function deliberately performs no lifecycle work: it does not create
@@ -949,6 +1060,14 @@ export interface GcResult {
    *  `idleDays` threshold is set (via CLI flag or per-session tag)
    *  and `lastAttachAt` is older than that threshold. */
   abandoned: { name: string; reason: "cwd-gone" | "idle"; idleDays?: number }[];
+  /** Reaps that could not complete safely. `signalled` distinguishes initial
+   *  contention (the process was untouched) from a race after shutdown began. */
+  reapSkipped: {
+    name: string;
+    operation: "orphan" | "abandoned";
+    reason: "busy" | "stale" | "signal-failed" | "shutdown-timeout";
+    signalled: boolean;
+  }[];
   /** Permanent sessions respawned this pass. `ptyfileReread` indicates
    *  whether the spawn used a fresh `pty.toml` read (when the session
    *  carries `ptyfile` + `ptyfile.session` tags) or its stored metadata. */
@@ -983,6 +1102,35 @@ export const DEFAULT_FAST_FAIL_WINDOW_SEC = 60;
  *  which auto-resets). Overridden by `opts.fastFailLimit` or the
  *  per-session `strategy.fast-fail-limit` tag. */
 export const DEFAULT_FAST_FAIL_LIMIT = 3;
+
+/** @internal Commit one gc flapping transition against the observed generation. */
+export function commitObservedFlapping(
+  name: string,
+  observed: SessionMetadata,
+  bookkeeping: Record<string, string>,
+  event: { counter: number; limit: number; window: number },
+): boolean {
+  if (!acquireEventLock(name)) return false;
+  try {
+    const result = mutateMetadataUnderLock(name, (metadata) => {
+      metadata.tags = { ...(metadata.tags ?? {}), ...bookkeeping };
+      return true;
+    }, {
+      expectedMetadata: observed,
+      onPublished: () => appendEventSyncLocked(name, {
+        session: name,
+        type: "session_flapping",
+        ts: new Date().toISOString(),
+        counter: event.counter,
+        limit: event.limit,
+        window: event.window,
+      }),
+    });
+    return result.status === "changed";
+  } finally {
+    releaseEventLock(name);
+  }
+}
 
 /** SHA-256 of a session's respawn command line, used to auto-reset the
  *  fast-fail counter when the operator edits the pty.toml (or otherwise
@@ -1072,6 +1220,7 @@ export async function gc(
   // loser dies; on the next tick the winner has no live parent either
   // and dies too. No cycle detection needed.
   const killedOrphanChildren: GcResult["killedOrphanChildren"] = [];
+  const reapSkipped: GcResult["reapSkipped"] = [];
   const withParent = initial
     .filter((s) => s.metadata?.tags?.parent)
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -1083,22 +1232,14 @@ export async function gc(
     if (parentAlive) continue;
     const reason: "missing" | "dead" = parentMeta ? "dead" : "missing";
     if (!dryRun) {
-      if (s.status === "running" && s.pid != null) {
-        // SIGTERM the live daemon, then wait briefly for it to exit so
-        // its shutdown handler doesn't race our cleanupAll by writing
-        // metadata back to disk after we've removed it. We poll the
-        // pid (up to ~1s) and fall through whether or not the daemon
-        // shut down in time — cleanupAll wipes whatever remains.
-        try { process.kill(s.pid, "SIGTERM"); } catch {}
-        const deadline = Date.now() + 1000;
-        while (Date.now() < deadline) {
-          if (!isProcessAlive(s.pid)) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
-      }
-      try {
-        cleanupAll(s.name);
-      } catch {
+      const result = await reapObservedSession(s);
+      if (result.status === "skipped") {
+        reapSkipped.push({
+          name: s.name,
+          operation: "orphan",
+          reason: result.reason,
+          signalled: result.signalled,
+        });
         continue;
       }
     }
@@ -1117,30 +1258,20 @@ export async function gc(
     if (!decision) continue;
 
     if (!dryRun) {
-      if (s.status === "running" && s.pid != null) {
-        try { process.kill(s.pid, "SIGTERM"); } catch {}
-        const deadline = Date.now() + 1000;
-        while (Date.now() < deadline) {
-          if (!isProcessAlive(s.pid)) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
-      }
-      // Emit the abandoned event BEFORE cleanupAll — cleanupAll unlinks
-      // the events file, and appendEventSync into a nonexistent file
-      // would just create a stub with a single event and leave orphaned
-      // JSONL on disk. Ordering: event → cleanup → gone.
-      try {
-        appendEventSync(s.name, {
+      const result = await reapObservedSession(s, {
           session: s.name,
           type: "session_abandoned",
           ts: new Date().toISOString(),
           reason: decision.reason,
           ...(decision.idleDays !== undefined ? { idleDays: decision.idleDays } : {}),
+      });
+      if (result.status === "skipped") {
+        reapSkipped.push({
+          name: s.name,
+          operation: "abandoned",
+          reason: result.reason,
+          signalled: result.signalled,
         });
-      } catch {}
-      try {
-        cleanupAll(s.name);
-      } catch {
         continue;
       }
     }
@@ -1197,34 +1328,16 @@ export async function gc(
     }
 
     if (decision.action === "flap-now") {
-      // Persist the flapping mark to on-disk metadata so subsequent
-      // ticks see it. We update the metadata file directly instead of
-      // going through updateTags — the session's daemon is gone, there's
-      // no live connection to notify, and cleanupAll ordering constraints
-      // in respawnPermanent don't apply here (we're NOT respawning).
-      try {
-        const meta = readMetadata(s.name);
-        if (meta) {
-          const merged: Record<string, string> = {
-            ...(meta.tags ?? {}),
-            ...decision.newBookkeeping,
-          };
-          writeMetadata(s.name, { ...meta, tags: merged });
-        }
-      } catch {
-        // Best-effort — if we can't persist the flag now, the next tick
-        // will recompute the same decision and try again.
-      }
-      try {
-        appendEventSync(s.name, {
-          session: s.name,
-          type: "session_flapping",
-          ts: new Date().toISOString(),
+      if (!commitObservedFlapping(
+        s.name,
+        s.metadata!,
+        decision.newBookkeeping,
+        {
           counter: decision.counter,
           limit: decision.effectiveLimit,
           window: decision.effectiveWindow,
-        });
-      } catch {}
+        },
+      )) continue;
       flapped.push({
         name: s.name,
         counter: decision.counter,
@@ -1274,6 +1387,7 @@ export async function gc(
     kept,
     killedOrphanChildren,
     abandoned,
+    reapSkipped,
     respawned,
     respawnFailed,
     flapped,
