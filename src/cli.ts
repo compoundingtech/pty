@@ -22,8 +22,10 @@ import {
   validateName,
   validateDisplayName,
   acquireLock,
+  acquireRecoveryLock,
   isLockOwnedByPid,
   releaseLock,
+  releaseRecoveryLock,
   updateTags,
   setDisplayName,
   patchMetadataById,
@@ -34,6 +36,9 @@ import {
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  getSocketPath,
+  getPidPath,
+  getMetadataPath,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
   type SessionMetadata,
@@ -48,6 +53,20 @@ import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import {
+  RECOVERY_PROTOCOL,
+  assertPrivateRecoveryPaths,
+  atomicWritePrivate,
+  readBoundedJson,
+  readProcessStartToken,
+  recoveryLockContents,
+  recoveryLockIdentity,
+  recoveryRequestPath,
+  recoveryResultPath,
+  signRecoveryRequest,
+  verifyRecoveryResult,
+  type RecoveryResult,
+} from "./recovery.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -275,6 +294,17 @@ SIGTERM a running session's daemon. Metadata is kept — restart or \`pty rm\` i
 Examples:
   pty kill myserver`,
 
+  recover: `Usage: pty recover <name> --snapshot <metadata.json>
+
+Ask the original supporting daemon to republish an externally unlinked socket
+and registry without signaling or restarting its PTY child.
+
+The snapshot must have been captured from the same selected PTY_ROOT before
+the registry was unlinked and must advertise a recovery capability.
+
+Example:
+  pty --root /state/pty recover myserver --snapshot ./myserver.json`,
+
   rm: `Usage: pty rm <ref>
 
 Remove an exited session's files (socket/pid/json/events) (alias: pty remove).
@@ -494,6 +524,7 @@ Lifecycle:
   pty restart <ref>                       SIGTERM + respawn using stored metadata (prompts if running)
   pty restart -y <ref>                    Same, no prompt
   pty kill <ref>                          SIGTERM a running session's daemon
+  pty recover <name> --snapshot <file>    Rebind a supporting live daemon after registry unlink
   pty rm <ref>                            Remove an exited session's metadata (alias: pty remove)
   pty gc                                  Reconciliation pass: orphan-kill, abandoned-reap,
                                           permanent-respawn, exited-sweep
@@ -1321,6 +1352,23 @@ async function main(): Promise<void> {
       }
       const resolvedKillName = await resolveRef(args[1]);
       await cmdKill(resolvedKillName);
+      break;
+    }
+
+    case "recover": {
+      const recoverName = args[1];
+      const snapshotIndex = args.indexOf("--snapshot");
+      const snapshotPath = snapshotIndex >= 0 ? args[snapshotIndex + 1] : null;
+      if (!recoverName || !snapshotPath) {
+        console.error("Usage: pty recover <name> --snapshot <metadata.json>");
+        process.exit(1);
+      }
+      try {
+        await cmdRecover(recoverName, snapshotPath);
+      } catch (error) {
+        console.error(`pty recover: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+      }
       break;
     }
 
@@ -2569,6 +2617,142 @@ async function cmdKill(name: string): Promise<void> {
   if (wasPermanent && session.metadata?.tags?.ptyfile) {
     console.error(`Note: this session is managed by ${session.metadata.tags.ptyfile}`);
     console.error("The strategy tag will be restored on the next 'pty up'.");
+  }
+}
+
+async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
+  validateName(name);
+  const root = path.resolve(getSessionDir());
+  const snapshot = readBoundedJson<SessionMetadata>(path.resolve(snapshotPath));
+  const capability = snapshot.recovery;
+  if (
+    capability?.protocol !== RECOVERY_PROTOCOL ||
+    typeof capability.secret !== "string" ||
+    typeof capability.metadataRevision !== "string" ||
+    capability.metadataRevision.length === 0 ||
+    !snapshot.generation ||
+    !snapshot.daemonPid
+  ) {
+    throw new Error("snapshot does not advertise supported recovery");
+  }
+  assertPrivateRecoveryPaths(root, capability);
+  if (readProcessStartToken(snapshot.daemonPid) !== capability.processStartToken) {
+    throw new Error("daemon PID/start identity no longer matches the snapshot");
+  }
+  const lockIdentity = recoveryLockIdentity({
+    name,
+    daemonPid: snapshot.daemonPid,
+    processStartToken: capability.processStartToken,
+    rootDevice: capability.rootDevice,
+    rootInode: capability.rootInode,
+    recoveryDirDevice: capability.recoveryDirDevice,
+    recoveryDirInode: capability.recoveryDirInode,
+  });
+  const lockContents = recoveryLockContents(snapshot.daemonPid, lockIdentity);
+  if (!acquireRecoveryLock(name, lockContents)) {
+    throw new Error(`session "${name}" is being created by another process`);
+  }
+
+  const requestPath = recoveryRequestPath(root, name);
+  const resultPath = recoveryResultPath(root, name);
+  try {
+    const targets = [
+      getSocketPath(name),
+      getPidPath(name),
+      getMetadataPath(name),
+    ];
+    if (targets.some((target) => fs.existsSync(target))) {
+      const current = readMetadata(name);
+      if (
+        !targets.every((target) => fs.existsSync(target)) ||
+        !current ||
+        current.daemonPid !== snapshot.daemonPid ||
+        current.generation !== snapshot.generation ||
+        current.recovery?.processStartToken !== capability.processStartToken ||
+        current.recovery.launchIdentity !== capability.launchIdentity
+      ) {
+        throw new Error("recovery target is no longer empty");
+      }
+      const stats = await queryStats(name);
+      if (stats.daemon.pid !== snapshot.daemonPid) {
+        throw new Error("republished socket reached a different daemon");
+      }
+      console.log(`Session "${name}" registry recovered without restart.`);
+      return;
+    }
+    assertPrivateRecoveryPaths(root, capability);
+    try { fs.unlinkSync(resultPath); } catch {}
+    const nonce = randomBytes(16).toString("hex");
+    const request = signRecoveryRequest(capability.secret, {
+      protocol: RECOVERY_PROTOCOL,
+      name,
+      daemonPid: snapshot.daemonPid,
+      generation: snapshot.generation,
+      processStartToken: capability.processStartToken,
+      launchIdentity: capability.launchIdentity,
+      rootDevice: capability.rootDevice,
+      rootInode: capability.rootInode,
+      lockIdentity,
+      nonce,
+      metadata: snapshot,
+    });
+    assertPrivateRecoveryPaths(root, capability);
+    atomicWritePrivate(requestPath, request);
+
+    const deadline = Date.now() + 7000;
+    let nextNotify = Date.now() + 250;
+    let result: RecoveryResult | null = null;
+    while (Date.now() < deadline) {
+      try {
+        const candidate = readBoundedJson<RecoveryResult>(resultPath);
+        if (candidate.nonce === nonce) {
+          result = candidate;
+          break;
+        }
+      } catch {}
+      if (Date.now() >= nextNotify) {
+        assertPrivateRecoveryPaths(root, capability);
+        atomicWritePrivate(requestPath, request);
+        nextNotify = Date.now() + 250;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!result) throw new Error("supporting daemon did not answer recovery request");
+    if (!verifyRecoveryResult(capability.secret, result)) {
+      throw new Error("daemon recovery response authentication failed");
+    }
+    if (!result.ok) throw new Error(result.error ?? "daemon refused recovery");
+    if (
+      result.daemonPid !== snapshot.daemonPid ||
+      result.generation !== snapshot.generation ||
+      result.processStartToken !== capability.processStartToken ||
+      result.launchIdentity !== capability.launchIdentity
+    ) {
+      throw new Error("daemon recovery response changed identity");
+    }
+
+    const current = readMetadata(name);
+    if (
+      !current ||
+      current.daemonPid !== snapshot.daemonPid ||
+      current.generation !== snapshot.generation ||
+      current.recovery?.processStartToken !== capability.processStartToken ||
+      current.recovery.launchIdentity !== capability.launchIdentity
+    ) {
+      throw new Error("republished metadata changed identity");
+    }
+    const stats = await queryStats(name);
+    if (stats.daemon.pid !== snapshot.daemonPid) {
+      throw new Error("republished socket reached a different daemon");
+    }
+    console.log(`Session "${name}" registry recovered without restart.`);
+  } finally {
+    try {
+      assertPrivateRecoveryPaths(root, capability);
+      try { fs.unlinkSync(requestPath); } catch {}
+      try { fs.unlinkSync(resultPath); } catch {}
+    } catch {}
+    releaseRecoveryLock(name, lockContents);
   }
 }
 

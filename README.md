@@ -105,6 +105,7 @@ pty emit myserver user.note --text "checkpoint reached"     # with a text payloa
 
 pty restart myserver                      # restart an exited session (must have been preserved)
 pty kill myserver                         # terminate a running session
+pty --root /state/pty recover myserver --snapshot ./myserver.json  # rebind a live supporting daemon after external unlink
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # reconcile: kill orphan children, respawn permanents, sweep vanished
 pty gc --dry-run                          # preview what gc would do without changing anything
@@ -197,6 +198,21 @@ Two per-session flags override the configured default either way:
 `strategy=permanent` sessions are always preserved (their supervisor reconciles
 against the dead metadata to respawn them). `pty kill` also preserves — it is
 stop-and-keep, deliberately distinct from `pty rm`.
+
+If an external cleanup unlinks a live session's socket, pid, and metadata
+paths, do not rerun its launch command: that can create a second provider.
+New daemons advertise a recovery capability in metadata when their selected
+root is private to the daemon user. Capture that complete metadata before the
+unlink, then use `pty recover <name> --snapshot <file>`
+against the same `PTY_ROOT`. Recovery authenticates the original daemon and
+rebinds its listener without signaling, restarting, or disconnecting existing
+clients. Missing, legacy, stale, tampered, wrong-root, and occupied-path
+snapshots fail closed.
+Recovery also rejects a snapshot captured before any later metadata mutation,
+and rechecks that both the root and its recovery directory are still private
+before exchanging authenticated state. An interrupted recover command can be
+resumed with the same valid snapshot; it never probes, signals, or relaunches
+the supporting daemon.
 
 ```sh
 pty run -d -- npm test                          # shipped default: reaped when it finishes

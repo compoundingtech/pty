@@ -5,6 +5,13 @@ import * as os from "node:os";
 import * as net from "node:net";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import {
+  assertPrivateRecoveryPaths,
+  atomicWritePrivate,
+  recoveryRevisionPath,
+  signRecoveryRevision,
+  stampRecoveryMetadata,
+} from "./recovery.ts";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
@@ -131,6 +138,9 @@ export interface SessionMetadata {
    *  sidecar pidfile, this survives socket cleanup long enough for `pty rm`
    *  to wait until deferred daemon shutdown is complete. */
   daemonPid?: number;
+  /** Capability advertised only by daemons that support authenticated,
+   *  signal-free recovery of an unlinked registry. Treat `secret` as opaque. */
+  recovery?: import("./recovery.ts").RecoveryCapability;
   command: string;
   args: string[];
   displayCommand: string; // original command as the user typed it
@@ -233,9 +243,39 @@ function randomHex(bytes: number): string {
   return out;
 }
 
-export function writeMetadata(name: string, metadata: SessionMetadata): void {
+export interface WriteMetadataHooks {
+  /** @internal Deterministic seam for proving recovery revision publication
+   *  precedes the metadata rename. */
+  afterRecoveryRevisionPublished?: () => void;
+}
+
+export function writeMetadata(
+  name: string,
+  metadata: SessionMetadata,
+  hooks: WriteMetadataHooks = {},
+): SessionMetadata {
   ensureSessionDir();
-  atomicWriteFileSync(getMetadataPath(name), JSON.stringify(metadata, null, 2));
+  const stamped = stampRecoveryMetadata(metadata);
+  const capability = stamped.recovery;
+  if (capability && stamped.generation) {
+    const root = path.resolve(getSessionDir());
+    assertPrivateRecoveryPaths(root, capability);
+    atomicWritePrivate(
+      recoveryRevisionPath(root, name),
+      signRecoveryRevision(capability.secret, {
+        protocol: capability.protocol,
+        name,
+        generation: stamped.generation,
+        metadataRevision: capability.metadataRevision,
+      }),
+    );
+    hooks.afterRecoveryRevisionPublished?.();
+  }
+  // For capability-bearing metadata the signed revision is authoritative
+  // first. If this rename fails, the advanced revision intentionally makes the
+  // old visible metadata unrecoverable rather than authorizing stale rollback.
+  atomicWriteFileSync(getMetadataPath(name), JSON.stringify(stamped, null, 2));
+  return stamped;
 }
 
 export interface MetadataPatch {
@@ -309,9 +349,9 @@ export function mutateMetadataUnderLock(
       return { status: "generation-mismatch" };
     }
 
-    writeMetadata(name, metadata);
-    options.onPublished?.(metadata);
-    return { status: "changed", metadata };
+    const published = writeMetadata(name, metadata);
+    options.onPublished?.(published);
+    return { status: "changed", metadata: published };
   } finally {
     releaseLock(name);
   }
@@ -647,6 +687,9 @@ export async function cleanupRawCandidateGuarded(
     try {
       fs.unlinkSync(getEventsPath(candidate.name));
     } catch {}
+    try {
+      fs.unlinkSync(recoveryRevisionPath(path.resolve(getSessionDir()), candidate.name));
+    } catch {}
     return true;
   } finally {
     releaseLock(candidate.name);
@@ -676,6 +719,9 @@ export function cleanupAllWhileLocked(name: string): void {
   } catch {}
   try {
     fs.unlinkSync(getEventsPath(name));
+  } catch {}
+  try {
+    fs.unlinkSync(recoveryRevisionPath(path.resolve(getSessionDir()), name));
   } catch {}
 }
 
@@ -1857,13 +1903,7 @@ export function cleanupAll(name: string): void {
     throw new Error(`Session id "${name}" metadata is busy. Retry the operation.`);
   }
   try {
-    cleanupSocket(name);
-    try {
-      fs.unlinkSync(getMetadataPath(name));
-    } catch {}
-    try {
-      fs.unlinkSync(getEventsPath(name));
-    } catch {}
+    cleanupAllWhileLocked(name);
   } finally {
     releaseLock(name);
     releaseEventLock(name);
@@ -1923,6 +1963,9 @@ export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): bo
     } catch {}
     try {
       fs.unlinkSync(getEventsPath(name));
+    } catch {}
+    try {
+      fs.unlinkSync(recoveryRevisionPath(path.resolve(getSessionDir()), name));
     } catch {}
     return true;
   } finally {
@@ -1999,6 +2042,42 @@ export function acquireFileLock(lockPath: string): boolean {
     if (e.code !== "ENOENT") return false;
   }
   return tryCreate();
+}
+
+/** Fail-closed lock acquisition for recovery.
+ *
+ * Unlike normal creation, recovery must not probe or steal an existing lock:
+ * any competing owner is grounds to refuse, and the recovery path promises no
+ * process signal (including a liveness-only signal 0 probe). */
+export function acquireRecoveryLock(name: string, contents: string): boolean {
+  ensureSessionDir();
+  try {
+    const fd = fs.openSync(getLockPath(name), "wx", 0o600);
+    try {
+      fs.writeSync(fd, contents);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      try {
+        return fs.readFileSync(getLockPath(name), "utf8") === contents;
+      } catch {
+        return false;
+      }
+    }
+    throw error;
+  }
+}
+
+/** Release only the recovery lock still owned by the authenticated identity. */
+export function releaseRecoveryLock(name: string, contents: string): void {
+  try {
+    if (fs.readFileSync(getLockPath(name), "utf8") === contents) {
+      fs.unlinkSync(getLockPath(name));
+    }
+  } catch {}
 }
 
 export function releaseFileLock(lockPath: string): void {

@@ -15,6 +15,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
+| `.recovery/` | authenticated request/result exchange for supported live daemons | 2 |
 | `<name>.events.lock` | event append/retention lock | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
@@ -36,6 +37,17 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 {
   generation?: string;       // opaque daemon generation; guards cleanup ownership
   daemonPid?: number;        // daemon owning this generation, retained after child exit
+  recovery?: {               // signal-free live-registry recovery capability
+    protocol: 1;
+    secret: string;          // opaque request-authentication key
+    processStartToken: string;
+    launchIdentity: string;
+    rootDevice: number;
+    rootInode: number;
+    recoveryDirDevice: number;
+    recoveryDirInode: number;
+    metadataRevision: string; // exact revision bound to retained recovery state
+  };
   command: string;            // resolved binary path
   args: string[];
   displayCommand: string;     // command as the user typed it
@@ -67,6 +79,18 @@ the historical ambient-inheritance behavior.
   removes files still owned by its generation, and `pty rm` waits for that
   daemon to finish deferred shutdown before it reports success. Readers should
   treat the generation token as opaque.
+- `recovery` is present only when the daemon can prove its OS process-start
+  identity and the selected root is owned by the daemon user with no
+  group/other permissions. A snapshot containing this capability can authenticate
+  `pty recover` after the socket, pid, and metadata paths are externally
+  unlinked. The root is mode `0700`; treat the embedded secret as opaque and
+  do not publish snapshots. The root and `.recovery` directory identities and
+  permissions are revalidated before recovery state is exchanged. A signed
+  retained revision rejects older snapshots after tags, display name, attach
+  state, or other metadata changes. The signed revision advances before changed
+  metadata is renamed into place: a partial publication may disable recovery,
+  but never re-authorizes the previous snapshot. Successful recovery rotates
+  the secret.
 - `displayName` is mutable presentation metadata and is not unique. Stable
   identity remains the `<name>` filename stem; consumers must not use
   `displayName` as a durable key.

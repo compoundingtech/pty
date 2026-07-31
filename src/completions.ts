@@ -177,6 +177,13 @@ const COMMANDS: readonly CommandSpec[] = [
     dynamic: "sessions",
   },
   {
+    name: "recover",
+    desc: "Rebind a supporting live daemon after registry unlink",
+    flags: [
+      { name: "snapshot", desc: "Captured capability-bearing metadata file" },
+    ],
+  },
+  {
     name: "rm",
     aliases: ["remove"],
     desc: "Remove exited metadata",
