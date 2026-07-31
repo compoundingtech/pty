@@ -3,7 +3,12 @@
 Import from `@compoundingtech/pty/client`.
 
 ```typescript
-import { SessionConnection, spawnDaemon, listSessions } from "@compoundingtech/pty/client";
+import {
+  SessionConnection,
+  spawnDaemon,
+  listSessions,
+  queryTerminalRegion,
+} from "@compoundingtech/pty/client";
 import { PtyServer } from "@compoundingtech/pty/server";
 import { resolveKey } from "@compoundingtech/pty/keys";
 import { PacketReader, MessageType } from "@compoundingtech/pty/protocol";
@@ -231,6 +236,46 @@ const screen = await peekScreen({ name: "myserver" });         // ANSI output
 const plain = await peekScreen({ name: "myserver", plain: true }); // plain text
 ```
 
+### `queryTerminalRegion(options): Promise<TerminalRegionResponse>`
+
+Read structured cells from the daemon's xterm-headless model without attaching
+or participating in terminal-size negotiation:
+
+```typescript
+const view = await queryTerminalRegion({
+  name: "myserver",
+  row: 0,
+  col: 0,
+  rows: 24,
+  cols: 80,
+});
+
+console.log(view.generation, view.revision);
+console.log(view.terminal.rows, view.terminal.cols);
+console.log(view.region.lines[0].cells[0]);
+```
+
+Rows are absolute indexes in the active buffer, including retained scrollback;
+row 0 is the oldest retained row. `terminal.viewportRow` identifies the current
+visible viewport. The returned origin and dimensions are clamped to the current
+buffer and effective terminal geometry.
+
+`revision` is monotonic within `generation` and changes when the terminal model
+consumes output or changes size. Pollers can ignore a response whose
+`(generation, revision)` pair they have already rendered. Each response is
+captured after an xterm parse barrier, so its revision, geometry, cursor, and
+cells describe one model state.
+
+This is the daemon's terminal model, not a renderer snapshot. It preserves the
+cell fields xterm-headless exposes, including palette indexes, RGB values,
+character width, wrapping, text styles, cursor position/visibility, and terminal modes. It
+does not include OSC 8 hyperlink metadata, graphics protocols, palette
+definitions, fonts, glyph rendering, or other host-terminal presentation state.
+It is a polling API for browse/pan/scan surfaces, not a realtime entered-mode
+transport. Use `queryStats()` when only effective geometry and aggregate client
+counts are needed. Requests are limited to 100,000 cells, and responses retain
+the protocol's 32 MiB packet ceiling.
+
 ### `queryStats(name: string, timeoutMs?: number): Promise<StatsResult>`
 
 Query live metrics from a running session.
@@ -384,6 +429,8 @@ const MessageType = {
   SCREEN: 5,   // Screen replay
   PEEK: 6,     // Read-only peek request
   STATUS: 7,   // Stats query/response
+  TERMINAL_REGION_REQUEST: 8,  // Read-only structured cell request
+  TERMINAL_REGION_RESPONSE: 9, // Structured cells at one revision
 };
 ```
 

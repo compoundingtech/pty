@@ -372,7 +372,7 @@ Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-f
 ```typescript
 import {
   spawnDaemon, listSessions, getSession,
-  SessionConnection, sendData, peekScreen, queryStats,
+  SessionConnection, sendData, peekScreen, queryStats, queryTerminalRegion,
   EventFollower, readRecentEvents,
   extractFilterTags, matchesAllTags,
 } from "@compoundingtech/pty/client";
@@ -422,7 +422,16 @@ For simpler operations:
 ```typescript
 await sendData({ name: "myserver", data: ["hello\r"] });
 const screen = await peekScreen({ name: "myserver", plain: true });
+const cells = await queryTerminalRegion({
+  name: "myserver", row: 0, col: 0, rows: 24, cols: 80,
+});
 ```
+
+`queryTerminalRegion()` reads a bounded, structured region from the daemon's
+terminal model without attaching or affecting size negotiation. Its generation,
+revision, effective geometry, cursor, and cells are captured atomically; see
+[the client API reference](docs/client.md#queryterminalregionoptions-promiseterminalregionresponse)
+for coordinate semantics and model limits.
 
 ### Following events
 

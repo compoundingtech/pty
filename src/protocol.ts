@@ -9,6 +9,8 @@ export const MessageType = {
   SCREEN: 5, // Server → Client: screen buffer replay on attach
   PEEK: 6, // Client → Server: read-only attach (no input, no resize)
   STATUS: 7, // Client → Server: request stats; Server → Client: JSON stats response
+  TERMINAL_REGION_REQUEST: 8, // Client → Server: read-only structured cell query
+  TERMINAL_REGION_RESPONSE: 9, // Server → Client: structured cells at one revision
 } as const;
 
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
@@ -16,6 +18,81 @@ export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 export interface Packet {
   type: MessageType;
   payload: Buffer;
+}
+
+export interface TerminalRegionRequest {
+  /** Absolute row in the active buffer, where 0 is the oldest retained row. */
+  row: number;
+  /** Zero-based column in the active buffer. */
+  col: number;
+  rows: number;
+  cols: number;
+}
+
+export type TerminalCellColor =
+  | { _tag: "default" }
+  | { _tag: "palette"; index: number }
+  | { _tag: "rgb"; value: number };
+
+export interface TerminalCell {
+  chars: string;
+  width: number;
+  fg: TerminalCellColor;
+  bg: TerminalCellColor;
+  bold: boolean;
+  italic: boolean;
+  dim: boolean;
+  underline: boolean;
+  blink: boolean;
+  inverse: boolean;
+  invisible: boolean;
+  strikethrough: boolean;
+  overline: boolean;
+}
+
+export interface TerminalRegionLine {
+  wrapped: boolean;
+  cells: TerminalCell[];
+}
+
+export interface TerminalModes {
+  applicationCursorKeys: boolean;
+  applicationKeypad: boolean;
+  bracketedPaste: boolean;
+  insert: boolean;
+  mouseTracking: "none" | "x10" | "vt200" | "drag" | "any";
+  origin: boolean;
+  reverseWraparound: boolean;
+  sendFocus: boolean;
+  synchronizedOutput: boolean;
+  wraparound: boolean;
+  sgrMouse: boolean;
+  cursorHidden: boolean;
+  kittyKeyboardFlags: number[];
+}
+
+export interface TerminalRegionResponse {
+  /** Identifies the daemon lifetime in which `revision` is monotonic. */
+  generation: string;
+  /** Monotonic daemon-local revision of the terminal model. */
+  revision: number;
+  terminal: {
+    rows: number;
+    cols: number;
+    buffer: "normal" | "alternate";
+    bufferRows: number;
+    viewportRow: number;
+    cursor: { row: number; col: number };
+    modes: TerminalModes;
+  };
+  region: {
+    /** Actual, clamped origin and dimensions returned by the daemon. */
+    row: number;
+    col: number;
+    rows: number;
+    cols: number;
+    lines: TerminalRegionLine[];
+  };
 }
 
 // Packet wire format: [type: uint8][length: uint32BE][payload: N bytes]
@@ -92,6 +169,66 @@ export function encodeStatus(): Buffer {
 
 export function encodeStatusResponse(json: string): Buffer {
   return encodePacket(MessageType.STATUS, Buffer.from(json));
+}
+
+/** Maximum requested cell count. Region queries are intended for bounded
+ * viewports and scans, not dumping the daemon's entire scrollback in one frame. */
+export const MAX_TERMINAL_REGION_CELLS = 100_000;
+
+function validateTerminalRegionRequest(value: unknown): TerminalRegionRequest {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Terminal region request must be an object");
+  }
+  const request = value as Record<string, unknown>;
+  const row = request.row;
+  const col = request.col;
+  const rows = request.rows;
+  const cols = request.cols;
+  if (
+    !Number.isInteger(row) || (row as number) < 0
+    || !Number.isInteger(col) || (col as number) < 0
+    || !Number.isInteger(rows) || (rows as number) <= 0
+    || !Number.isInteger(cols) || (cols as number) <= 0
+  ) {
+    throw new Error("Terminal region coordinates must be non-negative and dimensions positive");
+  }
+  if ((rows as number) * (cols as number) > MAX_TERMINAL_REGION_CELLS) {
+    throw new Error(
+      `Terminal region exceeds ${MAX_TERMINAL_REGION_CELLS} cells`,
+    );
+  }
+  return {
+    row: row as number,
+    col: col as number,
+    rows: rows as number,
+    cols: cols as number,
+  };
+}
+
+export function encodeTerminalRegionRequest(request: TerminalRegionRequest): Buffer {
+  return encodePacket(
+    MessageType.TERMINAL_REGION_REQUEST,
+    Buffer.from(JSON.stringify(validateTerminalRegionRequest(request))),
+  );
+}
+
+export function decodeTerminalRegionRequest(payload: Buffer): TerminalRegionRequest {
+  return validateTerminalRegionRequest(JSON.parse(payload.toString()));
+}
+
+export function encodeTerminalRegionResponse(response: TerminalRegionResponse): Buffer {
+  const payload = Buffer.from(JSON.stringify(response));
+  if (payload.length > MAX_PACKET_LENGTH) {
+    throw new PacketTooLargeError(payload.length);
+  }
+  return encodePacket(
+    MessageType.TERMINAL_REGION_RESPONSE,
+    payload,
+  );
+}
+
+export function decodeTerminalRegionResponse(payload: Buffer): TerminalRegionResponse {
+  return JSON.parse(payload.toString()) as TerminalRegionResponse;
 }
 
 export function decodeSize(payload: Buffer): { rows: number; cols: number } {

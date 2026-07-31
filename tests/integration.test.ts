@@ -15,6 +15,8 @@ import {
   encodePeek,
   encodeResize,
   encodeStatus,
+  encodeTerminalRegionRequest,
+  decodeTerminalRegionResponse,
   decodeExit,
 } from "../src/protocol.ts";
 import {
@@ -1419,6 +1421,117 @@ describe("STATUS message", () => {
 
     expect(stats.modes.sgrMouse).toBe(true);
     expect(stats.modes.cursorHidden).toBe(true);
+
+    client.destroy();
+  });
+});
+
+describe("TERMINAL_REGION message", () => {
+  it("returns styled cells at an atomic revision without participating in size negotiation", async () => {
+    const name = uniqueName();
+    await startServer(
+      name,
+      "sh",
+      ["-c", "printf '\\033[2J\\033[3;5H\\033[31;44;1mAB\\033[0m'; exec cat"],
+      { rows: 24, cols: 80 },
+    );
+    await new Promise((r) => setTimeout(r, 200));
+
+    const attached = await connect(name);
+    const attachedReader = new PacketReader();
+    attached.write(encodeAttach(40, 100));
+    await waitForType(attached, attachedReader, MessageType.SCREEN);
+
+    const query = async () => {
+      const client = await connect(name);
+      const reader = new PacketReader();
+      client.write(encodeTerminalRegionRequest({ row: 2, col: 4, rows: 2, cols: 4 }));
+      const packet = await waitForType(
+        client,
+        reader,
+        MessageType.TERMINAL_REGION_RESPONSE,
+      );
+      client.destroy();
+      return decodeTerminalRegionResponse(packet.payload);
+    };
+
+    const first = await query();
+    expect(first.generation).toEqual(expect.any(String));
+    expect(first.terminal).toMatchObject({
+      rows: 40,
+      cols: 100,
+      buffer: "normal",
+      viewportRow: 0,
+    });
+    expect(first.region).toMatchObject({
+      row: 2,
+      col: 4,
+      rows: 2,
+      cols: 4,
+    });
+    expect(first.region.lines[0].cells[0]).toMatchObject({
+      chars: "A",
+      width: 1,
+      fg: { _tag: "palette", index: 1 },
+      bg: { _tag: "palette", index: 4 },
+      bold: true,
+    });
+
+    const unchanged = await query();
+    expect(unchanged.revision).toBe(first.revision);
+
+    attached.write(encodeData("Z"));
+    await waitForContent(attached, attachedReader, "Z");
+    const changed = await query();
+    expect(changed.revision).toBeGreaterThan(first.revision);
+    expect(changed.terminal).toMatchObject({ rows: 40, cols: 100 });
+    expect(changed.region.lines[0].cells[2].chars).toBe("Z");
+
+    attached.destroy();
+  });
+
+  it("reads the active alternate buffer with every exposed cell style", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", [
+      "-c",
+      "printf '\\033[?1049h\\033[2J\\033[H" +
+        "\\033[?2004h\\033[?1000h\\033[?1006h\\033[?25l" +
+        "\\033[38;2;1;2;3;48;5;9;1;2;3;4;5;7;8;9;53mX\\033[0m'; sleep 30",
+    ]);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const client = await connect(name);
+    const reader = new PacketReader();
+    client.write(encodeTerminalRegionRequest({ row: 0, col: 0, rows: 1, cols: 1 }));
+    const packet = await waitForType(
+      client,
+      reader,
+      MessageType.TERMINAL_REGION_RESPONSE,
+    );
+    const response = decodeTerminalRegionResponse(packet.payload);
+
+    expect(response.terminal.buffer).toBe("alternate");
+    expect(response.terminal.modes).toMatchObject({
+      bracketedPaste: true,
+      mouseTracking: "vt200",
+      sgrMouse: true,
+      cursorHidden: true,
+    });
+    expect(response.region.lines[0].cells[0]).toEqual({
+      chars: "X",
+      width: 1,
+      fg: { _tag: "rgb", value: 0x010203 },
+      bg: { _tag: "palette", index: 9 },
+      bold: true,
+      italic: true,
+      dim: true,
+      underline: true,
+      blink: true,
+      inverse: true,
+      invisible: true,
+      strikethrough: true,
+      overline: true,
+    });
 
     client.destroy();
   });

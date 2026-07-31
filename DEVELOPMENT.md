@@ -85,6 +85,9 @@ Binary packets over Unix sockets: `[type: uint8][length: uint32BE][payload]`
 | EXIT | 4 | Server → Client | `[exitCode: int32BE]` (4 bytes) |
 | SCREEN | 5 | Server → Client | ANSI escape sequences (string) |
 | PEEK | 6 | Client → Server | Empty |
+| STATUS | 7 | Both | Empty request / JSON response |
+| TERMINAL_REGION_REQUEST | 8 | Client → Server | JSON region coordinates |
+| TERMINAL_REGION_RESPONSE | 9 | Server → Client | JSON generation, revision, geometry, cursor, and structured cells |
 
 `PacketReader` handles streaming reassembly of partial reads. Decoders gracefully handle truncated payloads (defaults for size, -1 for exit code). Unknown message types are silently ignored by the server.
 

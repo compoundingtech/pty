@@ -19,8 +19,9 @@ export { spawnDaemon, resolveCommand, waitForSocket, setServerModulePath, type S
 
 // Session interaction (programmatic — no process.exit, no stdin/stdout)
 export {
-  SessionConnection, sendData, peekScreen,
+  SessionConnection, sendData, peekScreen, queryTerminalRegion,
   type SessionConnectionOptions, type SendDataOptions, type PeekScreenOptions,
+  type QueryTerminalRegionOptions,
 } from "./connection.ts";
 
 // Session interaction (CLI-oriented — uses process.stdin/stdout, may call process.exit)
@@ -62,5 +63,7 @@ export { resolveKey, parseSeqValue } from "./keys.ts";
 // Protocol (advanced)
 export {
   PacketReader, MessageType,
-  type Packet,
+  type Packet, type TerminalCell, type TerminalCellColor,
+  type TerminalModes, type TerminalRegionLine, type TerminalRegionRequest,
+  type TerminalRegionResponse,
 } from "./protocol.ts";

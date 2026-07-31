@@ -8,6 +8,7 @@ import {
   SessionConnection,
   sendData,
   peekScreen,
+  queryTerminalRegion,
 } from "../src/connection.ts";
 import { terminateAndWait } from "./setup/processes.ts";
 
@@ -347,4 +348,47 @@ describe("peekScreen", () => {
       peekScreen({ name: "nonexistent" })
     ).rejects.toThrow("not found or not running");
   }, 15000);
+});
+
+describe("queryTerminalRegion", () => {
+  it("returns a bounded structured view without attaching", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    await startDaemon(
+      dir,
+      name,
+      "sh",
+      ["-c", "printf '\\033[2J\\033[H\\033[38;5;42;3mVIEW\\033[0m'; exec cat"],
+    );
+    await new Promise((r) => setTimeout(r, 200));
+
+    const result = await queryTerminalRegion({
+      name,
+      row: 0,
+      col: 0,
+      rows: 1,
+      cols: 4,
+    });
+
+    expect(result.terminal).toMatchObject({ rows: 24, cols: 80 });
+    expect(result.region.lines[0].cells[0]).toMatchObject({
+      chars: "V",
+      fg: { _tag: "palette", index: 42 },
+      italic: true,
+    });
+  }, 15000);
+
+  it("rejects for a missing session", async () => {
+    const dir = makeSessionDir();
+    process.env.PTY_SESSION_DIR = dir;
+
+    await expect(queryTerminalRegion({
+      name: "nonexistent",
+      row: 0,
+      col: 0,
+      rows: 1,
+      cols: 1,
+    })).rejects.toThrow("not found or not running");
+  });
 });

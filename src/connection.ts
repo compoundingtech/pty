@@ -8,7 +8,11 @@ import {
   encodeDetach,
   encodePeek,
   encodeResize,
+  encodeTerminalRegionRequest,
+  decodeTerminalRegionResponse,
   decodeExit,
+  type TerminalRegionRequest,
+  type TerminalRegionResponse,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
 import { resolveKey } from "./keys.ts";
@@ -38,6 +42,11 @@ export interface PeekScreenOptions {
   name: string;
   plain?: boolean;
   full?: boolean;
+}
+
+export interface QueryTerminalRegionOptions extends TerminalRegionRequest {
+  name: string;
+  timeoutMs?: number;
 }
 
 /**
@@ -240,6 +249,82 @@ export function peekScreen(options: PeekScreenOptions): Promise<string> {
 
     socket.on("close", () => {
       reject(new Error(`Connection to "${options.name}" closed before screen received.`));
+    });
+  });
+}
+
+/**
+ * Read a bounded region from the daemon's terminal model without attaching or
+ * participating in terminal-size negotiation.
+ *
+ * Rows are absolute active-buffer indexes: row 0 is the oldest retained row,
+ * and `terminal.viewportRow` identifies the current visible viewport.
+ */
+export function queryTerminalRegion(
+  options: QueryTerminalRegionOptions,
+): Promise<TerminalRegionResponse> {
+  return new Promise((resolve, reject) => {
+    const reader = new PacketReader();
+    const socket = net.createConnection(getSocketPath(options.name));
+    let settled = false;
+    const timer = setTimeout(() => {
+      fail(new Error(`Timeout querying terminal region for "${options.name}"`));
+    }, options.timeoutMs ?? 2000);
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error);
+    };
+
+    socket.on("connect", () => {
+      try {
+        socket.write(encodeTerminalRegionRequest(options));
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+
+    socket.on("data", (raw: Buffer) => {
+      let packets;
+      try {
+        packets = reader.feed(raw);
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      for (const packet of packets) {
+        if (packet.type !== MessageType.TERMINAL_REGION_RESPONSE) continue;
+        try {
+          const response = decodeTerminalRegionResponse(packet.payload);
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(response);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
+    });
+
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      const error =
+        err.code === "ENOENT" || err.code === "ECONNREFUSED"
+          ? new Error(`Session "${options.name}" not found or not running.`)
+          : new Error(`Connection error: ${err.message}`);
+      fail(error);
+    });
+
+    socket.on("close", () => {
+      if (!settled) {
+        fail(new Error(
+          `Connection to "${options.name}" closed before terminal region received.`,
+        ));
+      }
     });
   });
 }

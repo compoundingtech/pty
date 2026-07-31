@@ -13,6 +13,10 @@ import {
   encodeScreen,
   encodeStatus,
   encodeStatusResponse,
+  encodeTerminalRegionRequest,
+  encodeTerminalRegionResponse,
+  decodeTerminalRegionRequest,
+  decodeTerminalRegionResponse,
   decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
@@ -95,6 +99,98 @@ describe("protocol", () => {
       expect(packets).toHaveLength(1);
       expect(packets[0].type).toBe(MessageType.SCREEN);
       expect(packets[0].payload.toString()).toBe(screen);
+    });
+
+    it("round-trips a terminal region request", () => {
+      const reader = new PacketReader();
+      const [packet] = reader.feed(encodeTerminalRegionRequest({
+        row: 12,
+        col: 4,
+        rows: 8,
+        cols: 20,
+      }));
+
+      expect(packet.type).toBe(MessageType.TERMINAL_REGION_REQUEST);
+      expect(decodeTerminalRegionRequest(packet.payload)).toEqual({
+        row: 12,
+        col: 4,
+        rows: 8,
+        cols: 20,
+      });
+    });
+
+    it("rejects invalid or unbounded terminal region requests", () => {
+      expect(() => encodeTerminalRegionRequest({
+        row: -1,
+        col: 0,
+        rows: 1,
+        cols: 1,
+      })).toThrow("non-negative");
+      expect(() => encodeTerminalRegionRequest({
+        row: 0,
+        col: 0,
+        rows: 1000,
+        cols: 1000,
+      })).toThrow("exceeds");
+    });
+
+    it("round-trips a structured terminal region response", () => {
+      const response = {
+        generation: "generation-1",
+        revision: 7,
+        terminal: {
+          rows: 24,
+          cols: 80,
+          buffer: "alternate" as const,
+          bufferRows: 24,
+          viewportRow: 0,
+          cursor: { row: 2, col: 3 },
+          modes: {
+            applicationCursorKeys: false,
+            applicationKeypad: false,
+            bracketedPaste: true,
+            insert: false,
+            mouseTracking: "none" as const,
+            origin: false,
+            reverseWraparound: false,
+            sendFocus: false,
+            synchronizedOutput: false,
+            wraparound: true,
+            sgrMouse: false,
+            cursorHidden: false,
+            kittyKeyboardFlags: [],
+          },
+        },
+        region: {
+          row: 2,
+          col: 3,
+          rows: 1,
+          cols: 1,
+          lines: [{
+            wrapped: false,
+            cells: [{
+              chars: "X",
+              width: 1,
+              fg: { _tag: "palette" as const, index: 2 },
+              bg: { _tag: "rgb" as const, value: 0x112233 },
+              bold: true,
+              italic: false,
+              dim: false,
+              underline: false,
+              blink: false,
+              inverse: false,
+              invisible: false,
+              strikethrough: false,
+              overline: false,
+            }],
+          }],
+        },
+      };
+      const reader = new PacketReader();
+      const [packet] = reader.feed(encodeTerminalRegionResponse(response));
+
+      expect(packet.type).toBe(MessageType.TERMINAL_REGION_RESPONSE);
+      expect(decodeTerminalRegionResponse(packet.payload)).toEqual(response);
     });
   });
 

@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import * as pty from "node-pty";
 // @xterm/headless is CJS-only, so keep its default import. The serialize addon
 // ships native ESM with named exports, so import its runtime namespace.
-import type { Terminal } from "@xterm/headless";
+import type { IBufferCell, Terminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
 import xterm from "@xterm/headless";
 import * as xtermSerialize from "@xterm/addon-serialize";
@@ -16,7 +16,13 @@ import {
   encodeExit,
   encodeScreen,
   encodeStatusResponse,
+  encodeTerminalRegionResponse,
+  decodeTerminalRegionRequest,
   decodeSize,
+  type TerminalCell,
+  type TerminalCellColor,
+  type TerminalRegionRequest,
+  type TerminalRegionResponse,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -250,6 +256,7 @@ export class PtyServer {
   private mouseTracking1002 = false; // button-motion tracking
   private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
+  private terminalRevision = 0;
   private eventWriter: EventWriter;
   private generation: string;
   private lastTitle = "";
@@ -501,7 +508,9 @@ export class PtyServer {
     // handlers above and must NOT be forwarded to clients — otherwise the
     // client's terminal responds and its response appears as garbage input.
     this.ptyProcess.onData((data: string) => {
-      this.terminal.write(data);
+      this.terminal.write(data, () => {
+        this.terminalRevision++;
+      });
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
         this.broadcast(encodeData(cleaned));
@@ -733,6 +742,35 @@ export class PtyServer {
             socket.write(encodeStatusResponse(JSON.stringify(stats)));
             break;
           }
+
+          case MessageType.TERMINAL_REGION_REQUEST: {
+            if (client.attachSeq > 0) {
+              socket.destroy();
+              break;
+            }
+            let request: TerminalRegionRequest;
+            try {
+              request = decodeTerminalRegionRequest(packet.payload);
+            } catch {
+              socket.destroy();
+              break;
+            }
+            client.readonly = true;
+            // xterm's write pipeline is asynchronous. An empty write callback is
+            // a barrier behind all output already accepted by the daemon, so
+            // geometry, revision, and cells below describe one terminal-model cut.
+            this.terminal.write("", () => {
+              if (socket.destroyed) return;
+              try {
+                socket.write(
+                  encodeTerminalRegionResponse(this.collectTerminalRegion(request)),
+                );
+              } catch {
+                socket.destroy();
+              }
+            });
+            break;
+          }
         }
       }
     });
@@ -839,6 +877,7 @@ export class PtyServer {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
         this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
+        this.terminalRevision++;
         this.lastResizeTime = Date.now();
         return true;
       }
@@ -856,6 +895,110 @@ export class PtyServer {
     this.terminal.resize(cols - 1, rows);
     this.ptyProcess.resize(cols, rows);
     this.terminal.resize(cols, rows);
+    this.terminalRevision++;
+  }
+
+  private collectTerminalRegion(
+    request: TerminalRegionRequest,
+  ): TerminalRegionResponse {
+    const buffer = this.terminal.buffer.active;
+    const row = Math.min(request.row, buffer.length);
+    const col = Math.min(request.col, this.terminal.cols);
+    const rows = Math.min(request.rows, buffer.length - row);
+    const cols = Math.min(request.cols, this.terminal.cols - col);
+    const lines: TerminalRegionResponse["region"]["lines"] = [];
+    const reusableCell = buffer.getNullCell();
+
+    for (let y = row; y < row + rows; y++) {
+      const line = buffer.getLine(y);
+      const cells: TerminalCell[] = [];
+      for (let x = col; x < col + cols; x++) {
+        const cell = line?.getCell(x, reusableCell);
+        cells.push(cell ? this.readTerminalCell(cell) : this.emptyTerminalCell());
+      }
+      lines.push({ wrapped: line?.isWrapped ?? false, cells });
+    }
+
+    return {
+      generation: this.generation,
+      revision: this.terminalRevision,
+      terminal: {
+        rows: this.terminal.rows,
+        cols: this.terminal.cols,
+        buffer: buffer.type,
+        bufferRows: buffer.length,
+        viewportRow: buffer.viewportY,
+        cursor: {
+          row: buffer.baseY + buffer.cursorY,
+          col: buffer.cursorX,
+        },
+        modes: {
+          applicationCursorKeys: this.terminal.modes.applicationCursorKeysMode,
+          applicationKeypad: this.terminal.modes.applicationKeypadMode,
+          bracketedPaste: this.terminal.modes.bracketedPasteMode,
+          insert: this.terminal.modes.insertMode,
+          mouseTracking: this.terminal.modes.mouseTrackingMode,
+          origin: this.terminal.modes.originMode,
+          reverseWraparound: this.terminal.modes.reverseWraparoundMode,
+          sendFocus: this.terminal.modes.sendFocusMode,
+          synchronizedOutput: this.terminal.modes.synchronizedOutputMode,
+          wraparound: this.terminal.modes.wraparoundMode,
+          sgrMouse: this.sgrMouseMode,
+          cursorHidden: this.cursorHidden,
+          kittyKeyboardFlags: [...this.kittyKeyboardStack],
+        },
+      },
+      region: { row, col, rows, cols, lines },
+    };
+  }
+
+  private readTerminalCell(cell: IBufferCell): TerminalCell {
+    return {
+      chars: cell.getChars(),
+      width: cell.getWidth(),
+      fg: this.readTerminalColor(cell, "fg"),
+      bg: this.readTerminalColor(cell, "bg"),
+      bold: Boolean(cell.isBold()),
+      italic: Boolean(cell.isItalic()),
+      dim: Boolean(cell.isDim()),
+      underline: Boolean(cell.isUnderline()),
+      blink: Boolean(cell.isBlink()),
+      inverse: Boolean(cell.isInverse()),
+      invisible: Boolean(cell.isInvisible()),
+      strikethrough: Boolean(cell.isStrikethrough()),
+      overline: Boolean(cell.isOverline()),
+    };
+  }
+
+  private readTerminalColor(
+    cell: IBufferCell,
+    channel: "fg" | "bg",
+  ): TerminalCellColor {
+    const isDefault = channel === "fg" ? cell.isFgDefault() : cell.isBgDefault();
+    if (isDefault) return { _tag: "default" };
+    const value = channel === "fg" ? cell.getFgColor() : cell.getBgColor();
+    const isPalette = channel === "fg" ? cell.isFgPalette() : cell.isBgPalette();
+    return isPalette
+      ? { _tag: "palette", index: value }
+      : { _tag: "rgb", value };
+  }
+
+  private emptyTerminalCell(): TerminalCell {
+    return {
+      chars: "",
+      width: 1,
+      fg: { _tag: "default" },
+      bg: { _tag: "default" },
+      bold: false,
+      italic: false,
+      dim: false,
+      underline: false,
+      blink: false,
+      inverse: false,
+      invisible: false,
+      strikethrough: false,
+      overline: false,
+    };
   }
 
   private emitEvent(type: EventType, fields?: Record<string, unknown>): void {
