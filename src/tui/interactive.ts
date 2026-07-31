@@ -6,10 +6,10 @@ import { randomBytes } from "node:crypto";
 import { execFileSync, spawn as spawnChild, spawnSync } from "node:child_process";
 import { attach } from "../client.ts";
 import {
-  listSessions, acquireLock, releaseLock,
+  listSessions,
   cleanupAll, getSession, getSessionDir, type SessionInfo,
 } from "../sessions.ts";
-import { spawnDaemon } from "../spawn.ts";
+import { spawnDaemon, spawnDaemonWithCreationLock } from "../spawn.ts";
 import { matchesAllTags, isReservedTagKey } from "../tags.ts";
 import {
   app, screen, signal, computed, batch,
@@ -498,11 +498,13 @@ let myApp: ReturnType<typeof app> | null = null;
 async function doRestart(session: SessionInfo): Promise<void> {
   const meta = session.metadata;
   if (!meta) {
-    cleanupAll(session.name);
+    try {
+      cleanupAll(session.name);
+    } catch {}
     return;
   }
-  cleanupAll(session.name);
   try {
+    cleanupAll(session.name);
     // Preserve displayName (and tags) so a restarted session keeps its name
     // rather than reverting to its raw id.
     await spawnDaemon({
@@ -623,17 +625,6 @@ function doAttach(name: string): void {
 async function doCreate(dir: string, name: string, shell: string): Promise<void> {
   pauseApp();
 
-  // Random names come from randomSessionName() — no collision check needed,
-  // but we still acquireLock to guard against multi-process races during
-  // creation.
-  if (!acquireLock(name)) {
-    console.error(`Session "${name}" is being created by another process.`);
-    const updated = await listSessions();
-    sessions.set(updated);
-    resumeApp();
-    return;
-  }
-
   // Auto-apply --filter-tag tags so the new session stays in the layout.
   const tags = filterTags.peek();
   // displayName intentionally unset — matches `pty run --no-display-name`.
@@ -648,16 +639,19 @@ async function doCreate(dir: string, name: string, shell: string): Promise<void>
   };
 
   try {
-    await spawnDaemon(spawnOpts);
+    if (!await spawnDaemonWithCreationLock(spawnOpts)) {
+      console.error(`Session "${name}" is being created by another process.`);
+      const updated = await listSessions();
+      sessions.set(updated);
+      resumeApp();
+      return;
+    }
   } catch (e: any) {
-    releaseLock(name);
     console.error(e.message);
     const updated = await listSessions();
     sessions.set(updated);
     resumeApp();
     return;
-  } finally {
-    releaseLock(name);
   }
 
   doAttach(name);

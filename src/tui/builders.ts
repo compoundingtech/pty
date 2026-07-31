@@ -587,6 +587,8 @@ export function createPty(
  * Attach to an existing named PTY session (started with `pty run`).
  * Returns the same PtyHandle interface, but the child process is owned
  * by the external daemon — kill() detaches instead of terminating it.
+ * `cols` and `rows` track the daemon's effective shared geometry, which is
+ * delivered in stream order before width-sensitive screen/data bytes.
  *
  * ```
  * const handle = await attachPty("my-server");
@@ -605,6 +607,7 @@ export async function attachPty(
   const { getSocketPath } = require("../sessions.js") as typeof import("../sessions.ts");
   const {
     MessageType, PacketReader, encodeAttach, encodeData, encodeResize, encodeDetach,
+    decodeGeometry,
   } = require("../protocol.js") as typeof import("../protocol.ts");
 
   const cols = opts?.cols ?? 80;
@@ -668,6 +671,8 @@ export async function attachPty(
   let exited = false;
   let exitCode: number | null = null;
   let dirty = false;
+  let requestedCols = cols;
+  let requestedRows = rows;
   // See createPty for rationale — same pattern applies to attached sessions.
   const rev = signal(0);
   const bumpRev = () => rev.set(rev.peek() + 1);
@@ -677,13 +682,10 @@ export async function attachPty(
     write(data: string) { if (!exited) socket.write(encodeData(data)); },
 
     resize(newCols: number, newRows: number) {
-      if (!exited && (newCols !== handle.cols || newRows !== handle.rows)) {
-        handle.cols = newCols;
-        handle.rows = newRows;
+      if (!exited && (newCols !== requestedCols || newRows !== requestedRows)) {
+        requestedCols = newCols;
+        requestedRows = newRows;
         socket.write(encodeResize(newRows, newCols));
-        terminal.resize(newCols, newRows);
-        dirty = true;
-        bumpRev();
       }
     },
 
@@ -735,6 +737,16 @@ export async function attachPty(
     }
     for (const packet of packets) {
       switch (packet.type) {
+        case MessageType.GEOMETRY: {
+          const geometry = decodeGeometry(packet.payload);
+          handle.rows = geometry.rows;
+          handle.cols = geometry.cols;
+          terminal.resize(geometry.cols, geometry.rows);
+          dirty = true;
+          bumpRev();
+          handle.onActivity?.();
+          break;
+        }
         case MessageType.SCREEN:
           terminal.reset();
           terminal.write(packet.payload.toString());

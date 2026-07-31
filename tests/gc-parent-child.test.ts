@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { acquireLock, gc, isProcessAlive, releaseLock } from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -88,6 +89,35 @@ afterEach(async () => {
 });
 
 describe("pty gc — parent-child orphan-kill", () => {
+  it("continues the batch without reporting a cleanup blocked by a live lock", async () => {
+    const dir = makeSessionDir();
+    const blocked = uniqueName("blocked");
+    const removable = uniqueName("removable");
+    const blockedPid = await startDaemon(dir, blocked, "cat", [], { parent: "missing-parent" });
+    await startDaemon(dir, removable, "cat", [], { parent: "missing-parent" });
+    const previousRoot = process.env.PTY_SESSION_DIR;
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireLock(blocked)).toBe(true);
+
+    try {
+      const result = await gc();
+      expect(result.killedOrphanChildren.map(({ name }) => name)).toEqual([removable]);
+      expect(result.reapSkipped).toContainEqual({
+        name: blocked,
+        operation: "orphan",
+        reason: "busy",
+        signalled: false,
+      });
+      expect(isProcessAlive(blockedPid)).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${blocked}.json`))).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${removable}.json`))).toBe(false);
+    } finally {
+      releaseLock(blocked);
+      if (previousRoot === undefined) delete process.env.PTY_SESSION_DIR;
+      else process.env.PTY_SESSION_DIR = previousRoot;
+    }
+  }, 15000);
+
   it("kills a child when its parent's daemon is dead (no exit record)", async () => {
     const dir = makeSessionDir();
     const parent = uniqueName("par");

@@ -17,6 +17,7 @@ import {
   encodeExit,
   encodeScreen,
   encodeStatusResponse,
+  encodeGeometry,
   decodeSize,
 } from "./protocol.ts";
 import {
@@ -29,9 +30,11 @@ import {
   cleanupOwnedAll,
   writeMetadata,
   readMetadata,
+  mutateMetadataUnderLock,
   shouldReapAtExit,
   reapOnExitDefault,
   type SessionMetadata,
+  type MetadataMutationResult,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
 import {
@@ -60,6 +63,7 @@ import {
   type RecoveryRevision,
   type RecoveryResultPayload,
 } from "./recovery.ts";
+import type { StatsResult } from "./client.ts";
 
 interface Client {
   socket: net.Socket;
@@ -68,6 +72,14 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** DATA/EXIT must not overtake the SCREEN baseline for ATTACH or PEEK. */
+  initialScreenPhase: "live" | "settling" | "cutting";
+  /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
+  initialScreenGeneration: number;
+  postCutPackets: Array<{
+    type: typeof MessageType.DATA | typeof MessageType.EXIT;
+    packet: Buffer;
+  }>;
 }
 
 export interface ServerOptions {
@@ -94,14 +106,18 @@ export interface ServerOptions {
   /** Additional `KEY=VALUE` env entries overlaid on the inherited child
    *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Environment keys removed from the inherited child environment. Applied
+   *  before `extraEnv`, so an explicit assignment wins when both mention a key. */
+  unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
-   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
-   *  injected on top so nesting detection and `pty exec` keep working.
+   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` and the opaque
+   *  `PTY_SESSION_GENERATION` owner token are always injected on top so
+   *  nesting detection and generation-safe `pty exec` keep working.
    *
-   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
-   *  together with either throws. Use this when the caller wants total
-   *  control of the child environment (e.g., pty-layout's launcher shell
-   *  that injects a shim tmux on `PATH`). */
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
+   *  `env` together with inherited-environment policy throws. Use this when
+   *  the caller wants total control of the child environment (e.g., a
+   *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
 }
 
@@ -134,21 +150,22 @@ function ensureChildTerm(env: Record<string, string>): void {
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
   // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
-  // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
-  // you pass `env`; if you want scrub+extras you pass `isolateEnv`. Picking
+  // inherited-environment policy path. If you want total control you pass
+  // `env`; otherwise isolation/removals/assignments compose explicitly. Picking
   // one implicitly would hide intent.
-  if (options.env && (options.isolateEnv || options.extraEnv)) {
+  if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
-      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv. " +
-      "Use env for verbatim control, or isolateEnv (+ optional extraEnv) for allow-list semantics — not both."
+      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
+      "Use env for verbatim control, or inherited environment policy options — not both."
     );
   }
 
-  // Explicit verbatim env. No inheritance. Only PTY_SESSION is forced on
-  // top so internal pty tooling (nesting prevention, `pty exec`) works.
+  // Explicit verbatim env. No inheritance. PTY's identity and owner token are
+  // forced on top so internal tooling can fail closed across same-id reuse.
   if (options.env) {
     const env = { ...options.env };
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -159,10 +176,12 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     // Legacy behaviour: full inheritance, minus the server-config handoff.
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
+    for (const key of options.unsetEnv ?? []) delete env[key];
     if (options.extraEnv) {
       for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
     }
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -172,10 +191,12 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     if (v === undefined) continue;
     if (ISOLATED_ENV_ALLOWLIST.has(k) || k.startsWith("LC_")) env[k] = v;
   }
+  for (const key of options.unsetEnv ?? []) delete env[key];
   if (options.extraEnv) {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
   env.PTY_SESSION = options.name;
+  if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
   ensureChildTerm(env);
   return env;
 }
@@ -492,7 +513,7 @@ export class PtyServer {
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
-    const childEnv = buildChildEnv(options);
+    const childEnv = buildChildEnv({ ...options, generation: this.generation });
 
     const invalidCwd = describeInvalidCwd(options.cwd);
     if (invalidCwd !== undefined) {
@@ -537,7 +558,7 @@ export class PtyServer {
       this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
-        this.broadcast(encodeData(cleaned));
+        this.broadcast(MessageType.DATA, encodeData(cleaned));
       }
     });
 
@@ -550,7 +571,7 @@ export class PtyServer {
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
-      this.broadcast(encodeExit(code));
+      this.broadcast(MessageType.EXIT, encodeExit(code));
       this.emitEvent(EventType.SESSION_EXIT, {
         exitCode: code,
         ...(signal ? { signal } : {}),
@@ -559,7 +580,13 @@ export class PtyServer {
       // in pty list during the cleanup window. lastLines may be incomplete
       // here since PTY data could still be in-flight — close() will
       // update with the final output.
-      this.saveExitMetadata(code);
+      const exitMetadataStatus = this.saveExitMetadata(code);
+      if (exitMetadataStatus === "busy" || exitMetadataStatus === "stale") {
+        // Startup may still hold the creation lock for this generation. Retry
+        // within the existing 500ms client grace so exit metadata is observable
+        // before shutdown cleanup, while close() retains the final bounded retry.
+        void this.saveExitMetadataUntilSettled(code, 400).catch(() => {});
+      }
       this.resolveChildExited();
       options.onExit?.(code);
     });
@@ -635,6 +662,7 @@ export class PtyServer {
           ...(options.displayName ? { displayName: options.displayName } : {}),
           ...(options.isolateEnv ? { isolateEnv: true } : {}),
           ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+          ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
           ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
@@ -875,6 +903,9 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      initialScreenPhase: "live",
+      initialScreenGeneration: 0,
+      postCutPackets: [],
     };
     this.clients.set(socket, client);
 
@@ -901,42 +932,41 @@ export class PtyServer {
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
-            // Stamp the last-attach timestamp so `pty gc --idle-days N`
-            // (and per-session `strategy.idle-days=N` tags) can detect
-            // abandonment. Best-effort — if the metadata file was
-            // concurrently mutated by another writer (`pty tag`,
-            // `pty rename`), our read-modify-write may lose a field, but
-            // that's the same last-write-wins semantic every other
-            // metadata mutation carries. Wrapped in try so a torn read
-            // never crashes the daemon on attach.
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
+            // Best-effort: a concurrent metadata command wins this attach
+            // stamp, but neither writer can overwrite the other's snapshot.
             try {
-              const meta = readMetadata(this.name);
-              if (meta) {
+              mutateMetadataUnderLock(this.name, (meta) => {
                 meta.lastAttachAt = new Date().toISOString();
-                writeMetadata(this.name, meta);
-              }
+                return true;
+              }, { expectedGeneration: this.generation });
             } catch {}
 
             const sendScreen = () => {
-              if (socket.destroyed) return;
-              const screen = this.getModePrefix(true) + this.serialize.serialize();
-              socket.write(encodeScreen(screen));
-              if (this.exited) {
-                socket.write(encodeExit(this.exitCode));
-              } else {
-                // The serialize addon's output is an approximation — ECH/CUF
-                // sequences may not perfectly reproduce what the app originally
-                // drew (e.g., background fills in ratatui). Nudge the child
-                // with a SIGWINCH so it does a fresh full redraw, whose DATA
-                // overwrites any serialize artifacts on the client.
-                //
-                // Skipped when the client attached at the size the session
-                // already has: the child is drawn for that geometry, so the
-                // nudge buys nothing and wakes an otherwise idle process every
-                // time someone connects.
-                if (!sizeMatched) this.nudgeRedraw();
-              }
+              this.beginInitialScreenCut(
+                client,
+                initialScreenGeneration,
+                () => this.getModePrefix(true) + this.serialize.serialize(),
+                () => {
+                  // The serialize addon's output is an approximation — ECH/CUF
+                  // sequences may not perfectly reproduce what the app originally
+                  // drew (e.g., background fills in ratatui). Nudge the child
+                  // with a SIGWINCH so it does a fresh full redraw, whose DATA
+                  // overwrites any serialize artifacts on the client.
+                  //
+                  // Skipped when the client attached at the size the session
+                  // already has: the child is drawn for that geometry, so the
+                  // nudge buys nothing and wakes an otherwise idle process every
+                  // time someone connects.
+                  if (!this.exited && !sizeMatched) this.nudgeRedraw();
+                }
+              );
             };
 
             if (!this.exited) {
@@ -960,22 +990,25 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
+            const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
 
-            if (plain) {
-              socket.write(encodeScreen(full ? this.getFullPlainScreen() : this.getPlainScreen()));
-            } else {
+            this.beginInitialScreenCut(client, initialScreenGeneration, () => {
+              if (plain) {
+                return full ? this.getFullPlainScreen() : this.getPlainScreen();
+              }
               // scrollback: 0 for viewport only, omit for full scrollback
               const serializeOpts = full ? undefined : { scrollback: 0 };
-              const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
-              socket.write(encodeScreen(peekScreen));
-            }
-
-            if (this.exited) {
-              socket.write(encodeExit(this.exitCode));
-            }
+              return this.getModePrefix() + this.serialize.serialize(serializeOpts);
+            });
             break;
           }
 
@@ -1041,15 +1074,33 @@ export class PtyServer {
     return prefix;
   }
 
-  private collectStats(): object {
+  private collectStats(): StatsResult {
     const buf = this.terminal.buffer.active;
     const meta = readMetadata(this.name);
 
     let attached = 0;
     let readOnly = 0;
+    const connections: NonNullable<StatsResult["clients"]["connections"]> = [];
     for (const c of this.clients.values()) {
-      if (c.readonly) readOnly++;
-      else if (c.attachSeq > 0) attached++;
+      if (c.readonly) {
+        readOnly++;
+        connections.push({
+          role: "readonly",
+          constrains: { rows: false, cols: false },
+        });
+      } else if (c.attachSeq > 0) {
+        attached++;
+        connections.push({
+          role: "writable",
+          rows: c.rows,
+          cols: c.cols,
+          lastRequestSequence: c.attachSeq,
+          constrains: {
+            rows: c.rows === this.terminal.rows,
+            cols: c.cols === this.terminal.cols,
+          },
+        });
+      }
     }
 
     const createdAt = meta?.createdAt ?? null;
@@ -1084,6 +1135,7 @@ export class PtyServer {
         total: attached + readOnly,
         attached,
         readOnly,
+        connections,
       },
       modes: {
         sgrMouse: this.sgrMouseMode,
@@ -1111,13 +1163,23 @@ export class PtyServer {
 
     if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
-        this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
+        this.broadcastGeometry(rows, cols);
+        this.ptyProcess.resize(cols, rows);
         this.lastResizeTime = Date.now();
         return true;
       }
     }
     return false;
+  }
+
+  private broadcastGeometry(rows: number, cols: number): void {
+    const packet = encodeGeometry(rows, cols);
+    for (const client of this.clients.values()) {
+      if (client.attachSeq > 0 || client.readonly) {
+        client.socket.write(packet);
+      }
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
@@ -1141,9 +1203,59 @@ export class PtyServer {
     } as EventRecord);
   }
 
-  private broadcast(data: Buffer): void {
+  private beginInitialScreenCut(
+    client: Client,
+    generation: number,
+    getScreen: () => string,
+    onLive?: () => void
+  ): void {
+    if (
+      client.socket.destroyed ||
+      client.initialScreenGeneration !== generation
+    ) return;
+
+    client.initialScreenPhase = "cutting";
+    /** xterm parses writes asynchronously. This empty write is an ordered
+     *  marker: its callback runs after every earlier write and before later
+     *  writes, giving SCREEN an exact parser cut. */
+    this.terminal.write("", () => {
+      if (
+        client.socket.destroyed ||
+        client.initialScreenGeneration !== generation
+      ) return;
+
+      const postCutPackets = client.postCutPackets;
+      client.postCutPackets = [];
+      const hasPostCutExit = postCutPackets.some(
+        (pending) => pending.type === MessageType.EXIT
+      );
+
+      client.socket.write(encodeScreen(getScreen()));
+      client.initialScreenPhase = "live";
+      /** node-pty drains PTY data before its public exit event, so a queued
+       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
+       *  this queue and is synthesized only after any final post-cut DATA. */
+      for (const pending of postCutPackets) {
+        client.socket.write(pending.packet);
+      }
+      if (this.exited && !hasPostCutExit) {
+        client.socket.write(encodeExit(this.exitCode));
+      }
+      onLive?.();
+    });
+  }
+
+  private broadcast(
+    type: typeof MessageType.DATA | typeof MessageType.EXIT,
+    packet: Buffer
+  ): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (client.initialScreenPhase === "settling") continue;
+      if (client.initialScreenPhase === "cutting") {
+        client.postCutPackets.push({ type, packet });
+        continue;
+      }
+      client.socket.write(packet);
     }
   }
 
@@ -1189,40 +1301,32 @@ export class PtyServer {
     return lines.slice(-LAST_LINES_COUNT);
   }
 
-  private saveExitMetadata(exitCode: number): void {
-    // Don't resurrect a session whose metadata was already removed. On teardown
-    // the daemon re-flushes exit metadata during its (possibly watchdog-delayed)
-    // shutdown; if a caller already `pty rm`'d the session, re-creating its
-    // `.json` here would leave a stray registry file (and its atomic tmp) behind.
-    if (!fs.existsSync(getMetadataPath(this.name))) return;
-    const existing = readMetadata(this.name);
-    if (
-      existing?.generation !== undefined &&
-      existing.generation !== this.generation
-    ) {
-      return;
+  private saveExitMetadata(exitCode: number): MetadataMutationResult["status"] {
+    const result = mutateMetadataUnderLock(this.name, (metadata) => {
+      metadata.exitCode = exitCode;
+      metadata.exitedAt = new Date().toISOString();
+      metadata.lastLines = this.getLastLines();
+      return true;
+    }, { expectedGeneration: this.generation });
+    return result.status;
+  }
+
+  private async saveExitMetadataUntilSettled(
+    exitCode: number,
+    waitMs = 2_000,
+  ): Promise<void> {
+    const deadline = Date.now() + waitMs;
+    while (true) {
+      const status = this.saveExitMetadata(exitCode);
+      if (
+        status === "changed" ||
+        status === "unchanged" ||
+        status === "missing" ||
+        status === "generation-mismatch"
+      ) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    writeMetadata(this.name, {
-      generation: this.generation,
-      daemonPid: process.pid,
-      ...(this.recoveryCapability ? { recovery: this.recoveryCapability } : {}),
-      command: this.options.command,
-      args: this.options.args,
-      displayCommand: this.options.displayCommand,
-      cwd: this.options.cwd,
-      rows: this.options.rows,
-      cols: this.options.cols,
-      ephemeral: this.options.ephemeral === true,
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
-      exitCode,
-      exitedAt: new Date().toISOString(),
-      lastLines: this.getLastLines(),
-      ...(existing?.tags ? { tags: existing.tags } : {}),
-      ...(existing?.displayName ? { displayName: existing.displayName } : {}),
-      ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
-      ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
-      ...(this.options.env ? { env: this.options.env } : {}),
-    });
   }
 
   /** Clean up resources. Does not call process.exit(). */
@@ -1262,6 +1366,7 @@ export class PtyServer {
           this.childExited,
           new Promise<void>((r) => setTimeout(r, 2000)),
         ]);
+        if (this.exited) await this.saveExitMetadataUntilSettled(this.exitCode);
         try { await this.eventWriter.flush(); } catch {}
         resolve();
       });
@@ -1442,6 +1547,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
+    unsetEnv: config.unsetEnv,
     env: config.env,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down

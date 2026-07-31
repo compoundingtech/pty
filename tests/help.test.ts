@@ -12,7 +12,7 @@ const cliSource = fs.readFileSync(path.join(__dirname, "..", "src", "cli.ts"), "
 // Canonical subcommands that must each ship focused `--help`.
 const COMMANDS = [
   "run", "attach", "exec", "peek", "send", "events", "list", "stats",
-  "restart", "kill", "recover", "rm", "gc", "tag", "tag-multi", "emit", "rename",
+  "restart", "kill", "recover", "rm", "gc", "tag", "tag-multi", "emit", "rename", "metadata",
   "up", "down", "test", "remote-serve",
 ];
 // Aliases that must resolve to the same help.
@@ -57,6 +57,8 @@ describe("pty --help — no drift", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("--env KEY=VALUE");
     expect(r.stdout).toMatch(/environment variable \(repeatable\)/);
+    expect(r.stdout).toContain("--unset-env KEY");
+    expect(r.stdout).toMatch(/inherited environment variable \(repeatable\)/);
   });
 
   it("every dispatch `case` is either a documented command or a known non-command", () => {

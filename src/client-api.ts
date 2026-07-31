@@ -4,14 +4,15 @@
 // Session management
 export {
   listSessions, getSession, gc, pruneOrphanLayoutTags, isGone,
-  validateName, updateTags, setDisplayName,
+  validateName, updateTags, setDisplayName, patchMetadataById,
   getSessionDir, getSocketPath,
   cleanupSocket, cleanupAll,
   // Exposed for the same reason as `isReservedTagKey`: downstream tools
   // (relay, layout, supervisors) need to answer "is this session exempt
   // from reaping?" without re-deriving which tag values count as set.
   KEEP_TAG, isKeepRequested, shouldReapAtExit,
-  type SessionInfo, type SessionMetadata, type PrunedTagResult, type GcResult,
+  type SessionInfo, type SessionMetadata, type MetadataPatch, type MetadataPatchResult,
+  type PrunedTagResult, type GcResult,
 } from "./sessions.ts";
 
 // Session creation
@@ -42,7 +43,7 @@ export {
   type SessionStartEvent, type SessionExitEvent, type SessionExecEvent,
   type SessionRespawnEvent,
   type UserEvent,
-  type DisplayNameChangeEvent, type TagsChangeEvent,
+  type DisplayNameChangeEvent, type TagsChangeEvent, type MetadataChangeEvent,
   type FollowerOptions,
 } from "./events.ts";
 

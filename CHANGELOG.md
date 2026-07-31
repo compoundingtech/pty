@@ -18,6 +18,102 @@
   recovery revision before publishing the new metadata, so an unlink during
   publication can deny recovery but cannot authorize an older snapshot.
 
+### Restart-durable environment removals
+
+- `pty run --unset-env KEY` and programmatic `unsetEnv` persist inherited
+  environment removals across manual and permanent restart. Explicit `--env`
+  assignments are applied afterward and therefore win independent of flag
+  order.
+- Storage format: session metadata may include an optional `unsetEnv` string
+  array. Older records omit it and retain the historical ambient-inheritance
+  behavior; exact `env` remains mutually exclusive with inherited-environment
+  policy options.
+
+### Ordered initial attach snapshots
+
+- Every `ATTACH` and `PEEK` synchronization now sends the effective
+  `GEOMETRY`, then one `SCREEN` baseline, before any following `DATA` or
+  `EXIT`. Output already accepted by xterm at the snapshot cut is represented
+  by `SCREEN`; later output is queued and released in order after it, with a
+  single process exit following any final data.
+- A new `ATTACH` or `PEEK` on the same socket supersedes an unfinished
+  synchronization, so a re-attach or writable-to-readonly mode switch cannot
+  emit the previous mode's stale screen or queued output. Reconnects establish
+  the same fresh `GEOMETRY` → `SCREEN` → `DATA`/`EXIT` baseline.
+
+### Atomic exact-id metadata patching
+
+- `pty metadata patch --id <stable-id>` reads one merge-style JSON object from
+  stdin and atomically updates `displayName` and tags under one metadata lock.
+  It never falls back to display-name lookup, preserves unrelated tags, returns
+  `{ changed, metadata }`, and suppresses no-op writes and events.
+- `patchMetadataById(id, patch)` exposes the same exact-id operation from
+  `@compoundingtech/pty/client`. Existing rename/tag APIs share the merge engine
+  while retaining their documented specialized events for compatibility.
+- Metadata publication acquires the event lock before the metadata lock, so a
+  busy event log fails before either file changes. Event appends and retention
+  rewrites are serialized without a per-record byte-size assumption.
+- `pty exec` now carries an opaque generation owner token in session children
+  and refuses stale same-id replacements. Sessions started by an older build
+  must be restarted once before they can use `pty exec`.
+- The current display-name contract supersedes the permissive limits described
+  in earlier release notes: values must be nonempty, already trimmed,
+  single-line, free of Unicode control characters, and at most 160 Unicode
+  scalar values. Slash and backslash remain valid metadata characters.
+
+### Storage format
+
+Effective atomic patches append one `metadata_change` event whose `previous`
+and `value` objects contain only changed `displayName` and tag keys. No-op
+patches append no event. Lock contention cannot publish only one side of an
+effective patch. Metadata remains the authoritative state: a process crash or
+underlying I/O failure between its write and event append can omit the
+notification because pty does not journal a cross-file transaction.
+
+### Non-unique display names with unambiguous session resolution
+
+- Display names are presentation metadata and no longer need to be unique.
+  Creating or renaming a session may reuse another session's display name or a
+  stable id; stable session ids remain unique and immutable.
+- Every local CLI session reference resolves with the same rule: an exact stable
+  id wins, one display-name match resolves, and multiple display-name matches
+  fail closed while listing the candidate stable ids. Fabric remote routing uses
+  the same rule on the target host.
+
+### Framed machine attach stream
+
+- `pty attach --attach-stream-fd-v1 <fd> <ref>` keeps stdin/stdout as the
+  controlling terminal while writing ordered, existing-protocol `GEOMETRY`,
+  `SCREEN`, `DATA`, and `EXIT` packets to a dedicated inherited descriptor.
+  The descriptor remains caller-owned and must be closed by the caller for
+  consumers to observe EOF. Invalid descriptors, write failures, and daemons
+  that do not provide the v1 geometry-first contract fail clearly on stderr.
+- Ordinary interactive attach rendering and resize behavior are unchanged.
+
+### Stream-ordered effective geometry for embedded clients
+
+- Writable clients still select the shared PTY grid by independent row/column
+  minima, and zero viewers still preserve the last size. The daemon now sends
+  a framed `GEOMETRY` packet to writable and read-only output streams before
+  every affected `SCREEN`/`DATA`, including peer attach, resize, and
+  disconnect changes.
+- `SessionConnection` exposes `effectiveRows`/`effectiveCols` and a `geometry`
+  event. `attachPty()` and server-mode testing sessions resize their local
+  xterm grid from the same stream event before parsing later output. Older
+  clients safely ignore the bounded unknown packet and retain raw-byte
+  behavior.
+
+### Connected-client geometry introspection
+
+- `pty stats --json` and `queryStats()` retain their existing effective
+  terminal geometry and aggregate client counts, and now add anonymous
+  `clients.connections` details. Writable entries report their requested
+  rows/columns, last request sequence, and which min-wins axes they currently
+  constrain; readonly entries carry no geometry. This is point-in-time
+  observability and does not change attach/resize min-wins or DATA ordering
+  semantics. An attached client that switches to readonly via `PEEK` now
+  relinquishes its requested geometry, re-negotiating the effective size when
+  necessary.
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no

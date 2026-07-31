@@ -201,6 +201,20 @@ describe("pty peek --remote over fabric", () => {
     expect(p.status).not.toBe(0);
     expect(p.stderr).toMatch(/not found/); // route ack reports the missing session
   }, 20000);
+
+  it("fails closed and lists stable ids for an ambiguous remote display name", () => {
+    for (const id of ["remote-a", "remote-b"]) {
+      const c = runCli(srvRoot, ["run", "-d", "--id", id, "--name", "Remote Shared", "--", "sleep", "300"]);
+      expect(c.status).toBe(0);
+      try { bgPids.push(Number(fs.readFileSync(path.join(srvRoot, `${id}.pid`), "utf8").trim())); } catch {}
+    }
+
+    const p = runCli(cliRoot, ["peek", "--remote", "testpeer", "Remote Shared", "--plain"], { PTY_FABRIC_BIN: fakeFabric });
+    expect(p.status).not.toBe(0);
+    expect(p.stderr).toContain('Session reference "Remote Shared" is ambiguous.');
+    expect(p.stderr).toContain("remote-a");
+    expect(p.stderr).toContain("remote-b");
+  }, 20000);
 });
 
 describe("pty send --remote over fabric", () => {

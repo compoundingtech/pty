@@ -34,6 +34,7 @@ _pty() {
     'tag-multi:Bulk tag ops across sessions'
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
+    'metadata:Atomically patch presentation metadata by stable id'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
@@ -59,10 +60,11 @@ _pty() {
             '(a --attach){a,--attach}[Create OR attach if id already exists]' \
             '(e --ephemeral){e,--ephemeral}[Ephemeral: auto-remove metadata on clean exit]' \
             '--id[Pin on-disk id (charset-validated)]' \
-            '--name[Display label (any printable, ≤ 500 chars)]' \
+            '--name[Display label (trimmed, single-line, ≤ 160 Unicode scalars)]' \
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
             '--env[Overlay child environment (KEY=VALUE, repeatable)]' \
+            '--unset-env[Remove inherited environment key (repeatable)]' \
             '--cwd[Working directory]' \
             '--isolate-env[Scrub env to a safe allow-list]' \
             '--force[Create even from inside another pty]'
@@ -73,6 +75,7 @@ _pty() {
             '--no-restart[Attach only; never prompt or restart an exited session]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
+            '--attach-stream-fd-v1[Write framed machine events to an inherited fd]:fd:' \
             '1:session:_pty_sessions'
           ;;
         exec)
@@ -112,7 +115,7 @@ _pty() {
             '--tags[Include internal bookkeeping tags]' \
             '--filter-tag[Filter to k=v (repeatable, ALL match)]' \
             '--remote[Include remote sessions via pty-relay]' \
-            '--status[Filter by status]:running|exited|vanished' \
+            '--status[Filter by status]:status:(running exited vanished)' \
             '--older-than[Only sessions older than a duration]' \
             '--newer-than[Only sessions newer than a duration]' \
             '--summary[One-line count summary instead of the list]'
@@ -175,6 +178,11 @@ _pty() {
             '--show[Print current displayName]' \
             '--clear[Remove displayName]' \
             '1:session:_pty_sessions'
+          ;;
+        metadata)
+          _arguments \
+            '--id[Exact stable session id]' \
+            '1:mode:(patch)'
           ;;
         up)
           _arguments \

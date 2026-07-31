@@ -9,6 +9,7 @@ import { PacketReader, MessageType, encodeAttach } from "../src/protocol.ts";
 import { queryStats } from "../src/client.ts";
 import {
   acquireRecoveryLock,
+  mutateMetadataUnderLock,
   writeMetadata,
   type SessionMetadata,
 } from "../src/sessions.ts";
@@ -199,6 +200,46 @@ describe("live daemon registry recovery", () => {
     expect(metadata(root, name).tags).toEqual(mutated.tags);
     expect(metadata(root, name).displayName).toBe(mutated.displayName);
     expect(metadata(root, name).lastAttachAt).toBe(mutated.lastAttachAt);
+  });
+
+  it("returns the exact stamped record from a locked metadata mutation", () => {
+    const root = makeRoot();
+    const name = "published-record";
+    const recoveryDir = path.join(root, ".recovery");
+    fs.mkdirSync(recoveryDir, { mode: 0o700 });
+    const rootStat = fs.lstatSync(root);
+    const recoveryStat = fs.lstatSync(recoveryDir);
+    writeMetadata(name, {
+      generation: "published-generation",
+      daemonPid: process.pid,
+      recovery: {
+        protocol: RECOVERY_PROTOCOL,
+        secret: "33".repeat(32),
+        processStartToken: "test-start",
+        launchIdentity: "44".repeat(32),
+        rootDevice: rootStat.dev,
+        rootInode: rootStat.ino,
+        recoveryDirDevice: recoveryStat.dev,
+        recoveryDirInode: recoveryStat.ino,
+        metadataRevision: "",
+      },
+      command: "/bin/sh",
+      args: [],
+      displayCommand: "sh",
+      cwd: root,
+      createdAt: new Date().toISOString(),
+    });
+
+    const result = mutateMetadataUnderLock(name, (current) => {
+      current.tags = { role: "worker" };
+      return true;
+    }, { expectedGeneration: "published-generation" });
+
+    expect(result.status).toBe("changed");
+    if (result.status !== "changed") throw new Error("metadata mutation did not publish");
+    const onDisk = metadata(root, name);
+    expect(result.metadata).toEqual(onDisk);
+    expect(result.metadata.recovery?.metadataRevision).toBe(metadataRevision(onDisk));
   });
 
   it("fails closed when metadata publication stops after revision advancement", () => {
