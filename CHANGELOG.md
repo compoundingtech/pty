@@ -22,8 +22,10 @@
   `clients.connections` details. Writable entries report their requested
   rows/columns, last request sequence, and which min-wins axes they currently
   constrain; readonly entries carry no geometry. This is point-in-time
-  observability only and does not change attach, resize, negotiation, or DATA
-  ordering semantics.
+  observability and does not change attach/resize min-wins or DATA ordering
+  semantics. An attached client that switches to readonly via `PEEK` now
+  relinquishes its requested geometry, re-negotiating the effective size when
+  necessary.
 
 ### Read-only session listing
 
