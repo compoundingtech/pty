@@ -704,8 +704,10 @@ describe("screenshot: alternate screen buffer", () => {
   it("main buffer is restored after alternate screen exits", async () => {
     const session = await createSession("sh", [
       "-c",
-      // Write to main buffer, switch to alt, write there, switch back
+      // Write to main buffer, wait until the test observes it, then switch to
+      // alt, write there, and switch back.
       "echo 'main-buffer-text';" +
+        "read -r _;" +
         "printf '\\033[?1049h';" +
         "printf 'alt-screen-only';" +
         "sleep 0.3;" +
@@ -714,6 +716,8 @@ describe("screenshot: alternate screen buffer", () => {
         "sleep 30",
     ]);
 
+    await session.waitForText("main-buffer-text");
+    session.sendKeys("continue\n");
     const ss = await session.waitForText("main-buffer-restored");
     expect(ss.text).toContain("main-buffer-text");
     expect(ss.text).toContain("main-buffer-restored");
