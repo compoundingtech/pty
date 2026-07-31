@@ -33,6 +33,7 @@ import {
   type SessionMetadata,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
+import type { StatsResult } from "./client.ts";
 
 interface Client {
   socket: net.Socket;
@@ -690,7 +691,10 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
-            socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
@@ -772,15 +776,33 @@ export class PtyServer {
     return prefix;
   }
 
-  private collectStats(): object {
+  private collectStats(): StatsResult {
     const buf = this.terminal.buffer.active;
     const meta = readMetadata(this.name);
 
     let attached = 0;
     let readOnly = 0;
+    const connections: NonNullable<StatsResult["clients"]["connections"]> = [];
     for (const c of this.clients.values()) {
-      if (c.readonly) readOnly++;
-      else if (c.attachSeq > 0) attached++;
+      if (c.readonly) {
+        readOnly++;
+        connections.push({
+          role: "readonly",
+          constrains: { rows: false, cols: false },
+        });
+      } else if (c.attachSeq > 0) {
+        attached++;
+        connections.push({
+          role: "writable",
+          rows: c.rows,
+          cols: c.cols,
+          lastRequestSequence: c.attachSeq,
+          constrains: {
+            rows: c.rows === this.terminal.rows,
+            cols: c.cols === this.terminal.cols,
+          },
+        });
+      }
     }
 
     const createdAt = meta?.createdAt ?? null;
@@ -815,6 +837,7 @@ export class PtyServer {
         total: attached + readOnly,
         attached,
         readOnly,
+        connections,
       },
       modes: {
         sgrMouse: this.sgrMouseMode,

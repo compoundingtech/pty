@@ -246,7 +246,11 @@ const plain = await peekScreen({ name: "myserver", plain: true }); // plain text
 
 ### `queryStats(name: string, timeoutMs?: number): Promise<StatsResult>`
 
-Query live metrics from a running session.
+Query live metrics from a running session without attaching. The matching
+`pty stats --json` command uses the same non-attaching STATUS request.
+`terminal.rows` and `terminal.cols` are the current effective shared geometry;
+`clients` includes aggregate counts plus anonymous connection details showing
+each writable client's requested size and which min-wins axes it constrains.
 
 ```typescript
 interface StatsResult {
@@ -265,7 +269,21 @@ interface StatsResult {
     pid: number;
     resources: ProcessResources | null;
   };
-  clients: { total: number; attached: number; readOnly: number };
+  clients: {
+    total: number; attached: number; readOnly: number;
+    connections?: Array<
+      | {
+          role: "writable";
+          rows: number; cols: number;
+          lastRequestSequence: number;
+          constrains: { rows: boolean; cols: boolean };
+        }
+      | {
+          role: "readonly";
+          constrains: { rows: false; cols: false };
+        }
+    >;
+  };
   modes: {
     sgrMouse: boolean; cursorHidden: boolean;
     kittyKeyboard: boolean; kittyKeyboardFlags: number[];
@@ -279,6 +297,16 @@ interface ProcessResources {
   cpuPercent: number;
 }
 ```
+
+Connection details are anonymous and their order is unspecified. They are a
+point-in-time explanation of the current min-wins result, not an event stream;
+polling stats cannot order geometry changes relative to attached-session DATA.
+`lastRequestSequence` is a daemon-local counter for the writable connection's
+most recent attach or resize request, not a connection identity or timestamp.
+Older daemons omit `connections`; the aggregate counts remain authoritative and
+must not be reconstructed as an empty connection list. The daemon does not
+retain a durable client identity; socket and packet-parser state are transport
+internals and are not exposed.
 
 ## Session Interaction (CLI-oriented)
 

@@ -89,7 +89,7 @@ pty send myserver --paste "$(cat prompt.md)"           # wrap as bracketed paste
 
 pty stats                                 # live metrics for all sessions
 pty stats myserver                        # stats for a specific session
-pty stats --json                          # stats as JSON (includes CPU, memory, PIDs)
+pty stats --json                          # effective geometry, anonymous clients, CPU/memory/PIDs
 
 pty events myserver                       # follow events in real-time
 pty events --all                          # follow events from all sessions
