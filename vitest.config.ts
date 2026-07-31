@@ -17,6 +17,7 @@ const HEAVY_PTY_TESTS = [
   "tests/remote-reconnect.test.ts",
   "tests/remote-exec-bridge.test.ts",
   "tests/attach-no-restart.test.ts",
+  "tests/effective-geometry.test.ts",
   // Real-IO / real-daemon timing tests that TIME OUT (5s default) under sustained
   // parallel load — they spawn daemons / do heavy event-log IO / drive a TUI and
   // pass in isolation but flake when the box is CPU-starved (many parallel PTY

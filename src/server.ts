@@ -16,6 +16,7 @@ import {
   encodeExit,
   encodeScreen,
   encodeStatusResponse,
+  encodeGeometry,
   decodeSize,
 } from "./protocol.ts";
 import {
@@ -628,6 +629,9 @@ export class PtyServer {
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
             const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             // Stamp the last-attach timestamp so `pty gc --idle-days N`
             // (and per-session `strategy.idle-days=N` tags) can detect
             // abandonment. Best-effort — if the metadata file was
@@ -686,6 +690,7 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
@@ -837,13 +842,23 @@ export class PtyServer {
 
     if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
-        this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
+        this.broadcastGeometry(rows, cols);
+        this.ptyProcess.resize(cols, rows);
         this.lastResizeTime = Date.now();
         return true;
       }
     }
     return false;
+  }
+
+  private broadcastGeometry(rows: number, cols: number): void {
+    const packet = encodeGeometry(rows, cols);
+    for (const client of this.clients.values()) {
+      if (client.attachSeq > 0 || client.readonly) {
+        client.socket.write(packet);
+      }
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,

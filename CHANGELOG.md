@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Stream-ordered effective geometry for embedded clients
+
+- Writable clients still select the shared PTY grid by independent row/column
+  minima, and zero viewers still preserve the last size. The daemon now sends
+  a framed `GEOMETRY` packet to writable and read-only output streams before
+  every affected `SCREEN`/`DATA`, including peer attach, resize, and
+  disconnect changes.
+- `SessionConnection` exposes `effectiveRows`/`effectiveCols` and a `geometry`
+  event. `attachPty()` and server-mode testing sessions resize their local
+  xterm grid from the same stream event before parsing later output. Older
+  clients safely ignore the bounded unknown packet and retain raw-byte
+  behavior.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no
