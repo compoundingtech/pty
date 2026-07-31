@@ -438,6 +438,22 @@ unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
 their historical raw-byte behavior. Embedders that reconstruct a terminal grid
 must handle `GEOMETRY`.
 
+For each `ATTACH` or `PEEK`, the server establishes a new synchronization
+generation with this public stream order:
+
+```text
+GEOMETRY -> SCREEN -> DATA / EXIT
+```
+
+`GEOMETRY` is sent immediately. The server then takes an ordered xterm parser
+cut: output before that cut is represented by `SCREEN`, while later `DATA` and
+`EXIT` packets are queued and released after the screen baseline. If the child
+exits before the cut, the server emits one `EXIT` after any final queued data.
+A later `ATTACH` or `PEEK` on the same socket cancels the unfinished generation,
+including writable-to-readonly mode changes, so stale screen or queued output
+from the previous mode is not emitted. A reconnect starts the same ordering
+contract again with a fresh `GEOMETRY` and `SCREEN`.
+
 ### `TERMINAL_SANITIZE: string`
 
 ANSI sequence that resets all terminal modes (mouse tracking, cursor visibility, alternate screen, etc.). Useful after disconnecting from a session.
