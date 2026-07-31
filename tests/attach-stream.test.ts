@@ -323,6 +323,7 @@ describe("pty attach --attach-stream-fd-v1", () => {
         streamReader?.destroy();
         setTimeout(() => {
           socket.write(encodeGeometry(24, 80));
+          socket.write(encodeScreen("baseline"));
           socket.write(encodePacket(MessageType.DATA, Buffer.alloc(1024 * 1024, 65)));
         }, 10);
       });
