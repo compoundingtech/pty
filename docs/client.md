@@ -491,7 +491,7 @@ socket.on("data", (raw) => {
 const MessageType = {
   DATA: 0,     // Terminal output / input
   ATTACH: 1,   // Client attach with size
-  DETACH: 2,   // Client detach
+  DETACH: 2,   // Client → server request; machine stream → caller outcome
   RESIZE: 3,   // Terminal resize
   EXIT: 4,     // Process exited
   SCREEN: 5,   // Screen replay
@@ -500,6 +500,12 @@ const MessageType = {
   GEOMETRY: 10, // Effective shared rows/cols (server → client)
 };
 ```
+
+`DETACH` always has an empty payload. On the session socket it requests that
+the client connection detach. On `--attach-stream-fd-v1`, it is the terminal
+outcome for an intentional local detach and is flushed before clean completion.
+Clean EOF follows either `DETACH` or `EXIT`; EOF without either outcome is a
+truncated stream.
 
 Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
 unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
