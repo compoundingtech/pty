@@ -320,6 +320,18 @@ These functions use `process.stdin`/`process.stdout` directly and may call `proc
 
 Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to detach (double-tap to send through).
 
+Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
+machine mode. stdin and stdout remain the controlling terminal for input and
+resize events, but terminal output is written only to that descriptor using the
+existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, `DATA`,
+and `EXIT` packets. Each initial attach or reconnect starts with `GEOMETRY`; a
+daemon that sends terminal data first is rejected as unsupported.
+
+The descriptor remains caller-owned. `attach()` flushes its writer but does not
+close the descriptor, so a consumer sees EOF only when the caller closes its
+copy (or the process exits). Descriptor errors fail the attach and are reported
+on stderr; stderr text is never written into the framed stream.
+
 ### `peek(options: PeekOptions): void`
 
 Read-only view. Writes directly to stdout.

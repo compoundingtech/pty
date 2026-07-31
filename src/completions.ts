@@ -88,6 +88,7 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "no-restart", desc: "Attach only; never prompt or restart an exited session" },
       { name: "force", desc: "Attach even from inside another pty" },
       { name: "remote", desc: "Attach a session on a fabric peer" },
+      { name: "attach-stream-fd-v1", desc: "Write framed machine events to an inherited fd" },
     ],
   },
   {

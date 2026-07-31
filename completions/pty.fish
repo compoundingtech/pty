@@ -79,6 +79,7 @@ complete -c pty -n '__pty_using_command attach a' -l auto-restart -s r -d 'Auto-
 complete -c pty -n '__pty_using_command attach a' -l no-restart -d 'Attach only; never prompt or restart an exited session'
 complete -c pty -n '__pty_using_command attach a' -l force -d 'Attach even from inside another pty'
 complete -c pty -n '__pty_using_command attach a' -l remote -d 'Attach a session on a fabric peer'
+complete -c pty -n '__pty_using_command attach a' -l attach-stream-fd-v1 -d 'Write framed machine events to an inherited fd'
 complete -c pty -n '__pty_using_command attach a' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command exec' -F
 complete -c pty -n '__pty_using_command peek' -l follow -s f -d 'Follow output read-only'

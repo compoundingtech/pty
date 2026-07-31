@@ -24,6 +24,16 @@
   fail closed while listing the candidate stable ids. Fabric remote routing uses
   the same rule on the target host.
 
+### Framed machine attach stream
+
+- `pty attach --attach-stream-fd-v1 <fd> <ref>` keeps stdin/stdout as the
+  controlling terminal while writing ordered, existing-protocol `GEOMETRY`,
+  `SCREEN`, `DATA`, and `EXIT` packets to a dedicated inherited descriptor.
+  The descriptor remains caller-owned and must be closed by the caller for
+  consumers to observe EOF. Invalid descriptors, write failures, and daemons
+  that do not provide the v1 geometry-first contract fail clearly on stderr.
+- Ordinary interactive attach rendering and resize behavior are unchanged.
+
 ### Stream-ordered effective geometry for embedded clients
 
 - Writable clients still select the shared PTY grid by independent row/column

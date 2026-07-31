@@ -72,6 +72,7 @@ _pty() {
             '--no-restart[Attach only; never prompt or restart an exited session]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
+            '--attach-stream-fd-v1[Write framed machine events to an inherited fd]' \
             '1:session:_pty_sessions'
           ;;
         exec)

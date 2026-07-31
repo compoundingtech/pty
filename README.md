@@ -73,6 +73,7 @@ pty list --filter-tag role=web            # show only sessions with matching tag
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
 pty attach --no-restart myserver          # attach only; fail if not running
+pty attach --attach-stream-fd-v1 3 myserver 3>events.bin  # framed machine stream
 pty exec -- codex                         # replace this session's process (inside a session)
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)
