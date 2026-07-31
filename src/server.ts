@@ -867,8 +867,6 @@ export class PtyServer {
   /** Resize the PTY to the smallest dimensions across all connected writable clients.
    *  Returns true if the size actually changed. */
   private negotiateSize(): boolean {
-    if (this.exited) return false;
-
     let rows = 0;
     let cols = 0;
 

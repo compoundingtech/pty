@@ -434,6 +434,11 @@ describe("integration", () => {
       await attachingPackets.waitFor((packets) =>
         packets.some((packet) => packet.type === MessageType.GEOMETRY)
       );
+      attachingClient.write(encodeResize(24, 80));
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.filter((packet) => packet.type === MessageType.GEOMETRY).length === 2
+      );
 
       liveClient.write(encodeData("exit 7\n"));
       await livePackets.waitFor((packets) =>
@@ -446,6 +451,7 @@ describe("integration", () => {
       );
 
       expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
         MessageType.GEOMETRY,
         MessageType.SCREEN,
         MessageType.EXIT,
