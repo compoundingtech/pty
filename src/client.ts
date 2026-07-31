@@ -464,7 +464,7 @@ export function attach(options: AttachOptions): void {
   let inputWired = false;
   let stdinDataHandler: ((data: Buffer) => void) | null = null;
   let resizeHandler: (() => void) | null = null;
-  let sawGeometry = false;
+  let machineInitialState: "geometry" | "screen" | "ready" = "geometry";
   let streamBackpressured = false;
   const attachStream = attachStreamFd === undefined
     ? null
@@ -587,14 +587,29 @@ export function attach(options: AttachOptions): void {
           packet.type === MessageType.DATA ||
           packet.type === MessageType.EXIT;
         if (!isStreamEvent) continue;
-        if (!sawGeometry && packet.type !== MessageType.GEOMETRY) {
+        if (machineInitialState === "geometry" && packet.type !== MessageType.GEOMETRY) {
           console.error(
             "pty attach: daemon does not support attach stream v1 (expected GEOMETRY before terminal events)",
           );
           finish(1);
           return;
         }
-        if (packet.type === MessageType.GEOMETRY) sawGeometry = true;
+        if (
+          machineInitialState === "screen" &&
+          packet.type !== MessageType.GEOMETRY &&
+          packet.type !== MessageType.SCREEN
+        ) {
+          console.error(
+            `pty attach: daemon does not support attach stream v1 (expected SCREEN before ${packet.type === MessageType.DATA ? "DATA" : "EXIT"})`,
+          );
+          finish(1);
+          return;
+        }
+        if (machineInitialState === "geometry" && packet.type === MessageType.GEOMETRY) {
+          machineInitialState = "screen";
+        } else if (machineInitialState === "screen" && packet.type === MessageType.SCREEN) {
+          machineInitialState = "ready";
+        }
         if (!attachStream.write(encodePacket(packet.type, packet.payload)) && !streamBackpressured) {
           streamBackpressured = true;
           socket.pause();
@@ -636,6 +651,11 @@ export function attach(options: AttachOptions): void {
     // No reconnect: preserve the original not-found / exit-code behavior.
     if (err) {
       cleanExit();
+      if (attachStream && !sessionExited) {
+        console.error(`pty attach: machine stream truncated before EXIT: ${err.message}`);
+        finish(1);
+        return;
+      }
       const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
         || err.code === "ECONNRESET" || err.code === "EPIPE";
       if (notReachable) {
@@ -648,7 +668,7 @@ export function attach(options: AttachOptions): void {
       finish(1);
     } else {
       if (attachStream && !sessionExited) {
-        console.error("pty attach: machine stream ended before an EXIT event");
+        console.error("pty attach: machine stream truncated before EXIT: connection closed");
         finish(1);
       } else {
         finish(exitCode);
@@ -658,7 +678,7 @@ export function attach(options: AttachOptions): void {
 
   function bindSocket(s: net.Socket, preConnected: boolean): void {
     reader = new PacketReader();
-    sawGeometry = false;
+    machineInitialState = "geometry";
     if (streamBackpressured) s.pause();
     s.on("data", handleData);
     s.on("error", (err: NodeJS.ErrnoException) => handleDisconnect(err));

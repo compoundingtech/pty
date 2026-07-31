@@ -27,6 +27,9 @@ _pty() {
       COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --cwd --isolate-env --force" -- "${cur}"))
       ;;
     attach|a)
+      if [[ "${prev}" == "--attach-stream-fd-v1" ]]; then
+        return
+      fi
       if [[ "${cur}" == -* ]]; then
         COMPREPLY=($(compgen -W "-r --auto-restart --no-restart --force --remote --attach-stream-fd-v1" -- "${cur}"))
       else

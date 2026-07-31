@@ -210,6 +210,25 @@ describe("pty attach --attach-stream-fd-v1", () => {
     expect(result.stderr.toString()).toMatch(/daemon does not support attach stream v1/i);
   });
 
+  for (const premature of [
+    encodePacket(MessageType.DATA, Buffer.from("too early")),
+    encodeExit(0),
+  ]) {
+    const type = new PacketReader().feed(premature)[0].type === MessageType.DATA ? "DATA" : "EXIT";
+    it(`rejects a partial daemon that sends ${type} before the initial SCREEN`, async () => {
+      const result = await runAgainstFakeDaemon((socket) => {
+        socket.write(Buffer.concat([encodeGeometry(24, 80), premature]));
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toEqual(Buffer.alloc(0));
+      expect(result.stderr.toString()).toMatch(new RegExp(`expected SCREEN before ${type}`, "i"));
+      expect(new PacketReader().feed(result.stream).map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+      ]);
+    });
+  }
+
   it("fails when the connection closes without a framed EXIT event", async () => {
     const result = await runAgainstFakeDaemon((socket) => {
       socket.end(Buffer.concat([encodeGeometry(24, 80), encodeScreen("truncated")]));
@@ -217,11 +236,24 @@ describe("pty attach --attach-stream-fd-v1", () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toEqual(Buffer.alloc(0));
-    expect(result.stderr.toString()).toMatch(/machine stream ended before an EXIT event/i);
+    expect(result.stderr.toString()).toMatch(/machine stream truncated before EXIT: connection closed/i);
     expect(new PacketReader().feed(result.stream).map((packet) => packet.type)).toEqual([
       MessageType.GEOMETRY,
       MessageType.SCREEN,
     ]);
+  });
+
+  it("diagnoses a transport reset as a truncated stream, not a missing session", async () => {
+    const result = await runAgainstFakeDaemon((socket) => {
+      socket.write(Buffer.concat([encodeGeometry(24, 80), encodeScreen("partial")]), () => {
+        socket.resetAndDestroy();
+      });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toEqual(Buffer.alloc(0));
+    expect(result.stderr.toString()).toMatch(/machine stream truncated before EXIT/i);
+    expect(result.stderr.toString()).not.toMatch(/session .* not found/i);
   });
 
   it("fails instead of hanging when the inherited stream breaks", async () => {
@@ -323,5 +355,62 @@ describe("pty attach --attach-stream-fd-v1", () => {
       MessageType.EXIT,
     ]);
     expect(decodeSize(packets[3].payload)).toEqual({ rows: 21, cols: 71 });
+  });
+
+  it("requires a fresh SCREEN after GEOMETRY on reconnect", async () => {
+    const { server, port } = await listen();
+    let connection = 0;
+    server.on("connection", (socket) => {
+      const current = ++connection;
+      socket.once("data", () => {
+        if (current === 1) {
+          socket.end(Buffer.concat([
+            encodeGeometry(20, 70),
+            encodeScreen("first"),
+            encodePacket(MessageType.DATA, Buffer.from("before reconnect")),
+          ]));
+        } else {
+          socket.write(Buffer.concat([
+            encodeGeometry(21, 71),
+            encodePacket(MessageType.DATA, Buffer.from("too early")),
+          ]));
+        }
+      });
+    });
+    const script = `
+      import net from "node:net";
+      import { attach } from ${JSON.stringify(clientUrl)};
+      const dial = () => new Promise((resolve, reject) => {
+        const socket = net.createConnection({ host: "127.0.0.1", port: ${port} });
+        socket.once("connect", () => resolve(socket));
+        socket.once("error", reject);
+      });
+      const socket = await dial();
+      attach({
+        name: "fixture",
+        socket,
+        attachStreamFdV1: 3,
+        reconnect: dial,
+        onExit: (code) => process.exit(code),
+      });
+    `;
+    const child = spawn(nodeBin, ["--input-type=module", "-e", script], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    const stream = collect(child.stdio[3] as NodeJS.ReadableStream);
+    const status = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+    server.close();
+
+    expect(status).toBe(1);
+    expect(await stdout).toEqual(Buffer.alloc(0));
+    expect((await stderr).toString()).toMatch(/expected SCREEN before DATA/i);
+    expect(new PacketReader().feed(await stream).map((packet) => packet.type)).toEqual([
+      MessageType.GEOMETRY,
+      MessageType.SCREEN,
+      MessageType.DATA,
+      MessageType.GEOMETRY,
+    ]);
   });
 });
