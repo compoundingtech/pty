@@ -710,11 +710,13 @@ describe("screenshot: alternate screen buffer", () => {
         "printf 'alt-screen-only';" +
         "sleep 0.3;" +
         "printf '\\033[?1049l';" +
+        "echo 'main-buffer-restored';" +
         "sleep 30",
     ]);
 
-    const ss = await session.waitForText("main-buffer-text");
+    const ss = await session.waitForText("main-buffer-restored");
     expect(ss.text).toContain("main-buffer-text");
+    expect(ss.text).toContain("main-buffer-restored");
     // Alt screen content should NOT appear in the main buffer
     expect(ss.text).not.toContain("alt-screen-only");
   });
