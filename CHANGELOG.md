@@ -15,6 +15,16 @@
   clients safely ignore the bounded unknown packet and retain raw-byte
   behavior.
 
+### Connected-client geometry introspection
+
+- `pty stats --json` and `queryStats()` retain their existing effective
+  terminal geometry and aggregate client counts, and now add anonymous
+  `clients.connections` details. Writable entries report their requested
+  rows/columns, last request sequence, and which min-wins axes they currently
+  constrain; readonly entries carry no geometry. This is point-in-time
+  observability only and does not change attach, resize, negotiation, or DATA
+  ordering semantics.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no

@@ -1384,6 +1384,61 @@ describe("STATUS message", () => {
     statsClient.destroy();
   });
 
+  it("reports anonymous client geometry and per-axis constraints", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const tall = await connect(name);
+    const tallReader = new PacketReader();
+    tall.write(encodeAttach(50, 80));
+    await waitForType(tall, tallReader, MessageType.SCREEN);
+
+    const wide = await connect(name);
+    const wideReader = new PacketReader();
+    wide.write(encodeAttach(30, 120));
+    await waitForType(wide, wideReader, MessageType.SCREEN);
+
+    const peeker = await connect(name);
+    const peekReader = new PacketReader();
+    peeker.write(encodePeek());
+    await waitForType(peeker, peekReader, MessageType.SCREEN);
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+
+    const packet = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.terminal).toMatchObject({ rows: 30, cols: 80 });
+    expect(stats.clients.connections).toHaveLength(3);
+    expect(stats.clients.connections).toEqual(expect.arrayContaining([
+      {
+        role: "writable",
+        rows: 50,
+        cols: 80,
+        lastRequestSequence: 1,
+        constrains: { rows: false, cols: true },
+      },
+      {
+        role: "writable",
+        rows: 30,
+        cols: 120,
+        lastRequestSequence: 2,
+        constrains: { rows: true, cols: false },
+      },
+      {
+        role: "readonly",
+        constrains: { rows: false, cols: false },
+      },
+    ]));
+
+    tall.destroy();
+    wide.destroy();
+    peeker.destroy();
+    statsClient.destroy();
+  });
+
   it("reports exited process", async () => {
     const name = uniqueName();
     await startServer(name, "sh", ["-c", "exit 7"]);

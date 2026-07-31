@@ -260,15 +260,28 @@ describe("protocol", () => {
 
     it("round-trips a STATUS response (JSON payload)", () => {
       const reader = new PacketReader();
-      const json = JSON.stringify({ name: "test", terminal: { cols: 80, rows: 24 } });
+      const response = {
+        name: "test",
+        terminal: { cols: 80, rows: 24 },
+        clients: {
+          total: 1,
+          attached: 1,
+          readOnly: 0,
+          connections: [{
+            role: "writable",
+            rows: 24,
+            cols: 80,
+            lastRequestSequence: 1,
+            constrains: { rows: true, cols: true },
+          }],
+        },
+      };
+      const json = JSON.stringify(response);
       const encoded = encodeStatusResponse(json);
       const packets = reader.feed(encoded);
       expect(packets).toHaveLength(1);
       expect(packets[0].type).toBe(MessageType.STATUS);
-      expect(JSON.parse(packets[0].payload.toString())).toEqual({
-        name: "test",
-        terminal: { cols: 80, rows: 24 },
-      });
+      expect(JSON.parse(packets[0].payload.toString())).toEqual(response);
     });
 
     it("round-trips an effective GEOMETRY packet", () => {

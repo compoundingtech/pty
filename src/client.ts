@@ -314,6 +314,19 @@ export interface StatsResult {
     total: number;
     attached: number;
     readOnly: number;
+    connections: Array<
+      | {
+          role: "writable";
+          rows: number;
+          cols: number;
+          lastRequestSequence: number;
+          constrains: { rows: boolean; cols: boolean };
+        }
+      | {
+          role: "readonly";
+          constrains: { rows: false; cols: false };
+        }
+    >;
   };
   modes: {
     sgrMouse: boolean;
