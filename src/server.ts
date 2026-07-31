@@ -654,6 +654,7 @@ export class PtyServer {
             // to its own size, which would then look like it had matched.
             const sizeMatched =
               size.rows === this.terminal.rows && size.cols === this.terminal.cols;
+            client.readonly = false;
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;

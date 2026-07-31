@@ -13,6 +13,7 @@ import {
   encodeData,
   encodeDetach,
   encodeExit,
+  encodePacket,
   encodePeek,
   encodeResize,
   encodeStatus,
@@ -848,6 +849,173 @@ describe("integration", () => {
       vi.useRealTimers();
     }
     liveClient.destroy();
+  });
+
+  it("replaces a same-socket PEEK role with ATTACH", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const client = await connect(name);
+    const packets = recordPackets(client);
+    client.write(encodePeek());
+    await packets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+
+    client.write(encodeAttach(20, 70));
+    await packets.waitFor(
+      (received) =>
+        received.filter((packet) => packet.type === MessageType.SCREEN).length === 2
+    );
+    client.write(encodeData("writable-again\n"));
+    await packets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("writable-again")
+      )
+    );
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+    const status = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+    expect(stats.clients).toMatchObject({ attached: 1, readOnly: 0 });
+
+    client.write(encodeResize(18, 60));
+    await packets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.GEOMETRY &&
+          packet.payload.readUInt16BE(0) === 18 &&
+          packet.payload.readUInt16BE(2) === 60
+      )
+    );
+
+    client.destroy();
+    statsClient.destroy();
+  });
+
+  it("replaces a same-socket ATTACH role with PEEK", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const client = await connect(name);
+    const clientPackets = recordPackets(client);
+    client.write(encodeAttach(20, 70));
+    await clientPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    client.write(encodePeek());
+    await clientPackets.waitFor(
+      (received) =>
+        received.filter((packet) => packet.type === MessageType.SCREEN).length === 2
+    );
+
+    client.write(
+      Buffer.concat([
+        encodeResize(18, 60),
+        encodeData("must-not-reach-cat\n"),
+        encodeStatus(),
+      ])
+    );
+    await clientPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const status = clientPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({ attached: 0, readOnly: 1 });
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+
+    const observer = await connect(name);
+    const observerPackets = recordPackets(observer);
+    observer.write(encodeAttach(20, 70));
+    await observerPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    observer.write(encodeData("accepted-by-cat\n"));
+    await observerPackets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("accepted-by-cat")
+      )
+    );
+    const observedOutput = observerPackets.packets
+      .filter(
+        (packet) =>
+          packet.type === MessageType.SCREEN || packet.type === MessageType.DATA
+      )
+      .map((packet) => packet.payload.toString())
+      .join("");
+    expect(observedOutput).not.toContain("must-not-reach-cat");
+
+    client.destroy();
+    observer.destroy();
+  });
+
+  it("does not change either role for a malformed ATTACH payload", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "cat");
+    const terminalWrites = holdTerminalWrites(server);
+
+    const peeker = await connect(name);
+    const peekPackets = recordPackets(peeker);
+    peeker.write(encodePeek());
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.GEOMETRY)
+    );
+    expect(terminalWrites.pendingWrites).toHaveLength(1);
+    peeker.write(
+      Buffer.concat([
+        encodePacket(MessageType.ATTACH, Buffer.alloc(2)),
+        encodeStatus(),
+      ])
+    );
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const peekStatus = peekPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    expect(JSON.parse(peekStatus.payload.toString()).clients).toMatchObject({
+      attached: 0,
+      readOnly: 1,
+    });
+    await terminalWrites.releaseWrites();
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    terminalWrites.restore();
+
+    const attached = await connect(name);
+    const attachedPackets = recordPackets(attached);
+    attached.write(encodeAttach(20, 70));
+    await attachedPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    attached.write(
+      Buffer.concat([
+        encodePacket(MessageType.ATTACH, Buffer.alloc(2)),
+        encodeStatus(),
+      ])
+    );
+    await attachedPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const status = attachedPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({ attached: 1, readOnly: 1 });
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+
+    peeker.destroy();
+    attached.destroy();
   });
 
   it("skips the redraw SIGWINCH nudge at the session's current size", async () => {
