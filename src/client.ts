@@ -500,6 +500,27 @@ export function attach(options: AttachOptions): void {
       completeExit(code);
     }
   }
+  function finishDetach(): void {
+    if (exitHandled) return;
+    exitHandled = true;
+    detaching = true;
+    const completeDetach = () => {
+      if (exitCompleted) return;
+      exitCompleted = true;
+      options.onDetach?.();
+    };
+    if (attachStream && !attachStream.destroyed && !attachStream.writableEnded) {
+      attachStream.write(encodeDetach());
+      try { socket.write(encodeDetach()); } catch {}
+      cleanExit();
+      attachStream.end(completeDetach);
+    } else {
+      try { socket.write(encodeDetach()); } catch {}
+      cleanExit();
+      stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
+      completeDetach();
+    }
+  }
 
   attachStream?.on("error", (error) => {
     console.error(`pty attach: machine stream descriptor ${attachStreamFd} failed: ${error.message}`);
@@ -536,15 +557,7 @@ export function attach(options: AttachOptions): void {
             lastDetachKeyTime = now;
             setTimeout(() => {
               if (lastDetachKeyTime === now) {
-                detaching = true;
-                try { socket.write(encodeDetach()); } catch {}
-                cleanExit();
-                if (attachStream) {
-                  attachStream.end(() => options.onDetach?.());
-                } else {
-                  stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
-                  options.onDetach?.();
-                }
+                finishDetach();
               }
             }, DOUBLE_TAP_MS);
           }

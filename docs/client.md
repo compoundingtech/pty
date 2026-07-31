@@ -370,14 +370,19 @@ Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to de
 Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
 machine mode. stdin and stdout remain the controlling terminal for input and
 resize events, but terminal output is written only to that descriptor using the
-existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, `DATA`,
-and `EXIT` packets. Each initial attach or reconnect starts with `GEOMETRY`; a
+existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, and
+`DATA` packets followed by one terminal outcome: `EXIT` when the session process
+ends or `DETACH` when the local user intentionally detaches. `DETACH` may be the
+first packet when the user detaches before the daemon supplies its initial
+baseline. Each initial attach or reconnect otherwise starts with `GEOMETRY`; a
 daemon that sends terminal data first is rejected as unsupported.
 
 The descriptor remains caller-owned. `attach()` flushes its writer but does not
 close the descriptor, so a consumer sees EOF only when the caller closes its
-copy (or the process exits). Descriptor errors fail the attach and are reported
-on stderr; stderr text is never written into the framed stream.
+copy (or the process exits). A clean EOF follows a framed `EXIT` or `DETACH`;
+EOF without either outcome is a truncated stream. Descriptor errors fail the
+attach and are reported on stderr; stderr text is never written into the framed
+stream.
 
 ### `peek(options: PeekOptions): void`
 
