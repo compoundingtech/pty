@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { describe, it, expect, afterEach, afterAll, vi } from "vitest";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -97,6 +97,32 @@ function collectPackets(
 
     socket.on("data", onData);
   });
+}
+
+function recordPackets(socket: net.Socket): {
+  packets: Packet[];
+  waitFor: (predicate: (packets: Packet[]) => boolean) => Promise<void>;
+} {
+  const reader = new PacketReader();
+  const packets: Packet[] = [];
+  let wake: (() => void) | undefined;
+
+  socket.on("data", (data: Buffer) => {
+    packets.push(...reader.feed(data));
+    wake?.();
+  });
+
+  return {
+    packets,
+    async waitFor(predicate) {
+      while (!predicate(packets)) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+        wake = undefined;
+      }
+    },
+  };
 }
 
 /** Wait for a specific message type. */
@@ -337,6 +363,200 @@ describe("integration", () => {
 
     client1.destroy();
     client2.destroy();
+  });
+
+  it("sends SCREEN before live DATA produced during attach synchronization", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      liveClient.write(encodeData("during-initial-sync\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("during-initial-sync")
+        )
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+      expect(
+        attachingPackets.packets.find((packet) => packet.type === MessageType.SCREEN)?.payload.toString()
+      ).toContain("during-initial-sync");
+
+      attachingClient.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("sends one EXIT after SCREEN when the child exits during attach synchronization", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    let attachingClient: net.Socket | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      liveClient.write(encodeData("exit 7\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+        MessageType.EXIT,
+      ]);
+      const exitPackets = attachingPackets.packets.filter(
+        (packet) => packet.type === MessageType.EXIT
+      );
+      expect(exitPackets).toHaveLength(1);
+      expect(decodeExit(exitPackets[0].payload)).toBe(7);
+    } finally {
+      vi.useRealTimers();
+    }
+    const liveClosed = new Promise<void>((resolve) => liveClient.once("close", resolve));
+    liveClient.destroy();
+    await liveClosed;
+    if (attachingClient) {
+      const attachingClosed = new Promise<void>((resolve) =>
+        attachingClient!.once("close", resolve)
+      );
+      attachingClient.destroy();
+      await attachingClosed;
+    }
+  });
+
+  it("restarts attach synchronization when the same client re-attaches", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const reattachingClient = await connect(name);
+      const reattachingPackets = recordPackets(reattachingClient);
+
+      reattachingClient.write(encodeAttach(20, 70));
+      await reattachingPackets.waitFor((packets) => packets.length >= 1);
+      reattachingClient.write(encodeAttach(18, 60));
+      await reattachingPackets.waitFor((packets) => packets.length >= 2);
+
+      await vi.advanceTimersByTimeAsync(80);
+      await reattachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(reattachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+
+      reattachingClient.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("cancels pending attach synchronization when the client switches to PEEK", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const peeker = await connect(name);
+      const peekPackets = recordPackets(peeker);
+      const livePackets = recordPackets(liveClient);
+
+      peeker.write(encodeAttach(20, 70));
+      await peekPackets.waitFor((packets) => packets.length >= 1);
+      peeker.write(encodePeek());
+      await peekPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+      expect(peekPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+
+      liveClient.write(encodeData("peek-is-live\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("peek-is-live")
+        )
+      );
+      await peekPackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("peek-is-live")
+        )
+      );
+
+      peeker.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
   });
 
   it("skips the redraw SIGWINCH nudge at the session's current size", async () => {

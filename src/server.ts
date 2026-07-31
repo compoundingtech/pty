@@ -42,6 +42,10 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** DATA/EXIT must not overtake the delayed SCREEN baseline for ATTACH. */
+  initialScreenPending: boolean;
+  /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
+  initialScreenGeneration: number;
 }
 
 export interface ServerOptions {
@@ -603,6 +607,8 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      initialScreenPending: false,
+      initialScreenGeneration: 0,
     };
     this.clients.set(socket, client);
 
@@ -629,6 +635,8 @@ export class PtyServer {
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.initialScreenPending = true;
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -650,9 +658,13 @@ export class PtyServer {
             } catch {}
 
             const sendScreen = () => {
-              if (socket.destroyed) return;
+              if (
+                socket.destroyed ||
+                client.initialScreenGeneration !== initialScreenGeneration
+              ) return;
               const screen = this.getModePrefix(true) + this.serialize.serialize();
               socket.write(encodeScreen(screen));
+              client.initialScreenPending = false;
               if (this.exited) {
                 socket.write(encodeExit(this.exitCode));
               } else {
@@ -691,6 +703,7 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            client.initialScreenGeneration++;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -707,6 +720,7 @@ export class PtyServer {
               const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
               socket.write(encodeScreen(peekScreen));
             }
+            client.initialScreenPending = false;
 
             if (this.exited) {
               socket.write(encodeExit(this.exitCode));
@@ -853,6 +867,8 @@ export class PtyServer {
   /** Resize the PTY to the smallest dimensions across all connected writable clients.
    *  Returns true if the size actually changed. */
   private negotiateSize(): boolean {
+    if (this.exited) return false;
+
     let rows = 0;
     let cols = 0;
 
@@ -907,7 +923,7 @@ export class PtyServer {
 
   private broadcast(data: Buffer): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (!client.initialScreenPending) client.socket.write(data);
     }
   }
 
