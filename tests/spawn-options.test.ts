@@ -232,7 +232,8 @@ describe("spawnDaemon options", () => {
 
     const runResult = spawnSync(nodeBin, [
       cliPath, "run", "-d", "--id", name, "--isolate-env",
-      "--", "sh", "-c", "env > /tmp/pty-iso-env.txt; sleep 30",
+      "--unset-env", "PATH", "--env", `PATH=${process.env.PATH}`,
+      "--", "sh", "-c", "env > /tmp/pty-iso-env.txt; exec /bin/sleep 30",
     ], {
       env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SECRET_TEST: secret },
       encoding: "utf-8",
@@ -245,7 +246,7 @@ describe("spawnDaemon options", () => {
 
     const dumped = fs.readFileSync("/tmp/pty-iso-env.txt", "utf-8");
     expect(dumped).not.toContain("PTY_SECRET_TEST");
-    expect(dumped).toContain("PATH="); // PATH still propagates
+    expect(dumped).toContain(`PATH=${process.env.PATH}`); // explicit assignment wins after removal
     expect(dumped).toContain(`PTY_SESSION=${name}`); // set unconditionally
 
     // Clean up
@@ -361,6 +362,22 @@ describe("spawnDaemon options", () => {
       cwd: dir,
       env: { PATH: "/usr/bin:/bin" },
       extraEnv: { EXTRA: "nope" },
+    })).rejects.toThrow(/mutually exclusive/);
+  }, 15000);
+
+  it("env option combined with unsetEnv fails daemon startup", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+
+    await expect(spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      displayCommand: "sh",
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin" },
+      unsetEnv: ["NO_COLOR"],
     })).rejects.toThrow(/mutually exclusive/);
   }, 15000);
 

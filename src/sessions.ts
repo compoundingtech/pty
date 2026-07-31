@@ -144,6 +144,7 @@ export interface SessionMetadata {
   ephemeral?: boolean;
   isolateEnv?: boolean;
   extraEnv?: Record<string, string>;
+  unsetEnv?: string[];
   env?: Record<string, string>;
   createdAt: string;
   exitCode?: number;
@@ -1403,6 +1404,7 @@ export async function respawnPermanent(
   let tags: Record<string, string> | undefined = metadata.tags;
   const displayName = metadata.displayName;
   let extraEnv = metadata.extraEnv;
+  let unsetEnv = metadata.unsetEnv;
   let exactEnv = metadata.env;
 
   const ptyfilePath = metadata.tags?.ptyfile;
@@ -1419,6 +1421,7 @@ export async function respawnPermanent(
         displayCommand = sessDef.command;
         cwd = sessDef.cwd ?? ptyFile.dir;
         extraEnv = sessDef.env;
+        unsetEnv = undefined;
         exactEnv = undefined;
         tags = {
           ...sessDef.tags,
@@ -1469,6 +1472,7 @@ export async function respawnPermanent(
       ...(metadata.ephemeral !== undefined ? { ephemeral: metadata.ephemeral } : {}),
       ...(metadata.isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnv && Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
+      ...(unsetEnv && unsetEnv.length > 0 ? { unsetEnv } : {}),
       ...(exactEnv ? { env: exactEnv } : {}),
     });
   } finally {

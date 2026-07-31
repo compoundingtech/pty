@@ -154,6 +154,10 @@ interface SessionMetadata {
   lastLines?: string[];
   tags?: Record<string, string>;
   displayName?: string; // mutable, non-unique presentation label
+  isolateEnv?: boolean;
+  extraEnv?: Record<string, string>;
+  unsetEnv?: string[];
+  env?: Record<string, string>;
 }
 ```
 
@@ -176,8 +180,17 @@ interface SpawnDaemonOptions {
   rows?: number;                     // defaults to process.stdout.rows ?? 24
   cols?: number;                     // defaults to process.stdout.columns ?? 80
   tags?: Record<string, string>;     // key-value metadata (e.g. { owner: "forge" })
+  isolateEnv?: boolean;              // inherit only the safe allow-list
+  extraEnv?: Record<string, string>; // explicit assignments applied last
+  unsetEnv?: string[];               // inherited keys removed before assignments
+  env?: Record<string, string>;      // exact child env; mutually exclusive with the above
 }
 ```
+
+`unsetEnv` removals run before `extraEnv` assignments. The server then forces
+`PTY_SESSION` to the stable session id and fills an absent `TERM` with
+`xterm-256color`; naming either key in `unsetEnv` does not suppress those
+invariants. An explicit `extraEnv.TERM` value is preserved.
 
 ### `resolveCommand(cmd: string): string`
 
@@ -350,6 +363,18 @@ These functions use `process.stdin`/`process.stdout` directly and may call `proc
 
 Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to detach (double-tap to send through).
 
+Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
+machine mode. stdin and stdout remain the controlling terminal for input and
+resize events, but terminal output is written only to that descriptor using the
+existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, `DATA`,
+and `EXIT` packets. Each initial attach or reconnect starts with `GEOMETRY`; a
+daemon that sends terminal data first is rejected as unsupported.
+
+The descriptor remains caller-owned. `attach()` flushes its writer but does not
+close the descriptor, so a consumer sees EOF only when the caller closes its
+copy (or the process exits). Descriptor errors fail the attach and are reported
+on stderr; stderr text is never written into the framed stream.
+
 ### `peek(options: PeekOptions): void`
 
 Read-only view. Writes directly to stdout.
@@ -471,6 +496,22 @@ Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
 unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
 their historical raw-byte behavior. Embedders that reconstruct a terminal grid
 must handle `GEOMETRY`.
+
+For each `ATTACH` or `PEEK`, the server establishes a new synchronization
+generation with this public stream order:
+
+```text
+GEOMETRY -> SCREEN -> DATA / EXIT
+```
+
+`GEOMETRY` is sent immediately. The server then takes an ordered xterm parser
+cut: output before that cut is represented by `SCREEN`, while later `DATA` and
+`EXIT` packets are queued and released after the screen baseline. If the child
+exits before the cut, the server emits one `EXIT` after any final queued data.
+A later `ATTACH` or `PEEK` on the same socket cancels the unfinished generation,
+including writable-to-readonly mode changes, so stale screen or queued output
+from the previous mode is not emitted. A reconnect starts the same ordering
+contract again with a fresh `GEOMETRY` and `SCREEN`.
 
 ### `TERMINAL_SANITIZE: string`
 

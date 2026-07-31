@@ -42,6 +42,14 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** DATA/EXIT must not overtake the SCREEN baseline for ATTACH or PEEK. */
+  initialScreenPhase: "live" | "settling" | "cutting";
+  /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
+  initialScreenGeneration: number;
+  postCutPackets: Array<{
+    type: typeof MessageType.DATA | typeof MessageType.EXIT;
+    packet: Buffer;
+  }>;
 }
 
 export interface ServerOptions {
@@ -68,14 +76,17 @@ export interface ServerOptions {
   /** Additional `KEY=VALUE` env entries overlaid on the inherited child
    *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Environment keys removed from the inherited child environment. Applied
+   *  before `extraEnv`, so an explicit assignment wins when both mention a key. */
+  unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
    *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
    *  injected on top so nesting detection and `pty exec` keep working.
    *
-   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
-   *  together with either throws. Use this when the caller wants total
-   *  control of the child environment (e.g., pty-layout's launcher shell
-   *  that injects a shim tmux on `PATH`). */
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
+   *  `env` together with inherited-environment policy throws. Use this when
+   *  the caller wants total control of the child environment (e.g., a
+   *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
 }
 
@@ -108,13 +119,13 @@ function ensureChildTerm(env: Record<string, string>): void {
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
   // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
-  // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
-  // you pass `env`; if you want scrub+extras you pass `isolateEnv`. Picking
+  // inherited-environment policy path. If you want total control you pass
+  // `env`; otherwise isolation/removals/assignments compose explicitly. Picking
   // one implicitly would hide intent.
-  if (options.env && (options.isolateEnv || options.extraEnv)) {
+  if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
-      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv. " +
-      "Use env for verbatim control, or isolateEnv (+ optional extraEnv) for allow-list semantics — not both."
+      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
+      "Use env for verbatim control, or inherited environment policy options — not both."
     );
   }
 
@@ -133,6 +144,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     // Legacy behaviour: full inheritance, minus the server-config handoff.
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
+    for (const key of options.unsetEnv ?? []) delete env[key];
     if (options.extraEnv) {
       for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
     }
@@ -146,6 +158,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     if (v === undefined) continue;
     if (ISOLATED_ENV_ALLOWLIST.has(k) || k.startsWith("LC_")) env[k] = v;
   }
+  for (const key of options.unsetEnv ?? []) delete env[key];
   if (options.extraEnv) {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
@@ -506,7 +519,7 @@ export class PtyServer {
       this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
-        this.broadcast(encodeData(cleaned));
+        this.broadcast(MessageType.DATA, encodeData(cleaned));
       }
     });
 
@@ -519,7 +532,7 @@ export class PtyServer {
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
-      this.broadcast(encodeExit(code));
+      this.broadcast(MessageType.EXIT, encodeExit(code));
       this.emitEvent(EventType.SESSION_EXIT, {
         exitCode: code,
         ...(signal ? { signal } : {}),
@@ -575,6 +588,7 @@ export class PtyServer {
           ...(options.displayName ? { displayName: options.displayName } : {}),
           ...(options.isolateEnv ? { isolateEnv: true } : {}),
           ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+          ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
           ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
@@ -603,6 +617,9 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      initialScreenPhase: "live",
+      initialScreenGeneration: 0,
+      postCutPackets: [],
     };
     this.clients.set(socket, client);
 
@@ -629,6 +646,9 @@ export class PtyServer {
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -650,24 +670,24 @@ export class PtyServer {
             } catch {}
 
             const sendScreen = () => {
-              if (socket.destroyed) return;
-              const screen = this.getModePrefix(true) + this.serialize.serialize();
-              socket.write(encodeScreen(screen));
-              if (this.exited) {
-                socket.write(encodeExit(this.exitCode));
-              } else {
-                // The serialize addon's output is an approximation — ECH/CUF
-                // sequences may not perfectly reproduce what the app originally
-                // drew (e.g., background fills in ratatui). Nudge the child
-                // with a SIGWINCH so it does a fresh full redraw, whose DATA
-                // overwrites any serialize artifacts on the client.
-                //
-                // Skipped when the client attached at the size the session
-                // already has: the child is drawn for that geometry, so the
-                // nudge buys nothing and wakes an otherwise idle process every
-                // time someone connects.
-                if (!sizeMatched) this.nudgeRedraw();
-              }
+              this.beginInitialScreenCut(
+                client,
+                initialScreenGeneration,
+                () => this.getModePrefix(true) + this.serialize.serialize(),
+                () => {
+                  // The serialize addon's output is an approximation — ECH/CUF
+                  // sequences may not perfectly reproduce what the app originally
+                  // drew (e.g., background fills in ratatui). Nudge the child
+                  // with a SIGWINCH so it does a fresh full redraw, whose DATA
+                  // overwrites any serialize artifacts on the client.
+                  //
+                  // Skipped when the client attached at the size the session
+                  // already has: the child is drawn for that geometry, so the
+                  // nudge buys nothing and wakes an otherwise idle process every
+                  // time someone connects.
+                  if (!this.exited && !sizeMatched) this.nudgeRedraw();
+                }
+              );
             };
 
             if (!this.exited) {
@@ -691,6 +711,9 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -699,18 +722,14 @@ export class PtyServer {
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
 
-            if (plain) {
-              socket.write(encodeScreen(full ? this.getFullPlainScreen() : this.getPlainScreen()));
-            } else {
+            this.beginInitialScreenCut(client, initialScreenGeneration, () => {
+              if (plain) {
+                return full ? this.getFullPlainScreen() : this.getPlainScreen();
+              }
               // scrollback: 0 for viewport only, omit for full scrollback
               const serializeOpts = full ? undefined : { scrollback: 0 };
-              const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
-              socket.write(encodeScreen(peekScreen));
-            }
-
-            if (this.exited) {
-              socket.write(encodeExit(this.exitCode));
-            }
+              return this.getModePrefix() + this.serialize.serialize(serializeOpts);
+            });
             break;
           }
 
@@ -905,9 +924,59 @@ export class PtyServer {
     } as EventRecord);
   }
 
-  private broadcast(data: Buffer): void {
+  private beginInitialScreenCut(
+    client: Client,
+    generation: number,
+    getScreen: () => string,
+    onLive?: () => void
+  ): void {
+    if (
+      client.socket.destroyed ||
+      client.initialScreenGeneration !== generation
+    ) return;
+
+    client.initialScreenPhase = "cutting";
+    /** xterm parses writes asynchronously. This empty write is an ordered
+     *  marker: its callback runs after every earlier write and before later
+     *  writes, giving SCREEN an exact parser cut. */
+    this.terminal.write("", () => {
+      if (
+        client.socket.destroyed ||
+        client.initialScreenGeneration !== generation
+      ) return;
+
+      const postCutPackets = client.postCutPackets;
+      client.postCutPackets = [];
+      const hasPostCutExit = postCutPackets.some(
+        (pending) => pending.type === MessageType.EXIT
+      );
+
+      client.socket.write(encodeScreen(getScreen()));
+      client.initialScreenPhase = "live";
+      /** node-pty drains PTY data before its public exit event, so a queued
+       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
+       *  this queue and is synthesized only after any final post-cut DATA. */
+      for (const pending of postCutPackets) {
+        client.socket.write(pending.packet);
+      }
+      if (this.exited && !hasPostCutExit) {
+        client.socket.write(encodeExit(this.exitCode));
+      }
+      onLive?.();
+    });
+  }
+
+  private broadcast(
+    type: typeof MessageType.DATA | typeof MessageType.EXIT,
+    packet: Buffer
+  ): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (client.initialScreenPhase === "settling") continue;
+      if (client.initialScreenPhase === "cutting") {
+        client.postCutPackets.push({ type, packet });
+        continue;
+      }
+      client.socket.write(packet);
     }
   }
 
@@ -984,6 +1053,7 @@ export class PtyServer {
       ...(existing?.displayName ? { displayName: existing.displayName } : {}),
       ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
       ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
+      ...(this.options.unsetEnv && this.options.unsetEnv.length > 0 ? { unsetEnv: this.options.unsetEnv } : {}),
       ...(this.options.env ? { env: this.options.env } : {}),
     });
   }
@@ -1198,6 +1268,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
+    unsetEnv: config.unsetEnv,
     env: config.env,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down

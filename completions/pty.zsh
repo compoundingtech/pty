@@ -63,6 +63,7 @@ _pty() {
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
             '--env[Overlay child environment (KEY=VALUE, repeatable)]' \
+            '--unset-env[Remove inherited environment key (repeatable)]' \
             '--cwd[Working directory]' \
             '--isolate-env[Scrub env to a safe allow-list]' \
             '--force[Create even from inside another pty]'
@@ -73,6 +74,7 @@ _pty() {
             '--no-restart[Attach only; never prompt or restart an exited session]' \
             '--force[Attach even from inside another pty]' \
             '--remote[Attach a session on a fabric peer]' \
+            '--attach-stream-fd-v1[Write framed machine events to an inherited fd]:fd:' \
             '1:session:_pty_sessions'
           ;;
         exec)
@@ -112,7 +114,7 @@ _pty() {
             '--tags[Include internal bookkeeping tags]' \
             '--filter-tag[Filter to k=v (repeatable, ALL match)]' \
             '--remote[Include remote sessions via pty-relay]' \
-            '--status[Filter by status]:running|exited|vanished' \
+            '--status[Filter by status]:status:(running exited vanished)' \
             '--older-than[Only sessions older than a duration]' \
             '--newer-than[Only sessions newer than a duration]' \
             '--summary[One-line count summary instead of the list]'

@@ -24,15 +24,15 @@
 
 // ─── Spec ──────────────────────────────────────────────────────────────────
 
-/** A `--flag`. `values` (when present) is the closed set of completions for
- *  the flag's argument; absence means a boolean flag or a free-form value. */
+/** A `--flag`, optionally with one required argument. */
 interface FlagSpec {
   name: string;
   desc: string;
   /** `-x` short spelling, for fish `-s` and bash/zsh bundled forms. */
   short?: string;
-  /** Closed set of values for the flag's argument; absence = free-form/boolean. */
-  values?: readonly string[];
+  argument?:
+    | { _tag: "free"; name: string }
+    | { _tag: "choices"; name: string; values: readonly string[] };
 }
 
 /** A leaf command: a top-level subcommand. */
@@ -73,6 +73,7 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "no-display-name", desc: "Skip the auto-generated label" },
       { name: "tag", desc: "Tag session (k=v, repeatable)" },
       { name: "env", desc: "Overlay child environment (KEY=VALUE, repeatable)" },
+      { name: "unset-env", desc: "Remove inherited environment key (repeatable)" },
       { name: "cwd", desc: "Working directory" },
       { name: "isolate-env", desc: "Scrub env to a safe allow-list" },
       { name: "force", desc: "Create even from inside another pty" },
@@ -88,6 +89,11 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "no-restart", desc: "Attach only; never prompt or restart an exited session" },
       { name: "force", desc: "Attach even from inside another pty" },
       { name: "remote", desc: "Attach a session on a fabric peer" },
+      {
+        name: "attach-stream-fd-v1",
+        desc: "Write framed machine events to an inherited fd",
+        argument: { _tag: "free", name: "fd" },
+      },
     ],
   },
   {
@@ -140,7 +146,11 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "tags", desc: "Include internal bookkeeping tags" },
       { name: "filter-tag", desc: "Filter to k=v (repeatable, ALL match)" },
       { name: "remote", desc: "Include remote sessions via pty-relay" },
-      { name: "status", desc: "Filter by status", values: STATUS_VALUES },
+      {
+        name: "status",
+        desc: "Filter by status",
+        argument: { _tag: "choices", name: "status", values: STATUS_VALUES },
+      },
       { name: "older-than", desc: "Only sessions older than a duration" },
       { name: "newer-than", desc: "Only sessions newer than a duration" },
       { name: "summary", desc: "One-line count summary instead of the list" },
@@ -337,9 +347,13 @@ function fishScript(): string {
     // Flags.
     for (const f of c.flags ?? []) {
       const short = f.short ? ` -s ${f.short}` : "";
-      if (f.values) {
+      if (f.argument?._tag === "choices") {
         out.push(
-          `complete -c pty -n ${q(guard)} -l ${f.name}${short} -x -a ${q(f.values.join(" "))} -d ${q(f.desc)}`,
+          `complete -c pty -n ${q(guard)} -l ${f.name}${short} -x -a ${q(f.argument.values.join(" "))} -d ${q(f.desc)}`,
+        );
+      } else if (f.argument?._tag === "free") {
+        out.push(
+          `complete -c pty -n ${q(guard)} -l ${f.name}${short} -x -d ${q(f.desc)}`,
         );
       } else {
         out.push(
@@ -415,6 +429,19 @@ function bashScript(): string {
     const guard = `    ${names})`;
     if (takesSessions) {
       lines.push(guard);
+      for (const f of c.flags ?? []) {
+        if (!f.argument) continue;
+        const spellings = [f.short ? `-${f.short}` : null, `--${f.name}`].filter(Boolean);
+        const condition = spellings.map((spelling) => `"\${prev}" == "${spelling}"`).join(" || ");
+        lines.push(`      if [[ ${condition} ]]; then`);
+        if (f.argument._tag === "choices") {
+          lines.push(
+            `        COMPREPLY=($(compgen -W "${f.argument.values.join(" ")}" -- "\${cur}"))`,
+          );
+        }
+        lines.push("        return");
+        lines.push("      fi");
+      }
       lines.push("      if [[ \"${cur}\" == -* ]]; then");
       lines.push(
         `        COMPREPLY=($(compgen -W "${flagWords}" -- "\${cur}"))`,
@@ -496,7 +523,12 @@ function zshScript(): string {
       const opt = f.short
         ? `(${f.short} --${f.name}){${f.short},--${f.name}}`
         : `--${f.name}`;
-      specs.push(`'${opt}[${f.desc}]${f.values ? ":" + f.values.join("|") : ""}'`);
+      const argument = f.argument?._tag === "choices"
+        ? `:${f.argument.name}:(${f.argument.values.join(" ")})`
+        : f.argument?._tag === "free"
+          ? `:${f.argument.name}:`
+          : "";
+      specs.push(`'${opt}[${f.desc}]${argument}'`);
     }
     if (c.dynamic === "sessions") specs.push("'1:session:_pty_sessions'");
     if (c.takesPath) specs.push("'1:directory:_directories'");

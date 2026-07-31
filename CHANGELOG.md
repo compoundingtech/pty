@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Restart-durable environment removals
+
+- `pty run --unset-env KEY` and programmatic `unsetEnv` persist inherited
+  environment removals across manual and permanent restart. Explicit `--env`
+  assignments are applied afterward and therefore win independent of flag
+  order.
+- Storage format: session metadata may include an optional `unsetEnv` string
+  array. Older records omit it and retain the historical ambient-inheritance
+  behavior; exact `env` remains mutually exclusive with inherited-environment
+  policy options.
+
+### Ordered initial attach snapshots
+
+- Every `ATTACH` and `PEEK` synchronization now sends the effective
+  `GEOMETRY`, then one `SCREEN` baseline, before any following `DATA` or
+  `EXIT`. Output already accepted by xterm at the snapshot cut is represented
+  by `SCREEN`; later output is queued and released in order after it, with a
+  single process exit following any final data.
+- A new `ATTACH` or `PEEK` on the same socket supersedes an unfinished
+  synchronization, so a re-attach or writable-to-readonly mode switch cannot
+  emit the previous mode's stale screen or queued output. Reconnects establish
+  the same fresh `GEOMETRY` → `SCREEN` → `DATA`/`EXIT` baseline.
+
 ### Atomic exact-id metadata patching
 
 - `pty metadata patch --id <stable-id>` reads one merge-style JSON object from
@@ -27,6 +50,16 @@ patches append no event.
   id wins, one display-name match resolves, and multiple display-name matches
   fail closed while listing the candidate stable ids. Fabric remote routing uses
   the same rule on the target host.
+
+### Framed machine attach stream
+
+- `pty attach --attach-stream-fd-v1 <fd> <ref>` keeps stdin/stdout as the
+  controlling terminal while writing ordered, existing-protocol `GEOMETRY`,
+  `SCREEN`, `DATA`, and `EXIT` packets to a dedicated inherited descriptor.
+  The descriptor remains caller-owned and must be closed by the caller for
+  consumers to observe EOF. Invalid descriptors, write failures, and daemons
+  that do not provide the v1 geometry-first contract fail clearly on stderr.
+- Ordinary interactive attach rendering and resize behavior are unchanged.
 
 ### Stream-ordered effective geometry for embedded clients
 
