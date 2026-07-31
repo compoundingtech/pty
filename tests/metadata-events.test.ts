@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import {
-  setDisplayName, updateTags, readMetadata,
+  patchMetadataById, setDisplayName, updateTags, readMetadata,
 } from "../src/sessions.ts";
 import { EventFollower, formatEvent, type EventRecord } from "../src/events.ts";
 
@@ -78,6 +78,15 @@ function runCli(sessionDir: string, env: Record<string, string>, ...args: string
   });
 }
 
+function runCliWithInput(sessionDir: string, input: string, ...args: string[]) {
+  return spawnSync(nodeBin, [cliPath, ...args], {
+    env: { ...process.env, PTY_SESSION_DIR: sessionDir },
+    input,
+    encoding: "utf-8",
+    timeout: 10_000,
+  });
+}
+
 afterEach(async () => {
   await terminateAndWait(bgPids);
   bgPids = [];
@@ -95,6 +104,149 @@ function readEvents(dir: string, name: string): any[] {
     return content.trimEnd().split("\n").filter(Boolean).map(l => JSON.parse(l));
   } catch { return []; }
 }
+
+describe("patchMetadataById", () => {
+  it("atomically changes displayName and tags while preserving unrelated tags", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    updateTags(name, { keep: "yes", replace: "old", remove: "old" });
+
+    const result = await patchMetadataById(name, {
+      displayName: "Worker",
+      tags: { replace: "new", remove: null, added: "yes" },
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.metadata.displayName).toBe("Worker");
+    expect(result.metadata.tags).toEqual({ keep: "yes", replace: "new", added: "yes" });
+    const changes = readEvents(dir, name).filter((event) => event.type === "metadata_change");
+    expect(changes).toHaveLength(1);
+    expect(changes[0].previous).toEqual({
+      displayName: null,
+      tags: { replace: "old", remove: "old", added: null },
+    });
+    expect(changes[0].value).toEqual({
+      displayName: "Worker",
+      tags: { replace: "new", remove: null, added: "yes" },
+    });
+  }, 15000);
+
+  it("supports clear operations and emits one coherent event", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    await patchMetadataById(name, { displayName: "Before", tags: { remove: "yes", keep: "yes" } });
+
+    const result = await patchMetadataById(name, {
+      displayName: null,
+      tags: { remove: null },
+    });
+
+    expect(result.metadata.displayName).toBeUndefined();
+    expect(result.metadata.tags).toEqual({ keep: "yes" });
+    const changes = readEvents(dir, name).filter((event) => event.type === "metadata_change");
+    expect(changes).toHaveLength(2);
+    expect(changes[1].previous).toEqual({ displayName: "Before", tags: { remove: "yes" } });
+    expect(changes[1].value).toEqual({ displayName: null, tags: { remove: null } });
+  }, 15000);
+
+  it("suppresses both the write result and event for a no-op", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    await patchMetadataById(name, { displayName: "Stable", tags: { role: "worker" } });
+    const before = readEvents(dir, name).filter((event) => event.type === "metadata_change").length;
+
+    const result = await patchMetadataById(name, {
+      displayName: "Stable",
+      tags: { role: "worker", absent: null },
+    });
+
+    expect(result.changed).toBe(false);
+    expect(readEvents(dir, name).filter((event) => event.type === "metadata_change")).toHaveLength(before);
+  }, 15000);
+
+  it("never falls back from a missing stable id to a matching displayName", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    setDisplayName(name, "missing-id");
+
+    await expect(patchMetadataById("missing-id", { tags: { wrong: "target" } }))
+      .rejects.toThrow('Session id "missing-id" not found');
+    expect(readMetadata(name)?.tags?.wrong).toBeUndefined();
+  }, 15000);
+
+  it.each([
+    [{ displayName: "bad/name" }, /Invalid displayName/],
+    [{ tags: { "": "value" } }, /tag keys must be non-empty/],
+    [{ tags: { role: 1 } }, /tag values must be strings or null/],
+    [{ unknown: true }, /unknown field "unknown"/],
+  ])("rejects an invalid patch without writing metadata", async (patch, message) => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    const before = readMetadata(name);
+
+    await expect(patchMetadataById(name, patch as any)).rejects.toThrow(message);
+    expect(readMetadata(name)).toEqual(before);
+    expect(readEvents(dir, name).filter((event) => event.type === "metadata_change")).toHaveLength(0);
+  }, 15000);
+
+  it("exposes the exact-id atomic operation through JSON stdin/stdout", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+
+    const result = runCliWithInput(
+      dir,
+      JSON.stringify({ displayName: "CLI Worker", tags: { role: "worker" } }),
+      "metadata", "patch", "--id", name,
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      changed: true,
+      metadata: { displayName: "CLI Worker", tags: { role: "worker" } },
+    });
+    expect(readEvents(dir, name).filter((event) => event.type === "metadata_change")).toHaveLength(1);
+  }, 15000);
+
+  it("CLI exact-id lookup refuses a same-string displayName alias", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    setDisplayName(name, "missing-id");
+
+    const result = runCliWithInput(
+      dir,
+      JSON.stringify({ tags: { wrong: "target" } }),
+      "metadata", "patch", "--id", "missing-id",
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Session id "missing-id" not found');
+    expect(readMetadata(name)?.tags?.wrong).toBeUndefined();
+  }, 15000);
+
+  it.each([
+    [[], "{}", /missing required --id/],
+    [["--id", "target"], "not-json", /invalid JSON on stdin/],
+    [["--id", "target"], "[]", /Metadata patch must be a JSON object/],
+  ])("CLI reports actionable input errors", (args, input, message) => {
+    const dir = makeSessionDir();
+    const result = runCliWithInput(dir, input, "metadata", "patch", ...args);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(message);
+  });
+});
 
 describe("setDisplayName — display_name_change event", () => {
   it("emits on a real change, with previous + value populated", async () => {
@@ -355,5 +507,18 @@ describe("formatEvent for new metadata events", () => {
       value: {},
     });
     expect(line).toContain("{}");
+  });
+
+  it("formats metadata_change with coherent previous/value snapshots", () => {
+    const line = formatEvent({
+      session: "test",
+      type: "metadata_change",
+      ts: "2026-04-23T10:15:03.000Z",
+      previous: { displayName: null, tags: { role: null } },
+      value: { displayName: "Worker", tags: { role: "worker" } },
+    });
+    expect(line).toContain("metadata ->");
+    expect(line).toContain('"Worker"');
+    expect(line).toContain('"worker"');
   });
 });

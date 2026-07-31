@@ -33,6 +33,7 @@ _pty() {
     'tag-multi:Bulk tag ops across sessions'
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
+    'metadata:Atomically patch presentation metadata by stable id'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
@@ -170,6 +171,11 @@ _pty() {
             '--show[Print current displayName]' \
             '--clear[Remove displayName]' \
             '1:session:_pty_sessions'
+          ;;
+        metadata)
+          _arguments \
+            '--id[Exact stable session id]' \
+            '1:mode:(patch)'
           ;;
         up)
           _arguments \

@@ -62,6 +62,7 @@ pty rename my-label                       # inside a session: add/change its dis
 pty rename <ref> my-label                 # outside: set displayName on <ref>
 pty rename --show <ref>                   # show current displayName
 pty rename --clear [ref]                  # remove displayName
+pty metadata patch --id myserver < patch.json # atomically patch displayName/tags by exact id
 
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
@@ -124,6 +125,20 @@ labels and may be shared by multiple sessions. A command reference resolves an
 exact stable id first, then a display name only when that label has one match.
 Ambiguous display names fail without acting and print the candidate stable ids.
 Use stable ids in scripts and automation.
+
+For automation that must update presentation metadata without alias fallback,
+`pty metadata patch --id <stable-id>` reads one merge-style JSON object from
+stdin and returns `{ changed, metadata }` as JSON:
+
+```sh
+printf '%s' '{"displayName":"Worker","tags":{"role":"worker","old":null}}' \
+  | pty metadata patch --id a1b2c3d4
+```
+
+`displayName` and individual tag values use strings to set and `null` to clear;
+omitted fields and tag keys remain unchanged. The operation holds the session's
+metadata lock across one read/merge/atomic-write cycle. It fails if the exact id
+is absent, even when a display name has the same text.
 
 ### Remote over fabric
 

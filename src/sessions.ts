@@ -236,32 +236,192 @@ export function writeMetadata(name: string, metadata: SessionMetadata): void {
   atomicWriteFileSync(getMetadataPath(name), JSON.stringify(metadata, null, 2));
 }
 
+export interface MetadataPatch {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+}
+
+export interface MetadataPatchResult {
+  changed: boolean;
+  metadata: SessionMetadata;
+}
+
+type MetadataChangeSnapshot = {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+};
+
+type MetadataPatchEvent = "metadata_change" | "display_name_change" | "tags_change";
+
+function validateMetadataPatch(patch: unknown): asserts patch is MetadataPatch {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new Error("Metadata patch must be a JSON object.");
+  }
+  for (const key of Object.keys(patch)) {
+    if (key !== "displayName" && key !== "tags") {
+      throw new Error(`Metadata patch has unknown field "${key}". Allowed fields: displayName, tags.`);
+    }
+  }
+  const candidate = patch as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(candidate, "displayName")) {
+    if (candidate.displayName !== null && typeof candidate.displayName !== "string") {
+      throw new Error("Metadata patch displayName must be a string or null.");
+    }
+    if (typeof candidate.displayName === "string") {
+      try {
+        validateDisplayName(candidate.displayName);
+      } catch (e) {
+        throw new Error(`Invalid displayName: ${(e as Error).message}`);
+      }
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(candidate, "tags")) {
+    const tags = candidate.tags;
+    if (tags === null || typeof tags !== "object" || Array.isArray(tags)) {
+      throw new Error("Metadata patch tags must be a JSON object.");
+    }
+    for (const [key, value] of Object.entries(tags as Record<string, unknown>)) {
+      if (key.length === 0) throw new Error("Metadata patch tag keys must be non-empty.");
+      if (value !== null && typeof value !== "string") {
+        throw new Error(`Metadata patch tag values must be strings or null (invalid key: "${key}").`);
+      }
+    }
+  }
+}
+
+function setRecordValue(record: Record<string, string>, key: string, value: string): void {
+  Object.defineProperty(record, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function applyMetadataPatchById(
+  id: string,
+  patch: MetadataPatch,
+  eventType: MetadataPatchEvent,
+): MetadataPatchResult {
+  validateMetadataPatch(patch);
+  if (!acquireLock(id)) {
+    throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
+  }
+
+  try {
+    const metadata = readMetadata(id);
+    if (!metadata) throw new Error(`Session id "${id}" not found.`);
+
+    const previousTags = Object.fromEntries(Object.entries(metadata.tags ?? {}));
+    const nextTags = Object.fromEntries(Object.entries(previousTags));
+    const previous: MetadataChangeSnapshot = {};
+    const value: MetadataChangeSnapshot = {};
+
+    if (Object.prototype.hasOwnProperty.call(patch, "displayName")) {
+      const before = metadata.displayName ?? null;
+      const after = patch.displayName ?? null;
+      if (before !== after) {
+        previous.displayName = before;
+        value.displayName = after;
+        if (after === null) delete metadata.displayName;
+        else metadata.displayName = after;
+      }
+    }
+
+    if (patch.tags !== undefined) {
+      const changedTagKeys: string[] = [];
+      for (const [key, requested] of Object.entries(patch.tags)) {
+        const before = Object.prototype.hasOwnProperty.call(previousTags, key)
+          ? previousTags[key]
+          : null;
+        const after = requested ?? null;
+        if (before === after) continue;
+        changedTagKeys.push(key);
+        if (after === null) delete nextTags[key];
+        else setRecordValue(nextTags, key, after);
+      }
+      if (changedTagKeys.length > 0) {
+        previous.tags = {};
+        value.tags = {};
+        for (const key of changedTagKeys.sort()) {
+          const before = Object.prototype.hasOwnProperty.call(previousTags, key)
+            ? previousTags[key]
+            : null;
+          const after = Object.prototype.hasOwnProperty.call(nextTags, key)
+            ? nextTags[key]
+            : null;
+          Object.defineProperty(previous.tags, key, { value: before, enumerable: true });
+          Object.defineProperty(value.tags, key, { value: after, enumerable: true });
+        }
+        if (Object.keys(nextTags).length === 0) delete metadata.tags;
+        else metadata.tags = nextTags;
+      }
+    }
+
+    const changed = Object.keys(previous).length > 0;
+    if (!changed) return { changed: false, metadata };
+
+    if (metadata.displayName !== undefined) validateDisplayName(metadata.displayName);
+    for (const [key, tagValue] of Object.entries(metadata.tags ?? {})) {
+      if (key.length === 0) throw new Error("Resulting metadata contains an empty tag key.");
+      if (typeof tagValue !== "string") {
+        throw new Error(`Resulting metadata tag "${key}" is not a string.`);
+      }
+    }
+
+    writeMetadata(id, metadata);
+    if (eventType === "metadata_change") {
+      appendEventSync(id, {
+        session: id,
+        type: "metadata_change",
+        ts: new Date().toISOString(),
+        previous,
+        value,
+      });
+    } else if (eventType === "display_name_change") {
+      appendEventSync(id, {
+        session: id,
+        type: "display_name_change",
+        ts: new Date().toISOString(),
+        previous: previous.displayName ?? null,
+        value: value.displayName ?? null,
+      });
+    } else {
+      appendEventSync(id, {
+        session: id,
+        type: "tags_change",
+        ts: new Date().toISOString(),
+        previous: previousTags,
+        value: nextTags,
+      });
+    }
+    return { changed: true, metadata };
+  } finally {
+    releaseLock(id);
+  }
+}
+
+/** Atomically merge presentation metadata for one exact stable session id. */
+export async function patchMetadataById(
+  id: string,
+  patch: MetadataPatch,
+): Promise<MetadataPatchResult> {
+  validateMetadataPatch(patch);
+  const session = await getSessionByName(id);
+  if (!session) throw new Error(`Session id "${id}" not found.`);
+  return applyMetadataPatchById(id, patch, "metadata_change");
+}
+
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.
  *  Pass `null` to remove the alias. Throws if `name` doesn't exist. Emits a
  *  `display_name_change` event when (and only when) the value actually
  *  changed — no-op renames don't ping downstream watchers. */
 export function setDisplayName(name: string, displayName: string | null): void {
-  const metadata = readMetadata(name);
-  if (!metadata) {
-    throw new Error(`Session "${name}" not found.`);
-  }
-  const previous = metadata.displayName ?? null;
-  const next = displayName === null || displayName === "" ? null : displayName;
-  if (previous === next) return; // no-op write + no-op event
-
-  if (next === null) {
-    delete metadata.displayName;
-  } else {
-    metadata.displayName = next;
-  }
-  writeMetadata(name, metadata);
-  appendEventSync(name, {
-    session: name,
-    type: "display_name_change",
-    ts: new Date().toISOString(),
-    previous,
-    value: next,
-  });
+  applyMetadataPatchById(
+    name,
+    { displayName: displayName === "" ? null : displayName },
+    "display_name_change",
+  );
 }
 
 /** Update tags on an existing session. Performs an atomic read-modify-write.
@@ -273,43 +433,9 @@ export function updateTags(
   updates: Record<string, string>,
   removals: string[] = [],
 ): void {
-  const metadata = readMetadata(name);
-  if (!metadata) {
-    throw new Error(`Session "${name}" not found.`);
-  }
-  const previous = { ...(metadata.tags ?? {}) };
-  const tags = { ...previous };
-  for (const [k, v] of Object.entries(updates)) {
-    tags[k] = v;
-  }
-  for (const k of removals) {
-    delete tags[k];
-  }
-  if (tagsEqual(previous, tags)) return; // no-op write + no-op event
-
-  if (Object.keys(tags).length > 0) {
-    metadata.tags = tags;
-  } else {
-    delete metadata.tags;
-  }
-  writeMetadata(name, metadata);
-  appendEventSync(name, {
-    session: name,
-    type: "tags_change",
-    ts: new Date().toISOString(),
-    previous,
-    value: tags,
-  });
-}
-
-function tagsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  if (aKeys.length !== bKeys.length) return false;
-  for (const k of aKeys) {
-    if (!Object.prototype.hasOwnProperty.call(b, k) || a[k] !== b[k]) return false;
-  }
-  return true;
+  const tags: Record<string, string | null> = { ...updates };
+  for (const key of removals) tags[key] = null;
+  applyMetadataPatchById(name, { tags }, "tags_change");
 }
 
 export function readMetadata(name: string): SessionMetadata | null {

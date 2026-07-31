@@ -221,6 +221,12 @@ const COMMANDS: readonly CommandSpec[] = [
     ],
   },
   {
+    name: "metadata",
+    desc: "Atomically patch presentation metadata by stable id",
+    flags: [{ name: "id", desc: "Exact stable session id" }],
+    positionalValues: ["patch"],
+  },
+  {
     name: "up",
     desc: "Start sessions from pty.toml",
     takesPath: true,

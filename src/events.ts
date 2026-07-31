@@ -158,6 +158,19 @@ export interface TagsChangeEvent extends EventBase {
   value: Record<string, string>;
 }
 
+export interface MetadataChangeEvent extends EventBase {
+  type: "metadata_change";
+  /** Only fields and tag keys that effectively changed are present. */
+  previous: {
+    displayName?: string | null;
+    tags?: Record<string, string | null>;
+  };
+  value: {
+    displayName?: string | null;
+    tags?: Record<string, string | null>;
+  };
+}
+
 export type EventRecord =
   | BellEvent
   | TitleChangeEvent
@@ -172,7 +185,8 @@ export type EventRecord =
   | SessionFlappingEvent
   | UserEvent
   | DisplayNameChangeEvent
-  | TagsChangeEvent;
+  | TagsChangeEvent
+  | MetadataChangeEvent;
 
 /** Type guard: narrows an EventRecord to a UserEvent. */
 export function isUserEvent(e: EventRecord): e is UserEvent {
@@ -527,6 +541,8 @@ export function formatEvent(event: EventRecord): string {
         Object.keys(t).length === 0 ? "{}" : Object.entries(t).map(([k, v]) => `${k}=${v}`).join(" ");
       return `${prefix} tags -> ${fmt(event.value)} (was ${fmt(event.previous)})`;
     }
+    case "metadata_change":
+      return `${prefix} metadata -> ${JSON.stringify(event.value)} (was ${JSON.stringify(event.previous)})`;
     default: {
       // user.* events + anything else unknown-at-compile-time.
       const e = event as EventBase & { data?: unknown; text?: string };

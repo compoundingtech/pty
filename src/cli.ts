@@ -25,6 +25,7 @@ import {
   releaseLock,
   updateTags,
   setDisplayName,
+  patchMetadataById,
   allSessionNames,
   readMetadata,
   readSessionPid,
@@ -356,6 +357,20 @@ Examples:
   pty rename webapp "Web Frontend"
   pty rename --show webapp`,
 
+  metadata: `Usage: pty metadata patch --id <stable-id>
+
+Atomically merge displayName and tags for one exact stable session id. Reads
+one JSON object from stdin; it never resolves display-name aliases.
+
+Patch fields:
+  displayName   string to set, null to clear, omitted to preserve
+  tags          object of string values to set and null values to remove
+
+Examples:
+  pty metadata patch --id a1b2c3d4 < patch.json
+  printf '%s' '{"displayName":"Worker","tags":{"role":"worker"}}' | pty metadata patch --id a1b2c3d4
+  printf '%s' '{"displayName":null,"tags":{"temporary":null}}' | pty metadata patch --id a1b2c3d4`,
+
   up: `Usage: pty up [<dir>] [<name>...]
 
 Start sessions declared in a pty.toml. With no args, reads ./pty.toml and starts all.
@@ -452,6 +467,7 @@ Observe:
   pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 
 Modify:
+  pty metadata patch --id <id>            Atomically merge displayName/tags from JSON stdin
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName
@@ -1447,6 +1463,11 @@ async function main(): Promise<void> {
 
     case "rename": {
       await cmdRename(args.slice(1));
+      break;
+    }
+
+    case "metadata": {
+      await cmdMetadata(args.slice(1));
       break;
     }
 
@@ -2462,6 +2483,66 @@ function renameUsage(): void {
   // Single source of truth: the same text `pty rename --help` prints, to stderr
   // for the error paths.
   console.error(COMMAND_HELP.rename);
+}
+
+async function cmdMetadata(rawArgs: string[]): Promise<void> {
+  if (rawArgs[0] === "patch" && (rawArgs[1] === "-h" || rawArgs[1] === "--help")) {
+    printCommandHelp("metadata");
+    return;
+  }
+  if (rawArgs[0] !== "patch") {
+    console.error('pty metadata: expected subcommand "patch".');
+    console.error("  Usage: pty metadata patch --id <stable-id>");
+    process.exit(1);
+  }
+
+  let id: string | null = null;
+  for (let i = 1; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === "--id") {
+      const value = rawArgs[++i];
+      if (!value) {
+        console.error("pty metadata patch: --id requires a stable session id.");
+        process.exit(1);
+      }
+      if (id !== null) {
+        console.error("pty metadata patch: --id may only be provided once.");
+        process.exit(1);
+      }
+      id = value;
+    } else {
+      console.error(`pty metadata patch: unexpected argument "${arg}".`);
+      console.error("  Usage: pty metadata patch --id <stable-id>");
+      process.exit(1);
+    }
+  }
+  if (id === null) {
+    console.error("pty metadata patch: missing required --id <stable-id>.");
+    process.exit(1);
+  }
+
+  const input = fs.readFileSync(0, "utf-8").trim();
+  if (input.length === 0) {
+    console.error("pty metadata patch: expected one JSON patch object on stdin.");
+    console.error('  Example: printf \'%s\' \'{"displayName":"Worker"}\' | pty metadata patch --id a1b2c3d4');
+    process.exit(1);
+  }
+
+  let patch: unknown;
+  try {
+    patch = JSON.parse(input);
+  } catch (e) {
+    console.error(`pty metadata patch: invalid JSON on stdin: ${(e as Error).message}`);
+    process.exit(1);
+  }
+
+  try {
+    const result = await patchMetadataById(id, patch as any);
+    console.log(JSON.stringify(result));
+  } catch (e) {
+    console.error(`pty metadata patch: ${(e as Error).message}`);
+    process.exit(1);
+  }
 }
 
 async function cmdRename(rawArgs: string[]): Promise<void> {

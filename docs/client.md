@@ -27,6 +27,36 @@ matches. Resolve once, then pass `session.name` to socket-oriented APIs.
 
 Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]` and be at most 255 characters.
 
+### `patchMetadataById(id: string, patch: MetadataPatch): Promise<MetadataPatchResult>`
+
+Atomically merge presentation metadata for one exact stable id. This API never
+falls back to a matching display name. It holds the session metadata lock across
+one read, merge, validation, and atomic write; unrelated tags are preserved and
+a no-op returns `changed: false` without writing or emitting an event.
+
+```typescript
+const result = await patchMetadataById("a1b2c3d4", {
+  displayName: "Worker",
+  tags: { role: "worker", temporary: null },
+});
+
+interface MetadataPatch {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+}
+
+interface MetadataPatchResult {
+  changed: boolean;
+  metadata: SessionMetadata;
+}
+```
+
+Strings set values, `null` clears them, and omitted fields or tag keys remain
+unchanged. A successful change emits one `metadata_change` event containing
+only effective changes as `previous` and `value` snapshots. The existing
+`setDisplayName` and `updateTags` APIs retain their specialized event types for
+compatibility.
+
 ### `getSessionDir(): string`
 
 Returns the session directory path — `$PTY_ROOT` if set (the legacy `$PTY_SESSION_DIR` name is still honored), otherwise `~/.local/state/pty`.
@@ -381,6 +411,10 @@ Each extends `EventBase { session: string; type: EventType; ts: string }`.
 
 `NotificationEvent` adds `title?`, `body?`, `source?: "osc9" | "osc99" | "osc777"`.
 `TitleChangeEvent` adds `value: string`.
+
+`MetadataChangeEvent` has type `"metadata_change"` and carries `previous` and
+`value` objects. Only the changed `displayName` field and changed tag keys are
+present; `null` represents an absent or cleared value.
 
 ## Keys (also available via `@compoundingtech/pty/keys`)
 

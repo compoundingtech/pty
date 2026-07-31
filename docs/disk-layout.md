@@ -94,6 +94,7 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_flapping` | `counter, limit, window` — (`pty gc` flipped a permanent session to `strategy.status=flapping` after N consecutive fast-fail respawns; subsequent ticks skip it) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
+| `metadata_change` | `previous, value` containing only changed `displayName` and tag keys; absent tag values are `null` |
 | `user.<name>` | `data?, text?` — free-form, via `pty emit` |
 
 A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` payloads out of the event stream.
@@ -104,4 +105,4 @@ A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins a
 jq -r '.tags["role"] // empty' "$PTY_ROOT/myserver.json"
 ```
 
-For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `tags_change` / `display_name_change` / `session_*` fire on every mutation.
+For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `metadata_change` / `tags_change` / `display_name_change` / `session_*` fire on every mutation.

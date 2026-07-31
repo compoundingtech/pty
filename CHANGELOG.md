@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Atomic exact-id metadata patching
+
+- `pty metadata patch --id <stable-id>` reads one merge-style JSON object from
+  stdin and atomically updates `displayName` and tags under one metadata lock.
+  It never falls back to display-name lookup, preserves unrelated tags, returns
+  `{ changed, metadata }`, and suppresses no-op writes and events.
+- `patchMetadataById(id, patch)` exposes the same exact-id operation from
+  `@compoundingtech/pty/client`. Existing rename/tag APIs share the merge engine
+  while retaining their documented specialized events for compatibility.
+
+### Storage format
+
+Effective atomic patches append one `metadata_change` event whose `previous`
+and `value` objects contain only changed `displayName` and tag keys. No-op
+patches append no event.
+
 ### Non-unique display names with unambiguous session resolution
 
 - Display names are presentation metadata and no longer need to be unique.
