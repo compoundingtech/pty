@@ -175,7 +175,8 @@ and the daemon's signed metadata revision. Metadata mutation advances the signed
 revision before publishing the replacement record. Recovery therefore fails
 closed after a partial publication and rejects missing, legacy, stale, replayed,
 tampered, wrong-root, permission-downgraded, or path-replacement state. Success
-atomically republishes the registry state and rotates the recovery secret. An
+republishes the socket, pid, and metadata with no-replace and owned-rollback
+semantics and rotates the recovery secret. An
 authenticated lock left by an interrupted recoverer may resume; other creation
 locks remain authoritative and are never displaced (R10).
 
