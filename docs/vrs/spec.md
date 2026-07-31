@@ -158,6 +158,27 @@ Explicit lifecycle commands and `gc` own mutation. Cleanup is authorized by the
 observed generation; removal wins over late daemon finalization, and permanent
 respawn cannot overwrite a replacement (R03, R10).
 
+### Live registry recovery
+
+A supporting daemon may publish an opaque recovery capability only when it can
+prove its process-start identity and both `PTY_ROOT` and `.recovery` are private
+directories owned by the daemon user. If an external cleanup unlinks that live
+session's socket, pid, and metadata paths, `recover --snapshot` authenticates a
+complete retained metadata snapshot and asks the original daemon to rebind its
+listener. It preserves the daemon generation, child process, provider launch,
+terminal state, and attached clients; it does not probe by signal, restart,
+relaunch, or replace an occupied pathname (R03, R09).
+
+The request/result exchange binds stable id, daemon pid and process-start token,
+generation, launch identity, root and recovery-directory device/inode identity,
+and the daemon's signed metadata revision. Metadata mutation advances the signed
+revision before publishing the replacement record. Recovery therefore fails
+closed after a partial publication and rejects missing, legacy, stale, replayed,
+tampered, wrong-root, permission-downgraded, or path-replacement state. Success
+atomically republishes the registry state and rotates the recovery secret. An
+authenticated lock left by an interrupted recoverer may resume; other creation
+locks remain authoritative and are never displaced (R10).
+
 ## Surfaces
 
 The CLI, package entrypoint, exported client/server/protocol modules, testing
@@ -173,14 +194,14 @@ input, resize, and multi-client geometry without mocks.
 | --- | --- | --- |
 | R01 | [server](../../src/server.ts), [spawn](../../src/spawn.ts) | [integration](../../tests/integration.test.ts), [exit reap](../../tests/exit-reap.test.ts), [shutdown](../../tests/shutdown-backstop.test.ts) |
 | R02 | [server](../../src/server.ts), [spawn](../../src/spawn.ts), [sessions](../../src/sessions.ts), [ptyfile](../../src/ptyfile.ts) | [spawn options](../../tests/spawn-options.test.ts), [restart parity](../../tests/restart-launch-parity.test.ts), [restart scrub](../../tests/restart-env-scrub.test.ts), [ptyfile](../../tests/ptyfile.test.ts) |
-| R03 | [server](../../src/server.ts), [sessions](../../src/sessions.ts) | [kill](../../tests/kill-wait.test.ts), [immediate reuse](../../tests/rm-immediate-reuse.test.ts), [generation guard](../../tests/gc-generation-guard.test.ts), [exit signal](../../tests/exit-signal.test.ts) |
+| R03 | [server](../../src/server.ts), [sessions](../../src/sessions.ts), [recovery](../../src/recovery.ts) | [kill](../../tests/kill-wait.test.ts), [immediate reuse](../../tests/rm-immediate-reuse.test.ts), [generation guard](../../tests/gc-generation-guard.test.ts), [exit signal](../../tests/exit-signal.test.ts), [recovery](../../tests/recovery.test.ts) |
 | R04 | [server](../../src/server.ts), [connection](../../src/connection.ts) | [integration](../../tests/integration.test.ts), [alternate screen](../../tests/screen-replay-altscreen.test.ts), [scrollback](../../tests/scrollback-fidelity.test.ts) |
 | R05 | [server](../../src/server.ts) | [integration](../../tests/integration.test.ts) |
 | R06 | [server](../../src/server.ts), [protocol](../../src/protocol.ts) | [effective geometry](../../tests/effective-geometry.test.ts), [resize](../../tests/resize-tui.test.ts), [status](../../tests/stats-cli.test.ts) |
 | R07 | [protocol](../../src/protocol.ts), [connection](../../src/connection.ts), [remote](../../src/remote.ts) | [protocol](../../tests/protocol.test.ts), [connection](../../tests/connection.test.ts), [remote reconnect](../../tests/remote-reconnect.test.ts) |
 | R08 | [client](../../src/client.ts), [CLI](../../src/cli.ts), [entrypoint](../../bin/pty) | [attach stream](../../tests/attach-stream.test.ts), [signals](../../tests/wrapper-signal-forwarding.test.ts) |
-| R09 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [CLI](../../src/cli.ts) | [root](../../tests/pty-root.test.ts), [display name](../../tests/display-name.test.ts), [status](../../tests/stats-cli.test.ts), [list purity](../../tests/list-purity.test.ts) |
-| R10 | [sessions](../../src/sessions.ts), [events](../../src/events.ts), [protocol](../../src/protocol.ts) | [atomic writes](../../tests/atomic-writes.test.ts), [metadata events](../../tests/metadata-events.test.ts), [events](../../tests/events.test.ts), [disk layout](../../tests/disk-layout-docs.test.ts) |
+| R09 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [recovery](../../src/recovery.ts), [CLI](../../src/cli.ts) | [root](../../tests/pty-root.test.ts), [display name](../../tests/display-name.test.ts), [status](../../tests/stats-cli.test.ts), [list purity](../../tests/list-purity.test.ts), [recovery](../../tests/recovery.test.ts) |
+| R10 | [sessions](../../src/sessions.ts), [events](../../src/events.ts), [recovery](../../src/recovery.ts), [protocol](../../src/protocol.ts) | [atomic writes](../../tests/atomic-writes.test.ts), [metadata events](../../tests/metadata-events.test.ts), [events](../../tests/events.test.ts), [recovery](../../tests/recovery.test.ts), [disk layout](../../tests/disk-layout-docs.test.ts) |
 | R11 | [CLI](../../src/cli.ts), [client API](../../src/client-api.ts), [remote](../../src/remote.ts), [testing API](../../src/testing/index.ts) | [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [remote](../../tests/remote-fabric.test.ts), [screenshots](../../tests/screenshot.test.ts), [keys](../../tests/keys.test.ts) |
 
 `node scripts/verify-docs.ts --vrs-only` validates this two-document shape,

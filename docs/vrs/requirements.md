@@ -46,7 +46,9 @@ implementation contract and validation map live in [spec.md](./spec.md).
 - **R03 Ordered, generation-safe lifecycle:** Child output is drained before
   exit is finalized. Restart, permanent reconciliation, abandonment, explicit
   removal, and cleanup follow explicit policy and cannot mutate or delete a
-  replacement generation.
+  replacement generation. Recovery after external registry unlink rebinds the
+  same supporting daemon and child without signaling, restarting, relaunching,
+  duplicating the provider, or disconnecting existing clients.
 
 ### Must reconstruct one shared terminal
 
@@ -77,12 +79,18 @@ implementation contract and validation map live in [spec.md](./spec.md).
 - **R09 Stable, inspectable registry:** Registry root and filename-safe stable
   id are explicit. Display names and tags are presentation metadata. Inventory
   and status expose lifecycle, clients, requested/effective geometry, resources,
-  and metadata without attaching or mutating the session.
+  metadata, and any live-recovery capability without attaching or mutating the
+  session.
 - **R10 Durable, compatible records:** Metadata retains the launch and lifecycle
   fields needed for inspection and restart, preserves unknown fields on update,
   and uses generation-aware atomic replacement. Events are external-readable
   JSONL records with bounded retention. Readers reject structurally invalid or
-  unbounded input while retaining documented legacy fallbacks.
+  unbounded input while retaining documented legacy fallbacks. Live recovery
+  authenticates the current private registry root, recovery directory,
+  generation, daemon process, launch identity, and metadata revision; it fails
+  closed on stale, replayed, interrupted-publication, tampered, wrong-root, or
+  path-replacement attempts while allowing an authenticated interrupted lock to
+  resume.
 - **R11 Equivalent supported surfaces:** CLI commands, exported client/server/
   protocol/testing APIs, the shipped package entrypoint, local transport, and
   remote routing preserve the applicable runtime, stream, geometry, registry,
