@@ -182,6 +182,33 @@ describe("--name: explicit display label (any length / chars)", () => {
     collectPid(dir, "a1");
     collectPid(dir, "a2");
   });
+
+  it.each([
+    ["leading whitespace", " Worker"],
+    ["trailing whitespace", "Worker "],
+    ["ASCII control", "Worker\u0007"],
+    ["Unicode line separator", "Worker\u2028Next"],
+    ["Unicode paragraph separator", "Worker\u2029Next"],
+    ["more than 160 Unicode scalars", "😀".repeat(161)],
+  ])("rejects %s before spawning", (_case, displayName) => {
+    const dir = makeSessionDir();
+    const id = `invalid-${Math.random().toString(36).slice(2, 8)}`;
+    const result = runCli(dir, {}, "run", "-d", "--id", id, "--name", displayName, "--", "cat");
+    if (result.status === 0) collectPid(dir, id);
+
+    expect(result.status).not.toBe(0);
+    expect(listJson(dir)).toEqual([]);
+  });
+
+  it("accepts 160 Unicode scalars plus slash and backslash as pure metadata", () => {
+    const dir = makeSessionDir();
+    const displayName = `${"😀".repeat(156)}/a\\b`;
+    const result = runCli(dir, {}, "run", "-d", "--id", "unicode-boundary", "--name", displayName, "--", "cat");
+
+    expect(result.status).toBe(0);
+    expect(listJson(dir).find((session: any) => session.name === "unicode-boundary")?.displayName).toBe(displayName);
+    collectPid(dir, "unicode-boundary");
+  });
 });
 
 describe("pty rename (outside a session)", () => {

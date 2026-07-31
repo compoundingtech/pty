@@ -33,6 +33,7 @@ _pty() {
     'tag-multi:Bulk tag ops across sessions'
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
+    'metadata:Atomically patch presentation metadata by stable id'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
@@ -58,7 +59,7 @@ _pty() {
             '(a --attach){a,--attach}[Create OR attach if id already exists]' \
             '(e --ephemeral){e,--ephemeral}[Ephemeral: auto-remove metadata on clean exit]' \
             '--id[Pin on-disk id (charset-validated)]' \
-            '--name[Display label (any printable, ≤ 500 chars)]' \
+            '--name[Display label (trimmed, single-line, ≤ 160 Unicode scalars)]' \
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
             '--env[Overlay child environment (KEY=VALUE, repeatable)]' \
@@ -172,6 +173,11 @@ _pty() {
             '--show[Print current displayName]' \
             '--clear[Remove displayName]' \
             '1:session:_pty_sessions'
+          ;;
+        metadata)
+          _arguments \
+            '--id[Exact stable session id]' \
+            '1:mode:(patch)'
           ;;
         up)
           _arguments \

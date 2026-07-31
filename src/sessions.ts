@@ -4,10 +4,14 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as net from "node:net";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
-import { appendEventSync } from "./events.ts";
+import {
+  acquireEventLock, appendEventSync, appendEventSyncLocked, releaseEventLock,
+  type EventRecord,
+} from "./events.ts";
 
 export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
 
@@ -48,22 +52,19 @@ export function validateName(name: string): void {
   }
 }
 
-/** Permissive validator for display labels. Allowed: anything printable
- *  including spaces and punctuation, ≤ 500 chars. Rejected: empty, NUL,
- *  slashes (would confuse path-shaped UIs), backslashes, newlines, other
- *  control characters. Length cap is a sanity limit, not a kernel limit —
- *  display labels live in metadata.json, not in the socket path. */
+/** Validate mutable presentation metadata independently of stable session ids. */
 export function validateDisplayName(name: string): void {
-  if (!name || name.length === 0) {
+  if (name.length === 0) {
     throw new Error("Display name cannot be empty.");
   }
-  if (name.length > 500) {
-    throw new Error("Display name too long (max 500 characters).");
+  if (name !== name.trim()) {
+    throw new Error("Display name must be trimmed.");
   }
-  if (/[\0\/\\\n\r\t\x00-\x1f\x7f]/.test(name)) {
-    throw new Error(
-      `Invalid display name. Slashes, backslashes, newlines, and control characters are not allowed.`
-    );
+  if (Array.from(name).length > 160) {
+    throw new Error("Display name too long (max 160 Unicode scalars).");
+  }
+  if (/[\p{Cc}\u2028\u2029]/u.test(name)) {
+    throw new Error("Display name must be single-line and contain no control characters.");
   }
 }
 
@@ -237,32 +238,264 @@ export function writeMetadata(name: string, metadata: SessionMetadata): void {
   atomicWriteFileSync(getMetadataPath(name), JSON.stringify(metadata, null, 2));
 }
 
+export interface MetadataPatch {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+}
+
+export interface MetadataPatchResult {
+  changed: boolean;
+  metadata: SessionMetadata;
+}
+
+type MetadataChangeSnapshot = {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+};
+
+type MetadataPatchEvent = "metadata_change" | "display_name_change" | "tags_change";
+
+export type MetadataMutationResult =
+  | { status: "changed"; metadata: SessionMetadata }
+  | { status: "unchanged"; metadata: SessionMetadata }
+  | { status: "busy" }
+  | { status: "missing" }
+  | { status: "generation-mismatch" }
+  | { status: "stale" };
+
+/** Serialize one whole-record metadata mutation against lifecycle writers. */
+export function mutateMetadataUnderLock(
+  name: string,
+  mutate: (metadata: SessionMetadata) => boolean,
+  options: {
+    expectedGeneration?: string;
+    expectedMetadata?: SessionMetadata;
+    onPublished?: (metadata: SessionMetadata) => void;
+  } = {},
+): MetadataMutationResult {
+  if (!acquireLock(name)) return { status: "busy" };
+
+  try {
+    const metadata = readMetadata(name);
+    if (!metadata) return { status: "missing" };
+    if (
+      options.expectedMetadata !== undefined &&
+      !metadataMatchesObservation(options.expectedMetadata, metadata)
+    ) {
+      return { status: "generation-mismatch" };
+    }
+    if (
+      options.expectedGeneration !== undefined &&
+      metadata.generation !== options.expectedGeneration
+    ) {
+      return { status: "generation-mismatch" };
+    }
+
+    const observed = JSON.stringify(metadata);
+    if (!mutate(metadata)) return { status: "unchanged", metadata };
+
+    const latest = readMetadata(name);
+    if (!latest || JSON.stringify(latest) !== observed) return { status: "stale" };
+    if (
+      options.expectedMetadata !== undefined &&
+      !metadataMatchesObservation(options.expectedMetadata, latest)
+    ) {
+      return { status: "generation-mismatch" };
+    }
+    if (
+      options.expectedGeneration !== undefined &&
+      latest.generation !== options.expectedGeneration
+    ) {
+      return { status: "generation-mismatch" };
+    }
+
+    writeMetadata(name, metadata);
+    options.onPublished?.(metadata);
+    return { status: "changed", metadata };
+  } finally {
+    releaseLock(name);
+  }
+}
+
+function validateMetadataPatch(patch: unknown): asserts patch is MetadataPatch {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new Error("Metadata patch must be a JSON object.");
+  }
+  for (const key of Object.keys(patch)) {
+    if (key !== "displayName" && key !== "tags") {
+      throw new Error(`Metadata patch has unknown field "${key}". Allowed fields: displayName, tags.`);
+    }
+  }
+  const candidate = patch as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(candidate, "displayName")) {
+    if (candidate.displayName !== null && typeof candidate.displayName !== "string") {
+      throw new Error("Metadata patch displayName must be a string or null.");
+    }
+    if (typeof candidate.displayName === "string") {
+      try {
+        validateDisplayName(candidate.displayName);
+      } catch (e) {
+        throw new Error(`Invalid displayName: ${(e as Error).message}`);
+      }
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(candidate, "tags")) {
+    const tags = candidate.tags;
+    if (tags === null || typeof tags !== "object" || Array.isArray(tags)) {
+      throw new Error("Metadata patch tags must be a JSON object.");
+    }
+    for (const [key, value] of Object.entries(tags as Record<string, unknown>)) {
+      if (key.length === 0) throw new Error("Metadata patch tag keys must be non-empty.");
+      if (value !== null && typeof value !== "string") {
+        throw new Error(`Metadata patch tag values must be strings or null (invalid key: "${key}").`);
+      }
+    }
+  }
+}
+
+function setRecordValue(record: Record<string, string>, key: string, value: string): void {
+  Object.defineProperty(record, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function applyMetadataPatchById(
+  id: string,
+  patch: MetadataPatch,
+  eventType: MetadataPatchEvent,
+): MetadataPatchResult {
+  validateMetadataPatch(patch);
+  if (!acquireEventLock(id)) {
+    throw new Error(`Session id "${id}" event log is busy. Retry the operation.`);
+  }
+  try {
+    let previousTags: Record<string, string> = {};
+    let nextTags: Record<string, string> = {};
+    const previous: MetadataChangeSnapshot = {};
+    const value: MetadataChangeSnapshot = {};
+    const result = mutateMetadataUnderLock(id, (metadata) => {
+      previousTags = Object.fromEntries(Object.entries(metadata.tags ?? {}));
+      nextTags = Object.fromEntries(Object.entries(previousTags));
+      if (Object.prototype.hasOwnProperty.call(patch, "displayName")) {
+        const before = metadata.displayName ?? null;
+        const after = patch.displayName ?? null;
+        if (before !== after) {
+          previous.displayName = before;
+          value.displayName = after;
+          if (after === null) delete metadata.displayName;
+          else metadata.displayName = after;
+        }
+      }
+
+      if (patch.tags !== undefined) {
+        const changedTagKeys: string[] = [];
+        for (const [key, requested] of Object.entries(patch.tags)) {
+          const before = Object.prototype.hasOwnProperty.call(previousTags, key)
+            ? previousTags[key]
+            : null;
+          const after = requested ?? null;
+          if (before === after) continue;
+          changedTagKeys.push(key);
+          if (after === null) delete nextTags[key];
+          else setRecordValue(nextTags, key, after);
+        }
+        if (changedTagKeys.length > 0) {
+          previous.tags = {};
+          value.tags = {};
+          for (const key of changedTagKeys.sort()) {
+            const before = Object.prototype.hasOwnProperty.call(previousTags, key)
+              ? previousTags[key]
+              : null;
+            const after = Object.prototype.hasOwnProperty.call(nextTags, key)
+              ? nextTags[key]
+              : null;
+            Object.defineProperty(previous.tags, key, { value: before, enumerable: true });
+            Object.defineProperty(value.tags, key, { value: after, enumerable: true });
+          }
+          if (Object.keys(nextTags).length === 0) delete metadata.tags;
+          else metadata.tags = nextTags;
+        }
+      }
+
+      const changed = Object.keys(previous).length > 0;
+      if (!changed) return false;
+
+      if (metadata.displayName !== undefined) validateDisplayName(metadata.displayName);
+      for (const [key, tagValue] of Object.entries(metadata.tags ?? {})) {
+        if (key.length === 0) throw new Error("Resulting metadata contains an empty tag key.");
+        if (typeof tagValue !== "string") {
+          throw new Error(`Resulting metadata tag "${key}" is not a string.`);
+        }
+      }
+
+      return true;
+    }, {
+      onPublished: () => {
+        if (eventType === "metadata_change") {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "metadata_change",
+            ts: new Date().toISOString(),
+            previous,
+            value,
+          });
+        } else if (eventType === "display_name_change") {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "display_name_change",
+            ts: new Date().toISOString(),
+            previous: previous.displayName ?? null,
+            value: value.displayName ?? null,
+          });
+        } else {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "tags_change",
+            ts: new Date().toISOString(),
+            previous: previousTags,
+            value: nextTags,
+          });
+        }
+      },
+    });
+
+    if (result.status === "busy") {
+      throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
+    }
+    if (result.status === "missing") throw new Error(`Session id "${id}" not found.`);
+    if (result.status === "stale" || result.status === "generation-mismatch") {
+      throw new Error(`Session id "${id}" metadata changed during the operation. Retry it.`);
+    }
+    return { changed: result.status === "changed", metadata: result.metadata };
+  } finally {
+    releaseEventLock(id);
+  }
+}
+
+/** Atomically merge presentation metadata for one exact stable session id. */
+export async function patchMetadataById(
+  id: string,
+  patch: MetadataPatch,
+): Promise<MetadataPatchResult> {
+  validateMetadataPatch(patch);
+  const session = await getSessionByName(id);
+  if (!session) throw new Error(`Session id "${id}" not found.`);
+  return applyMetadataPatchById(id, patch, "metadata_change");
+}
+
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.
  *  Pass `null` to remove the alias. Throws if `name` doesn't exist. Emits a
  *  `display_name_change` event when (and only when) the value actually
  *  changed — no-op renames don't ping downstream watchers. */
 export function setDisplayName(name: string, displayName: string | null): void {
-  const metadata = readMetadata(name);
-  if (!metadata) {
-    throw new Error(`Session "${name}" not found.`);
-  }
-  const previous = metadata.displayName ?? null;
-  const next = displayName === null || displayName === "" ? null : displayName;
-  if (previous === next) return; // no-op write + no-op event
-
-  if (next === null) {
-    delete metadata.displayName;
-  } else {
-    metadata.displayName = next;
-  }
-  writeMetadata(name, metadata);
-  appendEventSync(name, {
-    session: name,
-    type: "display_name_change",
-    ts: new Date().toISOString(),
-    previous,
-    value: next,
-  });
+  applyMetadataPatchById(
+    name,
+    { displayName: displayName === "" ? null : displayName },
+    "display_name_change",
+  );
 }
 
 /** Update tags on an existing session. Performs an atomic read-modify-write.
@@ -274,43 +507,9 @@ export function updateTags(
   updates: Record<string, string>,
   removals: string[] = [],
 ): void {
-  const metadata = readMetadata(name);
-  if (!metadata) {
-    throw new Error(`Session "${name}" not found.`);
-  }
-  const previous = { ...(metadata.tags ?? {}) };
-  const tags = { ...previous };
-  for (const [k, v] of Object.entries(updates)) {
-    tags[k] = v;
-  }
-  for (const k of removals) {
-    delete tags[k];
-  }
-  if (tagsEqual(previous, tags)) return; // no-op write + no-op event
-
-  if (Object.keys(tags).length > 0) {
-    metadata.tags = tags;
-  } else {
-    delete metadata.tags;
-  }
-  writeMetadata(name, metadata);
-  appendEventSync(name, {
-    session: name,
-    type: "tags_change",
-    ts: new Date().toISOString(),
-    previous,
-    value: tags,
-  });
-}
-
-function tagsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  if (aKeys.length !== bKeys.length) return false;
-  for (const k of aKeys) {
-    if (!Object.prototype.hasOwnProperty.call(b, k) || a[k] !== b[k]) return false;
-  }
-  return true;
+  const tags: Record<string, string | null> = { ...updates };
+  for (const key of removals) tags[key] = null;
+  applyMetadataPatchById(name, { tags }, "tags_change");
 }
 
 export function readMetadata(name: string): SessionMetadata | null {
@@ -429,7 +628,11 @@ export async function cleanupRawCandidateGuarded(
   candidate: RawCleanupCandidate,
   options: ListSessionsOptions = {},
 ): Promise<boolean> {
-  if (!acquireLock(candidate.name)) return false;
+  if (!acquireEventLock(candidate.name)) return false;
+  if (!acquireLock(candidate.name)) {
+    releaseEventLock(candidate.name);
+    return false;
+  }
   try {
     const current = await inventoryRawCleanupCandidates(
       options,
@@ -447,6 +650,7 @@ export async function cleanupRawCandidateGuarded(
     return true;
   } finally {
     releaseLock(candidate.name);
+    releaseEventLock(candidate.name);
   }
 }
 
@@ -464,7 +668,8 @@ function metadataMatchesObservation(
   return JSON.stringify(observed) === JSON.stringify(current);
 }
 
-function cleanupAllWhileLocked(name: string): void {
+/** @internal Remove session artifacts while the caller owns both event and metadata locks. */
+export function cleanupAllWhileLocked(name: string): void {
   cleanupSocket(name);
   try {
     fs.unlinkSync(getMetadataPath(name));
@@ -478,7 +683,11 @@ function cleanupAllWhileLocked(name: string): void {
 export async function cleanupObservedSession(
   session: SessionInfo,
 ): Promise<boolean> {
-  if (!session.metadata || !acquireLock(session.name)) return false;
+  if (!session.metadata || !acquireEventLock(session.name)) return false;
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return false;
+  }
   try {
     const current = readMetadata(session.name);
     if (
@@ -491,6 +700,103 @@ export async function cleanupObservedSession(
     return true;
   } finally {
     releaseLock(session.name);
+    releaseEventLock(session.name);
+  }
+}
+
+type ReapObservedResult =
+  | { status: "reaped" }
+  | {
+    status: "skipped";
+    reason: "busy" | "stale" | "signal-failed" | "shutdown-timeout";
+    signalled: boolean;
+  };
+
+function hasProcessExitedForReap(pid: number): boolean {
+  if (!isProcessAlive(pid)) return true;
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const stateOffset = stat.lastIndexOf(") ") + 2;
+      return stateOffset >= 2 && stat[stateOffset] === "Z";
+    }
+    const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 1000,
+    }).trim();
+    return state === "" || state.startsWith("Z");
+  } catch {
+    return !isProcessAlive(pid);
+  }
+}
+
+/** Signal only after proving ownership, then reacquire after daemon shutdown
+ *  so its final event/metadata flush cannot recreate artifacts after cleanup. */
+async function reapObservedSession(
+  session: SessionInfo,
+  event?: Extract<EventRecord, { type: "session_abandoned" }>,
+): Promise<ReapObservedResult> {
+  if (!session.metadata) return { status: "skipped", reason: "stale", signalled: false };
+  if (!acquireEventLock(session.name)) {
+    return { status: "skipped", reason: "busy", signalled: false };
+  }
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return { status: "skipped", reason: "busy", signalled: false };
+  }
+  let signalled = false;
+  let signalFailed = false;
+  try {
+    const current = readMetadata(session.name);
+    if (!current || !metadataMatchesObservation(session.metadata, current)) {
+      return { status: "skipped", reason: "stale", signalled: false };
+    }
+
+    if (session.status === "running" && session.pid != null) {
+      try {
+        process.kill(session.pid, "SIGTERM");
+        signalled = true;
+      } catch {
+        signalFailed = isProcessAlive(session.pid);
+      }
+    }
+  } finally {
+    releaseLock(session.name);
+    releaseEventLock(session.name);
+  }
+
+  if (signalFailed) {
+    return { status: "skipped", reason: "signal-failed", signalled: false };
+  }
+
+  if (signalled && session.pid != null) {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline && !hasProcessExitedForReap(session.pid)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!hasProcessExitedForReap(session.pid)) {
+      return { status: "skipped", reason: "shutdown-timeout", signalled: true };
+    }
+  }
+
+  if (!acquireEventLock(session.name)) {
+    return { status: "skipped", reason: "busy", signalled };
+  }
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return { status: "skipped", reason: "busy", signalled };
+  }
+  try {
+    const current = readMetadata(session.name);
+    if (!current || !metadataMatchesObservation(session.metadata, current)) {
+      return { status: "skipped", reason: "stale", signalled };
+    }
+    if (event) appendEventSyncLocked(session.name, event);
+    cleanupAllWhileLocked(session.name);
+    return { status: "reaped" };
+  } finally {
+    releaseLock(session.name);
+    releaseEventLock(session.name);
   }
 }
 
@@ -754,6 +1060,14 @@ export interface GcResult {
    *  `idleDays` threshold is set (via CLI flag or per-session tag)
    *  and `lastAttachAt` is older than that threshold. */
   abandoned: { name: string; reason: "cwd-gone" | "idle"; idleDays?: number }[];
+  /** Reaps that could not complete safely. `signalled` distinguishes initial
+   *  contention (the process was untouched) from a race after shutdown began. */
+  reapSkipped: {
+    name: string;
+    operation: "orphan" | "abandoned";
+    reason: "busy" | "stale" | "signal-failed" | "shutdown-timeout";
+    signalled: boolean;
+  }[];
   /** Permanent sessions respawned this pass. `ptyfileReread` indicates
    *  whether the spawn used a fresh `pty.toml` read (when the session
    *  carries `ptyfile` + `ptyfile.session` tags) or its stored metadata. */
@@ -788,6 +1102,35 @@ export const DEFAULT_FAST_FAIL_WINDOW_SEC = 60;
  *  which auto-resets). Overridden by `opts.fastFailLimit` or the
  *  per-session `strategy.fast-fail-limit` tag. */
 export const DEFAULT_FAST_FAIL_LIMIT = 3;
+
+/** @internal Commit one gc flapping transition against the observed generation. */
+export function commitObservedFlapping(
+  name: string,
+  observed: SessionMetadata,
+  bookkeeping: Record<string, string>,
+  event: { counter: number; limit: number; window: number },
+): boolean {
+  if (!acquireEventLock(name)) return false;
+  try {
+    const result = mutateMetadataUnderLock(name, (metadata) => {
+      metadata.tags = { ...(metadata.tags ?? {}), ...bookkeeping };
+      return true;
+    }, {
+      expectedMetadata: observed,
+      onPublished: () => appendEventSyncLocked(name, {
+        session: name,
+        type: "session_flapping",
+        ts: new Date().toISOString(),
+        counter: event.counter,
+        limit: event.limit,
+        window: event.window,
+      }),
+    });
+    return result.status === "changed";
+  } finally {
+    releaseEventLock(name);
+  }
+}
 
 /** SHA-256 of a session's respawn command line, used to auto-reset the
  *  fast-fail counter when the operator edits the pty.toml (or otherwise
@@ -877,6 +1220,7 @@ export async function gc(
   // loser dies; on the next tick the winner has no live parent either
   // and dies too. No cycle detection needed.
   const killedOrphanChildren: GcResult["killedOrphanChildren"] = [];
+  const reapSkipped: GcResult["reapSkipped"] = [];
   const withParent = initial
     .filter((s) => s.metadata?.tags?.parent)
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -888,20 +1232,16 @@ export async function gc(
     if (parentAlive) continue;
     const reason: "missing" | "dead" = parentMeta ? "dead" : "missing";
     if (!dryRun) {
-      if (s.status === "running" && s.pid != null) {
-        // SIGTERM the live daemon, then wait briefly for it to exit so
-        // its shutdown handler doesn't race our cleanupAll by writing
-        // metadata back to disk after we've removed it. We poll the
-        // pid (up to ~1s) and fall through whether or not the daemon
-        // shut down in time — cleanupAll wipes whatever remains.
-        try { process.kill(s.pid, "SIGTERM"); } catch {}
-        const deadline = Date.now() + 1000;
-        while (Date.now() < deadline) {
-          if (!isProcessAlive(s.pid)) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
+      const result = await reapObservedSession(s);
+      if (result.status === "skipped") {
+        reapSkipped.push({
+          name: s.name,
+          operation: "orphan",
+          reason: result.reason,
+          signalled: result.signalled,
+        });
+        continue;
       }
-      cleanupAll(s.name);
     }
     killedOrphanChildren.push({ name: s.name, parent: parentRef, reason });
   }
@@ -918,28 +1258,22 @@ export async function gc(
     if (!decision) continue;
 
     if (!dryRun) {
-      if (s.status === "running" && s.pid != null) {
-        try { process.kill(s.pid, "SIGTERM"); } catch {}
-        const deadline = Date.now() + 1000;
-        while (Date.now() < deadline) {
-          if (!isProcessAlive(s.pid)) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
-      }
-      // Emit the abandoned event BEFORE cleanupAll — cleanupAll unlinks
-      // the events file, and appendEventSync into a nonexistent file
-      // would just create a stub with a single event and leave orphaned
-      // JSONL on disk. Ordering: event → cleanup → gone.
-      try {
-        appendEventSync(s.name, {
+      const result = await reapObservedSession(s, {
           session: s.name,
           type: "session_abandoned",
           ts: new Date().toISOString(),
           reason: decision.reason,
           ...(decision.idleDays !== undefined ? { idleDays: decision.idleDays } : {}),
+      });
+      if (result.status === "skipped") {
+        reapSkipped.push({
+          name: s.name,
+          operation: "abandoned",
+          reason: result.reason,
+          signalled: result.signalled,
         });
-      } catch {}
-      cleanupAll(s.name);
+        continue;
+      }
     }
     abandoned.push({
       name: s.name,
@@ -994,34 +1328,16 @@ export async function gc(
     }
 
     if (decision.action === "flap-now") {
-      // Persist the flapping mark to on-disk metadata so subsequent
-      // ticks see it. We update the metadata file directly instead of
-      // going through updateTags — the session's daemon is gone, there's
-      // no live connection to notify, and cleanupAll ordering constraints
-      // in respawnPermanent don't apply here (we're NOT respawning).
-      try {
-        const meta = readMetadata(s.name);
-        if (meta) {
-          const merged: Record<string, string> = {
-            ...(meta.tags ?? {}),
-            ...decision.newBookkeeping,
-          };
-          writeMetadata(s.name, { ...meta, tags: merged });
-        }
-      } catch {
-        // Best-effort — if we can't persist the flag now, the next tick
-        // will recompute the same decision and try again.
-      }
-      try {
-        appendEventSync(s.name, {
-          session: s.name,
-          type: "session_flapping",
-          ts: new Date().toISOString(),
+      if (!commitObservedFlapping(
+        s.name,
+        s.metadata!,
+        decision.newBookkeeping,
+        {
           counter: decision.counter,
           limit: decision.effectiveLimit,
           window: decision.effectiveWindow,
-        });
-      } catch {}
+        },
+      )) continue;
       flapped.push({
         name: s.name,
         counter: decision.counter,
@@ -1071,6 +1387,7 @@ export async function gc(
     kept,
     killedOrphanChildren,
     abandoned,
+    reapSkipped,
     respawned,
     respawnFailed,
     flapped,
@@ -1324,7 +1641,12 @@ export async function respawnPermanent(
   // Serialize compare-and-swap cleanup + replacement creation under the same
   // per-name lock. If the observed generation changed while gc was planning,
   // this tick is stale and must not touch the replacement.
-  if (!acquireLock(name)) return false;
+  if (!acquireEventLock(name)) return false;
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    return false;
+  }
+  let eventLocked = true;
   try {
     const current = readMetadata(name);
     if (!current || !metadataMatchesObservation(metadata, current)) {
@@ -1335,6 +1657,8 @@ export async function respawnPermanent(
     // over leftovers from the dead daemon. Keep the creation lock held until
     // the replacement has published its socket.
     cleanupAllWhileLocked(name);
+    releaseEventLock(name);
+    eventLocked = false;
 
     const { spawnDaemon } = await import("./spawn.ts");
     await spawnDaemon({
@@ -1351,6 +1675,7 @@ export async function respawnPermanent(
     });
   } finally {
     releaseLock(name);
+    if (eventLocked) releaseEventLock(name);
   }
 
   // Best-effort event; respawn already succeeded if we got here.
@@ -1524,14 +1849,25 @@ export function cleanupSocket(name: string): void {
 
 /** Remove everything including metadata. */
 export function cleanupAll(name: string): void {
-  cleanupSocket(name);
+  if (!acquireEventLock(name)) {
+    throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+  }
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    throw new Error(`Session id "${name}" metadata is busy. Retry the operation.`);
+  }
   try {
-    fs.unlinkSync(getMetadataPath(name));
-  } catch {}
-  try {
-    fs.unlinkSync(getEventsPath(name));
-  } catch {}
-  releaseLock(name);
+    cleanupSocket(name);
+    try {
+      fs.unlinkSync(getMetadataPath(name));
+    } catch {}
+    try {
+      fs.unlinkSync(getEventsPath(name));
+    } catch {}
+  } finally {
+    releaseLock(name);
+    releaseEventLock(name);
+  }
 }
 
 export interface SessionGenerationOwner {
@@ -1574,7 +1910,11 @@ export function cleanupOwnedSocket(name: string, owner: SessionGenerationOwner):
 
 /** Generation-safe full cleanup used by a daemon reaping its own session. */
 export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): boolean {
-  if (!acquireLock(name)) return false;
+  if (!acquireEventLock(name)) return false;
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    return false;
+  }
   try {
     if (!isCurrentGenerationOwner(name, owner)) return false;
     cleanupSocket(name);
@@ -1587,6 +1927,7 @@ export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): bo
     return true;
   } finally {
     releaseLock(name);
+    releaseEventLock(name);
   }
 }
 
@@ -1606,8 +1947,7 @@ export function isLockOwnedByPid(name: string, ownerPid: number): boolean {
 }
 
 /**
- * Acquire an exclusive lock for a session name. Prevents concurrent
- * `pty run` calls from racing to create the same session.
+ * Acquire an exclusive filesystem lock at an exact path.
  * Returns true if acquired, false if another process holds it.
  *
  * BUG-2 fix: the whole acquisition is built on `open(O_CREAT|O_EXCL)` via
@@ -1616,9 +1956,8 @@ export function isLockOwnedByPid(name: string, ownerPid: number): boolean {
  * unlink it and retry the exclusive open: whichever process wins the
  * post-unlink open owns the lock; the other gets EEXIST and gives up.
  */
-export function acquireLock(name: string): boolean {
+export function acquireFileLock(lockPath: string): boolean {
   ensureSessionDir();
-  const lockPath = getLockPath(name);
 
   const tryCreate = (): boolean => {
     try {
@@ -1662,10 +2001,18 @@ export function acquireLock(name: string): boolean {
   return tryCreate();
 }
 
-export function releaseLock(name: string): void {
+export function releaseFileLock(lockPath: string): void {
   try {
-    fs.unlinkSync(getLockPath(name));
+    fs.unlinkSync(lockPath);
   } catch {}
+}
+
+export function acquireLock(name: string): boolean {
+  return acquireFileLock(getLockPath(name));
+}
+
+export function releaseLock(name: string): void {
+  releaseFileLock(getLockPath(name));
 }
 
 // Keep backward compat for server.ts close()

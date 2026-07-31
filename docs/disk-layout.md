@@ -15,6 +15,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
+| `<name>.events.lock` | event append/retention lock | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |
@@ -100,9 +101,15 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_flapping` | `counter, limit, window` — (`pty gc` flipped a permanent session to `strategy.status=flapping` after N consecutive fast-fail respawns; subsequent ticks skip it) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
+| `metadata_change` | `previous, value` containing only changed `displayName` and tag keys; absent tag values are `null` |
 | `user.<name>` | `data?, text?` — free-form, via `pty emit` |
 
-A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` payloads out of the event stream.
+All event writers and retention rewrites are serialized by the per-session
+event lock. A complete JSONL record is therefore published without relying on
+an operating-system write-size limit, and retention cannot discard an append
+that races its atomic rewrite. Async writers wait up to five seconds for a live
+holder; synchronous writers fail immediately. Lock files are removed on release,
+and a dead holder's stale lock is reclaimed by the next writer or cleanup.
 
 ## Reading from outside pty
 
@@ -110,4 +117,4 @@ A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins a
 jq -r '.tags["role"] // empty' "$PTY_ROOT/myserver.json"
 ```
 
-For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `tags_change` / `display_name_change` / `session_*` fire on every mutation.
+For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `metadata_change` / `tags_change` / `display_name_change` / `session_*` fire on every mutation.

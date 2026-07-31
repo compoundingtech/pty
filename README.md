@@ -63,6 +63,7 @@ pty rename my-label                       # inside a session: add/change its dis
 pty rename <ref> my-label                 # outside: set displayName on <ref>
 pty rename --show <ref>                   # show current displayName
 pty rename --clear [ref]                  # remove displayName
+pty metadata patch --id myserver < patch.json # atomically patch displayName/tags by exact id
 
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
@@ -126,6 +127,20 @@ labels and may be shared by multiple sessions. A command reference resolves an
 exact stable id first, then a display name only when that label has one match.
 Ambiguous display names fail without acting and print the candidate stable ids.
 Use stable ids in scripts and automation.
+
+For automation that must update presentation metadata without alias fallback,
+`pty metadata patch --id <stable-id>` reads one merge-style JSON object from
+stdin and returns `{ changed, metadata }` as JSON:
+
+```sh
+printf '%s' '{"displayName":"Worker","tags":{"role":"worker","old":null}}' \
+  | pty metadata patch --id a1b2c3d4
+```
+
+`displayName` and individual tag values use strings to set and `null` to clear;
+omitted fields and tag keys remain unchanged. The operation holds the session's
+metadata lock across one read/merge/atomic-write cycle. It fails if the exact id
+is absent, even when a display name has the same text.
 
 ### Remote over fabric
 
@@ -271,7 +286,7 @@ display_name = "My Web Server"   # override the default `<prefix>-<sessionKey>` 
 cwd = "packages/web"             # working directory (default: the manifest's dir)
 ```
 
-`id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` is permissive (≤ 500 chars, any printable text); omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
+`id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` must be nonempty, already trimmed, single-line, free of Unicode control characters, and at most 160 Unicode scalar values; `/` and `\` are allowed because the value is metadata, not a path. Omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
 
 `cwd` sets the session's working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the default). This decouples where a session runs from where its `pty.toml` lives — so a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can still run its sessions in the repo root with `cwd = ".."`. The declared `cwd` is honored on the initial `pty up` and preserved across manual and `strategy=permanent` respawns.
 

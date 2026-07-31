@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as tty from "node:tty";
 import { fileURLToPath } from "node:url";
-import { getSocketPath } from "./sessions.ts";
+import {
+  acquireLock, getEventsPath, getSocketPath, readMetadata, releaseLock,
+  validateDisplayName,
+} from "./sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -133,6 +136,7 @@ function resolveSpawnStrategy(): SpawnStrategy {
 }
 
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
+  if (options.displayName !== undefined) validateDisplayName(options.displayName);
   if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
       "SpawnDaemonOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
@@ -142,6 +146,19 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   const strategy = resolveSpawnStrategy();
   if (strategy.kind === "cli") return spawnViaCli(options);
   return spawnViaNode(options, strategy.serverModule);
+}
+
+/** @internal Own the creation lease through daemon publication. */
+export async function spawnDaemonWithCreationLock(
+  options: SpawnDaemonOptions,
+): Promise<boolean> {
+  if (!acquireLock(options.name)) return false;
+  try {
+    await spawnDaemon({ ...options, creationLockOwnerPid: process.pid });
+    return true;
+  } finally {
+    releaseLock(options.name);
+  }
 }
 
 async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): Promise<void> {
@@ -195,18 +212,50 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
   child.unref();
 
   try {
-    await waitForSocket(options.name, options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, () => {
+    const timeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    const startedAt = Date.now();
+    const checkEarlyExit = () => {
       if (earlyExit) {
         const details = stderrOutput.trim();
         const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;
         throw new Error(details ? `${msg}\n${details}` : `${msg} Is the command valid?`);
       }
-    });
+    };
+    await waitForSocket(options.name, timeoutMs, checkEarlyExit);
+    while (true) {
+      const metadata = readMetadata(options.name);
+      const startPublished = metadata !== null &&
+        metadata.daemonPid === child.pid &&
+        hasPublishedSessionStart(options.name, metadata.createdAt);
+      if (startPublished) break;
+      checkEarlyExit();
+      if (Date.now() - startedAt >= timeoutMs) {
+        throw new Error(`Timed out waiting for daemon publication for session "${options.name}".`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   } catch (err) {
     if (!earlyExit && child.pid) {
       try { process.kill(child.pid, "SIGTERM"); } catch {}
     }
     throw err;
+  }
+}
+
+function hasPublishedSessionStart(name: string, createdAt: string): boolean {
+  try {
+    return fs.readFileSync(getEventsPath(name), "utf8")
+      .trimEnd()
+      .split("\n")
+      .some((line) => {
+        const event = JSON.parse(line);
+        return event.session === name &&
+          event.type === "session_start" &&
+          typeof event.ts === "string" &&
+          event.ts >= createdAt;
+      });
+  } catch {
+    return false;
   }
 }
 

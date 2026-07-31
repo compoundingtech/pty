@@ -69,7 +69,7 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "attach", short: "a", desc: "Create OR attach if id already exists" },
       { name: "ephemeral", short: "e", desc: "Ephemeral: auto-remove metadata on clean exit" },
       { name: "id", desc: "Pin on-disk id (charset-validated)" },
-      { name: "name", desc: "Display label (any printable, ≤ 500 chars)" },
+      { name: "name", desc: "Display label (trimmed, single-line, ≤ 160 Unicode scalars)" },
       { name: "no-display-name", desc: "Skip the auto-generated label" },
       { name: "tag", desc: "Tag session (k=v, repeatable)" },
       { name: "env", desc: "Overlay child environment (KEY=VALUE, repeatable)" },
@@ -229,6 +229,12 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "show", desc: "Print current displayName" },
       { name: "clear", desc: "Remove displayName" },
     ],
+  },
+  {
+    name: "metadata",
+    desc: "Atomically patch presentation metadata by stable id",
+    flags: [{ name: "id", desc: "Exact stable session id" }],
+    positionalValues: ["patch"],
   },
   {
     name: "up",

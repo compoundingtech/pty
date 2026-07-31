@@ -15,6 +15,7 @@ import {
   pruneOrphanLayoutTags,
   isGone,
   cleanupAll,
+  cleanupAllWhileLocked,
   cleanupSocket,
   cleanupOwnedAll,
   waitForProcessExit,
@@ -25,6 +26,8 @@ import {
   releaseLock,
   updateTags,
   setDisplayName,
+  patchMetadataById,
+  mutateMetadataUnderLock,
   allSessionNames,
   readMetadata,
   readSessionPid,
@@ -37,7 +40,7 @@ import {
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
-  EventFollower, EventWriter, EventType,
+  acquireEventLock, appendEventSyncLocked, EventFollower, EventWriter, EventType, releaseEventLock,
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
@@ -89,7 +92,7 @@ Create a session and attach to it (use -d to leave it running in the background)
 
 Flags:
   --id <id>            Pin the on-disk id (sock/json filename; charset-validated, ≤ 104-byte sock path)
-  --name <label>       Explicit display label (any printable text, ≤ 500 chars)
+  --name <label>       Display label (trimmed, single-line, ≤ 160 Unicode scalars)
   --no-display-name    Skip the auto cwd+command label — just the id
   -d, --detach         Create in the background; don't attach
   -a, --attach         Create, OR attach if a session with the same id already exists
@@ -361,6 +364,20 @@ Examples:
   pty rename webapp "Web Frontend"
   pty rename --show webapp`,
 
+  metadata: `Usage: pty metadata patch --id <stable-id>
+
+Atomically merge displayName and tags for one exact stable session id. Reads
+one JSON object from stdin; it never resolves display-name aliases.
+
+Patch fields:
+  displayName   string to set, null to clear, omitted to preserve
+  tags          object of string values to set and null values to remove
+
+Examples:
+  pty metadata patch --id a1b2c3d4 < patch.json
+  printf '%s' '{"displayName":"Worker","tags":{"role":"worker"}}' | pty metadata patch --id a1b2c3d4
+  printf '%s' '{"displayName":null,"tags":{"temporary":null}}' | pty metadata patch --id a1b2c3d4`,
+
   up: `Usage: pty up [<dir>] [<name>...]
 
 Start sessions declared in a pty.toml. With no args, reads ./pty.toml and starts all.
@@ -407,7 +424,7 @@ function usage(): void {
 Create sessions:
   pty run -- <command> [args...]          Create a session and attach (random id + auto display label)
   pty run --id <id> -- <command>          Pin the on-disk id (sock / json filename; charset-validated)
-  pty run --name <label> -- <command>     Set an explicit display label (any printable, ≤ 500 chars)
+  pty run --name <label> -- <command>     Set a trimmed, single-line display label (≤ 160 Unicode scalars)
   pty run --no-display-name -- <cmd>      Skip the friendly cwd+command label (just an id)
   pty run -d -- <command>                 Create in the background (detached)
   pty run -a -- <command>                 Create OR attach if a session with the same id already exists
@@ -458,6 +475,7 @@ Observe:
   pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 
 Modify:
+  pty metadata patch --id <id>            Atomically merge displayName/tags from JSON stdin
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName
@@ -1489,6 +1507,11 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "metadata": {
+      await cmdMetadata(args.slice(1));
+      break;
+    }
+
     case "rm":
     case "remove": {
       if (args.length < 2) {
@@ -1564,8 +1587,42 @@ async function cmdRun(
   extraEnv: Record<string, string> = {},
   unsetEnv: string[] = [],
 ): Promise<void> {
-  const session = await getSessionByName(name);
+  let session = await getSessionByName(name);
+
+  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
+  const inheritedCreationLock =
+    Number.isSafeInteger(delegatedOwner) &&
+    isLockOwnedByPid(name, delegatedOwner);
+  // This is a one-hop control value for the CLI process, not session env.
+  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
+  let ownsEventLock = false;
+  let ownsCreationLock = false;
+  if (!inheritedCreationLock) {
+    if (!acquireEventLock(name)) {
+      console.error(`Session "${name}" event log is busy. Try again.`);
+      process.exit(1);
+    }
+    ownsEventLock = true;
+    if (!acquireLock(name)) {
+      releaseEventLock(name);
+      console.error(
+        `Session "${name}" is being created by another process. Try again.`
+      );
+      process.exit(1);
+    }
+    ownsCreationLock = true;
+    session = await getSessionByName(name);
+  }
+
   if (session?.status === "running") {
+    if (ownsCreationLock) {
+      releaseLock(name);
+      ownsCreationLock = false;
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     if (attachExisting) {
       console.log(`Session "${name}" already running, attaching.`);
       doAttach(name);
@@ -1577,30 +1634,20 @@ async function cmdRun(
     process.exit(1);
   }
 
-  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
-  const inheritedCreationLock =
-    Number.isSafeInteger(delegatedOwner) &&
-    isLockOwnedByPid(name, delegatedOwner);
-  // This is a one-hop control value for the CLI process, not session env.
-  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
-  if (!inheritedCreationLock && !acquireLock(name)) {
-    console.error(
-      `Session "${name}" is being created by another process. Try again.`
-    );
-    process.exit(1);
-  }
-
   // Clean up any dead session with the same name, but preserve cwd and tags
   // so that `run -a` re-creates the session in the original directory with original tags.
   const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
   const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
   const previousExtraEnv = session && isGone(session.status) ? session.metadata?.extraEnv : undefined;
   const previousUnsetEnv = session && isGone(session.status) ? session.metadata?.unsetEnv : undefined;
-  if (session && isGone(session.status)) {
-    cleanupAll(name);
-  }
-
   try {
+    if (session && isGone(session.status) && !inheritedCreationLock) {
+      cleanupAllWhileLocked(name);
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
     const cwdOpt = explicitCwd ?? previousCwd;
     // If the session had a previous displayName (e.g., it was renamed before
@@ -1612,13 +1659,15 @@ async function cmdRun(
     const unsetEnvOpt = unsetEnv.length > 0 ? unsetEnv : previousUnsetEnv;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
+      creationLockOwnerPid: inheritedCreationLock ? delegatedOwner : process.pid,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
       ...(unsetEnvOpt && unsetEnvOpt.length > 0 ? { unsetEnv: unsetEnvOpt } : {}),
     });
   } finally {
-    if (!inheritedCreationLock) releaseLock(name);
+    if (ownsEventLock) releaseEventLock(name);
+    if (ownsCreationLock) releaseLock(name);
   }
 
   console.log(`Session "${name}" created.`);
@@ -1730,16 +1779,16 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     console.error("pty exec: not inside a pty session (PTY_SESSION not set).");
     process.exit(1);
   }
+  const ownerGeneration = process.env.PTY_SESSION_GENERATION;
+  if (!ownerGeneration) {
+    throw new Error(
+      "pty exec: current session has no generation owner token; restart it before using pty exec.",
+    );
+  }
 
   const meta = readMetadata(sessionName);
   if (!meta) {
     console.error(`pty exec: session "${sessionName}" metadata not found.`);
-    process.exit(1);
-  }
-
-  if (meta.tags?.ptyfile) {
-    console.error(`pty exec: session "${sessionName}" is managed by ${meta.tags.ptyfile}`);
-    console.error("Edit the pty.toml to change the command instead.");
     process.exit(1);
   }
 
@@ -1752,26 +1801,45 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Update metadata with the new command
-  const previousCommand = meta.displayCommand ?? [meta.command, ...(meta.args ?? [])].join(" ");
   const displayCommand = [command, ...cmdArgs].join(" ");
-  writeMetadata(sessionName, {
-    ...meta,
-    command: resolved,
-    args: cmdArgs,
-    displayCommand,
-  });
+  if (!acquireEventLock(sessionName)) {
+    throw new Error(`pty exec: session "${sessionName}" event log is busy; retry the operation.`);
+  }
+  try {
+    let previousCommand = "";
+    const result = mutateMetadataUnderLock(sessionName, (current) => {
+      if (current.tags?.ptyfile) {
+        throw new Error(
+          `pty exec: session "${sessionName}" is managed by ${current.tags.ptyfile}. ` +
+          "Edit the pty.toml to change the command instead.",
+        );
+      }
+      previousCommand = current.displayCommand ??
+        [current.command, ...(current.args ?? [])].join(" ");
+      current.command = resolved;
+      current.args = cmdArgs;
+      current.displayCommand = displayCommand;
+      return true;
+    }, {
+      expectedGeneration: ownerGeneration,
+      onPublished: () => appendEventSyncLocked(sessionName, {
+        session: sessionName,
+        type: EventType.SESSION_EXEC,
+        ts: new Date().toISOString(),
+        previousCommand,
+        command: displayCommand,
+      }),
+    });
 
-  // Emit exec event
-  const writer = new EventWriter(sessionName);
-  writer.append({
-    session: sessionName,
-    type: EventType.SESSION_EXEC,
-    ts: new Date().toISOString(),
-    previousCommand,
-    command: displayCommand,
-  } as any);
-  await writer.flush();
+    if (result.status !== "changed") {
+      const reason = result.status === "generation-mismatch"
+        ? "belongs to a replacement generation"
+        : `could not be updated (${result.status})`;
+      throw new Error(`pty exec: session "${sessionName}" ${reason}; command was not run.`);
+    }
+  } finally {
+    releaseEventLock(sessionName);
+  }
 
   // Replace this process with the new command
   const result = spawnSync(resolved, cmdArgs, {
@@ -2510,6 +2578,66 @@ function renameUsage(): void {
   console.error(COMMAND_HELP.rename);
 }
 
+async function cmdMetadata(rawArgs: string[]): Promise<void> {
+  if (rawArgs[0] === "patch" && (rawArgs[1] === "-h" || rawArgs[1] === "--help")) {
+    printCommandHelp("metadata");
+    return;
+  }
+  if (rawArgs[0] !== "patch") {
+    console.error('pty metadata: expected subcommand "patch".');
+    console.error("  Usage: pty metadata patch --id <stable-id>");
+    process.exit(1);
+  }
+
+  let id: string | null = null;
+  for (let i = 1; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === "--id") {
+      const value = rawArgs[++i];
+      if (!value) {
+        console.error("pty metadata patch: --id requires a stable session id.");
+        process.exit(1);
+      }
+      if (id !== null) {
+        console.error("pty metadata patch: --id may only be provided once.");
+        process.exit(1);
+      }
+      id = value;
+    } else {
+      console.error(`pty metadata patch: unexpected argument "${arg}".`);
+      console.error("  Usage: pty metadata patch --id <stable-id>");
+      process.exit(1);
+    }
+  }
+  if (id === null) {
+    console.error("pty metadata patch: missing required --id <stable-id>.");
+    process.exit(1);
+  }
+
+  const input = fs.readFileSync(0, "utf-8").trim();
+  if (input.length === 0) {
+    console.error("pty metadata patch: expected one JSON patch object on stdin.");
+    console.error('  Example: printf \'%s\' \'{"displayName":"Worker"}\' | pty metadata patch --id a1b2c3d4');
+    process.exit(1);
+  }
+
+  let patch: unknown;
+  try {
+    patch = JSON.parse(input);
+  } catch (e) {
+    console.error(`pty metadata patch: invalid JSON on stdin: ${(e as Error).message}`);
+    process.exit(1);
+  }
+
+  try {
+    const result = await patchMetadataById(id, patch as any);
+    console.log(JSON.stringify(result));
+  } catch (e) {
+    console.error(`pty metadata patch: ${(e as Error).message}`);
+    process.exit(1);
+  }
+}
+
 async function cmdRename(rawArgs: string[]): Promise<void> {
   const insideSession = !!process.env.PTY_SESSION;
 
@@ -2602,9 +2730,8 @@ async function cmdRename(rawArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Display names can be arbitrary printable text (spaces, punctuation, any
-  // length up to 500 chars). The on-disk id (`name`) carries the strict
-  // charset and the sock-path-length constraint; display names don't.
+  // Display names are bounded, single-line presentation metadata. The on-disk
+  // id (`name`) carries the strict charset and sock-path-length constraint.
   try {
     validateDisplayName(newDisplay);
   } catch (e: any) {
@@ -2699,6 +2826,12 @@ async function cmdGc(
       : a.reason;
     console.log(`${abandonVerb}: ${a.name} (${detail})`);
   }
+  for (const skipped of result.reapSkipped) {
+    const phase = skipped.signalled ? "after signalling" : "before signalling";
+    console.log(
+      `Skipped ${skipped.operation} reap: ${skipped.name} (${skipped.reason}, ${phase})`,
+    );
+  }
   for (const r of result.respawned) {
     const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
     console.log(`${respawnVerb}: ${r.name}${note}`);
@@ -2735,6 +2868,7 @@ async function cmdGc(
   const totalActions =
     result.killedOrphanChildren.length +
     result.abandoned.length +
+    result.reapSkipped.length +
     result.respawned.length +
     result.respawnFailed.length +
     result.flapped.length +
@@ -2753,6 +2887,9 @@ async function cmdGc(
   }
   if (result.abandoned.length > 0) {
     parts.push(`${result.abandoned.length} abandoned`);
+  }
+  if (result.reapSkipped.length > 0) {
+    parts.push(`${result.reapSkipped.length} reap skip${result.reapSkipped.length === 1 ? "" : "s"}`);
   }
   if (result.respawned.length > 0) {
     parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);
@@ -3277,7 +3414,14 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
 
     // Clean up an exited bound session so its slot can be reused.
     if (bound && isGone(bound.status)) {
-      cleanupAll(bound.name);
+      const label = bound.metadata?.displayName ?? bound.name;
+      try {
+        cleanupAll(bound.name);
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+        skipped++;
+        continue;
+      }
     }
 
     // Pick the on-disk id: honor the pty.toml's `id = "..."` if set,
@@ -3392,9 +3536,13 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
       }
       cleanupSocket(existingSession.name);
     } else if (isGone(existingSession.status)) {
-      cleanupAll(existingSession.name);
-      console.log(`  ○ ${label} (cleaned up)`);
-      stopped++;
+      try {
+        cleanupAll(existingSession.name);
+        console.log(`  ○ ${label} (cleaned up)`);
+        stopped++;
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+      }
     }
   }
 
