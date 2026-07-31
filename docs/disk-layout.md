@@ -60,6 +60,9 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   removes files still owned by its generation, and `pty rm` waits for that
   daemon to finish deferred shutdown before it reports success. Readers should
   treat the generation token as opaque.
+- `displayName` is mutable presentation metadata and is not unique. Stable
+  identity remains the `<name>` filename stem; consumers must not use
+  `displayName` as a durable key.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).

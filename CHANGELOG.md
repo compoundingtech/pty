@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Non-unique display names with unambiguous session resolution
+
+- Display names are presentation metadata and no longer need to be unique.
+  Creating or renaming a session may reuse another session's display name or a
+  stable id; stable session ids remain unique and immutable.
+- Every local CLI session reference resolves with the same rule: an exact stable
+  id wins, one display-name match resolves, and multiple display-name matches
+  fail closed while listing the candidate stable ids. Fabric remote routing uses
+  the same rule on the target host.
+
 ### Stream-ordered effective geometry for embedded clients
 
 - Writable clients still select the shared PTY grid by independent row/column

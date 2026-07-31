@@ -119,6 +119,12 @@ pty down                                  # stop all sessions from ./pty.toml
 pty down claude                           # stop specific sessions
 ```
 
+Session ids are stable and unique. Display names are mutable presentation
+labels and may be shared by multiple sessions. A command reference resolves an
+exact stable id first, then a display name only when that label has one match.
+Ambiguous display names fail without acting and print the candidate stable ids.
+Use stable ids in scripts and automation.
+
 ### Remote over fabric
 
 `pty list --remote <peer>` lists another machine's sessions over [fabric](https://github.com/compoundingtech/fabric), which hands consumers a plain local Unix socket — pty never touches iroh. The remote machine serves a small control protocol that fabric exposes under the `pty-remote` ALPN. The recommended form is **on-demand**: fabric spawns the handler per dial, pipes the connection to its stdin/stdout, and owns persistence + roaming (no persistent pty daemon):
@@ -128,7 +134,8 @@ pty down claude                           # stop specific sessions
 fabric expose pty-remote --exec -- pty remote-serve --stdio
 ```
 
-From any trusted peer, the ordinary session commands take `--remote <peer>` — `<ref>` is the session's name/id **on the remote**:
+From any trusted peer, the ordinary session commands take `--remote <peer>` —
+`<ref>` is a stable id or unambiguous display name **on the remote**:
 
 ```sh
 pty list --remote <peer>                  # list the peer's sessions

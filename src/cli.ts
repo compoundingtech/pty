@@ -10,6 +10,7 @@ import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
   getSession,
+  getSessionByName,
   gc,
   pruneOrphanLayoutTags,
   isGone,
@@ -24,7 +25,7 @@ import {
   releaseLock,
   updateTags,
   setDisplayName,
-  allRefs,
+  allSessionNames,
   readMetadata,
   readSessionPid,
   writeMetadata,
@@ -347,7 +348,8 @@ Examples:
        pty rename --show <ref>                Show the current displayName
        pty rename --clear [ref]               Clear the displayName
 
-displayName is a mutable alias; the session's stable id (name) never changes.
+displayName is a mutable, non-unique label; the session's stable id (name) never changes.
+An ambiguous displayName must be replaced with one of the reported stable ids.
 
 Examples:
   pty rename my-friendly-name
@@ -496,8 +498,9 @@ Global:
   pty test [watch | -t "pattern"]         Run the pty test suite (vitest passthrough)
 
 Session references (<ref>): the on-disk id (validated: [A-Za-z0-9._-], ≤ 255 chars,
-socket path ≤ 104 bytes), or a displayName. Inside a session, most commands default
-to $PTY_SESSION when the ref is omitted (see 'pty rename', 'pty exec', 'pty emit').
+socket path ≤ 104 bytes), or a displayName. Stable ids always win; a displayName
+resolves only when unique. Inside a session, most commands default to $PTY_SESSION
+when the ref is omitted (see 'pty rename', 'pty exec', 'pty emit').
 
 Env:
   PTY_ROOT                Registry dir (default ~/.local/state/pty). Canonical.
@@ -788,7 +791,9 @@ async function main(): Promise<void> {
         // --force path above is the documented way to override that.
         const lookupRef = explicitId ?? explicitDisplayName;
         if (attachExisting && lookupRef) {
-          const existing = await getSession(lookupRef);
+          const existing = explicitId
+            ? await getSessionByName(explicitId)
+            : await getSession(lookupRef);
           if (existing && existing.status === "running") {
             ensureNotNested("run -a", {
               force: false,
@@ -808,11 +813,11 @@ async function main(): Promise<void> {
         process.exit(result.status ?? 1);
       }
 
-      const existingRefs = await allRefs();
+      const existingNames = await allSessionNames();
 
       // Resolve `name` (the on-disk id). If --id was passed, validate and use
       // it verbatim; otherwise generate a short random id. Charset, length,
-      // and uniqueness checks are all done up front so automation fails
+      // and stable-id uniqueness checks are all done up front so automation fails
       // loudly rather than hitting EINVAL/ENAMETOOLONG deep in spawn.
       //
       // Uniqueness exception: under `-a` (attach-or-create), a collision
@@ -826,8 +831,8 @@ async function main(): Promise<void> {
           console.error(e.message);
           process.exit(1);
         }
-        if (existingRefs.has(explicitId) && !attachExisting) {
-          console.error(`Session id "${explicitId}" is already in use (as a name or displayName).`);
+        if (existingNames.has(explicitId) && !attachExisting) {
+          console.error(`Session id "${explicitId}" is already in use.`);
           process.exit(1);
         }
         name = explicitId;
@@ -835,7 +840,7 @@ async function main(): Promise<void> {
         let candidate: string | null = null;
         for (let attempt = 0; attempt < 8; attempt++) {
           const c = randomSessionName();
-          if (!existingRefs.has(c)) { candidate = c; break; }
+          if (!existingNames.has(c)) { candidate = c; break; }
         }
         if (!candidate) {
           console.error("Could not generate a unique session id after 8 attempts.");
@@ -846,9 +851,8 @@ async function main(): Promise<void> {
 
       // Resolve `displayName`. Precedence:
       //   1. --no-display-name → null
-      //   2. --name <x>         → x (validated permissively, deduped only
-      //                            against existing refs)
-      //   3. otherwise          → auto cwd+cmd label (sanitized + deduped)
+      //   2. --name <x>         → x (validated permissively)
+      //   3. otherwise          → auto cwd+cmd label (sanitized)
       let displayName: string | null = null;
       if (!noDisplayName) {
         if (explicitDisplayName) {
@@ -858,24 +862,10 @@ async function main(): Promise<void> {
             console.error(`Invalid displayName: ${e.message}`);
             process.exit(1);
           }
-          if (explicitDisplayName === name) {
-            console.error(`displayName cannot equal the session's id ("${name}").`);
-            process.exit(1);
-          }
-          if (existingRefs.has(explicitDisplayName)) {
-            console.error(`"${explicitDisplayName}" is already in use by another session (as a name or displayName).`);
-            process.exit(1);
-          }
           displayName = explicitDisplayName;
         } else {
           let candidate = autoName(autoNameCmd, cmdArgs);
           candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-          if (existingRefs.has(candidate) || candidate === name) {
-            for (let n = 2; ; n++) {
-              const c = `${candidate}-${n}`;
-              if (!existingRefs.has(c) && c !== name) { candidate = c; break; }
-            }
-          }
           displayName = candidate;
         }
       }
@@ -1534,7 +1524,7 @@ async function cmdRun(
   displayName: string | null = null,
   extraEnv: Record<string, string> = {},
 ): Promise<void> {
-  const session = await getSession(name);
+  const session = await getSessionByName(name);
   if (session?.status === "running") {
     if (attachExisting) {
       console.log(`Session "${name}" already running, attaching.`);
@@ -2576,18 +2566,6 @@ async function cmdRename(rawArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Uniqueness across (name ∪ displayName), excluding the target session itself.
-  const refs = await allRefs();
-  const currentDn = (await getSession(targetName))?.metadata?.displayName;
-  if (newDisplay === targetName) {
-    console.error(`displayName cannot equal the session's id ("${targetName}").`);
-    process.exit(1);
-  }
-  if (refs.has(newDisplay) && newDisplay !== currentDn) {
-    console.error(`"${newDisplay}" is already in use by another session (as a name or displayName).`);
-    process.exit(1);
-  }
-
   try {
     setDisplayName(targetName, newDisplay);
     console.log(`Set displayName on "${targetName}" → "${newDisplay}".`);
@@ -3177,7 +3155,7 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
     s.metadata?.tags?.ptyfile === tomlPath &&
     s.metadata?.tags?.["ptyfile.session"] === shortName
   );
-  const allRefSet = await allRefs();
+  const allNameSet = await allSessionNames();
 
   let started = 0;
   let skipped = 0;
@@ -3267,17 +3245,17 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
         console.error(`  ✗ ${sess.displayName}: ${e.message}`);
         continue;
       }
-      if (allRefSet.has(sess.id)) {
-        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use (as a name or displayName).`);
+      if (allNameSet.has(sess.id)) {
+        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use.`);
         continue;
       }
       name = sess.id;
-      allRefSet.add(sess.id);
+      allNameSet.add(sess.id);
     } else {
       let candidate: string | null = null;
       for (let attempt = 0; attempt < 8; attempt++) {
         const c = randomSessionName();
-        if (!allRefSet.has(c)) { candidate = c; allRefSet.add(c); break; }
+        if (!allNameSet.has(c)) { candidate = c; allNameSet.add(c); break; }
       }
       if (!candidate) {
         console.error(`  ✗ ${sess.displayName}: could not generate a unique session id after 8 attempts.`);

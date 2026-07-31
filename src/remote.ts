@@ -2,7 +2,7 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
-import { listSessions, getSocketPath, type SessionInfo } from "./sessions.ts";
+import { listSessions, getSession, getSocketPath, type SessionInfo } from "./sessions.ts";
 
 /** ALPN / fabric service name under which pty exposes its remote-access control
  *  protocol. `fabric expose pty-remote --exec -- pty remote-serve --stdio` on the
@@ -123,14 +123,25 @@ export function handleRemoteConnection(input: Readable, output: Writable, done: 
       return;
     }
     if (req.op === "route" && typeof req.name === "string") {
-      route(req.name, residual);
+      await route(req.name, residual);
       return;
     }
     writeLine(JSON.stringify({ error: `unknown op: ${String(req.op)}` }));
   }
 
-  function route(name: string, residual: Buffer): void {
-    const target = net.createConnection(getSocketPath(name));
+  async function route(ref: string, residual: Buffer): Promise<void> {
+    let session: SessionInfo | null;
+    try {
+      session = await getSession(ref);
+    } catch (e) {
+      writeLine(JSON.stringify({ error: (e as Error).message }));
+      return;
+    }
+    if (!session) {
+      writeLine(JSON.stringify({ error: `session "${ref}" not found` }));
+      return;
+    }
+    const target = net.createConnection(getSocketPath(session.name));
     const teardown = () => { try { target.destroy(); } catch {} finish(); };
     target.on("connect", () => {
       // ACK the route BEFORE splicing so the client knows it succeeded (the
@@ -144,7 +155,7 @@ export function handleRemoteConnection(input: Readable, output: Writable, done: 
     target.on("error", () => {
       // Reachable-but-gone: the client turns this line into a clean give-up
       // (see RouteRefusedError on the dial side).
-      output.write(JSON.stringify({ error: `session "${name}" not found` }) + "\n", () => teardown());
+      output.write(JSON.stringify({ error: `session "${ref}" not found` }) + "\n", () => teardown());
     });
     target.on("close", teardown);
     input.on("error", teardown);
