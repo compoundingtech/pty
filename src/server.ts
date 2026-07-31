@@ -947,11 +947,14 @@ export class PtyServer {
 
       client.socket.write(encodeScreen(getScreen()));
       client.initialScreenPhase = "live";
-      if (this.exited && !hasPostCutExit) {
-        client.socket.write(encodeExit(this.exitCode));
-      }
+      /** node-pty drains PTY data before its public exit event, so a queued
+       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
+       *  this queue and is synthesized only after any final post-cut DATA. */
       for (const pending of postCutPackets) {
         client.socket.write(pending.packet);
+      }
+      if (this.exited && !hasPostCutExit) {
+        client.socket.write(encodeExit(this.exitCode));
       }
       onLive?.();
     });

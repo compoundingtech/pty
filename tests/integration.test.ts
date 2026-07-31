@@ -12,6 +12,7 @@ import {
   encodeAttach,
   encodeData,
   encodeDetach,
+  encodeExit,
   encodePeek,
   encodeResize,
   encodeStatus,
@@ -591,6 +592,89 @@ describe("integration", () => {
       expect(
         attachingPackets.packets.find((packet) => packet.type === MessageType.DATA)?.payload.toString()
       ).toContain("post-cut-data");
+      const exitPackets = attachingPackets.packets.filter(
+        (packet) => packet.type === MessageType.EXIT
+      );
+      expect(exitPackets).toHaveLength(1);
+      expect(decodeExit(exitPackets[0].payload)).toBe(7);
+    } finally {
+      heldWrites.restore();
+      vi.useRealTimers();
+    }
+
+    const liveClosed = new Promise<void>((resolve) => liveClient.once("close", resolve));
+    liveClient.destroy();
+    await liveClosed;
+    if (attachingClient) {
+      const attachingClosed = new Promise<void>((resolve) =>
+        attachingClient!.once("close", resolve)
+      );
+      attachingClient.destroy();
+      await attachingClosed;
+    }
+  });
+
+  it("flushes final post-cut DATA before synthesizing a pre-cut EXIT", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    const heldWrites = holdTerminalWrites(server);
+    const internals = server as unknown as {
+      exited: boolean;
+      exitCode: number;
+      broadcast: (
+        type: typeof MessageType.DATA | typeof MessageType.EXIT,
+        packet: Buffer
+      ) => void;
+    };
+    let attachingClient: net.Socket | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      internals.exited = true;
+      internals.exitCode = 7;
+      internals.broadcast(MessageType.EXIT, encodeExit(7));
+      await vi.advanceTimersByTimeAsync(80);
+      expect(
+        heldWrites.pendingWrites.some(
+          (pending) => pending.data.length === 0 && pending.callback !== undefined
+        )
+      ).toBe(true);
+
+      internals.broadcast(
+        MessageType.DATA,
+        encodeData("final-post-cut-data")
+      );
+      const releaseWrites = heldWrites.releaseWrites();
+      await vi.runAllTimersAsync();
+      await releaseWrites;
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.some((packet) => packet.type === MessageType.SCREEN) &&
+          packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+        MessageType.DATA,
+        MessageType.EXIT,
+      ]);
+      expect(
+        attachingPackets.packets.find((packet) => packet.type === MessageType.DATA)?.payload.toString()
+      ).toContain("final-post-cut-data");
       const exitPackets = attachingPackets.packets.filter(
         (packet) => packet.type === MessageType.EXIT
       );
