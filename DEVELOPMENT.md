@@ -25,6 +25,7 @@ npm run typecheck      # typecheck with tsc (no emit)
 npm test               # run all tests once
 npm run test:watch     # run tests in watch mode
 npm run verify-docs    # run executable examples in docs/testing.md
+node scripts/verify-docs.ts --vrs-only  # validate the VRS hierarchy
 
 # Usage (during development — run the TS source directly with Node)
 node --experimental-strip-types src/cli.ts run -- <command> [args...]
@@ -46,6 +47,10 @@ Detach from any attached/following session with **Ctrl+\\**. Press Ctrl+\\ twice
 Source is written in TypeScript with `.ts` import extensions. `npm run build` compiles `src/` to `dist/` via `tsc -p tsconfig.build.json` (`rewriteRelativeImportExtensions` turns the `.ts` import specifiers into `.js` in the output), and the published package ships `dist/`. The `bin/pty` entry point runs the compiled `dist/cli.js` with Node — so run `npm run build` before invoking the installed `pty`. During development you can skip the build and run the source directly with Node's native type stripping: `node --experimental-strip-types src/cli.ts …`. The separate `tsconfig.json` (`noEmit: true`, `allowImportingTsExtensions: true`) backs `npm run typecheck` only.
 
 ## Architecture
+
+The hierarchical durable contract is maintained in
+[`docs/vrs`](docs/vrs/spec.md); this guide explains the implementation and
+development workflow.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -80,13 +85,21 @@ Binary packets over Unix sockets: `[type: uint8][length: uint32BE][payload]`
 |------|----|-----------|---------|
 | DATA | 0 | Both | Raw terminal bytes |
 | ATTACH | 1 | Client → Server | `[rows: uint16BE, cols: uint16BE]` (4 bytes) |
-| DETACH | 2 | Client → Server | Empty |
+| DETACH | 2 | Client → Server; machine adapter → consumer | Empty |
 | RESIZE | 3 | Client → Server | `[rows: uint16BE, cols: uint16BE]` (4 bytes) |
 | EXIT | 4 | Server → Client | `[exitCode: int32BE]` (4 bytes) |
 | SCREEN | 5 | Server → Client | ANSI escape sequences (string) |
-| PEEK | 6 | Client → Server | Empty |
+| PEEK | 6 | Client → Server | Flags: plain bit 0, full-scrollback bit 1 |
+| STATUS | 7 | Both | Empty request or JSON response |
+| GEOMETRY | 10 | Server → Client | `[rows: uint16BE, cols: uint16BE]` (4 bytes) |
 
-`PacketReader` handles streaming reassembly of partial reads. Decoders gracefully handle truncated payloads (defaults for size, -1 for exit code). Unknown message types are silently ignored by the server.
+`PacketReader` handles streaming reassembly of partial reads and rejects a
+declared payload above 32 MiB. Decoders retain legacy fallbacks for truncated
+size and exit payloads; command-specific surfaces validate stronger contracts.
+Unknown bounded message types are ignored by the server. Each valid `ATTACH` or
+recognized `PEEK` that emits terminal state starts with `GEOMETRY`, then an
+ordered `SCREEN` baseline, then live `DATA` or `EXIT`. A local machine detach
+may instead emit `DETACH` before the baseline.
 
 ## Key Design Decisions
 
@@ -102,9 +115,13 @@ We avoid TS enums because they emit runtime code that can't be type-stripped. In
 
 The PTY can only be one size. If a peek client's terminal size were used, it could reflow the session — imagine vim at 120x40 suddenly becoming 40x20 because someone peeked from their phone. Readonly clients are excluded from size negotiation entirely. They see whatever fits; the active user's layout is never disrupted.
 
-### Last attached client wins for size
+### Smallest writable client wins for size
 
-When multiple interactive (non-peek) clients are connected, the most recently attached client's terminal size is used for the PTY. This is simple and predictable. An alternative would be minimum dimensions across all clients, but that punishes the primary user when a smaller client connects.
+When multiple interactive (non-peek) clients are connected, the PTY uses the
+minimum requested row count and minimum requested column count independently.
+This guarantees that every writable client can represent the complete shared
+grid. Readonly clients receive effective-geometry updates but never constrain
+the size.
 
 ### xterm-headless as the screen buffer
 
@@ -168,6 +185,7 @@ npm test                       # run once (or: pty test)
 npm run test:watch             # watch mode (or: pty test watch)
 npx vitest run -t "peek"      # run tests matching "peek"
 npm run verify-docs            # run executable examples in docs/testing.md
+node scripts/verify-docs.ts --vrs-only  # validate the VRS hierarchy
 ```
 
 ### node-pty on macOS
@@ -204,8 +222,9 @@ tests/
   tui.test.ts
 docs/
   testing.md      Testing library documentation (with executable examples)
+  vrs/            Hierarchical system requirements and specification
 scripts/
-  verify-docs.ts  Extracts and runs doc examples via vitest
+  verify-docs.ts  Validates VRS structure and runs doc examples via vitest
 completions/
   pty.bash        Bash tab completion
   pty.zsh         Zsh tab completion

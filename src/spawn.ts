@@ -41,9 +41,10 @@ export interface SpawnDaemonOptions {
   extraEnv?: Record<string, string>;
   /** Environment keys removed from inheritance before `extraEnv` is applied. */
   unsetEnv?: string[];
-  /** Use this env dict verbatim for the spawned child — no inheritance from
-   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
-   *  injected on top so nesting detection and `pty exec` keep working.
+  /** Use this env dict as the child environment's replacement base — no
+   *  inheritance from the daemon's `process.env`, no allow-list. Runtime
+   *  invariants still force `PTY_SESSION` and normalize an absent or empty
+   *  `TERM`.
    *
    *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
    *  `env` together with inherited-environment policy will throw at startup. */
@@ -140,7 +141,7 @@ export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
   if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
       "SpawnDaemonOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
-        "Use env for verbatim control, or inherited environment policy options — not both.",
+        "Use env as a replacement base, or inherited environment policy options — not both.",
     );
   }
   const strategy = resolveSpawnStrategy();
