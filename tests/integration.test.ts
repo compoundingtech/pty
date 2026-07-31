@@ -960,14 +960,16 @@ describe("integration", () => {
 
   it("does not change either role for a malformed ATTACH payload", async () => {
     const name = uniqueName();
-    await startServer(name, "cat");
+    const server = await startServer(name, "cat");
+    const terminalWrites = holdTerminalWrites(server);
 
     const peeker = await connect(name);
     const peekPackets = recordPackets(peeker);
     peeker.write(encodePeek());
     await peekPackets.waitFor((received) =>
-      received.some((packet) => packet.type === MessageType.SCREEN)
+      received.some((packet) => packet.type === MessageType.GEOMETRY)
     );
+    expect(terminalWrites.pendingWrites).toHaveLength(1);
     peeker.write(
       Buffer.concat([
         encodePacket(MessageType.ATTACH, Buffer.alloc(2)),
@@ -984,6 +986,11 @@ describe("integration", () => {
       attached: 0,
       readOnly: 1,
     });
+    await terminalWrites.releaseWrites();
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    terminalWrites.restore();
 
     const attached = await connect(name);
     const attachedPackets = recordPackets(attached);
