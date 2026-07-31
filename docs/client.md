@@ -187,16 +187,14 @@ interface SpawnDaemonOptions {
   isolateEnv?: boolean;              // inherit only the safe allow-list
   extraEnv?: Record<string, string>; // explicit assignments applied last
   unsetEnv?: string[];               // inherited keys removed before assignments
-  env?: Record<string, string>;      // replacement base; PTY_SESSION/TERM invariants still apply
+  env?: Record<string, string>;      // exact child env; mutually exclusive with the above
 }
 ```
 
 `unsetEnv` removals run before `extraEnv` assignments. The server then forces
-`PTY_SESSION` to the stable session id. Node-pty treats `TERM` as terminal
-capability metadata: an absent or empty value selects the runtime's
-`xterm-256color` terminal name, while a nonempty value is preserved. Naming
-either key in `unsetEnv` does not suppress those invariants. Ordinary
-assignments retain exact values, including an empty `NO_COLOR`.
+`PTY_SESSION` to the stable session id and fills an absent `TERM` with
+`xterm-256color`; naming either key in `unsetEnv` does not suppress those
+invariants. An explicit `extraEnv.TERM` value is preserved.
 
 ### `resolveCommand(cmd: string): string`
 

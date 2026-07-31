@@ -2,83 +2,89 @@
 
 ## Context
 
-These requirements define the durable contract of the `pty` project described
-in the [README](../../README.md): persistent terminal sessions and the reusable
-libraries built on the same terminal model. The README remains the product
-purpose and user guide; this tree owns the testable system constraints. There
-is intentionally no `vision.md` in this tree.
-
-Child requirements refine this contract by scoped ID:
-
-- [session runtime](./01-session-runtime/requirements.md)
-- [session stream](./02-session-stream/requirements.md)
-- [registry](./03-registry/requirements.md)
-- [surfaces](./04-surfaces/requirements.md)
+The [README](../../README.md) is the concise purpose and user guide for `pty`.
+These requirements define its durable, testable system constraints. The
+implementation contract and validation map live in [spec.md](./spec.md).
 
 ## Assumptions
 
-- **PTY-A01 Unix host:** Supported hosts provide Unix PTYs, Unix-domain sockets,
+- **A01 Unix host:** Supported hosts provide Unix PTYs, Unix-domain sockets,
   process signals, and atomic same-filesystem rename. The supported products are
   macOS and Linux.
-- **PTY-A02 Trusted user boundary:** A registry belongs to one trusted OS user.
-  Socket and filesystem permissions are the access boundary; readonly clients
-  are a behavior mode, not an authorization mechanism.
-- **PTY-A03 Terminal byte stream:** A child process expresses terminal state as
-  ordered bytes and terminal control sequences. Reconstructing that state
-  requires a terminal emulator, not line-oriented logging.
+- **A02 Trusted user boundary:** One registry belongs to one trusted OS user.
+  Filesystem permissions are the access boundary; readonly mode is behavior,
+  not authorization.
+- **A03 Terminal semantics:** Child output is an ordered terminal byte stream.
+  Reconstructing it requires a terminal emulator rather than line-oriented logs.
 
 ## Acceptable tradeoffs
 
-- **PTY-T01 Per-session daemon:** Each persistent session pays the resource cost
-  of an independent daemon in exchange for failure isolation and no central
-  lifetime owner.
-- **PTY-T02 Shared grid:** All writable clients share one effective PTY grid.
-  The smallest requested row and column dimensions win, preserving a complete
-  view for every writable client at the cost of reducing larger clients.
-- **PTY-T03 Pre-1.0 evolution:** Public storage and package APIs may change
-  before 1.0 when the documented compatibility tier permits it. Changes remain
-  explicit and version-pinned consumers can retain the old contract.
+- **T01 Per-session daemon:** Each session pays for an independent daemon in
+  exchange for client-independent lifetime and failure isolation.
+- **T02 Shared grid:** All writable clients share the minimum requested rows and
+  minimum requested columns so every writer can represent the complete grid.
+- **T03 Pre-1.0 compatibility:** Public storage and package APIs may evolve
+  before 1.0, but readers remain bounded and documented compatibility tiers are
+  preserved deliberately.
 
 ## Requirements
 
-### Must preserve sessions independently of observers
+### Must preserve runtime meaning
 
-- **PTY-R01 — Persistent execution.** A session's child process and terminal state
-  continue independently of the client that created, attached to, or detached
-  from it.
-- **PTY-R02 — Isolated failure domains.** Failure or replacement of one session,
-  client, or control-plane invocation does not implicitly terminate unrelated
-  sessions.
+- **R01 Independent session lifetime:** A session child and terminal state
+  continue independently of creating, attached, detached, or observing clients;
+  failure of one session or client does not implicitly terminate another.
+- **R02 Durable launch context:** Initial launch, explicit restart, and
+  policy-driven respawn preserve command, arguments, working directory, initial
+  geometry, lifetime policy, labels, tags, and child-environment policy.
+  Exact-environment mode is exclusive with inherited/isolate policy; inherited
+  removals precede assignments. Ordinary assigned values, including an empty
+  `NO_COLOR`, remain exact. `PTY_SESSION` and its generation token are
+  runtime-owned; absent or empty `TERM` selects `xterm-256color`, while a
+  nonempty terminal name is preserved. Historical metadata without removals
+  retains ambient-inheritance behavior.
+- **R03 Ordered, generation-safe lifecycle:** Child output is drained before
+  exit is finalized. Restart, permanent reconciliation, abandonment, explicit
+  removal, and cleanup follow explicit policy and cannot mutate or delete a
+  replacement generation.
 
-### Must preserve terminal meaning
+### Must reconstruct one shared terminal
 
-- **PTY-R03 — Reconstructable terminal.** A newly attached client can reconstruct
-  a causally valid terminal state, including style, cursor, modes, alternate
-  screen, scrollback, and subsequent output, without a byte-loss or reordering
-  window.
-- **PTY-R04 — Deterministic shared geometry.** Concurrent writable clients produce
-  one explicit effective geometry, and every reconstructing client learns that
-  geometry in causal order with the terminal state it describes. Readonly
-  observation does not alter it.
+- **R04 Ordered reconstruction:** Every valid attach or recognized peek that
+  emits terminal state sends effective geometry, exactly one screen baseline,
+  then post-cut data and at most one process exit in source order. A later mode
+  request supersedes an unfinished generation; reconnect starts a new one.
+- **R05 Replaceable client roles:** A complete `ATTACH` makes its socket
+  writable, installs requested geometry, and enables input and resize. A
+  recognized `PEEK` makes it readonly and removes its geometry constraint. A
+  malformed attach changes neither role nor synchronization generation.
+- **R06 Deterministic geometry:** Effective rows and columns are the independent
+  minima requested by writable clients. Attach, resize, and disconnect
+  recompute them; readonly observation never constrains them. Geometry changes
+  are visible before terminal bytes produced for the new size.
+- **R07 Bounded stream protocol:** Packets are length-delimited, fragmented
+  input is reassembled, oversized input is rejected without unbounded
+  buffering, and reconnect or unsupported capability failure is explicit.
+- **R08 Machine attach outcomes:** Machine attach preserves the framed
+  `GEOMETRY`, `SCREEN`, `DATA`, and `EXIT` stream on a caller-owned inherited
+  descriptor while stdin/stdout remain the controlling terminal. A clean stream
+  ends with exactly one `EXIT` when the session process ended or empty `DETACH`
+  when this client intentionally detached; EOF without either is truncation.
+  Administrative destruction is truncation unless process `EXIT` was observed.
 
-### Must make lifecycle and state inspectable
+### Must expose durable state through one behavioral core
 
-- **PTY-R05 — Durable launch and lifecycle.** A preserved session retains enough
-  launch definition for an equivalent explicit or policy-driven restart, while
-  explicit removal and cleanup cannot delete a replacement generation.
-- **PTY-R06 — Observational state.** Callers can inspect session identity,
-  lifecycle, metadata, events, clients, resources, and effective geometry
-  without attaching or mutating the session.
-- **PTY-R07 — Explicit isolation and identity.** Registry selection and stable
-  session identity are explicit. Presentation labels and tags do not silently
-  become durable identity or hard isolation boundaries.
-
-### Must compose through supported surfaces
-
-- **PTY-R08 — Contract-equivalent surfaces.** The CLI, exported libraries,
-  testing API, local socket transport, machine attach stream, and remote route
-  preserve the same session, stream, geometry, and lifecycle contracts where
-  they expose those capabilities.
-- **PTY-R09 — Bounded compatibility.** Protocol and storage readers reject
-  unbounded or structurally invalid input, while documented extension and
-  compatibility paths preserve older clients and metadata where safe.
+- **R09 Stable, inspectable registry:** Registry root and filename-safe stable
+  id are explicit. Display names and tags are presentation metadata. Inventory
+  and status expose lifecycle, clients, requested/effective geometry, resources,
+  and metadata without attaching or mutating the session.
+- **R10 Durable, compatible records:** Metadata retains the launch and lifecycle
+  fields needed for inspection and restart, preserves unknown fields on update,
+  and uses generation-aware atomic replacement. Events are external-readable
+  JSONL records with bounded retention. Readers reject structurally invalid or
+  unbounded input while retaining documented legacy fallbacks.
+- **R11 Equivalent supported surfaces:** CLI commands, exported client/server/
+  protocol/testing APIs, the shipped package entrypoint, local transport, and
+  remote routing preserve the applicable runtime, stream, geometry, registry,
+  and lifecycle contracts. A surface rejects unsupported capabilities instead
+  of silently weakening them; tests use real PTYs and processes.

@@ -58,7 +58,7 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   isolateEnv?: boolean;
   extraEnv?: { [k: string]: string }; // explicit inherited-env overlay (`--env`)
   unsetEnv?: string[];         // inherited env keys removed before `extraEnv`
-  env?: { [k: string]: string };      // replacement base; runtime invariants still apply
+  env?: { [k: string]: string };      // exact child env for programmatic callers
   createdAt: string;          // ISO 8601
   exitCode?: number;          // present after clean exit
   exitedAt?: string;

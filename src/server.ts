@@ -116,7 +116,7 @@ export interface ServerOptions {
    *
    *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
    *  `env` together with inherited-environment policy throws. Use this when
-   *  the caller wants exact ordinary environment keys (e.g., a
+   *  the caller wants total control of the child environment (e.g., a
    *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
 }
@@ -142,21 +142,21 @@ const ISOLATED_ENV_ALLOWLIST = new Set([
  *  Shift+Enter is indistinguishable from Enter. */
 const DEFAULT_CHILD_TERM = "xterm-256color";
 
-/** Apply the TERM default in-place after the env has been assembled. A
- *  nonempty terminal name is preserved; absence and empty both select the
- *  runtime default. */
+/** Apply the TERM default in-place after the env has been assembled. Never
+ *  overrides an explicit value — only fills in when it's absent. */
 function ensureChildTerm(env: Record<string, string>): void {
   if (!env.TERM) env.TERM = DEFAULT_CHILD_TERM;
 }
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
-  // Mutual exclusion: the replacement-base `env` can't be combined with the
-  // inherited-environment policy path. Otherwise isolation, removals, and
-  // assignments compose explicitly. Picking one implicitly would hide intent.
+  // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
+  // inherited-environment policy path. If you want total control you pass
+  // `env`; otherwise isolation/removals/assignments compose explicitly. Picking
+  // one implicitly would hide intent.
   if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
       "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
-      "Use env as a replacement base, or inherited environment policy options — not both."
+      "Use env for verbatim control, or inherited environment policy options — not both."
     );
   }
 
@@ -526,7 +526,7 @@ export class PtyServer {
       // NOTE: intentionally no `name:` option here — node-pty's `name`
       // unconditionally clobbers env.TERM, which would hide any TERM the
       // caller inherited or set explicitly. `buildChildEnv` guarantees
-      // childEnv.TERM is populated (defaulting if absent or empty),
+      // childEnv.TERM is populated (defaulting to xterm-256color if absent),
       // so node-pty will pick it up naturally. Was `name: "xterm-256color"`
       // before; removing it lets inherited values like `xterm-kitty` flow
       // through and lets TUIs negotiate the richer capabilities they allow.
