@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Ordered initial attach snapshots
+
+- Every `ATTACH` and `PEEK` synchronization now sends the effective
+  `GEOMETRY`, then one `SCREEN` baseline, before any following `DATA` or
+  `EXIT`. Output already accepted by xterm at the snapshot cut is represented
+  by `SCREEN`; later output is queued and released in order after it, with a
+  single process exit following any final data.
+- A new `ATTACH` or `PEEK` on the same socket supersedes an unfinished
+  synchronization, so a re-attach or writable-to-readonly mode switch cannot
+  emit the previous mode's stale screen or queued output. Reconnects establish
+  the same fresh `GEOMETRY` → `SCREEN` → `DATA`/`EXIT` baseline.
+
 ### Non-unique display names with unambiguous session resolution
 
 - Display names are presentation metadata and no longer need to be unique.

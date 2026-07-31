@@ -42,6 +42,14 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** DATA/EXIT must not overtake the SCREEN baseline for ATTACH or PEEK. */
+  initialScreenPhase: "live" | "settling" | "cutting";
+  /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
+  initialScreenGeneration: number;
+  postCutPackets: Array<{
+    type: typeof MessageType.DATA | typeof MessageType.EXIT;
+    packet: Buffer;
+  }>;
 }
 
 export interface ServerOptions {
@@ -506,7 +514,7 @@ export class PtyServer {
       this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
-        this.broadcast(encodeData(cleaned));
+        this.broadcast(MessageType.DATA, encodeData(cleaned));
       }
     });
 
@@ -519,7 +527,7 @@ export class PtyServer {
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
-      this.broadcast(encodeExit(code));
+      this.broadcast(MessageType.EXIT, encodeExit(code));
       this.emitEvent(EventType.SESSION_EXIT, {
         exitCode: code,
         ...(signal ? { signal } : {}),
@@ -603,6 +611,9 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      initialScreenPhase: "live",
+      initialScreenGeneration: 0,
+      postCutPackets: [],
     };
     this.clients.set(socket, client);
 
@@ -629,6 +640,9 @@ export class PtyServer {
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -650,24 +664,24 @@ export class PtyServer {
             } catch {}
 
             const sendScreen = () => {
-              if (socket.destroyed) return;
-              const screen = this.getModePrefix(true) + this.serialize.serialize();
-              socket.write(encodeScreen(screen));
-              if (this.exited) {
-                socket.write(encodeExit(this.exitCode));
-              } else {
-                // The serialize addon's output is an approximation — ECH/CUF
-                // sequences may not perfectly reproduce what the app originally
-                // drew (e.g., background fills in ratatui). Nudge the child
-                // with a SIGWINCH so it does a fresh full redraw, whose DATA
-                // overwrites any serialize artifacts on the client.
-                //
-                // Skipped when the client attached at the size the session
-                // already has: the child is drawn for that geometry, so the
-                // nudge buys nothing and wakes an otherwise idle process every
-                // time someone connects.
-                if (!sizeMatched) this.nudgeRedraw();
-              }
+              this.beginInitialScreenCut(
+                client,
+                initialScreenGeneration,
+                () => this.getModePrefix(true) + this.serialize.serialize(),
+                () => {
+                  // The serialize addon's output is an approximation — ECH/CUF
+                  // sequences may not perfectly reproduce what the app originally
+                  // drew (e.g., background fills in ratatui). Nudge the child
+                  // with a SIGWINCH so it does a fresh full redraw, whose DATA
+                  // overwrites any serialize artifacts on the client.
+                  //
+                  // Skipped when the client attached at the size the session
+                  // already has: the child is drawn for that geometry, so the
+                  // nudge buys nothing and wakes an otherwise idle process every
+                  // time someone connects.
+                  if (!this.exited && !sizeMatched) this.nudgeRedraw();
+                }
+              );
             };
 
             if (!this.exited) {
@@ -691,6 +705,9 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
@@ -699,18 +716,14 @@ export class PtyServer {
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
 
-            if (plain) {
-              socket.write(encodeScreen(full ? this.getFullPlainScreen() : this.getPlainScreen()));
-            } else {
+            this.beginInitialScreenCut(client, initialScreenGeneration, () => {
+              if (plain) {
+                return full ? this.getFullPlainScreen() : this.getPlainScreen();
+              }
               // scrollback: 0 for viewport only, omit for full scrollback
               const serializeOpts = full ? undefined : { scrollback: 0 };
-              const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
-              socket.write(encodeScreen(peekScreen));
-            }
-
-            if (this.exited) {
-              socket.write(encodeExit(this.exitCode));
-            }
+              return this.getModePrefix() + this.serialize.serialize(serializeOpts);
+            });
             break;
           }
 
@@ -905,9 +918,59 @@ export class PtyServer {
     } as EventRecord);
   }
 
-  private broadcast(data: Buffer): void {
+  private beginInitialScreenCut(
+    client: Client,
+    generation: number,
+    getScreen: () => string,
+    onLive?: () => void
+  ): void {
+    if (
+      client.socket.destroyed ||
+      client.initialScreenGeneration !== generation
+    ) return;
+
+    client.initialScreenPhase = "cutting";
+    /** xterm parses writes asynchronously. This empty write is an ordered
+     *  marker: its callback runs after every earlier write and before later
+     *  writes, giving SCREEN an exact parser cut. */
+    this.terminal.write("", () => {
+      if (
+        client.socket.destroyed ||
+        client.initialScreenGeneration !== generation
+      ) return;
+
+      const postCutPackets = client.postCutPackets;
+      client.postCutPackets = [];
+      const hasPostCutExit = postCutPackets.some(
+        (pending) => pending.type === MessageType.EXIT
+      );
+
+      client.socket.write(encodeScreen(getScreen()));
+      client.initialScreenPhase = "live";
+      /** node-pty drains PTY data before its public exit event, so a queued
+       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
+       *  this queue and is synthesized only after any final post-cut DATA. */
+      for (const pending of postCutPackets) {
+        client.socket.write(pending.packet);
+      }
+      if (this.exited && !hasPostCutExit) {
+        client.socket.write(encodeExit(this.exitCode));
+      }
+      onLive?.();
+    });
+  }
+
+  private broadcast(
+    type: typeof MessageType.DATA | typeof MessageType.EXIT,
+    packet: Buffer
+  ): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (client.initialScreenPhase === "settling") continue;
+      if (client.initialScreenPhase === "cutting") {
+        client.postCutPackets.push({ type, packet });
+        continue;
+      }
+      client.socket.write(packet);
     }
   }
 
