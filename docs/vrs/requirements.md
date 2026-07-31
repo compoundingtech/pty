@@ -59,10 +59,11 @@ implementation contract and validation map live in [spec.md](./spec.md).
   request supersedes an unfinished generation; reconnect starts a new one.
 - **R05 Replaceable client roles:** A fresh command socket accepts input and
   status requests but starts no screen baseline, has no geometry membership,
-  and cannot resize. A complete `ATTACH` makes it writable-attached, installs
-  requested geometry, and enables input and resize. A recognized `PEEK` makes
-  it readonly and removes its geometry constraint. A malformed attach changes
-  neither role nor synchronization generation.
+  and cannot resize. A complete `ATTACH` makes it writable-attached, retaining
+  input and status capabilities while installing requested geometry, enabling
+  resize, and starting ordered baseline synchronization. A recognized `PEEK`
+  makes it readonly and removes its geometry constraint. A malformed attach
+  changes neither role nor synchronization generation.
 - **R06 Deterministic geometry:** Effective rows and columns are the independent
   minima requested by writable-attached clients. Attach, resize, and disconnect
   recompute them; readonly observation never constrains them. Geometry changes
