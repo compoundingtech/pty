@@ -123,8 +123,8 @@ Flags:
                        the session's name/id ON THE REMOTE
   --attach-stream-fd-v1 <fd>
                        Machine mode for a running session. Write ordered framed
-                       GEOMETRY, SCREEN, DATA, and EXIT events to inherited fd
-                       (>= 3); keep stdin/stdout as the controlling terminal
+                       GEOMETRY, SCREEN, DATA, and terminal EXIT or DETACH outcome
+                       to inherited fd (>= 3); keep stdin/stdout controlling TTY
 
 Examples:
   pty attach myserver
