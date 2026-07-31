@@ -406,10 +406,14 @@ const stats = await queryStats("myserver");
 
 ```typescript
 const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
-const initialScreen = await conn.connect();
 
+conn.on("geometry", ({ rows, cols }) => myTerminalView.resize(cols, rows));
 conn.on("data", (data) => myTerminalView.write(data));
 conn.on("exit", (code) => console.log(`Exited: ${code}`));
+
+const initialScreen = await conn.connect();
+myTerminalView.resize(conn.effectiveCols, conn.effectiveRows);
+myTerminalView.write(initialScreen);
 
 conn.write("hello\r");
 conn.press("ctrl+c");

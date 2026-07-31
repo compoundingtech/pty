@@ -186,25 +186,38 @@ Bidirectional, event-driven connection to a session.
 
 ```typescript
 const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
-const initialScreen = await conn.connect();
 
+conn.on("geometry", ({ rows, cols }) => {
+  // Resize your emulator before the following screen/data bytes are parsed.
+  terminal.resize(cols, rows);
+});
 conn.on("data", (data: string) => { /* terminal output */ });
 conn.on("exit", (code: number) => { /* process exited */ });
 conn.on("close", () => { /* connection closed */ });
 conn.on("error", (err: Error) => { /* connection error */ });
 
+const initialScreen = await conn.connect();
+// Initial GEOMETRY is stream-ordered before SCREEN. The effective getters are
+// therefore authoritative before applying the returned replay.
+terminal.resize(conn.effectiveCols, conn.effectiveRows);
+terminal.write(initialScreen);
+
 conn.write("hello\r");          // send raw data
 conn.press("ctrl+c");           // send named key
-conn.resize(30, 100);           // resize terminal
+conn.resize(30, 100);           // request a shared-grid size
 conn.disconnect();               // close connection
 ```
 
 **Properties:**
 - `connected: boolean` — whether the connection is active
+- `effectiveRows: number` / `effectiveCols: number` — current authoritative
+  shared-grid dimensions. These can differ from the client's requested size
+  when another writable client is smaller.
 
 **Events:**
 | Event | Payload | Description |
 |---|---|---|
+| `geometry` | `{ rows, cols }` | Effective shared geometry, ordered before affected `screen`/`data` |
 | `data` | `string` | Terminal output from the session |
 | `screen` | `string` | Initial screen replay on connect |
 | `exit` | `number` | Session process exited with code |
@@ -384,8 +397,14 @@ const MessageType = {
   SCREEN: 5,   // Screen replay
   PEEK: 6,     // Read-only peek request
   STATUS: 7,   // Stats query/response
+  GEOMETRY: 10, // Effective shared rows/cols (server → client)
 };
 ```
+
+Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
+unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
+their historical raw-byte behavior. Embedders that reconstruct a terminal grid
+must handle `GEOMETRY`.
 
 ### `TERMINAL_SANITIZE: string`
 

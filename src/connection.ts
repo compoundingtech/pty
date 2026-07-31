@@ -8,6 +8,7 @@ import {
   encodeDetach,
   encodePeek,
   encodeResize,
+  decodeGeometry,
   decodeExit,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
@@ -47,6 +48,7 @@ export interface PeekScreenOptions {
  *
  * Events:
  * - 'data' (data: string) — terminal output from the session
+ * - 'geometry' ({ rows, cols }) — effective shared grid before affected output
  * - 'screen' (screen: string) — initial screen replay on connect
  * - 'exit' (code: number) — session process exited
  * - 'close' () — connection closed
@@ -57,14 +59,26 @@ export class SessionConnection extends EventEmitter {
   private reader = new PacketReader();
   private _connected = false;
   private options: SessionConnectionOptions;
+  private _effectiveRows: number;
+  private _effectiveCols: number;
 
   constructor(options: SessionConnectionOptions) {
     super();
     this.options = options;
+    this._effectiveRows = options.rows;
+    this._effectiveCols = options.cols;
   }
 
   get connected(): boolean {
     return this._connected;
+  }
+
+  get effectiveRows(): number {
+    return this._effectiveRows;
+  }
+
+  get effectiveCols(): number {
+    return this._effectiveCols;
   }
 
   connect(): Promise<string> {
@@ -88,6 +102,13 @@ export class SessionConnection extends EventEmitter {
         }
         for (const packet of packets) {
           switch (packet.type) {
+            case MessageType.GEOMETRY: {
+              const geometry = decodeGeometry(packet.payload);
+              this._effectiveRows = geometry.rows;
+              this._effectiveCols = geometry.cols;
+              this.emit("geometry", geometry);
+              break;
+            }
             case MessageType.SCREEN: {
               const screen = packet.payload.toString();
               if (!initialScreenResolved) {
@@ -147,6 +168,8 @@ export class SessionConnection extends EventEmitter {
 
   resize(rows: number, cols: number): void {
     if (!this.socket || !this._connected) return;
+    this.options.rows = rows;
+    this.options.cols = cols;
     this.socket.write(encodeResize(rows, cols));
   }
 

@@ -13,7 +13,9 @@ import {
   encodeScreen,
   encodeStatus,
   encodeStatusResponse,
+  encodeGeometry,
   decodeSize,
+  decodeGeometry,
   decodeExit,
 } from "../src/protocol.ts";
 import { Buffer } from "node:buffer";
@@ -267,6 +269,33 @@ describe("protocol", () => {
         name: "test",
         terminal: { cols: 80, rows: 24 },
       });
+    });
+
+    it("round-trips an effective GEOMETRY packet", () => {
+      const reader = new PacketReader();
+      const packets = reader.feed(encodeGeometry(24, 80));
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.GEOMETRY);
+      expect(decodeGeometry(packets[0].payload)).toEqual({
+        rows: 24,
+        cols: 80,
+      });
+    });
+
+    it("lets an older client ignore an unknown framed type and continue DATA", () => {
+      const reader = new PacketReader();
+      const packets = reader.feed(Buffer.concat([
+        encodeGeometry(24, 80),
+        encodeData("after-unknown"),
+      ]));
+      let received = "";
+      for (const packet of packets) {
+        // This intentionally models the pre-GEOMETRY client switch.
+        if (packet.type === MessageType.DATA) {
+          received += packet.payload.toString();
+        }
+      }
+      expect(received).toBe("after-unknown");
     });
   });
 });
