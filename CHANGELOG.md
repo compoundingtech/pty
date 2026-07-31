@@ -24,6 +24,10 @@
   synchronization, so a re-attach or writable-to-readonly mode switch cannot
   emit the previous mode's stale screen or queued output. Reconnects establish
   the same fresh `GEOMETRY` → `SCREEN` → `DATA`/`EXIT` baseline.
+- Valid `ATTACH` and `PEEK` messages now explicitly replace the socket's client
+  role. In particular, attaching after a read-only peek restores input, resize,
+  and shared-grid geometry participation; malformed attaches preserve the
+  existing role and synchronization generation.
 
 ### Atomic exact-id metadata patching
 

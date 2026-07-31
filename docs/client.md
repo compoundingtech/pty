@@ -517,6 +517,13 @@ including writable-to-readonly mode changes, so stale screen or queued output
 from the previous mode is not emitted. A reconnect starts the same ordering
 contract again with a fresh `GEOMETRY` and `SCREEN`.
 
+Each valid `ATTACH` or `PEEK` also replaces the socket's current role rather
+than accumulating state. `ATTACH` makes the socket writable, installs its
+requested geometry, and restores `DATA`/`RESIZE` handling and shared-grid
+participation. `PEEK` makes it read-only and removes its geometry constraint.
+A malformed `ATTACH` payload leaves the prior role and synchronization
+generation unchanged.
+
 ### `TERMINAL_SANITIZE: string`
 
 ANSI sequence that resets all terminal modes (mouse tracking, cursor visibility, alternate screen, etc.). Useful after disconnecting from a session.
