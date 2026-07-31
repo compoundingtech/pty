@@ -94,6 +94,28 @@ async function waitForFile(pathname: string, pattern: string): Promise<string> {
 }
 
 describe("guarded compare-and-send", () => {
+  it("succeeds once with explicit idle authority and an unchanged token", async () => {
+    const name = uniqueName();
+    await startServer(name);
+    const activity = await connectActivityPublisher(name, {
+      producerEpoch: "idle-authority",
+      source: "adapter",
+    });
+    await activity.publish("idle");
+    const observed = await queryStats(name);
+    expect(observed.activity.state).toBe("idle");
+
+    const result = await compareAndSend(name, {
+      generation: observed.generation,
+      ioRevision: observed.ioRevision,
+      data: "x",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.ioRevision).toBeGreaterThan(observed.ioRevision);
+    expect((await queryStats(name)).activity.state).toBe("idle");
+    activity.close();
+  });
+
   it("succeeds once for an unchanged token and rejects replay with zero bytes", async () => {
     const name = uniqueName();
     const captured = path.join(testRoot, `${name}.txt`);

@@ -1,0 +1,116 @@
+{
+  "cases": [
+    {
+      "name": "idle",
+      "screen": "> ",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 10 },
+      "change": "none",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": true,
+        "deliveryAllowed": true
+      }
+    },
+    {
+      "name": "active",
+      "screen": "Working",
+      "activity": "active",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 10 },
+      "change": "none",
+      "expected": {
+        "adapterEligible": false,
+        "guardAccepted": true,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "alternate-screen-vim",
+      "screen": "~\n~\nNORMAL",
+      "activity": "unknown",
+      "alternateScreen": true,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 10 },
+      "change": "none",
+      "expected": {
+        "adapterEligible": false,
+        "guardAccepted": true,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "user-input",
+      "screen": "> draft",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 11 },
+      "change": "user_input",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": false,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "child-output",
+      "screen": "background output",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 11 },
+      "change": "child_output",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": false,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "resize",
+      "screen": "> ",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-a", "ioRevision": 11 },
+      "change": "resize",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": false,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "stale-token",
+      "screen": "> ",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 9 },
+      "current": { "generation": "generation-a", "ioRevision": 10 },
+      "change": "stale_token",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": false,
+        "deliveryAllowed": false
+      }
+    },
+    {
+      "name": "daemon-replacement",
+      "screen": "> ",
+      "activity": "idle",
+      "alternateScreen": false,
+      "observed": { "generation": "generation-a", "ioRevision": 10 },
+      "current": { "generation": "generation-b", "ioRevision": 0 },
+      "change": "daemon_replacement",
+      "expected": {
+        "adapterEligible": true,
+        "guardAccepted": false,
+        "deliveryAllowed": false
+      }
+    }
+  ]
+}
