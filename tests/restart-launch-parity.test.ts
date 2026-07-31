@@ -70,6 +70,39 @@ function restartShape(metadata: any) {
 }
 
 describe("complete persisted launch parity", () => {
+  it("preserves env removals when run -a recreates an exited session", () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "run-a-unset-root-"));
+    const output = path.join(testRoot, "run-a-unset-child.txt");
+    const name = "run-a-unset";
+
+    const created = runCli(root, [
+      "run", "-d", "--id", name, "--no-display-name", "--tag", "keep=true",
+      "--unset-env", "NO_COLOR", "--", "true",
+    ], { NO_COLOR: "ambient-create" });
+    expect(created.status, created.stderr).toBe(0);
+
+    const metadataPath = path.join(root, `${name}.json`);
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 5_000) {
+      const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+      if (metadata.exitedAt) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+    expect(JSON.parse(fs.readFileSync(metadataPath, "utf8")).exitedAt).toBeTruthy();
+
+    const recreated = runCli(root, [
+      "run", "-a", "-d", "--id", name, "--no-display-name",
+      "--", "sh", "-c",
+      `if [ "\${NO_COLOR+x}" = x ]; then printf set; else printf unset; fi > ${JSON.stringify(output)}; exec sleep 300`,
+    ], { NO_COLOR: "ambient-recreate" });
+    expect(recreated.status, recreated.stderr).toBe(0);
+    trackPid(root, name);
+    expect(waitForContent(output)).toBe("unset");
+
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+    expect(metadata.unsetEnv).toEqual(["NO_COLOR"]);
+  }, 30_000);
+
   it("preserves inherited env removals across manual restart", () => {
     const root = fs.mkdtempSync(path.join(testRoot, "unset-root-"));
     const output = path.join(testRoot, "unset-child.txt");

@@ -157,6 +157,11 @@ interface SpawnDaemonOptions {
 }
 ```
 
+`unsetEnv` removals run before `extraEnv` assignments. The server then forces
+`PTY_SESSION` to the stable session id and fills an absent `TERM` with
+`xterm-256color`; naming either key in `unsetEnv` does not suppress those
+invariants. An explicit `extraEnv.TERM` value is preserved.
+
 ### `resolveCommand(cmd: string): string`
 
 Resolve a command name to an absolute path (like `which`). Throws if not found.

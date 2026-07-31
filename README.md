@@ -289,6 +289,8 @@ The values are overlaid on the session child's inherited environment before its 
 
 Direct launches can also persist removals from the inherited environment with repeatable `pty run --unset-env KEY`. Removals are applied before `--env` overlays, so an explicit assignment wins when both mention the same key, regardless of flag order. Both policies survive manual and permanent restart. Metadata created before `unsetEnv` was introduced retains the historical ambient-inheritance behavior.
 
+Two child invariants are applied after that policy: `PTY_SESSION` is always set to the session's stable id, and an absent `TERM` receives the existing `xterm-256color` default. Consequently, `--unset-env PTY_SESSION` cannot remove the session marker, and `--unset-env TERM` selects the default rather than leaving `TERM` absent. An explicit `--env TERM=...` assignment is preserved.
+
 ### Permanent sessions
 
 Tag a session with `strategy=permanent` and `pty gc` will respawn it whenever its daemon exits or vanishes:
