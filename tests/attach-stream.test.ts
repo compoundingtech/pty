@@ -19,6 +19,7 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const cliPath = path.join(__dirname, "..", "dist", "cli.js");
+const binPath = path.join(__dirname, "..", "bin", "pty");
 const clientUrl = pathToFileURL(path.join(__dirname, "..", "dist", "client.js")).href;
 const nodeBin = process.execPath;
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-attach-stream-"));
@@ -121,6 +122,63 @@ describe("pty attach --attach-stream-fd-v1", () => {
     expect(result.stderr).toMatch(/attach-stream-fd-v1 requires a file descriptor/);
     expect(result.stdout).toBe("");
   });
+
+  it("streams framed events through fd 3 from the shipped bin launcher", async () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "launcher-"));
+    const name = `launcher-${process.pid}`;
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PTY_ROOT: root,
+      PTY_ROOT_LEGACY_SILENT: "1",
+    };
+    delete launcherEnv.PTY_SESSION;
+    delete launcherEnv.PTY_SERVER_CONFIG;
+    const created = spawnSync(
+      nodeBin,
+      [cliPath, "run", "-d", "--id", name, "--", "sh", "-c", "printf LAUNCHER_READY; read value"],
+      { env: launcherEnv, encoding: "utf8" },
+    );
+    expect(created.status, created.stderr).toBe(0);
+    const child = spawn(
+      nodeBin,
+      [binPath, "attach", "--attach-stream-fd-v1", "3", name],
+      {
+        env: launcherEnv,
+        stdio: ["pipe", "pipe", "pipe", "pipe"],
+      },
+    );
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    const streamChunks: Buffer[] = [];
+    const reader = new PacketReader();
+    let sentInput = false;
+    (child.stdio[3] as NodeJS.ReadableStream).on("data", (chunk) => {
+      const data = Buffer.from(chunk);
+      streamChunks.push(data);
+      for (const packet of reader.feed(data)) {
+        if (packet.type === MessageType.SCREEN && !sentInput) {
+          sentInput = true;
+          child.stdin.write("done\n");
+        }
+      }
+    });
+    const status = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("bin launcher attach timed out")), 10_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+    expect(status).toBe(0);
+    expect(await stdout).toEqual(Buffer.alloc(0));
+    expect(await stderr).toEqual(Buffer.alloc(0));
+    const packets = new PacketReader().feed(Buffer.concat(streamChunks));
+    expect(packets[0].type).toBe(MessageType.GEOMETRY);
+    expect(packets[1].type).toBe(MessageType.SCREEN);
+    expect(packets[1].payload.toString()).toContain("LAUNCHER_READY");
+    expect(packets.at(-1)?.type).toBe(MessageType.EXIT);
+  }, 15_000);
 
   it("reframes fragmented and coalesced daemon packets in order without stdout output", async () => {
     const geometry = encodeGeometry(31, 97);

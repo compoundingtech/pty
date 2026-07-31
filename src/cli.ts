@@ -2796,8 +2796,8 @@ function printLaunchdPlist(interval: number): void {
   const escape = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  // We point ProgramArguments at node + the resolved CLI script so the
-  // plist doesn't depend on the `pty` shim staying on PATH at launchd's
+  // We point ProgramArguments at node + the invoked launcher or CLI script so
+  // the plist doesn't depend on the `pty` shim staying on PATH at launchd's
   // (minimal) shell. EnvironmentVariables still carries PATH so the
   // spawned children (and any `which` inside pty itself) find the user's
   // tools. PTY_ROOT (canonical) pins the target registry.
