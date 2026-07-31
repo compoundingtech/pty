@@ -16,9 +16,12 @@ import { PacketReader, MessageType } from "@compoundingtech/pty/protocol";
 List all retained sessions without mutating the registry. Cleanup is owned by
 explicit lifecycle operations such as `gc()` and `cleanupAll()`.
 
-### `getSession(name: string): Promise<SessionInfo | null>`
+### `getSession(ref: string): Promise<SessionInfo | null>`
 
-Get a single session by name.
+Resolve a stable session id or display name. An exact stable id always wins. A
+display name resolves only when it has exactly one match; multiple matches throw
+an error that lists the candidate stable ids. Returns `null` when no session
+matches. Resolve once, then pass `session.name` to socket-oriented APIs.
 
 ### `validateName(name: string): void`
 
@@ -120,6 +123,7 @@ interface SessionMetadata {
   exitedAt?: string;
   lastLines?: string[];
   tags?: Record<string, string>;
+  displayName?: string; // mutable, non-unique presentation label
 }
 ```
 

@@ -152,8 +152,8 @@ export interface SessionMetadata {
   tags?: Record<string, string>;
   /** Optional human-friendly alias for the session. Mutable via `pty rename`.
    *  The immutable stable id is always `SessionInfo.name`. Most code should
-   *  keep using `name`; `displayName` is purely for presentation and as an
-   *  additional lookup key alongside `name`. */
+   *  keep using `name`; `displayName` is a non-unique presentation label and
+   *  resolves as a reference only when exactly one session matches it. */
   displayName?: string;
   /** ISO 8601 timestamp of the last non-readonly client ATTACH. Written by
    *  the daemon on every attach. Used by `pty gc --idle-days N` (and the
@@ -703,27 +703,33 @@ export function reapOnExitDefault(
   return !KEEP_FALSEY.has(raw.trim().toLowerCase());
 }
 
-/** Look up a session by either its stable `name` (immutable id) or its
- *  mutable `displayName` alias. Name match takes precedence over displayName
- *  match so the stable id always wins in case both happen to resolve. */
+/** Look up a session by its immutable on-disk id only. */
+export async function getSessionByName(name: string): Promise<SessionInfo | null> {
+  const sessions = await listSessions();
+  return sessions.find((s) => s.name === name) ?? null;
+}
+
+/** Look up a session by either its stable `name` (immutable id) or its mutable
+ *  `displayName`. An exact stable-id match always wins. A display name resolves
+ *  only when it identifies exactly one session; ambiguous labels fail closed
+ *  and report the stable ids callers can use instead. */
 export async function getSession(ref: string): Promise<SessionInfo | null> {
   const sessions = await listSessions();
   const byName = sessions.find((s) => s.name === ref);
   if (byName) return byName;
-  const byDisplay = sessions.find((s) => s.metadata?.displayName === ref);
-  return byDisplay ?? null;
+  const byDisplay = sessions.filter((s) => s.metadata?.displayName === ref);
+  if (byDisplay.length <= 1) return byDisplay[0] ?? null;
+  const ids = byDisplay.map((s) => s.name).sort();
+  throw new Error(
+    `Session reference "${ref}" is ambiguous. Matching stable session IDs:\n` +
+    ids.map((id) => `  ${id}`).join("\n") +
+    "\nUse a stable session ID instead."
+  );
 }
 
-/** Return every reference (name or displayName) currently claimed by a live
- *  or exited session. Used for uniqueness checks at creation/rename time. */
-export async function allRefs(): Promise<Set<string>> {
-  const sessions = await listSessions();
-  const refs = new Set<string>();
-  for (const s of sessions) {
-    refs.add(s.name);
-    if (s.metadata?.displayName) refs.add(s.metadata.displayName);
-  }
-  return refs;
+/** Return every immutable session id currently claimed by a live or exited session. */
+export async function allSessionNames(): Promise<Set<string>> {
+  return new Set((await listSessions()).map((session) => session.name));
 }
 
 /** Result of a `gc()` reconciliation pass. Five buckets correspond to the
