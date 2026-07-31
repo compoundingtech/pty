@@ -271,7 +271,7 @@ interface StatsResult {
   };
   clients: {
     total: number; attached: number; readOnly: number;
-    connections: Array<
+    connections?: Array<
       | {
           role: "writable";
           rows: number; cols: number;
@@ -303,8 +303,10 @@ point-in-time explanation of the current min-wins result, not an event stream;
 polling stats cannot order geometry changes relative to attached-session DATA.
 `lastRequestSequence` is a daemon-local counter for the writable connection's
 most recent attach or resize request, not a connection identity or timestamp.
-The daemon does not retain a durable client identity; socket and packet-parser
-state are transport internals and are not exposed.
+Older daemons omit `connections`; the aggregate counts remain authoritative and
+must not be reconstructed as an empty connection list. The daemon does not
+retain a durable client identity; socket and packet-parser state are transport
+internals and are not exposed.
 
 ## Session Interaction (CLI-oriented)
 

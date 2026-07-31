@@ -19,6 +19,7 @@ import {
   decodeExit,
 } from "../src/protocol.ts";
 import { Buffer } from "node:buffer";
+import type { StatsResult } from "../src/client.ts";
 
 describe("protocol", () => {
   describe("encodePacket / PacketReader", () => {
@@ -309,6 +310,38 @@ describe("protocol", () => {
         }
       }
       expect(received).toBe("after-unknown");
+    });
+
+    it("accepts an old-daemon STATUS response without connection details", () => {
+      const response = {
+        name: "legacy",
+        terminal: {
+          cols: 80,
+          rows: 24,
+          cursorX: 0,
+          cursorY: 0,
+          scrollbackUsed: 24,
+          scrollbackCapacity: 10024,
+        },
+        process: { alive: true, exitCode: null, pid: 123, resources: null },
+        daemon: { pid: 456, resources: null },
+        clients: { total: 2, attached: 2, readOnly: 0 },
+        modes: {
+          sgrMouse: false,
+          cursorHidden: false,
+          kittyKeyboard: false,
+          kittyKeyboardFlags: [],
+        },
+        uptimeSeconds: 10,
+        createdAt: "2026-07-31T00:00:00.000Z",
+      } satisfies StatsResult;
+
+      const reader = new PacketReader();
+      const packets = reader.feed(encodeStatusResponse(JSON.stringify(response)));
+      const decoded = JSON.parse(packets[0].payload.toString()) as StatsResult;
+
+      expect(decoded.clients).toEqual({ total: 2, attached: 2, readOnly: 0 });
+      expect(decoded.clients.connections).toBeUndefined();
     });
   });
 });

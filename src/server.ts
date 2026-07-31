@@ -779,7 +779,7 @@ export class PtyServer {
 
     let attached = 0;
     let readOnly = 0;
-    const connections: StatsResult["clients"]["connections"] = [];
+    const connections: NonNullable<StatsResult["clients"]["connections"]> = [];
     for (const c of this.clients.values()) {
       if (c.readonly) {
         readOnly++;

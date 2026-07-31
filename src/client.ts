@@ -314,7 +314,7 @@ export interface StatsResult {
     total: number;
     attached: number;
     readOnly: number;
-    connections: Array<
+    connections?: Array<
       | {
           role: "writable";
           rows: number;
