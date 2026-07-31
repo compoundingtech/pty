@@ -364,6 +364,22 @@ describe("spawnDaemon options", () => {
     })).rejects.toThrow(/mutually exclusive/);
   }, 15000);
 
+  it("env option combined with unsetEnv fails daemon startup", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+
+    await expect(spawnDaemon({
+      name,
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      displayCommand: "sh",
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin" },
+      unsetEnv: ["NO_COLOR"],
+    })).rejects.toThrow(/mutually exclusive/);
+  }, 15000);
+
   it("surfaces a missing cwd explicitly instead of failing silently", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

@@ -97,6 +97,7 @@ Flags:
                        (non-permanent sessions already self-remove by default)
   --tag key=value      Tag the session (repeatable)
   --env KEY=VALUE      Overlay a child environment variable (repeatable)
+  --unset-env KEY      Remove an inherited environment variable (repeatable)
   --tag keep=true      Exempt from reaping: keep metadata/logs after exit
   --cwd <path>         Working directory for the command
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
@@ -409,6 +410,7 @@ Create sessions:
   pty run -e -- <command>                 Ephemeral: auto-remove metadata on clean exit
   pty run --tag key=value -- <command>    Tag a session (repeatable)
   pty run --env KEY=VALUE -- <command>    Overlay child environment (repeatable; persisted for restart)
+  pty run --unset-env KEY -- <command>    Remove inherited environment (repeatable; persisted for restart)
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
@@ -693,6 +695,7 @@ async function main(): Promise<void> {
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
       const extraEnv: Record<string, string> = {};
+      const unsetEnv: string[] = [];
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
@@ -721,6 +724,15 @@ async function main(): Promise<void> {
             process.exit(1);
           }
           extraEnv[assignment.slice(0, eq)] = assignment.slice(eq + 1);
+          i += 2;
+        }
+        else if (args[i] === "--unset-env" && i + 1 < args.length) {
+          const key = args[i + 1];
+          if (key.length === 0 || key.includes("=")) {
+            console.error(`Invalid env key: "${key}". Use --unset-env KEY`);
+            process.exit(1);
+          }
+          if (!unsetEnv.includes(key)) unsetEnv.push(key);
           i += 2;
         }
         else break;
@@ -806,9 +818,12 @@ async function main(): Promise<void> {
         console.error(
           `Already inside pty session "${process.env.PTY_SESSION}", running directly.`
         );
+        const directEnv = { ...process.env };
+        for (const key of unsetEnv) delete directEnv[key];
+        Object.assign(directEnv, extraEnv);
         const result = spawnSync(cmd, cmdArgs, {
           stdio: "inherit",
-          env: { ...process.env, ...extraEnv },
+          env: directEnv,
         });
         process.exit(result.status ?? 1);
       }
@@ -872,7 +887,7 @@ async function main(): Promise<void> {
 
       await cmdRun(
         name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral,
-        tags, cwd, isolateEnv, displayName, extraEnv,
+        tags, cwd, isolateEnv, displayName, extraEnv, unsetEnv,
       );
       break;
     }
@@ -1523,6 +1538,7 @@ async function cmdRun(
   isolateEnv = false,
   displayName: string | null = null,
   extraEnv: Record<string, string> = {},
+  unsetEnv: string[] = [],
 ): Promise<void> {
   const session = await getSessionByName(name);
   if (session?.status === "running") {
@@ -1555,6 +1571,7 @@ async function cmdRun(
   const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
   const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
   const previousExtraEnv = session && isGone(session.status) ? session.metadata?.extraEnv : undefined;
+  const previousUnsetEnv = session && isGone(session.status) ? session.metadata?.unsetEnv : undefined;
   if (session && isGone(session.status)) {
     cleanupAll(name);
   }
@@ -1568,11 +1585,13 @@ async function cmdRun(
     const prevDisplayName = session && isGone(session.status) ? session.metadata?.displayName : undefined;
     const displayNameOpt = displayName ?? prevDisplayName;
     const extraEnvOpt = Object.keys(extraEnv).length > 0 ? extraEnv : previousExtraEnv;
+    const unsetEnvOpt = unsetEnv.length > 0 ? unsetEnv : previousUnsetEnv;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
+      ...(unsetEnvOpt && unsetEnvOpt.length > 0 ? { unsetEnv: unsetEnvOpt } : {}),
     });
   } finally {
     if (!inheritedCreationLock) releaseLock(name);
@@ -3399,6 +3418,7 @@ function persistedLaunchOptions(meta: SessionMetadata) {
     ...(meta.ephemeral !== undefined ? { ephemeral: meta.ephemeral } : {}),
     ...(meta.isolateEnv ? { isolateEnv: true } : {}),
     ...(meta.extraEnv && Object.keys(meta.extraEnv).length > 0 ? { extraEnv: meta.extraEnv } : {}),
+    ...(meta.unsetEnv && meta.unsetEnv.length > 0 ? { unsetEnv: meta.unsetEnv } : {}),
     ...(meta.env ? { env: meta.env } : {}),
   };
 }

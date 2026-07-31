@@ -24,7 +24,7 @@ _pty() {
 
   case "${COMP_WORDS[1]}" in
     run)
-      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --cwd --isolate-env --force" -- "${cur}"))
+      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force" -- "${cur}"))
       ;;
     attach|a)
       if [[ "${cur}" == -* ]]; then

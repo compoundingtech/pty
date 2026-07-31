@@ -55,6 +55,7 @@ pty run -a -- node server.js                       # create or attach if already
 pty run -e -- npm test                             # ephemeral: reap even on `pty kill` / permanent
 pty run --tag owner=forge -- node srv.js           # tag a session with metadata
 pty run --env PORT=3000 --env MODE=dev -- node srv.js # persisted child env overlay
+pty run --unset-env NO_COLOR -- node srv.js           # persisted inherited-env removal
 pty run --tag keep=true -- npm test                # keep it even past a gc sweep, until you rm it
 pty run --cwd /path -- node server.js              # run in a specific directory
 
@@ -284,7 +285,9 @@ PORT = "8080"
 LOG_LEVEL = "debug"
 ```
 
-The values are overlaid on the session child's inherited environment before its `/bin/sh -c` command runs. The effective overlay is stored with the other launch settings, so `pty restart` preserves it exactly; `strategy=permanent` respawns re-read the manifest and pick up edits. The equivalent direct-launch flag is repeatable `pty run --env KEY=VALUE` (later entries for the same key win). Ambient process-environment inheritance remains unchanged.
+The values are overlaid on the session child's inherited environment before its `/bin/sh -c` command runs. The effective overlay is stored with the other launch settings, so `pty restart` preserves it exactly; `strategy=permanent` respawns re-read the manifest and pick up edits. The equivalent direct-launch flag is repeatable `pty run --env KEY=VALUE` (later entries for the same key win).
+
+Direct launches can also persist removals from the inherited environment with repeatable `pty run --unset-env KEY`. Removals are applied before `--env` overlays, so an explicit assignment wins when both mention the same key, regardless of flag order. Both policies survive manual and permanent restart. Metadata created before `unsetEnv` was introduced retains the historical ambient-inheritance behavior.
 
 ### Permanent sessions
 

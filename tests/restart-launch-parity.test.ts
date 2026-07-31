@@ -65,10 +65,46 @@ function restartShape(metadata: any) {
     displayName: metadata.displayName,
     isolateEnv: metadata.isolateEnv,
     extraEnv: metadata.extraEnv,
+    unsetEnv: metadata.unsetEnv,
   };
 }
 
 describe("complete persisted launch parity", () => {
+  it("preserves inherited env removals across manual restart", () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "unset-root-"));
+    const output = path.join(testRoot, "unset-child.txt");
+    const name = "unset-parity";
+    const recorder =
+      `printf '%s|%s' "\${NO_COLOR+x}" "$ASSIGNMENT_WINS" > ${JSON.stringify(output)}; exec sleep 300`;
+
+    const created = runCli(root, [
+      "run", "-d", "--id", name, "--no-display-name", "--tag", "keep=true",
+      "--unset-env", "NO_COLOR",
+      "--env", "ASSIGNMENT_WINS=explicit",
+      "--unset-env", "ASSIGNMENT_WINS",
+      "--", "sh", "-c", recorder,
+    ], { NO_COLOR: "1", ASSIGNMENT_WINS: "ambient-create" });
+    expect(created.status, created.stderr).toBe(0);
+    trackPid(root, name);
+    expect(waitForContent(output)).toBe("|explicit");
+
+    const before = JSON.parse(fs.readFileSync(path.join(root, `${name}.json`), "utf8"));
+    expect(before.unsetEnv).toEqual(["NO_COLOR", "ASSIGNMENT_WINS"]);
+    expect(before.extraEnv).toEqual({ ASSIGNMENT_WINS: "explicit" });
+
+    fs.rmSync(output, { force: true });
+    const restarted = runCli(root, ["restart", "-y", name], {
+      NO_COLOR: "1",
+      ASSIGNMENT_WINS: "ambient-restarter",
+    });
+    expect(restarted.status, restarted.stderr).toBe(0);
+    trackPid(root, name);
+    expect(waitForContent(output)).toBe("|explicit");
+
+    const after = JSON.parse(fs.readFileSync(path.join(root, `${name}.json`), "utf8"));
+    expect(restartShape(after)).toEqual(restartShape(before));
+  }, 30_000);
+
   it("persists repeatable --env and every restart-relevant pty run setting", () => {
     const root = fs.mkdtempSync(path.join(testRoot, "run-root-"));
     const cwd = fs.mkdtempSync(path.join(testRoot, "run-cwd-"));

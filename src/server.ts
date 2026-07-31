@@ -76,14 +76,17 @@ export interface ServerOptions {
   /** Additional `KEY=VALUE` env entries overlaid on the inherited child
    *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Environment keys removed from the inherited child environment. Applied
+   *  before `extraEnv`, so an explicit assignment wins when both mention a key. */
+  unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
    *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
    *  injected on top so nesting detection and `pty exec` keep working.
    *
-   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
-   *  together with either throws. Use this when the caller wants total
-   *  control of the child environment (e.g., pty-layout's launcher shell
-   *  that injects a shim tmux on `PATH`). */
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
+   *  `env` together with inherited-environment policy throws. Use this when
+   *  the caller wants total control of the child environment (e.g., a
+   *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
 }
 
@@ -116,13 +119,13 @@ function ensureChildTerm(env: Record<string, string>): void {
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
   // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
-  // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
-  // you pass `env`; if you want scrub+extras you pass `isolateEnv`. Picking
+  // inherited-environment policy path. If you want total control you pass
+  // `env`; otherwise isolation/removals/assignments compose explicitly. Picking
   // one implicitly would hide intent.
-  if (options.env && (options.isolateEnv || options.extraEnv)) {
+  if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
-      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv. " +
-      "Use env for verbatim control, or isolateEnv (+ optional extraEnv) for allow-list semantics — not both."
+      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
+      "Use env for verbatim control, or inherited environment policy options — not both."
     );
   }
 
@@ -141,6 +144,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     // Legacy behaviour: full inheritance, minus the server-config handoff.
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
+    for (const key of options.unsetEnv ?? []) delete env[key];
     if (options.extraEnv) {
       for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
     }
@@ -154,6 +158,7 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     if (v === undefined) continue;
     if (ISOLATED_ENV_ALLOWLIST.has(k) || k.startsWith("LC_")) env[k] = v;
   }
+  for (const key of options.unsetEnv ?? []) delete env[key];
   if (options.extraEnv) {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
@@ -583,6 +588,7 @@ export class PtyServer {
           ...(options.displayName ? { displayName: options.displayName } : {}),
           ...(options.isolateEnv ? { isolateEnv: true } : {}),
           ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+          ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
           ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
@@ -1047,6 +1053,7 @@ export class PtyServer {
       ...(existing?.displayName ? { displayName: existing.displayName } : {}),
       ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
       ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
+      ...(this.options.unsetEnv && this.options.unsetEnv.length > 0 ? { unsetEnv: this.options.unsetEnv } : {}),
       ...(this.options.env ? { env: this.options.env } : {}),
     });
   }
@@ -1261,6 +1268,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
+    unsetEnv: config.unsetEnv,
     env: config.env,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
