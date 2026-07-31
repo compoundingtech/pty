@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Restart-durable environment removals
+
+- `pty run --unset-env KEY` and programmatic `unsetEnv` persist inherited
+  environment removals across manual and permanent restart. Explicit `--env`
+  assignments are applied afterward and therefore win independent of flag
+  order.
+- Storage format: session metadata may include an optional `unsetEnv` string
+  array. Older records omit it and retain the historical ambient-inheritance
+  behavior; exact `env` remains mutually exclusive with inherited-environment
+  policy options.
+
 ### Ordered initial attach snapshots
 
 - Every `ATTACH` and `PEEK` synchronization now sends the effective

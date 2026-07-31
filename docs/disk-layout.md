@@ -44,6 +44,7 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   ephemeral?: boolean;
   isolateEnv?: boolean;
   extraEnv?: { [k: string]: string }; // explicit inherited-env overlay (`--env`)
+  unsetEnv?: string[];         // inherited env keys removed before `extraEnv`
   env?: { [k: string]: string };      // exact child env for programmatic callers
   createdAt: string;          // ISO 8601
   exitCode?: number;          // present after clean exit
@@ -54,6 +55,11 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   lastAttachAt?: string;      // ISO 8601 — set by the daemon on every non-readonly ATTACH
 }
 ```
+
+`unsetEnv` and `extraEnv` form the persisted inherited-environment policy.
+Removals are applied first and explicit assignments second, so an assignment
+wins when both mention the same key. Older metadata without `unsetEnv` keeps
+the historical ambient-inheritance behavior.
 
 - Status (`running` / `exited` / `vanished`) is *derived* from socket + pid, not stored.
 - `generation` and `daemonPid` are internal lifecycle guards. A daemon only

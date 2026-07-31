@@ -99,6 +99,7 @@ describe("spawnDaemon strategy resolution", () => {
         displayCommand: "sh",
         cwd: dir,
         tags: { source: "test" },
+        unsetEnv: ["NO_COLOR"],
       });
     } finally {
       process.env.PATH = oldPath;
@@ -107,6 +108,8 @@ describe("spawnDaemon strategy resolution", () => {
     const stats = await queryStats(name);
     expect(stats.name).toBe(name);
     expect(stats.process.alive).toBe(true);
+    const metadata = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), "utf8"));
+    expect(metadata.unsetEnv).toEqual(["NO_COLOR"]);
     trackPid(dir, name);
   }, 15000);
 

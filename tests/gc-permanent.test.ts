@@ -37,10 +37,14 @@ async function startDaemon(
   command: string,
   args: string[] = [],
   tags?: Record<string, string>,
+  launchOptions: {
+    extraEnv?: Record<string, string>;
+    unsetEnv?: string[];
+  } = {},
 ): Promise<number> {
   const config = JSON.stringify({
     name, command, args, displayCommand: command,
-    cwd: os.tmpdir(), rows: 24, cols: 80, tags,
+    cwd: os.tmpdir(), rows: 24, cols: 80, tags, ...launchOptions,
   });
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
@@ -117,6 +121,54 @@ afterEach(async () => {
 });
 
 describe("pty gc — strategy=permanent respawn", () => {
+  it("preserves env removals when respawning a permanent session", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const output = path.join(dir, "env.txt");
+    const previousNoColor = process.env.NO_COLOR;
+    const previousOverride = process.env.ASSIGNMENT_WINS;
+    process.env.NO_COLOR = "ambient";
+    process.env.ASSIGNMENT_WINS = "ambient";
+    try {
+      await startDaemon(
+        dir,
+        name,
+        "/bin/sh",
+        ["-c", `printf '%s|%s\\n' "\${NO_COLOR+x}" "$ASSIGNMENT_WINS" >> ${JSON.stringify(output)}`],
+        { strategy: "permanent" },
+        {
+          unsetEnv: ["NO_COLOR", "ASSIGNMENT_WINS"],
+          extraEnv: { ASSIGNMENT_WINS: "explicit" },
+        },
+      );
+
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 5_000 && !fs.existsSync(output)) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(fs.readFileSync(output, "utf8")).toBe("|explicit\n");
+
+      const before = readMeta(dir, name);
+      expect(before.unsetEnv).toEqual(["NO_COLOR", "ASSIGNMENT_WINS"]);
+
+      const result = runCli(dir, "gc");
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain(`Respawned: ${name}`);
+
+      const respawnedAt = Date.now();
+      while (Date.now() - respawnedAt < 5_000) {
+        if (fs.readFileSync(output, "utf8").split("\n").filter(Boolean).length === 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(fs.readFileSync(output, "utf8")).toBe("|explicit\n|explicit\n");
+    } finally {
+      if (previousNoColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previousNoColor;
+      if (previousOverride === undefined) delete process.env.ASSIGNMENT_WINS;
+      else process.env.ASSIGNMENT_WINS = previousOverride;
+    }
+  }, 20_000);
+
   it("respawns an exited permanent session", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

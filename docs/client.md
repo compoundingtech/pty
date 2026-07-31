@@ -124,6 +124,10 @@ interface SessionMetadata {
   lastLines?: string[];
   tags?: Record<string, string>;
   displayName?: string; // mutable, non-unique presentation label
+  isolateEnv?: boolean;
+  extraEnv?: Record<string, string>;
+  unsetEnv?: string[];
+  env?: Record<string, string>;
 }
 ```
 
@@ -146,8 +150,17 @@ interface SpawnDaemonOptions {
   rows?: number;                     // defaults to process.stdout.rows ?? 24
   cols?: number;                     // defaults to process.stdout.columns ?? 80
   tags?: Record<string, string>;     // key-value metadata (e.g. { owner: "forge" })
+  isolateEnv?: boolean;              // inherit only the safe allow-list
+  extraEnv?: Record<string, string>; // explicit assignments applied last
+  unsetEnv?: string[];               // inherited keys removed before assignments
+  env?: Record<string, string>;      // exact child env; mutually exclusive with the above
 }
 ```
+
+`unsetEnv` removals run before `extraEnv` assignments. The server then forces
+`PTY_SESSION` to the stable session id and fills an absent `TERM` with
+`xterm-256color`; naming either key in `unsetEnv` does not suppress those
+invariants. An explicit `extraEnv.TERM` value is preserved.
 
 ### `resolveCommand(cmd: string): string`
 
