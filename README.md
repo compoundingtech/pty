@@ -6,6 +6,9 @@ Persistent terminal sessions. Run a process, detach, reconnect later. From anywh
 
 Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless) internally.
 
+The durable system contract lives in
+[docs/vrs](docs/vrs/spec.md).
+
 ## Install
 
 ```sh
