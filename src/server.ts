@@ -691,7 +691,10 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
-            socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
