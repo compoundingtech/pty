@@ -34,12 +34,22 @@
 - `patchMetadataById(id, patch)` exposes the same exact-id operation from
   `@compoundingtech/pty/client`. Existing rename/tag APIs share the merge engine
   while retaining their documented specialized events for compatibility.
+- Metadata publication acquires the event lock before the metadata lock, so a
+  busy event log fails before either file changes. Event appends and retention
+  rewrites are serialized without a per-record byte-size assumption.
+- The current display-name contract supersedes the permissive limits described
+  in earlier release notes: values must be nonempty, already trimmed,
+  single-line, free of Unicode control characters, and at most 160 Unicode
+  scalar values. Slash and backslash remain valid metadata characters.
 
 ### Storage format
 
 Effective atomic patches append one `metadata_change` event whose `previous`
 and `value` objects contain only changed `displayName` and tag keys. No-op
-patches append no event.
+patches append no event. Lock contention cannot publish only one side of an
+effective patch. Metadata remains the authoritative state: a process crash or
+underlying I/O failure between its write and event append can omit the
+notification because pty does not journal a cross-file transaction.
 
 ### Non-unique display names with unambiguous session resolution
 

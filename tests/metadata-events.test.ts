@@ -8,12 +8,18 @@ import { terminateAndWait } from "./setup/processes.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as net from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import {
-  patchMetadataById, setDisplayName, updateTags, readMetadata,
+  acquireLock, patchMetadataById, readMetadata, releaseLock, setDisplayName,
+  updateTags, writeMetadata,
 } from "../src/sessions.ts";
-import { EventFollower, formatEvent, type EventRecord } from "../src/events.ts";
+import {
+  acquireEventLock, EventFollower, formatEvent, releaseEventLock,
+  type EventRecord,
+} from "../src/events.ts";
+import { encodeAttach } from "../src/protocol.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -39,10 +45,15 @@ function uniqueName(): string {
   return `mev${++nameCounter}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-async function startDaemon(sessionDir: string, name: string): Promise<number> {
+async function startDaemon(
+  sessionDir: string,
+  name: string,
+  overrides: Record<string, unknown> = {},
+): Promise<number> {
   const config = JSON.stringify({
     name, command: "cat", args: [], displayCommand: "cat",
     cwd: os.tmpdir(), rows: 24, cols: 80,
+    ...overrides,
   });
   const child = spawn(nodeBin, [serverModule], {
     detached: true,
@@ -68,6 +79,32 @@ async function startDaemon(sessionDir: string, name: string): Promise<number> {
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error("Timeout waiting for daemon");
+}
+
+async function attach(sessionDir: string, name: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.createConnection(path.join(sessionDir, `${name}.sock`), () => {
+      socket.write(encodeAttach(24, 80));
+    });
+    socket.once("data", () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", reject);
+  });
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
 }
 
 function runCli(sessionDir: string, env: Record<string, string>, ...args: string[]) {
@@ -106,6 +143,123 @@ function readEvents(dir: string, name: string): any[] {
 }
 
 describe("patchMetadataById", () => {
+  it("fails before changing metadata or events when event publication is locked", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    const metadataPath = path.join(dir, `${name}.json`);
+    const eventsPath = path.join(dir, `${name}.events.jsonl`);
+    const metadataBefore = fs.readFileSync(metadataPath);
+    const eventsBefore = fs.readFileSync(eventsPath);
+    expect(acquireEventLock(name)).toBe(true);
+
+    try {
+      await expect(patchMetadataById(name, {
+        displayName: "Blocked",
+        tags: { description: "x".repeat(1000) },
+      })).rejects.toThrow(/event log is busy/i);
+      expect(fs.readFileSync(metadataPath)).toEqual(metadataBefore);
+      expect(fs.readFileSync(eventsPath)).toEqual(eventsBefore);
+    } finally {
+      releaseEventLock(name);
+    }
+  }, 15_000);
+
+  it("preserves the complete recovery record and unknown future fields", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    const current = readMetadata(name)!;
+    writeMetadata(name, {
+      ...current,
+      rows: 41,
+      cols: 121,
+      ephemeral: true,
+      isolateEnv: true,
+      extraEnv: { ASSIGNED: "yes" },
+      unsetEnv: ["NO_COLOR"],
+      futureRecoveryCapability: { version: 2 },
+    } as typeof current);
+
+    const result = await patchMetadataById(name, {
+      displayName: "Recovery-safe",
+      tags: { owner: "agent" },
+    });
+
+    expect(result.metadata).toMatchObject({
+      rows: 41,
+      cols: 121,
+      ephemeral: true,
+      isolateEnv: true,
+      extraEnv: { ASSIGNED: "yes" },
+      unsetEnv: ["NO_COLOR"],
+      futureRecoveryCapability: { version: 2 },
+      displayName: "Recovery-safe",
+      tags: { owner: "agent" },
+    });
+  }, 15_000);
+
+  it("daemon attach cannot write through a held metadata lock", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    await patchMetadataById(name, { displayName: "Locked", tags: { owner: "agent" } });
+    const before = fs.readFileSync(path.join(dir, `${name}.json`), "utf8");
+    expect(acquireLock(name)).toBe(true);
+
+    try {
+      await attach(dir, name);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(fs.readFileSync(path.join(dir, `${name}.json`), "utf8")).toBe(before);
+    } finally {
+      releaseLock(name);
+    }
+
+    await attach(dir, name);
+    await waitFor(() => readMetadata(name)?.lastAttachAt !== undefined, "post-lock attach metadata");
+    expect(readMetadata(name)).toMatchObject({
+      displayName: "Locked",
+      tags: { owner: "agent" },
+    });
+  }, 15_000);
+
+  it("exit metadata retries after a short external lock winner", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, {
+      command: "sh",
+      args: ["-c", "sleep 0.4; exit 7"],
+      displayCommand: "exit 7",
+      tags: { keep: "true" },
+      unsetEnv: ["NO_COLOR"],
+    });
+    process.env.PTY_SESSION_DIR = dir;
+    await patchMetadataById(name, { displayName: "Exiting", tags: { owner: "agent" } });
+    expect(acquireLock(name)).toBe(true);
+
+    try {
+      await waitFor(
+        () => readEvents(dir, name).some((event) => event.type === "session_exit"),
+        "session_exit while metadata is locked",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(readMetadata(name)?.exitedAt).toBeUndefined();
+    } finally {
+      releaseLock(name);
+    }
+
+    await waitFor(() => readMetadata(name)?.exitedAt !== undefined, "close-time exit metadata flush");
+    expect(readMetadata(name)).toMatchObject({
+      exitCode: 7,
+      displayName: "Exiting",
+      tags: { keep: "true", owner: "agent" },
+      unsetEnv: ["NO_COLOR"],
+    });
+  }, 15_000);
+
   it("atomically changes displayName and tags while preserving unrelated tags", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
@@ -183,7 +337,10 @@ describe("patchMetadataById", () => {
   }, 15000);
 
   it.each([
-    [{ displayName: "bad/name" }, /Invalid displayName/],
+    [{ displayName: " Worker" }, /Invalid displayName/],
+    [{ displayName: "Worker\u2028Next" }, /Invalid displayName/],
+    [{ displayName: "Worker\u2029Next" }, /Invalid displayName/],
+    [{ displayName: "😀".repeat(161) }, /Invalid displayName/],
     [{ tags: { "": "value" } }, /tag keys must be non-empty/],
     [{ tags: { role: 1 } }, /tag values must be strings or null/],
     [{ unknown: true }, /unknown field "unknown"/],
@@ -197,6 +354,18 @@ describe("patchMetadataById", () => {
     await expect(patchMetadataById(name, patch as any)).rejects.toThrow(message);
     expect(readMetadata(name)).toEqual(before);
     expect(readEvents(dir, name).filter((event) => event.type === "metadata_change")).toHaveLength(0);
+  }, 15000);
+
+  it("accepts the 160-scalar boundary with slash and backslash", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    const displayName = `${"😀".repeat(156)}/a\\b`;
+
+    const result = await patchMetadataById(name, { displayName });
+
+    expect(result.metadata.displayName).toBe(displayName);
   }, 15000);
 
   it("exposes the exact-id atomic operation through JSON stdin/stdout", async () => {

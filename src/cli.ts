@@ -15,6 +15,7 @@ import {
   pruneOrphanLayoutTags,
   isGone,
   cleanupAll,
+  cleanupAllWhileLocked,
   cleanupSocket,
   cleanupOwnedAll,
   waitForProcessExit,
@@ -38,7 +39,7 @@ import {
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
-  EventFollower, EventWriter, EventType,
+  acquireEventLock, EventFollower, EventWriter, EventType, releaseEventLock,
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
@@ -90,7 +91,7 @@ Create a session and attach to it (use -d to leave it running in the background)
 
 Flags:
   --id <id>            Pin the on-disk id (sock/json filename; charset-validated, ≤ 104-byte sock path)
-  --name <label>       Explicit display label (any printable text, ≤ 500 chars)
+  --name <label>       Display label (trimmed, single-line, ≤ 160 Unicode scalars)
   --no-display-name    Skip the auto cwd+command label — just the id
   -d, --detach         Create in the background; don't attach
   -a, --attach         Create, OR attach if a session with the same id already exists
@@ -422,7 +423,7 @@ function usage(): void {
 Create sessions:
   pty run -- <command> [args...]          Create a session and attach (random id + auto display label)
   pty run --id <id> -- <command>          Pin the on-disk id (sock / json filename; charset-validated)
-  pty run --name <label> -- <command>     Set an explicit display label (any printable, ≤ 500 chars)
+  pty run --name <label> -- <command>     Set a trimmed, single-line display label (≤ 160 Unicode scalars)
   pty run --no-display-name -- <cmd>      Skip the friendly cwd+command label (just an id)
   pty run -d -- <command>                 Create in the background (detached)
   pty run -a -- <command>                 Create OR attach if a session with the same id already exists
@@ -1585,8 +1586,42 @@ async function cmdRun(
   extraEnv: Record<string, string> = {},
   unsetEnv: string[] = [],
 ): Promise<void> {
-  const session = await getSessionByName(name);
+  let session = await getSessionByName(name);
+
+  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
+  const inheritedCreationLock =
+    Number.isSafeInteger(delegatedOwner) &&
+    isLockOwnedByPid(name, delegatedOwner);
+  // This is a one-hop control value for the CLI process, not session env.
+  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
+  let ownsEventLock = false;
+  let ownsCreationLock = false;
+  if (!inheritedCreationLock) {
+    if (!acquireEventLock(name)) {
+      console.error(`Session "${name}" event log is busy. Try again.`);
+      process.exit(1);
+    }
+    ownsEventLock = true;
+    if (!acquireLock(name)) {
+      releaseEventLock(name);
+      console.error(
+        `Session "${name}" is being created by another process. Try again.`
+      );
+      process.exit(1);
+    }
+    ownsCreationLock = true;
+    session = await getSessionByName(name);
+  }
+
   if (session?.status === "running") {
+    if (ownsCreationLock) {
+      releaseLock(name);
+      ownsCreationLock = false;
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     if (attachExisting) {
       console.log(`Session "${name}" already running, attaching.`);
       doAttach(name);
@@ -1598,30 +1633,20 @@ async function cmdRun(
     process.exit(1);
   }
 
-  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
-  const inheritedCreationLock =
-    Number.isSafeInteger(delegatedOwner) &&
-    isLockOwnedByPid(name, delegatedOwner);
-  // This is a one-hop control value for the CLI process, not session env.
-  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
-  if (!inheritedCreationLock && !acquireLock(name)) {
-    console.error(
-      `Session "${name}" is being created by another process. Try again.`
-    );
-    process.exit(1);
-  }
-
   // Clean up any dead session with the same name, but preserve cwd and tags
   // so that `run -a` re-creates the session in the original directory with original tags.
   const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
   const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
   const previousExtraEnv = session && isGone(session.status) ? session.metadata?.extraEnv : undefined;
   const previousUnsetEnv = session && isGone(session.status) ? session.metadata?.unsetEnv : undefined;
-  if (session && isGone(session.status)) {
-    cleanupAll(name);
-  }
-
   try {
+    if (session && isGone(session.status) && !inheritedCreationLock) {
+      cleanupAllWhileLocked(name);
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
     const cwdOpt = explicitCwd ?? previousCwd;
     // If the session had a previous displayName (e.g., it was renamed before
@@ -1633,13 +1658,15 @@ async function cmdRun(
     const unsetEnvOpt = unsetEnv.length > 0 ? unsetEnv : previousUnsetEnv;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
+      creationLockOwnerPid: inheritedCreationLock ? delegatedOwner : process.pid,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
       ...(unsetEnvOpt && unsetEnvOpt.length > 0 ? { unsetEnv: unsetEnvOpt } : {}),
     });
   } finally {
-    if (!inheritedCreationLock) releaseLock(name);
+    if (ownsEventLock) releaseEventLock(name);
+    if (ownsCreationLock) releaseLock(name);
   }
 
   console.log(`Session "${name}" created.`);
@@ -2683,9 +2710,8 @@ async function cmdRename(rawArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Display names can be arbitrary printable text (spaces, punctuation, any
-  // length up to 500 chars). The on-disk id (`name`) carries the strict
-  // charset and the sock-path-length constraint; display names don't.
+  // Display names are bounded, single-line presentation metadata. The on-disk
+  // id (`name`) carries the strict charset and sock-path-length constraint.
   try {
     validateDisplayName(newDisplay);
   } catch (e: any) {
@@ -3358,7 +3384,14 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
 
     // Clean up an exited bound session so its slot can be reused.
     if (bound && isGone(bound.status)) {
-      cleanupAll(bound.name);
+      const label = bound.metadata?.displayName ?? bound.name;
+      try {
+        cleanupAll(bound.name);
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+        skipped++;
+        continue;
+      }
     }
 
     // Pick the on-disk id: honor the pty.toml's `id = "..."` if set,
@@ -3473,9 +3506,13 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
       }
       cleanupSocket(existingSession.name);
     } else if (isGone(existingSession.status)) {
-      cleanupAll(existingSession.name);
-      console.log(`  ○ ${label} (cleaned up)`);
-      stopped++;
+      try {
+        cleanupAll(existingSession.name);
+        console.log(`  ○ ${label} (cleaned up)`);
+        stopped++;
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+      }
     }
   }
 

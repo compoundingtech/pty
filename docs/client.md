@@ -127,7 +127,11 @@ Remove a session's `.sock` and `.pid` files.
 
 ### `cleanupAll(name: string): void`
 
-Remove all files for a session (socket, pid, metadata, events, lock).
+Remove all files for a session (socket, pid, metadata, and events). Cleanup is
+serialized by acquiring the event lock before the metadata/creation lock. It
+throws when either lock has a live holder, changes no session files in that
+case, and removes only locks acquired by the cleanup call. Dead holders' stale
+locks are reclaimed.
 
 ### Types
 

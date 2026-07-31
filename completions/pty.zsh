@@ -59,7 +59,7 @@ _pty() {
             '(a --attach){a,--attach}[Create OR attach if id already exists]' \
             '(e --ephemeral){e,--ephemeral}[Ephemeral: auto-remove metadata on clean exit]' \
             '--id[Pin on-disk id (charset-validated)]' \
-            '--name[Display label (any printable, ≤ 500 chars)]' \
+            '--name[Display label (trimmed, single-line, ≤ 160 Unicode scalars)]' \
             '--no-display-name[Skip the auto-generated label]' \
             '--tag[Tag session (k=v, repeatable)]' \
             '--env[Overlay child environment (KEY=VALUE, repeatable)]' \

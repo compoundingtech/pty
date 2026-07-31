@@ -22,15 +22,16 @@ import {
 import {
   getSocketPath,
   getPidPath,
-  getMetadataPath,
   ensureSessionDir,
   cleanupOwnedSocket,
   cleanupOwnedAll,
   writeMetadata,
   readMetadata,
+  mutateMetadataUnderLock,
   shouldReapAtExit,
   reapOnExitDefault,
   type SessionMetadata,
+  type MetadataMutationResult,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
 import type { StatsResult } from "./client.ts";
@@ -541,7 +542,13 @@ export class PtyServer {
       // in pty list during the cleanup window. lastLines may be incomplete
       // here since PTY data could still be in-flight — close() will
       // update with the final output.
-      this.saveExitMetadata(code);
+      const exitMetadataStatus = this.saveExitMetadata(code);
+      if (exitMetadataStatus === "busy" || exitMetadataStatus === "stale") {
+        // Startup may still hold the creation lock for this generation. Retry
+        // within the existing 500ms client grace so exit metadata is observable
+        // before shutdown cleanup, while close() retains the final bounded retry.
+        void this.saveExitMetadataUntilSettled(code, 400).catch(() => {});
+      }
       this.resolveChildExited();
       options.onExit?.(code);
     });
@@ -653,20 +660,13 @@ export class PtyServer {
             if (!resized) {
               socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
             }
-            // Stamp the last-attach timestamp so `pty gc --idle-days N`
-            // (and per-session `strategy.idle-days=N` tags) can detect
-            // abandonment. Best-effort — if the metadata file was
-            // concurrently mutated by another writer (`pty tag`,
-            // `pty rename`), our read-modify-write may lose a field, but
-            // that's the same last-write-wins semantic every other
-            // metadata mutation carries. Wrapped in try so a torn read
-            // never crashes the daemon on attach.
+            // Best-effort: a concurrent metadata command wins this attach
+            // stamp, but neither writer can overwrite the other's snapshot.
             try {
-              const meta = readMetadata(this.name);
-              if (meta) {
+              mutateMetadataUnderLock(this.name, (meta) => {
                 meta.lastAttachAt = new Date().toISOString();
-                writeMetadata(this.name, meta);
-              }
+                return true;
+              }, { expectedGeneration: this.generation });
             } catch {}
 
             const sendScreen = () => {
@@ -1022,40 +1022,32 @@ export class PtyServer {
     return lines.slice(-LAST_LINES_COUNT);
   }
 
-  private saveExitMetadata(exitCode: number): void {
-    // Don't resurrect a session whose metadata was already removed. On teardown
-    // the daemon re-flushes exit metadata during its (possibly watchdog-delayed)
-    // shutdown; if a caller already `pty rm`'d the session, re-creating its
-    // `.json` here would leave a stray registry file (and its atomic tmp) behind.
-    if (!fs.existsSync(getMetadataPath(this.name))) return;
-    const existing = readMetadata(this.name);
-    if (
-      existing?.generation !== undefined &&
-      existing.generation !== this.generation
-    ) {
-      return;
+  private saveExitMetadata(exitCode: number): MetadataMutationResult["status"] {
+    const result = mutateMetadataUnderLock(this.name, (metadata) => {
+      metadata.exitCode = exitCode;
+      metadata.exitedAt = new Date().toISOString();
+      metadata.lastLines = this.getLastLines();
+      return true;
+    }, { expectedGeneration: this.generation });
+    return result.status;
+  }
+
+  private async saveExitMetadataUntilSettled(
+    exitCode: number,
+    waitMs = 2_000,
+  ): Promise<void> {
+    const deadline = Date.now() + waitMs;
+    while (true) {
+      const status = this.saveExitMetadata(exitCode);
+      if (
+        status === "changed" ||
+        status === "unchanged" ||
+        status === "missing" ||
+        status === "generation-mismatch"
+      ) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    writeMetadata(this.name, {
-      generation: this.generation,
-      daemonPid: process.pid,
-      command: this.options.command,
-      args: this.options.args,
-      displayCommand: this.options.displayCommand,
-      cwd: this.options.cwd,
-      rows: this.options.rows,
-      cols: this.options.cols,
-      ephemeral: this.options.ephemeral === true,
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
-      exitCode,
-      exitedAt: new Date().toISOString(),
-      lastLines: this.getLastLines(),
-      ...(existing?.tags ? { tags: existing.tags } : {}),
-      ...(existing?.displayName ? { displayName: existing.displayName } : {}),
-      ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
-      ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
-      ...(this.options.unsetEnv && this.options.unsetEnv.length > 0 ? { unsetEnv: this.options.unsetEnv } : {}),
-      ...(this.options.env ? { env: this.options.env } : {}),
-    });
   }
 
   /** Clean up resources. Does not call process.exit(). */
@@ -1088,6 +1080,7 @@ export class PtyServer {
           this.childExited,
           new Promise<void>((r) => setTimeout(r, 2000)),
         ]);
+        if (this.exited) await this.saveExitMetadataUntilSettled(this.exitCode);
         try { await this.eventWriter.flush(); } catch {}
         resolve();
       });

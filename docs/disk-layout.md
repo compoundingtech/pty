@@ -15,6 +15,7 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
+| `<name>.events.lock` | event append/retention lock | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |
@@ -103,7 +104,12 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `metadata_change` | `previous, value` containing only changed `displayName` and tag keys; absent tag values are `null` |
 | `user.<name>` | `data?, text?` — free-form, via `pty emit` |
 
-A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` payloads out of the event stream.
+All event writers and retention rewrites are serialized by the per-session
+event lock. A complete JSONL record is therefore published without relying on
+an operating-system write-size limit, and retention cannot discard an append
+that races its atomic rewrite. Async writers wait up to five seconds for a live
+holder; synchronous writers fail immediately. Lock files are removed on release,
+and a dead holder's stale lock is reclaimed by the next writer or cleanup.
 
 ## Reading from outside pty
 

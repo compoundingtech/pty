@@ -69,7 +69,7 @@ complete -c pty -n '__pty_using_command run' -l detach -s d -d 'Create in the ba
 complete -c pty -n '__pty_using_command run' -l attach -s a -d 'Create OR attach if id already exists'
 complete -c pty -n '__pty_using_command run' -l ephemeral -s e -d 'Ephemeral: auto-remove metadata on clean exit'
 complete -c pty -n '__pty_using_command run' -l id -d 'Pin on-disk id (charset-validated)'
-complete -c pty -n '__pty_using_command run' -l name -d 'Display label (any printable, ≤ 500 chars)'
+complete -c pty -n '__pty_using_command run' -l name -d 'Display label (trimmed, single-line, ≤ 160 Unicode scalars)'
 complete -c pty -n '__pty_using_command run' -l no-display-name -d 'Skip the auto-generated label'
 complete -c pty -n '__pty_using_command run' -l tag -d 'Tag session (k=v, repeatable)'
 complete -c pty -n '__pty_using_command run' -l env -d 'Overlay child environment (KEY=VALUE, repeatable)'

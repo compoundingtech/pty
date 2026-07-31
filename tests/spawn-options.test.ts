@@ -6,7 +6,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { queryStats } from "../src/client.ts";
-import { spawnDaemon, setServerModulePath } from "../src/spawn.ts";
+import {
+  spawnDaemon, spawnDaemonWithCreationLock, setServerModulePath,
+} from "../src/spawn.ts";
+import {
+  acquireLock, patchMetadataById, releaseLock,
+} from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -144,6 +149,103 @@ afterEach(async () => {
 });
 
 describe("spawnDaemon options", () => {
+  it("releases a failed owned creation lease exactly once", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+
+    const failedSpawn = spawnDaemonWithCreationLock({
+      name,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      launcher: { command: nodeBin, args: ["-e", "process.exit(7)"] },
+      startTimeoutMs: 300,
+    });
+    const competitor = (async () => {
+      while (!acquireLock(name)) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      return fs.statSync(path.join(dir, `${name}.lock`)).ino;
+    })();
+
+    await expect(failedSpawn).rejects.toThrow();
+    const competitorLockInode = await competitor;
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(acquireLock(name)).toBe(false);
+      expect(fs.statSync(path.join(dir, `${name}.lock`)).ino).toBe(competitorLockInode);
+    } finally {
+      releaseLock(name);
+    }
+  }, 5000);
+
+  it("validates displayName before launching the daemon", async () => {
+    const dir = makeSessionDir();
+    process.env.PTY_SESSION_DIR = dir;
+
+    await expect(spawnDaemon({
+      name: uniqueName(),
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      displayName: " Worker",
+    })).rejects.toThrow("Display name must be trimmed");
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it("does not report readiness for a socket without matching daemon metadata", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const socketOnlyLauncher = [
+      'const net = require("node:net")',
+      'const path = require("node:path")',
+      'const name = JSON.parse(process.env.PTY_SERVER_CONFIG).name',
+      'net.createServer(() => {}).listen(path.join(process.env.PTY_SESSION_DIR, `${name}.sock`))',
+      'setInterval(() => {}, 1000)',
+    ].join(";");
+
+    await expect(spawnDaemon({
+      name,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      launcher: { command: nodeBin, args: ["-e", socketOnlyLauncher] },
+      startTimeoutMs: 300,
+    })).rejects.toThrow("daemon publication");
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(false);
+  }, 5000);
+
+  it("returns only after the fresh session_start is published", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    fs.writeFileSync(path.join(dir, `${name}.events.jsonl`), JSON.stringify({
+      session: name,
+      type: "session_start",
+      ts: "9999-12-31T23:59:59.999Z",
+    }) + "\n");
+
+    await spawnDaemon({
+      name,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+    });
+    await patchMetadataById(name, { displayName: "Ready" });
+
+    const events = fs.readFileSync(path.join(dir, `${name}.events.jsonl`), "utf8")
+      .trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(events.map(({ type }) => type).slice(0, 2)).toEqual([
+      "session_start",
+      "metadata_change",
+    ]);
+    expect(events[0].ts).not.toBe("9999-12-31T23:59:59.999Z");
+    const pid = parseInt(fs.readFileSync(path.join(dir, `${name}.pid`), "utf8"), 10);
+    bgPids.push(pid);
+  }, 15000);
+
   it("CLI passes through to spawnDaemon with options object", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
@@ -167,6 +269,32 @@ describe("spawnDaemon options", () => {
     const pidFile = path.join(dir, `${name}.pid`);
     const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
     bgPids.push(pid);
+  }, 15000);
+
+  it("preserves an explicitly delegated creation lock through publication", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireLock(name)).toBe(true);
+
+    try {
+      const result = spawnSync(nodeBin, [cliPath, "run", "-d", "--id", name, "--", "cat"], {
+        env: {
+          ...process.env,
+          PTY_SESSION_DIR: dir,
+          PTY_CREATION_LOCK_OWNER_PID: String(process.pid),
+        },
+        encoding: "utf-8",
+        timeout: 10000,
+      });
+
+      expect(result.status).toBe(0);
+      expect(fs.readFileSync(path.join(dir, `${name}.lock`), "utf8").trim()).toBe(String(process.pid));
+      const pid = parseInt(fs.readFileSync(path.join(dir, `${name}.pid`), "utf-8").trim(), 10);
+      bgPids.push(pid);
+    } finally {
+      releaseLock(name);
+    }
   }, 15000);
 
   it("custom rows and cols are applied via server config", async () => {

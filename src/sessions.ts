@@ -7,7 +7,9 @@ import { createHash } from "node:crypto";
 // Circular import: events.ts imports getEventsPath/ensureSessionDir from
 // this file. Cycle is safe — `appendEventSync` is only called at runtime
 // from inside functions, never at module-init time.
-import { appendEventSync } from "./events.ts";
+import {
+  acquireEventLock, appendEventSync, appendEventSyncLocked, releaseEventLock,
+} from "./events.ts";
 
 export const DEFAULT_SESSION_DIR = path.join(os.homedir(), ".local", "state", "pty");
 
@@ -48,22 +50,19 @@ export function validateName(name: string): void {
   }
 }
 
-/** Permissive validator for display labels. Allowed: anything printable
- *  including spaces and punctuation, ≤ 500 chars. Rejected: empty, NUL,
- *  slashes (would confuse path-shaped UIs), backslashes, newlines, other
- *  control characters. Length cap is a sanity limit, not a kernel limit —
- *  display labels live in metadata.json, not in the socket path. */
+/** Validate mutable presentation metadata independently of stable session ids. */
 export function validateDisplayName(name: string): void {
-  if (!name || name.length === 0) {
+  if (name.length === 0) {
     throw new Error("Display name cannot be empty.");
   }
-  if (name.length > 500) {
-    throw new Error("Display name too long (max 500 characters).");
+  if (name !== name.trim()) {
+    throw new Error("Display name must be trimmed.");
   }
-  if (/[\0\/\\\n\r\t\x00-\x1f\x7f]/.test(name)) {
-    throw new Error(
-      `Invalid display name. Slashes, backslashes, newlines, and control characters are not allowed.`
-    );
+  if (Array.from(name).length > 160) {
+    throw new Error("Display name too long (max 160 Unicode scalars).");
+  }
+  if (/[\p{Cc}\u2028\u2029]/u.test(name)) {
+    throw new Error("Display name must be single-line and contain no control characters.");
   }
 }
 
@@ -254,6 +253,55 @@ type MetadataChangeSnapshot = {
 
 type MetadataPatchEvent = "metadata_change" | "display_name_change" | "tags_change";
 
+export type MetadataMutationResult =
+  | { status: "changed"; metadata: SessionMetadata }
+  | { status: "unchanged"; metadata: SessionMetadata }
+  | { status: "busy" }
+  | { status: "missing" }
+  | { status: "generation-mismatch" }
+  | { status: "stale" };
+
+/** Serialize one whole-record metadata mutation against lifecycle writers. */
+export function mutateMetadataUnderLock(
+  name: string,
+  mutate: (metadata: SessionMetadata) => boolean,
+  options: {
+    expectedGeneration?: string;
+    onPublished?: (metadata: SessionMetadata) => void;
+  } = {},
+): MetadataMutationResult {
+  if (!acquireLock(name)) return { status: "busy" };
+
+  try {
+    const metadata = readMetadata(name);
+    if (!metadata) return { status: "missing" };
+    if (
+      options.expectedGeneration !== undefined &&
+      metadata.generation !== options.expectedGeneration
+    ) {
+      return { status: "generation-mismatch" };
+    }
+
+    const observed = JSON.stringify(metadata);
+    if (!mutate(metadata)) return { status: "unchanged", metadata };
+
+    const latest = readMetadata(name);
+    if (!latest || JSON.stringify(latest) !== observed) return { status: "stale" };
+    if (
+      options.expectedGeneration !== undefined &&
+      latest.generation !== options.expectedGeneration
+    ) {
+      return { status: "generation-mismatch" };
+    }
+
+    writeMetadata(name, metadata);
+    options.onPublished?.(metadata);
+    return { status: "changed", metadata };
+  } finally {
+    releaseLock(name);
+  }
+}
+
 function validateMetadataPatch(patch: unknown): asserts patch is MetadataPatch {
   if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
     throw new Error("Metadata patch must be a JSON object.");
@@ -305,100 +353,110 @@ function applyMetadataPatchById(
   eventType: MetadataPatchEvent,
 ): MetadataPatchResult {
   validateMetadataPatch(patch);
-  if (!acquireLock(id)) {
-    throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
+  if (!acquireEventLock(id)) {
+    throw new Error(`Session id "${id}" event log is busy. Retry the operation.`);
   }
-
   try {
-    const metadata = readMetadata(id);
-    if (!metadata) throw new Error(`Session id "${id}" not found.`);
-
-    const previousTags = Object.fromEntries(Object.entries(metadata.tags ?? {}));
-    const nextTags = Object.fromEntries(Object.entries(previousTags));
+    let previousTags: Record<string, string> = {};
+    let nextTags: Record<string, string> = {};
     const previous: MetadataChangeSnapshot = {};
     const value: MetadataChangeSnapshot = {};
-
-    if (Object.prototype.hasOwnProperty.call(patch, "displayName")) {
-      const before = metadata.displayName ?? null;
-      const after = patch.displayName ?? null;
-      if (before !== after) {
-        previous.displayName = before;
-        value.displayName = after;
-        if (after === null) delete metadata.displayName;
-        else metadata.displayName = after;
+    const result = mutateMetadataUnderLock(id, (metadata) => {
+      previousTags = Object.fromEntries(Object.entries(metadata.tags ?? {}));
+      nextTags = Object.fromEntries(Object.entries(previousTags));
+      if (Object.prototype.hasOwnProperty.call(patch, "displayName")) {
+        const before = metadata.displayName ?? null;
+        const after = patch.displayName ?? null;
+        if (before !== after) {
+          previous.displayName = before;
+          value.displayName = after;
+          if (after === null) delete metadata.displayName;
+          else metadata.displayName = after;
+        }
       }
-    }
 
-    if (patch.tags !== undefined) {
-      const changedTagKeys: string[] = [];
-      for (const [key, requested] of Object.entries(patch.tags)) {
-        const before = Object.prototype.hasOwnProperty.call(previousTags, key)
-          ? previousTags[key]
-          : null;
-        const after = requested ?? null;
-        if (before === after) continue;
-        changedTagKeys.push(key);
-        if (after === null) delete nextTags[key];
-        else setRecordValue(nextTags, key, after);
-      }
-      if (changedTagKeys.length > 0) {
-        previous.tags = {};
-        value.tags = {};
-        for (const key of changedTagKeys.sort()) {
+      if (patch.tags !== undefined) {
+        const changedTagKeys: string[] = [];
+        for (const [key, requested] of Object.entries(patch.tags)) {
           const before = Object.prototype.hasOwnProperty.call(previousTags, key)
             ? previousTags[key]
             : null;
-          const after = Object.prototype.hasOwnProperty.call(nextTags, key)
-            ? nextTags[key]
-            : null;
-          Object.defineProperty(previous.tags, key, { value: before, enumerable: true });
-          Object.defineProperty(value.tags, key, { value: after, enumerable: true });
+          const after = requested ?? null;
+          if (before === after) continue;
+          changedTagKeys.push(key);
+          if (after === null) delete nextTags[key];
+          else setRecordValue(nextTags, key, after);
         }
-        if (Object.keys(nextTags).length === 0) delete metadata.tags;
-        else metadata.tags = nextTags;
+        if (changedTagKeys.length > 0) {
+          previous.tags = {};
+          value.tags = {};
+          for (const key of changedTagKeys.sort()) {
+            const before = Object.prototype.hasOwnProperty.call(previousTags, key)
+              ? previousTags[key]
+              : null;
+            const after = Object.prototype.hasOwnProperty.call(nextTags, key)
+              ? nextTags[key]
+              : null;
+            Object.defineProperty(previous.tags, key, { value: before, enumerable: true });
+            Object.defineProperty(value.tags, key, { value: after, enumerable: true });
+          }
+          if (Object.keys(nextTags).length === 0) delete metadata.tags;
+          else metadata.tags = nextTags;
+        }
       }
-    }
 
-    const changed = Object.keys(previous).length > 0;
-    if (!changed) return { changed: false, metadata };
+      const changed = Object.keys(previous).length > 0;
+      if (!changed) return false;
 
-    if (metadata.displayName !== undefined) validateDisplayName(metadata.displayName);
-    for (const [key, tagValue] of Object.entries(metadata.tags ?? {})) {
-      if (key.length === 0) throw new Error("Resulting metadata contains an empty tag key.");
-      if (typeof tagValue !== "string") {
-        throw new Error(`Resulting metadata tag "${key}" is not a string.`);
+      if (metadata.displayName !== undefined) validateDisplayName(metadata.displayName);
+      for (const [key, tagValue] of Object.entries(metadata.tags ?? {})) {
+        if (key.length === 0) throw new Error("Resulting metadata contains an empty tag key.");
+        if (typeof tagValue !== "string") {
+          throw new Error(`Resulting metadata tag "${key}" is not a string.`);
+        }
       }
-    }
 
-    writeMetadata(id, metadata);
-    if (eventType === "metadata_change") {
-      appendEventSync(id, {
-        session: id,
-        type: "metadata_change",
-        ts: new Date().toISOString(),
-        previous,
-        value,
-      });
-    } else if (eventType === "display_name_change") {
-      appendEventSync(id, {
-        session: id,
-        type: "display_name_change",
-        ts: new Date().toISOString(),
-        previous: previous.displayName ?? null,
-        value: value.displayName ?? null,
-      });
-    } else {
-      appendEventSync(id, {
-        session: id,
-        type: "tags_change",
-        ts: new Date().toISOString(),
-        previous: previousTags,
-        value: nextTags,
-      });
+      return true;
+    }, {
+      onPublished: () => {
+        if (eventType === "metadata_change") {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "metadata_change",
+            ts: new Date().toISOString(),
+            previous,
+            value,
+          });
+        } else if (eventType === "display_name_change") {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "display_name_change",
+            ts: new Date().toISOString(),
+            previous: previous.displayName ?? null,
+            value: value.displayName ?? null,
+          });
+        } else {
+          appendEventSyncLocked(id, {
+            session: id,
+            type: "tags_change",
+            ts: new Date().toISOString(),
+            previous: previousTags,
+            value: nextTags,
+          });
+        }
+      },
+    });
+
+    if (result.status === "busy") {
+      throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
     }
-    return { changed: true, metadata };
+    if (result.status === "missing") throw new Error(`Session id "${id}" not found.`);
+    if (result.status === "stale" || result.status === "generation-mismatch") {
+      throw new Error(`Session id "${id}" metadata changed during the operation. Retry it.`);
+    }
+    return { changed: result.status === "changed", metadata: result.metadata };
   } finally {
-    releaseLock(id);
+    releaseEventLock(id);
   }
 }
 
@@ -555,7 +613,11 @@ export async function cleanupRawCandidateGuarded(
   candidate: RawCleanupCandidate,
   options: ListSessionsOptions = {},
 ): Promise<boolean> {
-  if (!acquireLock(candidate.name)) return false;
+  if (!acquireEventLock(candidate.name)) return false;
+  if (!acquireLock(candidate.name)) {
+    releaseEventLock(candidate.name);
+    return false;
+  }
   try {
     const current = await inventoryRawCleanupCandidates(
       options,
@@ -573,6 +635,7 @@ export async function cleanupRawCandidateGuarded(
     return true;
   } finally {
     releaseLock(candidate.name);
+    releaseEventLock(candidate.name);
   }
 }
 
@@ -590,7 +653,8 @@ function metadataMatchesObservation(
   return JSON.stringify(observed) === JSON.stringify(current);
 }
 
-function cleanupAllWhileLocked(name: string): void {
+/** @internal Remove session artifacts while the caller owns both event and metadata locks. */
+export function cleanupAllWhileLocked(name: string): void {
   cleanupSocket(name);
   try {
     fs.unlinkSync(getMetadataPath(name));
@@ -604,7 +668,11 @@ function cleanupAllWhileLocked(name: string): void {
 export async function cleanupObservedSession(
   session: SessionInfo,
 ): Promise<boolean> {
-  if (!session.metadata || !acquireLock(session.name)) return false;
+  if (!session.metadata || !acquireEventLock(session.name)) return false;
+  if (!acquireLock(session.name)) {
+    releaseEventLock(session.name);
+    return false;
+  }
   try {
     const current = readMetadata(session.name);
     if (
@@ -617,6 +685,7 @@ export async function cleanupObservedSession(
     return true;
   } finally {
     releaseLock(session.name);
+    releaseEventLock(session.name);
   }
 }
 
@@ -1027,7 +1096,11 @@ export async function gc(
           await new Promise((r) => setTimeout(r, 25));
         }
       }
-      cleanupAll(s.name);
+      try {
+        cleanupAll(s.name);
+      } catch {
+        continue;
+      }
     }
     killedOrphanChildren.push({ name: s.name, parent: parentRef, reason });
   }
@@ -1065,7 +1138,11 @@ export async function gc(
           ...(decision.idleDays !== undefined ? { idleDays: decision.idleDays } : {}),
         });
       } catch {}
-      cleanupAll(s.name);
+      try {
+        cleanupAll(s.name);
+      } catch {
+        continue;
+      }
     }
     abandoned.push({
       name: s.name,
@@ -1450,7 +1527,12 @@ export async function respawnPermanent(
   // Serialize compare-and-swap cleanup + replacement creation under the same
   // per-name lock. If the observed generation changed while gc was planning,
   // this tick is stale and must not touch the replacement.
-  if (!acquireLock(name)) return false;
+  if (!acquireEventLock(name)) return false;
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    return false;
+  }
+  let eventLocked = true;
   try {
     const current = readMetadata(name);
     if (!current || !metadataMatchesObservation(metadata, current)) {
@@ -1461,6 +1543,8 @@ export async function respawnPermanent(
     // over leftovers from the dead daemon. Keep the creation lock held until
     // the replacement has published its socket.
     cleanupAllWhileLocked(name);
+    releaseEventLock(name);
+    eventLocked = false;
 
     const { spawnDaemon } = await import("./spawn.ts");
     await spawnDaemon({
@@ -1477,6 +1561,7 @@ export async function respawnPermanent(
     });
   } finally {
     releaseLock(name);
+    if (eventLocked) releaseEventLock(name);
   }
 
   // Best-effort event; respawn already succeeded if we got here.
@@ -1650,14 +1735,25 @@ export function cleanupSocket(name: string): void {
 
 /** Remove everything including metadata. */
 export function cleanupAll(name: string): void {
-  cleanupSocket(name);
+  if (!acquireEventLock(name)) {
+    throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+  }
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    throw new Error(`Session id "${name}" metadata is busy. Retry the operation.`);
+  }
   try {
-    fs.unlinkSync(getMetadataPath(name));
-  } catch {}
-  try {
-    fs.unlinkSync(getEventsPath(name));
-  } catch {}
-  releaseLock(name);
+    cleanupSocket(name);
+    try {
+      fs.unlinkSync(getMetadataPath(name));
+    } catch {}
+    try {
+      fs.unlinkSync(getEventsPath(name));
+    } catch {}
+  } finally {
+    releaseLock(name);
+    releaseEventLock(name);
+  }
 }
 
 export interface SessionGenerationOwner {
@@ -1700,7 +1796,11 @@ export function cleanupOwnedSocket(name: string, owner: SessionGenerationOwner):
 
 /** Generation-safe full cleanup used by a daemon reaping its own session. */
 export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): boolean {
-  if (!acquireLock(name)) return false;
+  if (!acquireEventLock(name)) return false;
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    return false;
+  }
   try {
     if (!isCurrentGenerationOwner(name, owner)) return false;
     cleanupSocket(name);
@@ -1713,6 +1813,7 @@ export function cleanupOwnedAll(name: string, owner: SessionGenerationOwner): bo
     return true;
   } finally {
     releaseLock(name);
+    releaseEventLock(name);
   }
 }
 
@@ -1732,8 +1833,7 @@ export function isLockOwnedByPid(name: string, ownerPid: number): boolean {
 }
 
 /**
- * Acquire an exclusive lock for a session name. Prevents concurrent
- * `pty run` calls from racing to create the same session.
+ * Acquire an exclusive filesystem lock at an exact path.
  * Returns true if acquired, false if another process holds it.
  *
  * BUG-2 fix: the whole acquisition is built on `open(O_CREAT|O_EXCL)` via
@@ -1742,9 +1842,8 @@ export function isLockOwnedByPid(name: string, ownerPid: number): boolean {
  * unlink it and retry the exclusive open: whichever process wins the
  * post-unlink open owns the lock; the other gets EEXIST and gives up.
  */
-export function acquireLock(name: string): boolean {
+export function acquireFileLock(lockPath: string): boolean {
   ensureSessionDir();
-  const lockPath = getLockPath(name);
 
   const tryCreate = (): boolean => {
     try {
@@ -1788,10 +1887,18 @@ export function acquireLock(name: string): boolean {
   return tryCreate();
 }
 
-export function releaseLock(name: string): void {
+export function releaseFileLock(lockPath: string): void {
   try {
-    fs.unlinkSync(getLockPath(name));
+    fs.unlinkSync(lockPath);
   } catch {}
+}
+
+export function acquireLock(name: string): boolean {
+  return acquireFileLock(getLockPath(name));
+}
+
+export function releaseLock(name: string): void {
+  releaseFileLock(getLockPath(name));
 }
 
 // Keep backward compat for server.ts close()
