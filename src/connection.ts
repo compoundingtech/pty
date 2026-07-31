@@ -8,6 +8,7 @@ import {
   encodeDetach,
   encodePeek,
   encodeResize,
+  decodeSize,
   decodeExit,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
@@ -16,6 +17,11 @@ import { BRACKETED_PASTE_START, BRACKETED_PASTE_END } from "./paste.ts";
 
 export interface SessionConnectionOptions {
   name: string;
+  rows: number;
+  cols: number;
+}
+
+export interface SessionGeometry {
   rows: number;
   cols: number;
 }
@@ -100,6 +106,9 @@ export class SessionConnection extends EventEmitter {
             case MessageType.DATA:
               this.emit("data", packet.payload.toString());
               break;
+            case MessageType.GEOMETRY:
+              this.emit("geometry", decodeSize(packet.payload));
+              break;
             case MessageType.EXIT: {
               const code = decodeExit(packet.payload);
               this.emit("exit", code);
@@ -157,6 +166,13 @@ export class SessionConnection extends EventEmitter {
     this._connected = false;
     this.socket = null;
   }
+}
+
+export interface SessionConnection {
+  on(event: "geometry", listener: (geometry: SessionGeometry) => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+  emit(event: "geometry", geometry: SessionGeometry): boolean;
+  emit(event: string | symbol, ...args: any[]): boolean;
 }
 
 /** Send data to a session. Promise-based alternative to the CLI send(). */

@@ -260,6 +260,46 @@ describe("resize-tui: reattach at different size triggers redraw", () => {
     },
     20000
   );
+
+  it(
+    "programmatic clients render at effective geometry without changing their request",
+    async () => {
+      const child = `
+process.stdout.write("READY")
+process.stdout.on("resize", () => {
+  process.stdout.write("\\x1b[2J\\x1b[H" + "X".repeat(process.stdout.columns * 2))
+})
+setInterval(() => {}, 1_000)
+`;
+      const large = await createSession(
+        process.execPath,
+        ["-e", child],
+        { rows: 6, cols: 20 },
+      );
+
+      await large.waitForText("READY");
+      const small = await Session.connectToExisting(large, { rows: 6, cols: 10 });
+      sessions.push(small);
+      await small.attach();
+
+      const expected = ["XXXXXXXXXX", "XXXXXXXXXX"];
+      await large.waitFor(
+        (screen) => screen.lines.filter((line) => line.length > 0).length === 2,
+        5_000,
+        "the authoritative two-row grid",
+      );
+
+      expect(large.screenshot().lines.filter((line) => line.length > 0)).toEqual(expected);
+      expect(small.screenshot().lines.filter((line) => line.length > 0)).toEqual(expected);
+      expect({ rows: large.rows, cols: large.cols }).toEqual({ rows: 6, cols: 20 });
+
+      // Re-advertising the larger viewport must not resize the local emulator
+      // while the smaller peer still constrains the effective geometry.
+      large.resize(6, 20);
+      expect(large.screenshot().lines.filter((line) => line.length > 0)).toEqual(expected);
+    },
+    20000,
+  );
 });
 
 describe("resize-tui: serialization round-trip preserves 24-bit color", () => {

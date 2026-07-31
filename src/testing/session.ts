@@ -11,6 +11,7 @@ import {
   encodeAttach,
   encodeData,
   encodeResize,
+  decodeSize,
 } from "../protocol.ts";
 import { getSocketPath } from "../sessions.ts";
 import { resolveKey } from "../keys.ts";
@@ -64,6 +65,9 @@ export class Session {
   private backend: Backend;
   private _rows: number;
   private _cols: number;
+  // _rows/_cols are this client's request; the xterm follows effective
+  // GEOMETRY packets so a smaller peer cannot feed back through resize().
+  private geometryAware: boolean | null = null;
 
   private constructor(
     terminal: Terminal,
@@ -381,7 +385,9 @@ export class Session {
     this._rows = rows;
     this._cols = cols;
     this.backend.socket.write(encodeResize(rows, cols));
-    this.terminal.resize(cols, rows);
+    if (this.geometryAware !== true) {
+      this.terminal.resize(cols, rows);
+    }
   }
 
   // ── Lifecycle ──
@@ -427,6 +433,7 @@ export class Session {
       for (const packet of packets) {
         switch (packet.type) {
           case MessageType.SCREEN:
+            if (this.geometryAware === null) this.geometryAware = false;
             this.terminal.reset();
             this.terminal.write(packet.payload.toString(), () => {
               const cbs = backend.screenCallbacks;
@@ -434,6 +441,12 @@ export class Session {
               for (const cb of cbs) cb();
             });
             break;
+          case MessageType.GEOMETRY: {
+            this.geometryAware = true;
+            const { rows, cols } = decodeSize(packet.payload);
+            this.terminal.resize(cols, rows);
+            break;
+          }
           case MessageType.DATA:
             this.terminal.write(packet.payload.toString());
             break;

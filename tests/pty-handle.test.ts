@@ -1,5 +1,17 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { createPty, type PtyHandle } from "../src/tui/index.ts";
+import * as net from "node:net";
+import { attachPty, createPty, type PtyHandle } from "../src/tui/index.ts";
+import { PtyServer } from "../src/server.ts";
+import {
+  MessageType,
+  PacketReader,
+  encodeScreen,
+} from "../src/protocol.ts";
+import {
+  cleanupAll,
+  ensureSessionDir,
+  getSocketPath,
+} from "../src/sessions.ts";
 
 const handles: PtyHandle[] = [];
 
@@ -54,11 +66,102 @@ function cellsToText(cells: ReturnType<PtyHandle["readCells"]>): string {
   return cells.map(row => row.map(c => c.char).join("")).join("\n");
 }
 
+function nonEmptyLines(handle: PtyHandle): string[] {
+  return handle.readCells()
+    .map((row) => row.map((cell) => cell.char).join("").trimEnd())
+    .filter((line) => line.length > 0);
+}
+
 afterEach(() => {
   for (const h of handles) {
     try { h.kill(); } catch {}
   }
   handles.length = 0;
+});
+
+describe("attachPty effective geometry", () => {
+  it("keeps requested layout size separate from the shared emulator size", async () => {
+    const name = `handle-${process.pid}-${Date.now()}`;
+    const child = `
+process.stdout.write("READY")
+process.stdout.on("resize", () => {
+  process.stdout.write("\\x1b[2J\\x1b[H" + "X".repeat(process.stdout.columns * 2))
+})
+setInterval(() => {}, 1_000)
+`;
+    const server = new PtyServer({
+      name,
+      command: process.execPath,
+      args: ["-e", child],
+      displayCommand: "geometry-child",
+      cwd: process.cwd(),
+      rows: 6,
+      cols: 20,
+    });
+    await server.ready;
+
+    try {
+      const large = await attachPty(name, { rows: 6, cols: 20 });
+      await new Promise<void>((resolve) => {
+        const ready = () => {
+          if (nonEmptyLines(large).includes("READY")) resolve();
+        };
+        large.onActivity = ready;
+        ready();
+      });
+      const largeConverged = new Promise<void>((resolve) => {
+        large.onActivity = () => {
+          if (nonEmptyLines(large).length === 2) resolve();
+        };
+      });
+      const small = await attachPty(name, { rows: 6, cols: 10 });
+      handles.push(large, small);
+
+      await largeConverged;
+      expect(nonEmptyLines(large)).toEqual(["XXXXXXXXXX", "XXXXXXXXXX"]);
+      expect(nonEmptyLines(small)).toEqual(["XXXXXXXXXX", "XXXXXXXXXX"]);
+      expect({ rows: large.rows, cols: large.cols }).toEqual({ rows: 6, cols: 20 });
+
+      large.resize(20, 6);
+      expect(nonEmptyLines(large)).toEqual(["XXXXXXXXXX", "XXXXXXXXXX"]);
+    } finally {
+      await server.close();
+      cleanupAll(name);
+    }
+  }, 15000);
+
+  it("keeps legacy behavior when SCREEN arrives without GEOMETRY", async () => {
+    const name = `legacy-handle-${process.pid}-${Date.now()}`;
+    ensureSessionDir();
+    const server = net.createServer((socket) => {
+      const reader = new PacketReader();
+      socket.on("data", (data) => {
+        for (const packet of reader.feed(Buffer.from(data))) {
+          if (packet.type === MessageType.ATTACH) {
+            socket.write(encodeScreen("LEGACY"));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(getSocketPath(name), resolve);
+    });
+
+    let handle: PtyHandle | undefined;
+    try {
+      handle = await attachPty(name, { rows: 6, cols: 20 });
+      handles.push(handle);
+      expect(nonEmptyLines(handle)).toEqual(["LEGACY"]);
+
+      handle.resize(12, 6);
+      expect(handle.readCells()[0]).toHaveLength(12);
+    } finally {
+      handle?.kill();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      cleanupAll(name);
+    }
+  }, 15000);
 });
 
 // --- cursorRow / cursorCol ---

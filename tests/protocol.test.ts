@@ -9,6 +9,7 @@ import {
   encodeAttach,
   encodeDetach,
   encodeResize,
+  encodeGeometry,
   encodeExit,
   encodeScreen,
   encodeStatus,
@@ -74,6 +75,14 @@ describe("protocol", () => {
       const size = decodeSize(packets[0].payload);
       expect(size.rows).toBe(48);
       expect(size.cols).toBe(120);
+    });
+
+    it("round-trips a GEOMETRY packet", () => {
+      const reader = new PacketReader();
+      const [packet] = reader.feed(encodeGeometry(30, 100));
+
+      expect(packet.type).toBe(MessageType.GEOMETRY);
+      expect(decodeSize(packet.payload)).toEqual({ rows: 30, cols: 100 });
     });
 
     it("round-trips an EXIT packet", () => {

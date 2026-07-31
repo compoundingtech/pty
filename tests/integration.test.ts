@@ -15,6 +15,7 @@ import {
   encodePeek,
   encodeResize,
   encodeStatus,
+  decodeSize,
   decodeExit,
 } from "../src/protocol.ts";
 import {
@@ -672,6 +673,113 @@ describe("integration", () => {
 
     client1.destroy();
     client2.destroy();
+  });
+
+  it("sends effective geometry before initial screen and peer-driven redraws", async () => {
+    const name = uniqueName();
+    const reporter = [
+      "const draw = () => process.stdout.write(`\\x1b[2J\\x1b[HDRAW:${process.stdout.columns}x${process.stdout.rows}`)",
+      "process.stdout.on('resize', draw)",
+      "process.stdin.setRawMode(true)",
+      "process.stdin.on('data', data => { if (data.toString().includes('r')) process.stdout.write('READY') })",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    await startServer(name, process.execPath, ["-e", reporter], { rows: 6, cols: 20 });
+
+    const large = await connect(name);
+    const largeReader = new PacketReader();
+    const initialPackets = collectPackets(large, largeReader, 2);
+    large.write(encodeAttach(6, 20));
+    const initial = await initialPackets;
+
+    expect(initial.map((packet) => packet.type)).toEqual([
+      MessageType.GEOMETRY,
+      MessageType.SCREEN,
+    ]);
+    expect(decodeSize(initial[0].payload)).toEqual({ rows: 6, cols: 20 });
+    const ready = waitForContent(large, largeReader, "READY");
+    large.write(encodeData("r"));
+    await ready;
+
+    const observe = (rows: number, cols: number) =>
+      new Promise<void>((resolve, reject) => {
+        let sawGeometry = false;
+        let output = "";
+        const timer = setTimeout(() => {
+          large.off("data", onData);
+          reject(new Error(`Timed out waiting for ordered ${cols}x${rows} redraw`));
+        }, 5000);
+        const onData = (data: Buffer) => {
+          for (const packet of largeReader.feed(data)) {
+            if (
+              packet.type === MessageType.GEOMETRY &&
+              decodeSize(packet.payload).rows === rows &&
+              decodeSize(packet.payload).cols === cols
+            ) {
+              sawGeometry = true;
+            }
+            if (packet.type === MessageType.DATA) {
+              output += packet.payload.toString();
+              if (output.includes(`DRAW:${cols}x${rows}`)) {
+                clearTimeout(timer);
+                large.off("data", onData);
+                if (!sawGeometry) {
+                  reject(new Error("resize-triggered DATA arrived before GEOMETRY"));
+                } else {
+                  resolve();
+                }
+              }
+            }
+          }
+        };
+        large.on("data", onData);
+      });
+
+    const small = await connect(name);
+    const smallReader = new PacketReader();
+    const shrunk = observe(3, 20);
+    const smallInitial = collectPackets(small, smallReader, 2);
+    small.write(encodeAttach(3, 30));
+    const [smallPackets] = await Promise.all([smallInitial, shrunk]);
+    expect(smallPackets.map((packet) => packet.type)).toEqual([
+      MessageType.GEOMETRY,
+      MessageType.SCREEN,
+    ]);
+    expect(decodeSize(smallPackets[0].payload)).toEqual({ rows: 3, cols: 20 });
+
+    const resized = observe(6, 10);
+    small.write(encodeResize(8, 10));
+    await resized;
+
+    const restored = observe(6, 20);
+    small.write(encodeDetach());
+    await restored;
+
+    large.destroy();
+    small.destroy();
+  }, 15000);
+
+  it("notifies surviving clients when a quiet peer detaches", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh", ["-c", "sleep 30"], { rows: 6, cols: 20 });
+
+    const large = await connect(name);
+    const largeReader = new PacketReader();
+    large.write(encodeAttach(6, 20));
+    await waitForType(large, largeReader, MessageType.SCREEN);
+
+    const small = await connect(name);
+    const smallReader = new PacketReader();
+    const constrained = waitForType(large, largeReader, MessageType.GEOMETRY);
+    small.write(encodeAttach(6, 10));
+    await waitForType(small, smallReader, MessageType.SCREEN);
+    expect(decodeSize((await constrained).payload)).toEqual({ rows: 6, cols: 10 });
+
+    const restored = waitForType(large, largeReader, MessageType.GEOMETRY);
+    small.destroy();
+    expect(decodeSize((await restored).payload)).toEqual({ rows: 6, cols: 20 });
+
+    large.destroy();
   });
 
   it("uses minimum of each dimension independently", async () => {

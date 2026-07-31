@@ -4,11 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import * as net from "node:net";
 import {
   SessionConnection,
   sendData,
   peekScreen,
 } from "../src/connection.ts";
+import {
+  MessageType,
+  PacketReader,
+  encodeScreen,
+} from "../src/protocol.ts";
+import { getSocketPath } from "../src/sessions.ts";
 import { terminateAndWait } from "./setup/processes.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +120,63 @@ describe("SessionConnection", () => {
     expect(conn.connected).toBe(true);
     conn.disconnect();
     expect(conn.connected).toBe(false);
+  }, 15000);
+
+  it("emits effective geometry before the initial screen and peer redraw", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    await startDaemon(dir, name, "cat");
+
+    const events: string[] = [];
+    const large = new SessionConnection({ name, rows: 6, cols: 20 });
+    large.on("geometry", ({ rows, cols }) => events.push(`geometry:${cols}x${rows}`));
+    large.on("screen", () => events.push("screen"));
+    await large.connect();
+
+    expect(events.slice(0, 2)).toEqual(["geometry:20x6", "screen"]);
+
+    const peerGeometry = new Promise<{ rows: number; cols: number }>((resolve) => {
+      large.on("geometry", (geometry) => {
+        if (geometry.cols === 10) resolve(geometry);
+      });
+    });
+    const small = new SessionConnection({ name, rows: 6, cols: 10 });
+    await small.connect();
+
+    await expect(peerGeometry).resolves.toEqual({ rows: 6, cols: 10 });
+
+    small.disconnect();
+    large.disconnect();
+  }, 15000);
+
+  it("connects to a legacy server that sends SCREEN without GEOMETRY", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const socketPath = getSocketPath(name);
+    const server = net.createServer((socket) => {
+      const reader = new PacketReader();
+      socket.on("data", (data) => {
+        for (const packet of reader.feed(Buffer.from(data))) {
+          if (packet.type === MessageType.ATTACH) {
+            socket.write(encodeScreen("legacy-screen"));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+
+    try {
+      const conn = new SessionConnection({ name, rows: 24, cols: 80 });
+      await expect(conn.connect()).resolves.toContain("legacy-screen");
+      conn.disconnect();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   }, 15000);
 
   it("receives data events after connect", async () => {

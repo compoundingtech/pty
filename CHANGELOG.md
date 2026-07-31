@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Ordered effective geometry for embedded clients
+
+- Attached clients now receive a `GEOMETRY` protocol packet before the initial
+  `SCREEN` and before output caused by peer attach, resize, or detach changes
+  the min-wins terminal size. Legacy CLI clients safely ignore the additive
+  packet.
+- `SessionConnection` emits a typed `geometry` event. `attachPty()` and the
+  testing `Session` keep their requested viewport separate from the effective
+  emulator geometry, avoiding constrained-client resize feedback loops.
+
 ### Read-only session listing
 
 - `listSessions()` and `pty list` are now strictly observational: they no

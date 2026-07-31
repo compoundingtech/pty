@@ -409,6 +409,7 @@ const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
 const initialScreen = await conn.connect();
 
 conn.on("data", (data) => myTerminalView.write(data));
+conn.on("geometry", ({ rows, cols }) => myTerminalView.resize(cols, rows));
 conn.on("exit", (code) => console.log(`Exited: ${code}`));
 
 conn.write("hello\r");

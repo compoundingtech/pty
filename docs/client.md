@@ -189,6 +189,7 @@ const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
 const initialScreen = await conn.connect();
 
 conn.on("data", (data: string) => { /* terminal output */ });
+conn.on("geometry", ({ rows, cols }) => { /* effective shared size */ });
 conn.on("exit", (code: number) => { /* process exited */ });
 conn.on("close", () => { /* connection closed */ });
 conn.on("error", (err: Error) => { /* connection error */ });
@@ -206,6 +207,7 @@ conn.disconnect();               // close connection
 | Event | Payload | Description |
 |---|---|---|
 | `data` | `string` | Terminal output from the session |
+| `geometry` | `{ rows: number; cols: number }` | Effective shared geometry, emitted before the initial screen and before output caused by a geometry transition |
 | `screen` | `string` | Initial screen replay on connect |
 | `exit` | `number` | Session process exited with code |
 | `close` | — | Connection closed |
@@ -384,6 +386,7 @@ const MessageType = {
   SCREEN: 5,   // Screen replay
   PEEK: 6,     // Read-only peek request
   STATUS: 7,   // Stats query/response
+  GEOMETRY: 8, // Effective shared size (server → client)
 };
 ```
 

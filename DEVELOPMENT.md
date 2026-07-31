@@ -85,6 +85,8 @@ Binary packets over Unix sockets: `[type: uint8][length: uint32BE][payload]`
 | EXIT | 4 | Server → Client | `[exitCode: int32BE]` (4 bytes) |
 | SCREEN | 5 | Server → Client | ANSI escape sequences (string) |
 | PEEK | 6 | Client → Server | Empty |
+| STATUS | 7 | Both | Empty request / JSON response |
+| GEOMETRY | 8 | Server → Client | `[rows: uint16BE, cols: uint16BE]` (4 bytes) |
 
 `PacketReader` handles streaming reassembly of partial reads. Decoders gracefully handle truncated payloads (defaults for size, -1 for exit code). Unknown message types are silently ignored by the server.
 
@@ -102,9 +104,13 @@ We avoid TS enums because they emit runtime code that can't be type-stripped. In
 
 The PTY can only be one size. If a peek client's terminal size were used, it could reflow the session — imagine vim at 120x40 suddenly becoming 40x20 because someone peeked from their phone. Readonly clients are excluded from size negotiation entirely. They see whatever fits; the active user's layout is never disrupted.
 
-### Last attached client wins for size
+### Smallest connected client wins for size
 
-When multiple interactive (non-peek) clients are connected, the most recently attached client's terminal size is used for the PTY. This is simple and predictable. An alternative would be minimum dimensions across all clients, but that punishes the primary user when a smaller client connects.
+When multiple interactive clients are connected, the PTY uses the minimum rows
+and columns requested across them. Before changing that effective size, the
+server sends `GEOMETRY` to attached clients. Programmatic clients can therefore
+resize their emulators before interpreting the redraw caused by `SIGWINCH`.
+Read-only peek clients do not participate in negotiation.
 
 ### xterm-headless as the screen buffer
 

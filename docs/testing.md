@@ -356,7 +356,9 @@ await session2.waitForText("shared");
 - `session.hasExited` — whether the process has exited (always `false` for spawn-mode)
 - `session.name` — the session name (server-mode only)
 - `session.server` — the underlying `PtyServer` instance (server-mode only)
-- `session.rows` / `session.cols` — current terminal dimensions
+- `session.rows` / `session.cols` — this client's requested dimensions. In
+  server mode the local emulator follows the effective shared geometry reported
+  by the daemon, which may be smaller while another client is attached.
 
 ## Running Tests
 

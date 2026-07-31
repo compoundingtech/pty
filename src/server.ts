@@ -14,6 +14,7 @@ import {
   PacketReader,
   encodeData,
   encodeExit,
+  encodeGeometry,
   encodeScreen,
   encodeStatusResponse,
   decodeSize,
@@ -40,6 +41,7 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  screenReady: boolean;
 }
 
 export interface ServerOptions {
@@ -601,6 +603,7 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      screenReady: false,
     };
     this.clients.set(socket, client);
 
@@ -627,7 +630,11 @@ export class PtyServer {
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.screenReady = false;
             const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             // Stamp the last-attach timestamp so `pty gc --idle-days N`
             // (and per-session `strategy.idle-days=N` tags) can detect
             // abandonment. Best-effort — if the metadata file was
@@ -648,6 +655,7 @@ export class PtyServer {
               if (socket.destroyed) return;
               const screen = this.getModePrefix(true) + this.serialize.serialize();
               socket.write(encodeScreen(screen));
+              client.screenReady = true;
               if (this.exited) {
                 socket.write(encodeExit(this.exitCode));
               } else {
@@ -698,6 +706,7 @@ export class PtyServer {
               const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
               socket.write(encodeScreen(peekScreen));
             }
+            client.screenReady = true;
 
             if (this.exited) {
               socket.write(encodeExit(this.exitCode));
@@ -837,6 +846,7 @@ export class PtyServer {
 
     if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
+        this.broadcastGeometry(rows, cols);
         this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
         this.lastResizeTime = Date.now();
@@ -844,6 +854,15 @@ export class PtyServer {
       }
     }
     return false;
+  }
+
+  private broadcastGeometry(rows: number, cols: number): void {
+    const packet = encodeGeometry(rows, cols);
+    for (const client of this.clients.values()) {
+      if (!client.readonly && client.attachSeq > 0) {
+        client.socket.write(packet);
+      }
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
@@ -869,7 +888,9 @@ export class PtyServer {
 
   private broadcast(data: Buffer): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (client.screenReady) {
+        client.socket.write(data);
+      }
     }
   }
 

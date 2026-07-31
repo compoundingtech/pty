@@ -12,6 +12,16 @@ import type { BoxStyle, Theme } from "./colors.ts";
 import type { ScrollRegion } from "./scrollable.ts";
 import type { TextInputState } from "./text-input.ts";
 import { signal } from "./signals.ts";
+import { getSocketPath } from "../sessions.ts";
+import {
+  MessageType,
+  PacketReader,
+  encodeAttach,
+  encodeData,
+  encodeResize,
+  encodeDetach,
+  decodeSize,
+} from "../protocol.ts";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
@@ -602,10 +612,6 @@ export async function attachPty(
   const net = require("node:net") as typeof import("node:net");
   const xtermMod = require("@xterm/headless") as any;
   const TerminalClass = xtermMod.default?.Terminal ?? xtermMod.Terminal;
-  const { getSocketPath } = require("../sessions.js") as typeof import("../sessions.ts");
-  const {
-    MessageType, PacketReader, encodeAttach, encodeData, encodeResize, encodeDetach,
-  } = require("../protocol.js") as typeof import("../protocol.ts");
 
   const cols = opts?.cols ?? 80;
   const rows = opts?.rows ?? 24;
@@ -668,6 +674,15 @@ export async function attachPty(
   let exited = false;
   let exitCode: number | null = null;
   let dirty = false;
+  // Layout requests remain on handle.cols/rows. The emulator follows the
+  // daemon's effective size so a constrained peer cannot trigger resize loops.
+  let effectiveCols = cols;
+  let effectiveRows = rows;
+  let geometryAware: boolean | null = null;
+  let resolveInitialScreen!: () => void;
+  const initialScreen = new Promise<void>((resolve) => {
+    resolveInitialScreen = resolve;
+  });
   // See createPty for rationale — same pattern applies to attached sessions.
   const rev = signal(0);
   const bumpRev = () => rev.set(rev.peek() + 1);
@@ -681,18 +696,22 @@ export async function attachPty(
         handle.cols = newCols;
         handle.rows = newRows;
         socket.write(encodeResize(newRows, newCols));
-        terminal.resize(newCols, newRows);
+        if (geometryAware !== true) {
+          effectiveCols = newCols;
+          effectiveRows = newRows;
+          terminal.resize(newCols, newRows);
+        }
         dirty = true;
         bumpRev();
       }
     },
 
     readCells(scrollOffset?: number) {
-      return readXtermCells(terminal, handle.rows, handle.cols, scrollOffset ?? 0);
+      return readXtermCells(terminal, effectiveRows, effectiveCols, scrollOffset ?? 0);
     },
 
     readWrappedFlags(scrollOffset?: number) {
-      return readXtermWrappedFlags(terminal, handle.rows, scrollOffset ?? 0);
+      return readXtermWrappedFlags(terminal, effectiveRows, scrollOffset ?? 0);
     },
 
     kill() {
@@ -736,11 +755,17 @@ export async function attachPty(
     for (const packet of packets) {
       switch (packet.type) {
         case MessageType.SCREEN:
+          if (geometryAware === null) geometryAware = false;
           terminal.reset();
-          terminal.write(packet.payload.toString());
-          dirty = true;
-          bumpRev();
-          handle.onActivity?.();
+          const screen = packet.payload.toString();
+          const screenReady = () => {
+            dirty = true;
+            bumpRev();
+            handle.onActivity?.();
+            resolveInitialScreen();
+          };
+          if (screen.length === 0) screenReady();
+          else terminal.write(screen, screenReady);
           break;
         case MessageType.DATA:
           terminal.write(packet.payload.toString(), () => {
@@ -749,6 +774,17 @@ export async function attachPty(
             handle.onActivity?.();
           });
           break;
+        case MessageType.GEOMETRY: {
+          geometryAware = true;
+          const size = decodeSize(packet.payload);
+          effectiveCols = size.cols;
+          effectiveRows = size.rows;
+          terminal.resize(effectiveCols, effectiveRows);
+          dirty = true;
+          bumpRev();
+          handle.onActivity?.();
+          break;
+        }
         case MessageType.EXIT:
           exitCode = packet.payload.readInt32BE(0);
           exited = true;
@@ -761,7 +797,7 @@ export async function attachPty(
   });
 
   socket.write(encodeAttach(rows, cols));
-  await new Promise(r => setTimeout(r, 100));
+  await initialScreen;
 
   return handle;
 }
