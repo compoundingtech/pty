@@ -180,6 +180,150 @@ describe("pty attach --attach-stream-fd-v1", () => {
     expect(packets.at(-1)?.type).toBe(MessageType.EXIT);
   }, 15_000);
 
+  it("frames an intentional local detach before the shipped bin launcher closes fd 3", async () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "launcher-detach-"));
+    const name = `launcher-detach-${process.pid}`;
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PTY_ROOT: root,
+      PTY_ROOT_LEGACY_SILENT: "1",
+    };
+    delete launcherEnv.PTY_SESSION;
+    delete launcherEnv.PTY_SERVER_CONFIG;
+    const created = spawnSync(
+      nodeBin,
+      [cliPath, "run", "-d", "--id", name, "--", "sh", "-c", "printf DETACH_READY; sleep 300"],
+      { env: launcherEnv, encoding: "utf8" },
+    );
+    expect(created.status, created.stderr).toBe(0);
+
+    const child = spawn(
+      nodeBin,
+      [binPath, "attach", "--attach-stream-fd-v1", "3", name],
+      { env: launcherEnv, stdio: ["pipe", "pipe", "pipe", "pipe"] },
+    );
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    const streamChunks: Buffer[] = [];
+    const reader = new PacketReader();
+    let requestedDetach = false;
+    (child.stdio[3] as NodeJS.ReadableStream).on("data", (chunk) => {
+      const data = Buffer.from(chunk);
+      streamChunks.push(data);
+      for (const packet of reader.feed(data)) {
+        if (packet.type === MessageType.SCREEN && !requestedDetach) {
+          requestedDetach = true;
+          child.stdin.write(Buffer.from([0x1c]));
+        }
+      }
+    });
+
+    const status = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("bin launcher detach timed out")), 10_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+    spawnSync(nodeBin, [cliPath, "kill", name], { env: launcherEnv, encoding: "utf8" });
+
+    expect(status).toBe(0);
+    expect(await stdout).toEqual(Buffer.alloc(0));
+    expect(await stderr).toEqual(Buffer.alloc(0));
+    const packets = new PacketReader().feed(Buffer.concat(streamChunks));
+    expect(packets[0].type).toBe(MessageType.GEOMETRY);
+    expect(packets[1].type).toBe(MessageType.SCREEN);
+    expect(packets[1].payload.toString()).toContain("DETACH_READY");
+    expect(packets.at(-1)?.type).toBe(MessageType.DETACH);
+    expect(packets.some((packet) => packet.type === MessageType.EXIT)).toBe(false);
+  }, 15_000);
+
+  it("frames an intentional local detach before the initial daemon baseline", async () => {
+    const { server, port } = await listen();
+    const attached = new Promise<void>((resolve) => {
+      server.once("connection", (socket) => socket.once("data", () => resolve()));
+    });
+    const child = spawn(nodeBin, ["--input-type=module", "-e", attachScript(port)], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    const stream = collect(child.stdio[3] as NodeJS.ReadableStream);
+    await attached;
+    child.stdin.write(Buffer.from([0x1c]));
+    const status = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("pre-baseline detach timed out")), 5_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+    server.close();
+
+    expect(status).toBe(0);
+    expect(await stdout).toEqual(Buffer.alloc(0));
+    expect(await stderr).toEqual(Buffer.alloc(0));
+    expect(new PacketReader().feed(await stream).map((packet) => packet.type)).toEqual([
+      MessageType.DETACH,
+    ]);
+  });
+
+  it("does not frame DETACH when EXIT wins the pending detach-key window", async () => {
+    const { server, port } = await listen();
+    let daemonSocket: net.Socket | undefined;
+    server.once("connection", (socket) => {
+      daemonSocket = socket;
+      socket.once("data", () => socket.write(Buffer.concat([
+        encodeGeometry(24, 80),
+        encodeScreen("exit wins"),
+      ])));
+    });
+    const script = `
+      import net from "node:net";
+      import { attach } from ${JSON.stringify(clientUrl)};
+      const socket = net.createConnection({ host: "127.0.0.1", port: ${port} });
+      socket.once("connect", () => attach({
+        name: "fixture",
+        socket,
+        attachStreamFdV1: 3,
+        onExit: (code) => setTimeout(() => process.exit(code), 600),
+        onDetach: () => process.exit(42),
+      }));
+    `;
+    const child = spawn(nodeBin, ["--input-type=module", "-e", script], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    const chunks: Buffer[] = [];
+    const reader = new PacketReader();
+    (child.stdio[3] as NodeJS.ReadableStream).on("data", (chunk) => {
+      const data = Buffer.from(chunk);
+      chunks.push(data);
+      if (reader.feed(data).some((packet) => packet.type === MessageType.SCREEN)) {
+        child.stdin.write(Buffer.from([0x1c]));
+        setTimeout(() => daemonSocket?.end(encodeExit(0)), 50);
+      }
+    });
+    const status = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("exit/detach race timed out")), 5_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+    server.close();
+
+    expect(status).toBe(0);
+    expect(await stdout).toEqual(Buffer.alloc(0));
+    expect(await stderr).toEqual(Buffer.alloc(0));
+    expect(new PacketReader().feed(Buffer.concat(chunks)).map((packet) => packet.type)).toEqual([
+      MessageType.GEOMETRY,
+      MessageType.SCREEN,
+      MessageType.EXIT,
+    ]);
+  });
+
   it("reframes fragmented and coalesced daemon packets in order without stdout output", async () => {
     const geometry = encodeGeometry(31, 97);
     const screen = encodeScreen("\x1b[31mred\x1b[0m");

@@ -68,7 +68,10 @@ notification because pty does not journal a cross-file transaction.
 
 - `pty attach --attach-stream-fd-v1 <fd> <ref>` keeps stdin/stdout as the
   controlling terminal while writing ordered, existing-protocol `GEOMETRY`,
-  `SCREEN`, `DATA`, and `EXIT` packets to a dedicated inherited descriptor.
+  `SCREEN`, and `DATA` packets plus a terminal `EXIT` or `DETACH` outcome to a
+  dedicated inherited descriptor. Intentional local detach is framed and
+  flushed even when it occurs before the initial daemon baseline, so consumers
+  can distinguish it from a truncated stream.
   The descriptor remains caller-owned and must be closed by the caller for
   consumers to observe EOF. Invalid descriptors, write failures, and daemons
   that do not provide the v1 geometry-first contract fail clearly on stderr.

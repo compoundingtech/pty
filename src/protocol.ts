@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 export const MessageType = {
   DATA: 0, // Terminal data (bidirectional)
   ATTACH: 1, // Client → Server: attaching with terminal size
-  DETACH: 2, // Client → Server: detaching
+  DETACH: 2, // Client → Server: detach; machine stream → caller: intentional detach outcome
   RESIZE: 3, // Client → Server: terminal resized
   EXIT: 4, // Server → Client: process exited
   SCREEN: 5, // Server → Client: screen buffer replay on attach

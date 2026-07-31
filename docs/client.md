@@ -370,14 +370,19 @@ Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to de
 Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
 machine mode. stdin and stdout remain the controlling terminal for input and
 resize events, but terminal output is written only to that descriptor using the
-existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, `DATA`,
-and `EXIT` packets. Each initial attach or reconnect starts with `GEOMETRY`; a
+existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, and
+`DATA` packets followed by one terminal outcome: `EXIT` when the session process
+ends or `DETACH` when the local user intentionally detaches. `DETACH` may be the
+first packet when the user detaches before the daemon supplies its initial
+baseline. Each initial attach or reconnect otherwise starts with `GEOMETRY`; a
 daemon that sends terminal data first is rejected as unsupported.
 
 The descriptor remains caller-owned. `attach()` flushes its writer but does not
 close the descriptor, so a consumer sees EOF only when the caller closes its
-copy (or the process exits). Descriptor errors fail the attach and are reported
-on stderr; stderr text is never written into the framed stream.
+copy (or the process exits). A clean EOF follows a framed `EXIT` or `DETACH`;
+EOF without either outcome is a truncated stream. Descriptor errors fail the
+attach and are reported on stderr; stderr text is never written into the framed
+stream.
 
 ### `peek(options: PeekOptions): void`
 
@@ -486,7 +491,7 @@ socket.on("data", (raw) => {
 const MessageType = {
   DATA: 0,     // Terminal output / input
   ATTACH: 1,   // Client attach with size
-  DETACH: 2,   // Client detach
+  DETACH: 2,   // Client → server request; machine stream → caller outcome
   RESIZE: 3,   // Terminal resize
   EXIT: 4,     // Process exited
   SCREEN: 5,   // Screen replay
@@ -495,6 +500,12 @@ const MessageType = {
   GEOMETRY: 10, // Effective shared rows/cols (server → client)
 };
 ```
+
+`DETACH` always has an empty payload. On the session socket it requests that
+the client connection detach. On `--attach-stream-fd-v1`, it is the terminal
+outcome for an intentional local detach and is flushed before clean completion.
+Clean EOF follows either `DETACH` or `EXIT`; EOF without either outcome is a
+truncated stream.
 
 Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
 unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
