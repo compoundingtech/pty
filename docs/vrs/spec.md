@@ -141,7 +141,7 @@ The last row is a non-zero truncation, not a third clean outcome (R07, R08).
 generation locks; display names and tags remain mutable lookup/presentation
 fields (R09).
 
-Inventory is observational: it derives running/exited/stale state and enriches
+Inventory is observational: it derives running/exited/vanished state and enriches
 it with live status when available, but does not restart, reap, or attach.
 Status reports client roles, requested/effective geometry, process resources,
 and terminal modes.

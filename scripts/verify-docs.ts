@@ -10,7 +10,10 @@ const docsPath = path.join(projectRoot, "docs", "testing.md");
 const vrsRoot = path.join(projectRoot, "docs", "vrs");
 
 function verifyVrs(): void {
-  if (!fs.existsSync(vrsRoot)) return;
+  if (!fs.existsSync(vrsRoot)) {
+    console.error("VRS verification failed:\n- docs/vrs is missing");
+    process.exit(1);
+  }
 
   const expected = ["requirements.md", "spec.md"];
   const actual = fs.readdirSync(vrsRoot).sort();
