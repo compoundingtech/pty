@@ -169,8 +169,9 @@ describe("pty nesting prevention", () => {
     expect(found).toBeDefined();
     expect(found.status).toBe("running");
 
-    // Clean up the daemon
-    try { process.kill(found.pid, "SIGTERM"); } catch {}
+    // Let the awaited teardown barrier stop this detached daemon before the
+    // suite removes its session root.
+    bgPids.push(found.pid);
   }, 15000);
 
   it("propagates exit code from nested command", () => {
@@ -207,7 +208,8 @@ describe("pty nesting prevention", () => {
     const found = sessions.find((s: any) => s.name === name);
     expect(found).toBeDefined();
 
-    // Clean up the daemon
-    try { process.kill(found.pid, "SIGTERM"); } catch {}
+    // Let the awaited teardown barrier stop this detached daemon before the
+    // suite removes its session root.
+    bgPids.push(found.pid);
   }, 15000);
 });
