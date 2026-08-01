@@ -1,4 +1,8 @@
 import { Buffer } from "node:buffer";
+import {
+  BoundedFrameReader,
+  encodeLengthPrefixedFrame,
+} from "./frame-codec.ts";
 
 export const MessageType = {
   DATA: 0, // Terminal data (bidirectional)
@@ -20,9 +24,6 @@ export interface Packet {
   payload: Buffer;
 }
 
-// Packet wire format: [type: uint8][length: uint32BE][payload: N bytes]
-const HEADER_SIZE = 5;
-
 // BUG-3: cap legitimate packet size. SCREEN replays carry the serialized
 // xterm buffer (rows × cols × attrs × scrollback). With the 10k-line default
 // scrollback plus mode prefixes, 32 MiB is generously above any real payload
@@ -43,10 +44,7 @@ export class PacketTooLargeError extends Error {
 }
 
 export function encodePacket(type: MessageType, payload: Buffer): Buffer {
-  const header = Buffer.alloc(HEADER_SIZE);
-  header.writeUInt8(type, 0);
-  header.writeUInt32BE(payload.length, 1);
-  return Buffer.concat([header, payload]);
+  return encodeLengthPrefixedFrame(type, payload);
 }
 
 export function encodeData(data: string): Buffer {
@@ -128,32 +126,12 @@ export function decodeExit(payload: Buffer): number {
  *  Throws `PacketTooLargeError` if a peer declares a length exceeding
  *  `MAX_PACKET_LENGTH` — handlers should destroy the socket. */
 export class PacketReader {
-  private buffer = Buffer.alloc(0);
+  private readonly reader = new BoundedFrameReader<MessageType>({
+    maximum: MAX_PACKET_LENGTH,
+    error: (declaredLength) => new PacketTooLargeError(declaredLength),
+  });
 
   feed(data: Buffer): Packet[] {
-    this.buffer = Buffer.concat([this.buffer, data]);
-    const packets: Packet[] = [];
-
-    while (this.buffer.length >= HEADER_SIZE) {
-      const type = this.buffer.readUInt8(0) as MessageType;
-      const length = this.buffer.readUInt32BE(1);
-
-      if (length > MAX_PACKET_LENGTH) {
-        // Poison the buffer so subsequent feed() calls can't continue past
-        // the bad header (even though the caller should drop the connection).
-        this.buffer = Buffer.alloc(0);
-        throw new PacketTooLargeError(length);
-      }
-
-      if (this.buffer.length < HEADER_SIZE + length) break;
-
-      const payload = Buffer.from(
-        this.buffer.subarray(HEADER_SIZE, HEADER_SIZE + length)
-      );
-      packets.push({ type, payload });
-      this.buffer = this.buffer.subarray(HEADER_SIZE + length);
-    }
-
-    return packets;
+    return this.reader.feed(data);
   }
 }

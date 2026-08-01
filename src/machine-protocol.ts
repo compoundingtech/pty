@@ -1,9 +1,12 @@
 import { Buffer } from "node:buffer";
+import {
+  BoundedFrameReader,
+  encodeLengthPrefixedFrame,
+} from "./frame-codec.ts";
 
 export const MACHINE_PROTOCOL_VERSION = 2 as const;
 export const MAX_MACHINE_FRAME_LENGTH = 32 * 1024 * 1024;
 
-const HEADER_SIZE = 5;
 const MAX_STRUCTURED_PAYLOAD_LENGTH = 64 * 1024;
 const MAX_STRING_LENGTH = 4096;
 const MAX_CAPABILITIES = 32;
@@ -159,39 +162,27 @@ export class MachineProtocolError extends Error {
 }
 
 function encodeFrame(type: number, payload: Buffer): Buffer {
-  if (payload.length > MAX_MACHINE_FRAME_LENGTH) {
-    throw new MachineProtocolError(
-      `Machine frame length ${payload.length} exceeds maximum ${MAX_MACHINE_FRAME_LENGTH}`,
-    );
-  }
-  const header = Buffer.alloc(HEADER_SIZE);
-  header.writeUInt8(type, 0);
-  header.writeUInt32BE(payload.length, 1);
-  return Buffer.concat([header, payload]);
+  return encodeLengthPrefixedFrame(type, payload, {
+    maximum: MAX_MACHINE_FRAME_LENGTH,
+    error: machineFrameTooLarge,
+  });
 }
 
 export class MachineFrameReader {
-  private buffer = Buffer.alloc(0);
+  private readonly reader = new BoundedFrameReader<number>({
+    maximum: MAX_MACHINE_FRAME_LENGTH,
+    error: machineFrameTooLarge,
+  });
 
   feed(chunk: Buffer): MachineWireFrame[] {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    const frames: MachineWireFrame[] = [];
-    while (this.buffer.length >= HEADER_SIZE) {
-      const type = this.buffer.readUInt8(0);
-      const length = this.buffer.readUInt32BE(1);
-      if (length > MAX_MACHINE_FRAME_LENGTH) {
-        this.buffer = Buffer.alloc(0);
-        throw new MachineProtocolError(`Machine frame length ${length} exceeds maximum ${MAX_MACHINE_FRAME_LENGTH}`);
-      }
-      if (this.buffer.length < HEADER_SIZE + length) break;
-      frames.push({
-        type,
-        payload: Buffer.from(this.buffer.subarray(HEADER_SIZE, HEADER_SIZE + length)),
-      });
-      this.buffer = this.buffer.subarray(HEADER_SIZE + length);
-    }
-    return frames;
+    return this.reader.feed(chunk);
   }
+}
+
+function machineFrameTooLarge(declaredLength: number): MachineProtocolError {
+  return new MachineProtocolError(
+    `Machine frame length ${declaredLength} exceeds maximum ${MAX_MACHINE_FRAME_LENGTH}`,
+  );
 }
 
 function structured(value: unknown): Buffer {

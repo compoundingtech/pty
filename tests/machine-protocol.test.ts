@@ -56,6 +56,30 @@ describe("machine attach v2 protocol", () => {
     expect(frames).toEqual([open, { _tag: "Input", bytes: input }, { _tag: "Detach" }]);
   });
 
+  it("round-trips many deterministic fragmentations of a coalesced stream", () => {
+    const expected = [
+      open,
+      { _tag: "Input" as const, bytes: Buffer.from([0x00, 0xff, 0x1b, 0x62, 0x1c]) },
+      { _tag: "Resize" as const, rows: 60, cols: 180 },
+      { _tag: "Detach" as const },
+    ];
+    const wire = Buffer.concat(expected.map(encodeMachineRequest));
+
+    for (let seed = 1; seed <= 64; seed += 1) {
+      const reader = new MachineFrameReader();
+      const frames = [];
+      let offset = 0;
+      let state = seed;
+      while (offset < wire.length) {
+        state = (state * 1664525 + 1013904223) >>> 0;
+        const length = 1 + (state % 23);
+        frames.push(...reader.feed(wire.subarray(offset, offset + length)));
+        offset += length;
+      }
+      expect(frames.map(decodeMachineRequest)).toEqual(expected);
+    }
+  });
+
   it("preserves arbitrary bytes within the framed transport", () => {
     const bytes = Buffer.from([0x00, 0xff, 0x1b, 0x62, 0x1c]);
     for (const frame of [
@@ -109,7 +133,21 @@ describe("machine attach v2 protocol", () => {
     const oversized = Buffer.alloc(5);
     oversized.writeUInt8(1, 0);
     oversized.writeUInt32BE(32 * 1024 * 1024 + 1, 1);
-    expect(() => new MachineFrameReader().feed(oversized)).toThrow(MachineProtocolError);
+    const poisonedReader = new MachineFrameReader();
+    let initialError: unknown;
+    try {
+      poisonedReader.feed(oversized);
+    } catch (error) {
+      initialError = error;
+    }
+    expect(initialError).toBeInstanceOf(MachineProtocolError);
+    let subsequentError: unknown;
+    try {
+      poisonedReader.feed(encodeMachineRequest({ _tag: "Detach" }));
+    } catch (error) {
+      subsequentError = error;
+    }
+    expect(subsequentError).toBe(initialError);
 
     expect(() => encodeMachineRequest({ ...open, rows: 0 })).toThrow(MachineProtocolError);
 

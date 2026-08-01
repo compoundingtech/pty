@@ -235,18 +235,44 @@ describe("protocol", () => {
       expect(() => reader.feed(header)).toThrow(PacketTooLargeError);
     });
 
-    it("poisons the buffer after oversize throw (subsequent feeds don't buffer unbounded)", () => {
+    it("remains poisoned after an oversized header", () => {
       const reader = new PacketReader();
       const header = Buffer.alloc(5);
       header.writeUInt8(MessageType.DATA, 0);
       header.writeUInt32BE(0xffffffff, 1);
 
-      try { reader.feed(header); } catch {}
-      // Buffer is cleared, so subsequent valid packets parse correctly from
-      // the new boundary (not treating their bytes as payload of the bad one).
-      const packets = reader.feed(encodeData("hi"));
-      expect(packets).toHaveLength(1);
-      expect(packets[0].payload.toString()).toBe("hi");
+      let initialError: unknown;
+      try {
+        reader.feed(header);
+      } catch (error) {
+        initialError = error;
+      }
+      expect(initialError).toBeInstanceOf(PacketTooLargeError);
+      let subsequentError: unknown;
+      try {
+        reader.feed(encodeData("hi"));
+      } catch (error) {
+        subsequentError = error;
+      }
+      expect(subsequentError).toBe(initialError);
+    });
+
+    it("round-trips coalesced packets under every single-byte split", () => {
+      const wire = Buffer.concat([
+        encodeData("alpha"),
+        encodeDetach(),
+        encodePacket(99 as MessageType, Buffer.from([0x00, 0xff, 0x1b])),
+        encodeData("omega"),
+      ]);
+      const reader = new PacketReader();
+      const packets = [...wire].flatMap((byte) => reader.feed(Buffer.from([byte])));
+
+      expect(packets).toEqual([
+        { type: MessageType.DATA, payload: Buffer.from("alpha") },
+        { type: MessageType.DETACH, payload: Buffer.alloc(0) },
+        { type: 99, payload: Buffer.from([0x00, 0xff, 0x1b]) },
+        { type: MessageType.DATA, payload: Buffer.from("omega") },
+      ]);
     });
 
     it("accepts packets at exactly MAX_PACKET_LENGTH", () => {
