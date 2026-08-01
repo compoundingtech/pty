@@ -127,6 +127,7 @@ describe("vanished status", () => {
     const found = sessions.find((s: any) => s.name === name);
     expect(found).toBeDefined();
     expect(found.status).toBe("vanished");
+    expect(found.generation).toBeNull();
     expect(found.exitCode).toBeNull();
     expect(found.exitedAt).toBeNull();
   }, 10000);

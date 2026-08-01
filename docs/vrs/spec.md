@@ -273,6 +273,12 @@ fields (R09).
 
 Inventory is observational: it derives running/exited/vanished state and enriches
 it with live status when available, but does not restart, reap, or attach.
+Every flattened local or remote inventory row carries the stable id and the
+current opaque daemon generation as `generation: string | null`; live status
+carries the same daemon generation as a string. Machine clients use this exact
+pair for same-connection admission. Historical generation-less records remain
+visible as `null` but are not eligible for machine attach v2; `createdAt` is
+never interpreted as a generation.
 Status reports client roles, requested/effective geometry, process resources,
 and terminal modes.
 

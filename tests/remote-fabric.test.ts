@@ -39,7 +39,7 @@ function waitForFile(p: string, timeoutMs: number): boolean {
 
 /** Speak the control protocol directly (no fabric): one line {"op":"list"},
  *  read until the server half-closes, parse the JSON response. */
-function rawList(sockPath: string): Promise<{ sessions: { name: string }[] }> {
+function rawList(sockPath: string): Promise<{ sessions: { name: string; generation: string | null }[] }> {
   return new Promise((resolve, reject) => {
     const c = net.createConnection(sockPath);
     let buf = "";
@@ -95,6 +95,7 @@ describe("pty ls --remote over fabric", () => {
     expect(names).toContain("demo");
     const demo = out.remote[0].sessions.find((s: { name: string }) => s.name === "demo");
     expect(demo.status).toBe("running");
+    expect(demo.generation).toEqual(expect.any(String));
     expect(demo.command).toBe("sleep 300");
     expect(demo.displayName).toBe("Demo Session");
   }, 20000);

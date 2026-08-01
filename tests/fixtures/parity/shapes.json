@@ -15,6 +15,7 @@
           "run": ["run", "-d", "--id", "runsess", "--no-display-name", "--", "cat"],
           "expect": {
             "name": { "exact": "runsess" },
+            "generation": { "type": "string" },
             "status": { "exact": "running" },
             "pid": { "type": "number", "note": "daemon pid; != stats.process.pid (child)" },
             "command": { "exact": "cat" },
@@ -30,6 +31,7 @@
           "run": ["run", "-d", "--id", "exsess", "--name", "my-label", "--", "sh", "-c", "exit 3"],
           "expect": {
             "name": { "exact": "exsess" },
+            "generation": { "type": "string" },
             "status": { "exact": "exited" },
             "pid": { "exact": null },
             "command": { "exact": "sh -c exit 3" },

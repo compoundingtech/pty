@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Machine admission inventory
+
+- `pty list --json`, remote inventory, and live status now expose the opaque
+  daemon `generation` alongside the stable session `name`. Current sessions
+  return a string; flattened historical generation-less inventory returns
+  `null`. Machine clients can discover the exact identity pair required by
+  `machine-attach-v2` without parsing registry files or substituting
+  `createdAt` as an unsafe heuristic.
+
 ### Storage format
 
 - Supporting live daemons now advertise a `recovery` capability in session

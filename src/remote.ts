@@ -20,6 +20,7 @@ export const FABRIC_BIN = process.env.PTY_FABRIC_BIN ?? "fabric";
  *  results render through the existing path unchanged. */
 export interface RemoteSessionRow {
   name: string;
+  generation: string | null;
   status: string;
   command?: string;
   cwd?: string;
@@ -62,6 +63,7 @@ function toRow(s: SessionInfo): RemoteSessionRow {
   const m = s.metadata;
   return {
     name: s.name,
+    generation: m?.generation ?? null,
     status: s.status,
     ...(m?.displayCommand ? { command: m.displayCommand } : {}),
     ...(m?.cwd ? { cwd: m.cwd } : {}),

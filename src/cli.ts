@@ -2254,6 +2254,7 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
         ? s.metadata.displayCommand
         : null,
       cwd: s.metadata?.cwd ?? null,
+      generation: s.metadata?.generation ?? null,
       createdAt: s.metadata?.createdAt ?? null,
       exitCode: s.metadata?.exitCode ?? null,
       exitedAt: s.metadata?.exitedAt ?? null,

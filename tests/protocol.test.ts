@@ -338,9 +338,10 @@ describe("protocol", () => {
       expect(received).toBe("after-unknown");
     });
 
-    it("accepts an old-daemon STATUS response without connection details", () => {
+    it("accepts a STATUS response without connection details", () => {
       const response = {
         name: "legacy",
+        generation: "legacy-generation",
         terminal: {
           cols: 80,
           rows: 24,

@@ -16,6 +16,13 @@ import { PacketReader, MessageType } from "@compoundingtech/pty/protocol";
 List all retained sessions without mutating the registry. Cleanup is owned by
 explicit lifecycle operations such as `gc()` and `cleanupAll()`.
 
+`SessionInfo.metadata?.generation` is the current daemon's opaque admission
+token. `pty list --json` projects it as `generation: string | null` alongside
+the stable `name`, and remote inventory preserves the same pair. Machine
+clients pass a non-null observed token as `OPEN.expectedGeneration`; `null`
+identifies historical metadata that cannot be admitted through machine attach
+v2. `createdAt` is presentation metadata and is never an admission token.
+
 ### `getSession(ref: string): Promise<SessionInfo | null>`
 
 Resolve a stable session id or display name. An exact stable id always wins. A
@@ -148,6 +155,7 @@ interface SessionInfo {
 }
 
 interface SessionMetadata {
+  generation?: string; // opaque daemon-generation token
   command: string;
   args: string[];
   displayCommand: string;
@@ -306,6 +314,7 @@ each writable client's requested size and which min-wins axes it constrains.
 ```typescript
 interface StatsResult {
   name: string;
+  generation: string; // opaque daemon-generation token
   terminal: {
     cols: number; rows: number;
     cursorX: number; cursorY: number;

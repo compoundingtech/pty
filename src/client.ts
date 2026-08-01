@@ -292,6 +292,7 @@ export interface ProcessResources {
 
 export interface StatsResult {
   name: string;
+  generation: string;
   terminal: {
     cols: number;
     rows: number;

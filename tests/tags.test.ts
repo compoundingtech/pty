@@ -115,7 +115,7 @@ describe("session tags", () => {
     expect(meta.tags).toEqual({ owner: "forge", env: "dev" });
   }, 15000);
 
-  it("tags appear in pty list --json", async () => {
+  it("list and stats publish the exact daemon generation", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     await startDaemon(dir, name, "cat", [], { owner: "myapp" });
@@ -123,8 +123,15 @@ describe("session tags", () => {
     const output = runCli(dir, "list", "--json");
     const sessions = JSON.parse(output);
     const session = sessions.find((s: any) => s.name === name);
+    const metadata = JSON.parse(fs.readFileSync(path.join(dir, `${name}.json`), "utf-8"));
+    const stats = JSON.parse(runCli(dir, "stats", "--json", name));
     expect(session).toBeDefined();
     expect(session.tags).toEqual({ owner: "myapp" });
+    expect(session.generation).toBe(metadata.generation);
+    expect(stats.generation).toBe(metadata.generation);
+    expect(stats.generation).toBe(session.generation);
+    expect(session.generation).not.toBe(session.createdAt);
+    expect(stats.generation).not.toBe(stats.createdAt);
   }, 15000);
 
   it("pty list --filter-tag filters JSON output to matching sessions", async () => {

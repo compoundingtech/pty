@@ -1762,6 +1762,7 @@ export class PtyServer {
 
     return {
       name: this.name,
+      generation: this.generation,
       terminal: {
         cols: this.terminal.cols,
         rows: this.terminal.rows,
