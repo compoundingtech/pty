@@ -2063,6 +2063,58 @@ describe("STATUS message", () => {
     statsClient.destroy();
   });
 
+  it("ignores RESIZE from a command socket until that socket attaches", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const attached = await connect(name);
+    const attachedPackets = recordPackets(attached);
+    attached.write(encodeAttach(24, 80));
+    await attachedPackets.waitFor((packets) =>
+      packets.some((packet) => packet.type === MessageType.SCREEN)
+    );
+
+    const command = await connect(name);
+    const commandPackets = recordPackets(command);
+    command.write(
+      Buffer.concat([
+        encodeData("command-input-remains-valid\n"),
+        encodeResize(13, 37),
+        encodeStatus(),
+      ])
+    );
+    await commandPackets.waitFor((packets) =>
+      packets.some((packet) => packet.type === MessageType.STATUS)
+    );
+    await attachedPackets.waitFor((packets) =>
+      packets.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("command-input-remains-valid")
+      )
+    );
+
+    const status = commandPackets.packets.find(
+      (packet) => packet.type === MessageType.STATUS
+    )!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({
+      total: 1,
+      attached: 1,
+      readOnly: 0,
+    });
+    expect(stats.terminal).toMatchObject({ rows: 24, cols: 80 });
+    expect(
+      commandPackets.packets.some((packet) => packet.type === MessageType.GEOMETRY)
+    ).toBe(false);
+    expect(
+      commandPackets.packets.some((packet) => packet.type === MessageType.SCREEN)
+    ).toBe(false);
+
+    attached.destroy();
+    command.destroy();
+  });
+
   it("reports anonymous client geometry and per-axis constraints", async () => {
     const name = uniqueName();
     await startServer(name, "cat");

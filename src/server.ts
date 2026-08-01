@@ -1021,7 +1021,7 @@ export class PtyServer {
           }
 
           case MessageType.RESIZE: {
-            if (!client.readonly && packet.payload.length >= 4) {
+            if (!client.readonly && client.attachSeq > 0 && packet.payload.length >= 4) {
               const size = decodeSize(packet.payload);
               client.rows = size.rows;
               client.cols = size.cols;

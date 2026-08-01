@@ -96,16 +96,32 @@ A local machine detach may end with `DETACH` before a baseline is emitted.
 
 ### Roles and geometry
 
-Role frames replace, rather than accumulate, socket state (R05):
+Each socket begins in the command role. Role frames replace, rather than
+accumulate, socket state (R05):
 
 | Frame | Resulting role | Geometry membership | Input/resize |
 | --- | --- | --- | --- |
-| complete `ATTACH(rows, cols)` | writable | requested rows/cols | enabled |
+| complete `ATTACH(rows, cols)` | writable-attached | requested rows/cols | enabled |
 | recognized `PEEK(flags)` | readonly | none | disabled |
 | malformed `ATTACH` | unchanged | unchanged | unchanged |
 | `STATUS` | unchanged | unchanged | unchanged |
 
-For writable request set `W`, shared geometry is (R06):
+Client-to-server data, status, and resize behavior is role-specific:
+
+| Role | `DATA` | `STATUS` | `RESIZE` |
+| --- | --- | --- | --- |
+| command | accepted | accepted | ignored |
+| writable-attached | accepted | accepted | accepted |
+| readonly | ignored | accepted | ignored |
+
+Command sockets do not receive a screen baseline and do not participate in
+geometry. They may receive baseline-less live `DATA` or `EXIT` broadcasts;
+those packets do not constitute reconstructable terminal state. A consumer that
+needs reconstructable terminal state must first send `ATTACH` or `PEEK`. Public
+stats omit command sockets and expose the writable-attached role with the
+compatibility string `"writable"`.
+
+For writable-attached request set `W`, shared geometry is (R06):
 
 ```text
 rows = min(client.rows for client in W)
@@ -114,7 +130,7 @@ cols = min(client.cols for client in W)
 
 The dimensions are minimized independently. A changed `GEOMETRY` notification
 precedes terminal output produced after the corresponding PTY resize. Removing
-the last writable client leaves the last effective geometry stable.
+the last writable-attached client leaves the last effective geometry stable.
 
 ### Machine attach
 

@@ -21,8 +21,9 @@ implementation contract and validation map live in [spec.md](./spec.md).
 
 - **T01 Per-session daemon:** Each session pays for an independent daemon in
   exchange for client-independent lifetime and failure isolation.
-- **T02 Shared grid:** All writable clients share the minimum requested rows and
-  minimum requested columns so every writer can represent the complete grid.
+- **T02 Shared grid:** All writable-attached clients share the minimum requested
+  rows and minimum requested columns so every attached writer can represent the
+  complete grid.
 - **T03 Pre-1.0 compatibility:** Public storage and package APIs may evolve
   before 1.0, but readers remain bounded and documented compatibility tiers are
   preserved deliberately.
@@ -56,12 +57,15 @@ implementation contract and validation map live in [spec.md](./spec.md).
   emits terminal state sends effective geometry, exactly one screen baseline,
   then post-cut data and at most one process exit in source order. A later mode
   request supersedes an unfinished generation; reconnect starts a new one.
-- **R05 Replaceable client roles:** A complete `ATTACH` makes its socket
-  writable, installs requested geometry, and enables input and resize. A
-  recognized `PEEK` makes it readonly and removes its geometry constraint. A
-  malformed attach changes neither role nor synchronization generation.
+- **R05 Replaceable client roles:** A fresh command socket accepts input and
+  status requests but starts no screen baseline, has no geometry membership,
+  and cannot resize. A complete `ATTACH` makes it writable-attached, retaining
+  input and status capabilities while installing requested geometry, enabling
+  resize, and starting ordered baseline synchronization. A recognized `PEEK`
+  makes it readonly and removes its geometry constraint. A malformed attach
+  changes neither role nor synchronization generation.
 - **R06 Deterministic geometry:** Effective rows and columns are the independent
-  minima requested by writable clients. Attach, resize, and disconnect
+  minima requested by writable-attached clients. Attach, resize, and disconnect
   recompute them; readonly observation never constrains them. Geometry changes
   are visible before terminal bytes produced for the new size.
 - **R07 Bounded stream protocol:** Packets are length-delimited, fragmented
