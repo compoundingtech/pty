@@ -134,22 +134,82 @@ the last writable-attached client leaves the last effective geometry stable.
 
 ### Machine attach
 
-`attach --attach-stream-fd-v1 <fd> <ref>` requires an inherited writable
-descriptor `fd >= 3`. The packaged CLI runs without a wrapper child so the
-descriptor, controlling terminal, signals, and process identity reach the
-adapter unchanged (R08, R11).
+`machine-attach-v2` gives stdin and stdout exclusively to a bounded framed
+protocol. It does not allocate a controlling terminal, inherit a side-channel
+descriptor, interpret an interactive detach key, or fall back to machine attach
+v1 (R08, R11).
 
-The adapter reframes only `GEOMETRY`, `SCREEN`, `DATA`, and terminal outcomes to
-the descriptor; terminal interaction stays on stdin/stdout and diagnostics use
-stderr. It flushes exactly one clean outcome before EOF:
+```text
+host                         adapter                         daemon
+ | OPEN(id,generation,size,caps) |                              |
+ |------------------------------>| OPEN_V2 + STATUS sentinel    |
+ |                               |----------------------------->|
+ |       ADMISSION_FAILURE       |<-- STATUS (legacy) ----------|
+ |<------------------------------|                              |
+ |                               |<-- ADMISSION_V2 --------------|
+ | HELLO -> READY -> updates     |                              |
+ |<------------------------------|                              |
+ | INPUT / RESIZE / DETACH       |                              |
+ |------------------------------>|----------------------------->|
+ | typed stream outcome -> EOF   |                              |
+ |<------------------------------|                              |
+```
 
-| Outcome | Meaning |
-| --- | --- |
-| `EXIT(code)` | the session process ended |
-| empty `DETACH` | this local client intentionally detached |
-| EOF without either | transport loss, reconnect give-up, descriptor failure, or abrupt administrative destruction |
+Every machine frame uses the common five-byte header and the 32 MiB bound.
+Structured payloads are fatal UTF-8 JSON capped at 64 KiB with exact fields;
+unknown tags or fields are protocol errors. `DATA`, `INPUT`, and the screen
+suffixes of `READY` and `SNAPSHOT` remain byte payloads. `INPUT` reaches the
+node-pty string boundary only after one fatal UTF-8 validation. Valid UTF-8 and
+all C0/escape bytes, including `0x1c`, pass unchanged; invalid UTF-8 produces a
+typed failure rather than replacement characters (R07, R08).
 
-The last row is a non-zero truncation, not a third clean outcome (R07, R08).
+The direction-specific frame schemas are:
+
+| Direction | Frame | Payload and ordering |
+| --- | --- | --- |
+| host -> adapter | `OPEN` | Protocol 2, exact session id and expected generation, non-zero rows/cols, required capabilities; exactly once and first |
+| host -> adapter | `INPUT` | Framed terminal bytes; only after `READY` |
+| host -> adapter | `RESIZE` | Non-zero rows/cols; only after `READY` |
+| host -> adapter | `DETACH` | Empty explicit intent after `HELLO`, including before `READY`; at most once |
+| adapter -> host | `HELLO` | Exact generation, negotiated capabilities, diagnostic daemon build identity |
+| adapter -> host | `READY` | Atomic effective geometry, complete input-mode snapshot, and screen baseline; at most once |
+| adapter -> host | `DATA` / `GEOMETRY` | Ordered terminal bytes or effective size after `READY` |
+| adapter -> host | `INPUT_MODES` | Complete input-mode state at a strictly increasing revision |
+| adapter -> host | `SNAPSHOT` | Atomic geometry, complete non-regressing input-mode state, and screen |
+| adapter -> host | `ADMISSION_FAILURE` | Typed rejection before `HELLO`; no daemon attach mutation |
+| adapter -> host | `EXITED` / `DETACHED` / `STREAM_FAILURE` | Exactly one terminal outcome, then EOF |
+
+The complete child-input mode snapshot contains application cursor keys,
+application keypad, bracketed paste, focus reporting, mouse tracking, mouse
+encoding, and the Kitty keyboard flag stack. It is state, not an inference from
+screen bytes. A mode change is ordered with `DATA` and sent as a complete
+`INPUT_MODES` replacement with an advancing revision.
+
+The adapter sends daemon packet `OPEN_V2` (reserved type 8) followed by a
+`STATUS` request on the same command-role socket. A v2 daemon answers first with
+`ADMISSION_V2` (reserved type 9); a legacy daemon ignores type 8 and answers the
+status sentinel first. Generation comparison and role transition are one
+daemon operation. An accepting v2 daemon consumes and suppresses the following
+status sentinel so no legacy status response enters the accepted stream.
+Rejection leaves the command role unchanged. Version and
+build identity are diagnostic; the three required capabilities are
+`framed-utf8-input`, `typed-outcome`, and `input-mode-snapshot` (R07).
+
+The host lifecycle grammar is (R08):
+
+```text
+( HELLO ( READY (DATA | GEOMETRY | INPUT_MODES | SNAPSHOT)* STREAM_END
+        | STREAM_END )
+| ADMISSION_FAILURE ) EOF
+
+STREAM_END = EXITED | DETACHED | STREAM_FAILURE
+```
+
+Bare EOF, a second outcome, a pre-`READY` update, a repeated `READY`, or a
+backward input-mode revision is a protocol violation. `AdmissionFailure`
+includes unsupported daemon/capability, generation mismatch, missing or denied
+session, malformed request, and adapter transport failure before `HELLO`.
+`StreamFailure` covers baseline, streaming, or shutdown failure after `HELLO`.
 
 ## Registry and lifecycle state
 
@@ -215,8 +275,8 @@ input, resize, and multi-client geometry without mocks.
 | R04 | [server](../../src/server.ts), [connection](../../src/connection.ts) | [integration](../../tests/integration.test.ts), [alternate screen](../../tests/screen-replay-altscreen.test.ts), [scrollback](../../tests/scrollback-fidelity.test.ts) |
 | R05 | [server](../../src/server.ts) | [integration](../../tests/integration.test.ts) |
 | R06 | [server](../../src/server.ts), [protocol](../../src/protocol.ts) | [effective geometry](../../tests/effective-geometry.test.ts), [resize](../../tests/resize-tui.test.ts), [status](../../tests/stats-cli.test.ts) |
-| R07 | [protocol](../../src/protocol.ts), [connection](../../src/connection.ts), [remote](../../src/remote.ts) | [protocol](../../tests/protocol.test.ts), [connection](../../tests/connection.test.ts), [remote reconnect](../../tests/remote-reconnect.test.ts) |
-| R08 | [client](../../src/client.ts), [CLI](../../src/cli.ts), [entrypoint](../../bin/pty) | [attach stream](../../tests/attach-stream.test.ts), [signals](../../tests/wrapper-signal-forwarding.test.ts) |
+| R07 | [protocol](../../src/protocol.ts), [machine protocol](../../src/machine-protocol.ts), [connection](../../src/connection.ts), [remote](../../src/remote.ts) | [protocol](../../tests/protocol.test.ts), [machine protocol](../../tests/machine-protocol.test.ts), [connection](../../tests/connection.test.ts), [remote reconnect](../../tests/remote-reconnect.test.ts) |
+| R08 | [machine protocol](../../src/machine-protocol.ts), [client](../../src/client.ts), [CLI](../../src/cli.ts), [entrypoint](../../bin/pty) | [machine protocol](../../tests/machine-protocol.test.ts), [attach stream](../../tests/attach-stream.test.ts), [signals](../../tests/wrapper-signal-forwarding.test.ts) |
 | R09 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [recovery](../../src/recovery.ts), [CLI](../../src/cli.ts) | [root](../../tests/pty-root.test.ts), [display name](../../tests/display-name.test.ts), [status](../../tests/stats-cli.test.ts), [list purity](../../tests/list-purity.test.ts), [recovery](../../tests/recovery.test.ts) |
 | R10 | [sessions](../../src/sessions.ts), [events](../../src/events.ts), [recovery](../../src/recovery.ts), [protocol](../../src/protocol.ts) | [atomic writes](../../tests/atomic-writes.test.ts), [metadata events](../../tests/metadata-events.test.ts), [events](../../tests/events.test.ts), [recovery](../../tests/recovery.test.ts), [disk layout](../../tests/disk-layout-docs.test.ts) |
 | R11 | [CLI](../../src/cli.ts), [client API](../../src/client-api.ts), [remote](../../src/remote.ts), [testing API](../../src/testing/index.ts) | [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [remote](../../tests/remote-fabric.test.ts), [screenshots](../../tests/screenshot.test.ts), [keys](../../tests/keys.test.ts) |

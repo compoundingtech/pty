@@ -71,12 +71,22 @@ implementation contract and validation map live in [spec.md](./spec.md).
 - **R07 Bounded stream protocol:** Packets are length-delimited, fragmented
   input is reassembled, oversized input is rejected without unbounded
   buffering, and reconnect or unsupported capability failure is explicit.
-- **R08 Machine attach outcomes:** Machine attach preserves the framed
-  `GEOMETRY`, `SCREEN`, `DATA`, and `EXIT` stream on a caller-owned inherited
-  descriptor while stdin/stdout remain the controlling terminal. A clean stream
-  ends with exactly one `EXIT` when the session process ended or empty `DETACH`
-  when this client intentionally detached; EOF without either is truncation.
-  Administrative destruction is truncation unless process `EXIT` was observed.
+  Machine admission verifies the exact stable id and generation on the same
+  connection it attaches; rejection causes no attach, resize, or redraw
+  mutation. Capability support is negotiated behaviorally rather than inferred
+  from version strings, record shapes, separate preflight observations, or
+  timeouts.
+- **R08 Machine attach stream:** Machine attach is an exclusively framed,
+  bidirectional stdin/stdout protocol distinct from interactive attach. One
+  `OPEN` receives either exactly one `ADMISSION_FAILURE` then EOF, or `HELLO`,
+  an optional atomic `READY` baseline with ordered updates, exactly one typed
+  bound-stream outcome, then EOF. `READY` contains effective
+  geometry, the complete revisioned child-input mode snapshot, and screen
+  bytes. `INPUT` framing preserves its byte payload; the child boundary accepts
+  valid UTF-8 plus all C0 and escape bytes without replacement or reserved-byte
+  interpretation and rejects invalid UTF-8 explicitly. Detach is its own frame,
+  never inferred from input. EOF before a typed outcome is truncation, and
+  administrative destruction is truncation unless process exit was observed.
 
 ### Must expose durable state through one behavioral core
 
@@ -99,4 +109,5 @@ implementation contract and validation map live in [spec.md](./spec.md).
   protocol/testing APIs, the shipped package entrypoint, local transport, and
   remote routing preserve the applicable runtime, stream, geometry, registry,
   and lifecycle contracts. A surface rejects unsupported capabilities instead
-  of silently weakening them; tests use real PTYs and processes.
+  of silently weakening them; machine attach never falls back to an older
+  protocol after v2 admission fails. Tests use real PTYs and processes.
