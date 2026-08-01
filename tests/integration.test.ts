@@ -628,7 +628,7 @@ describe("integration", () => {
     const internals = server as unknown as {
       exited: boolean;
       exitCode: number;
-      broadcast: (
+      broadcastLegacy: (
         type: typeof MessageType.DATA | typeof MessageType.EXIT,
         packet: Buffer
       ) => void;
@@ -646,7 +646,7 @@ describe("integration", () => {
 
       internals.exited = true;
       internals.exitCode = 7;
-      internals.broadcast(MessageType.EXIT, encodeExit(7));
+      internals.broadcastLegacy(MessageType.EXIT, encodeExit(7));
       await vi.advanceTimersByTimeAsync(80);
       expect(
         heldWrites.pendingWrites.some(
@@ -654,7 +654,7 @@ describe("integration", () => {
         )
       ).toBe(true);
 
-      internals.broadcast(
+      internals.broadcastLegacy(
         MessageType.DATA,
         encodeData("final-post-cut-data")
       );

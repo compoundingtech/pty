@@ -25,6 +25,7 @@ const modes: MachineInputModeSnapshotV1 = {
   applicationKeypad: false,
   bracketedPaste: true,
   focusReporting: false,
+  modifyOtherKeys: 2,
   mouseTracking: "any",
   mouseEncoding: "sgr",
   kittyKeyboardFlags: [1, 15],
@@ -122,6 +123,26 @@ describe("machine attach v2 protocol", () => {
     const invalidUtf8 = Buffer.from([1, 0, 0, 0, 1, 0xff]);
     const [invalidFrame] = new MachineFrameReader().feed(invalidUtf8);
     expect(() => decodeMachineRequest(invalidFrame)).toThrow(/Invalid machine protocol JSON/);
+
+    const invalidModes = encodeMachineResponse({
+      _tag: "InputModes",
+      inputModes: { ...modes, modifyOtherKeys: 3 as 2 },
+    });
+    const [invalidModesFrame] = new MachineFrameReader().feed(invalidModes);
+    expect(() => decodeMachineResponse(invalidModesFrame)).toThrow(/modifyOtherKeys/);
+  });
+
+  it("round-trips the complete key and mouse mode vocabulary", () => {
+    const inputModes: MachineInputModeSnapshotV1 = {
+      ...modes,
+      mouseTracking: "x10",
+      mouseEncoding: "sgr-pixels",
+      modifyOtherKeys: 1,
+    };
+    const [frame] = new MachineFrameReader().feed(
+      encodeMachineResponse({ _tag: "InputModes", inputModes })
+    );
+    expect(decodeMachineResponse(frame)).toEqual({ _tag: "InputModes", inputModes });
   });
 
   it("accepts only HELLO then READY then updates then one outcome then EOF", () => {
@@ -184,6 +205,7 @@ describe("machine attach v2 protocol", () => {
       _tag: "Frame",
       frame: { _tag: "Ready", rows: 24, cols: 80, inputModes: modes, screen: Buffer.alloc(0) },
     });
+    expect(streaming).toEqual({ _tag: "Streaming", inputModeRevision: 7 });
     const advanced = reduceMachineAttach(streaming, {
       _tag: "Frame",
       frame: { _tag: "InputModes", inputModes: { ...modes, revision: 8 } },

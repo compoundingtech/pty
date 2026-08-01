@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import * as pty from "node-pty";
 // @xterm/headless is CJS-only, so keep its default import. The serialize addon
 // ships native ESM with named exports, so import its runtime namespace.
@@ -20,6 +21,20 @@ import {
   encodeGeometry,
   decodeSize,
 } from "./protocol.ts";
+import {
+  DaemonExtensionType,
+  MACHINE_PROTOCOL_VERSION,
+  decodeDaemonOpenV2,
+  decodeMachineRequest,
+  encodeDaemonAdmissionV2,
+  encodeMachineResponse,
+  type MachineCapability,
+  type MachineInputModeSnapshotV1,
+  type MachineResponse,
+  type MouseEncodingMode,
+  type MouseTrackingMode,
+} from "./machine-protocol.ts";
+import { readPackageVersion } from "./version.ts";
 import {
   getSocketPath,
   getPidPath,
@@ -68,19 +83,72 @@ import type { StatsResult } from "./client.ts";
 interface Client {
   socket: net.Socket;
   reader: PacketReader;
-  rows: number;
-  cols: number;
-  readonly: boolean;
-  attachSeq: number;
-  /** DATA/EXIT must not overtake the SCREEN baseline for ATTACH or PEEK. */
-  initialScreenPhase: "live" | "settling" | "cutting";
+  role:
+    | { readonly _tag: "Command" }
+    | { readonly _tag: "Rejected" }
+    | {
+        readonly _tag: "Legacy";
+        readonly phase:
+          | { readonly _tag: "Settling" }
+          | {
+              readonly _tag: "Cutting";
+              readonly packets: Array<{ readonly isExit: boolean; readonly packet: Buffer }>;
+            }
+          | { readonly _tag: "Live" };
+        readonly rows: number;
+        readonly cols: number;
+        readonly attachSeq: number;
+      }
+    | {
+        readonly _tag: "Readonly";
+        readonly phase:
+          | { readonly _tag: "Settling" }
+          | {
+              readonly _tag: "Cutting";
+              readonly packets: Array<{ readonly isExit: boolean; readonly packet: Buffer }>;
+            }
+          | { readonly _tag: "Live" };
+      }
+    | {
+        readonly _tag: "MachineAwaitingSentinel";
+        readonly rows: number;
+        readonly cols: number;
+      }
+    | {
+        readonly _tag: "Machine";
+        readonly phase: "syncing" | "live" | "ended";
+        readonly rows: number;
+        readonly cols: number;
+        readonly attachSeq: number;
+      };
   /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
   initialScreenGeneration: number;
-  postCutPackets: Array<{
-    type: typeof MessageType.DATA | typeof MessageType.EXIT;
-    packet: Buffer;
-  }>;
 }
+
+interface TerminalInputModeState {
+  readonly revision: number;
+  readonly applicationCursorKeys: boolean;
+  readonly applicationKeypad: boolean;
+  readonly bracketedPaste: boolean;
+  readonly focusReporting: boolean;
+  readonly modifyOtherKeys: 0 | 1 | 2;
+  readonly mouseTracking9: boolean;
+  readonly mouseTracking1000: boolean;
+  readonly mouseTracking1002: boolean;
+  readonly mouseTracking1003: boolean;
+  readonly mouseEncoding1005: boolean;
+  readonly mouseEncoding1006: boolean;
+  readonly mouseEncoding1015: boolean;
+  readonly mouseEncoding1016: boolean;
+  readonly kittyKeyboardFlags: readonly number[];
+}
+
+const MACHINE_CAPABILITIES = [
+  "framed-utf8-input",
+  "typed-outcome",
+  "input-mode-snapshot",
+] as const satisfies readonly MachineCapability[];
+const MAX_KITTY_KEYBOARD_STACK_DEPTH = 64;
 
 export interface ServerOptions {
   name: string;
@@ -280,9 +348,25 @@ export class PtyServer {
   private name: string;
   private options: ServerOptions;
   private attachCounter = 0;
-  private sgrMouseMode = false;
   private cursorHidden = false;
-  private kittyKeyboardStack: number[] = [];
+  private inputModeState: TerminalInputModeState = {
+    revision: 0,
+    applicationCursorKeys: false,
+    applicationKeypad: false,
+    bracketedPaste: false,
+    focusReporting: false,
+    modifyOtherKeys: 0,
+    mouseTracking9: false,
+    mouseTracking1000: false,
+    mouseTracking1002: false,
+    mouseTracking1003: false,
+    mouseEncoding1005: false,
+    mouseEncoding1006: false,
+    mouseEncoding1015: false,
+    mouseEncoding1016: false,
+    kittyKeyboardFlags: [],
+  };
+  private lastBroadcastInputModeRevision = 0;
   // Alt-screen buffer state (DEC private modes ?1049 / ?1047 / ?47). Set when
   // the child process enters the alternate screen buffer; cleared when it
   // leaves. Replayed to attaching clients so the SCREEN snapshot lands in the
@@ -296,9 +380,6 @@ export class PtyServer {
   // reports, not whether tracking is active. Clients attaching to a session
   // that's already mid-stream need all active modes replayed so their own
   // mouse forwarding logic sees the correct state.
-  private mouseTracking1000 = false; // button press/release tracking
-  private mouseTracking1002 = false; // button-motion tracking
-  private mouseTracking1003 = false; // any-motion tracking
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private generation: string;
@@ -339,10 +420,17 @@ export class PtyServer {
       (params) => {
         for (const p of params) {
           const v = typeof p === "number" ? p : p[0];
-          if (v === 1006) this.sgrMouseMode = true;
-          if (v === 1000) this.mouseTracking1000 = true;
-          if (v === 1002) this.mouseTracking1002 = true;
-          if (v === 1003) this.mouseTracking1003 = true;
+          if (v === 1) this.updateInputModes({ applicationCursorKeys: true });
+          if (v === 9) this.updateInputModes({ mouseTracking9: true });
+          if (v === 1000) this.updateInputModes({ mouseTracking1000: true });
+          if (v === 1002) this.updateInputModes({ mouseTracking1002: true });
+          if (v === 1003) this.updateInputModes({ mouseTracking1003: true });
+          if (v === 1004) this.updateInputModes({ focusReporting: true });
+          if (v === 1005) this.updateInputModes({ mouseEncoding1005: true });
+          if (v === 1006) this.updateInputModes({ mouseEncoding1006: true });
+          if (v === 1015) this.updateInputModes({ mouseEncoding1015: true });
+          if (v === 1016) this.updateInputModes({ mouseEncoding1016: true });
+          if (v === 2004) this.updateInputModes({ bracketedPaste: true });
           if (v === 1049 || v === 1047 || v === 47) this.altScreenActive = true;
           if (v === 25) {
             if (this.cursorHidden) this.emitEvent(EventType.CURSOR_VISIBLE);
@@ -358,10 +446,17 @@ export class PtyServer {
       (params) => {
         for (const p of params) {
           const v = typeof p === "number" ? p : p[0];
-          if (v === 1006) this.sgrMouseMode = false;
-          if (v === 1000) this.mouseTracking1000 = false;
-          if (v === 1002) this.mouseTracking1002 = false;
-          if (v === 1003) this.mouseTracking1003 = false;
+          if (v === 1) this.updateInputModes({ applicationCursorKeys: false });
+          if (v === 9) this.updateInputModes({ mouseTracking9: false });
+          if (v === 1000) this.updateInputModes({ mouseTracking1000: false });
+          if (v === 1002) this.updateInputModes({ mouseTracking1002: false });
+          if (v === 1003) this.updateInputModes({ mouseTracking1003: false });
+          if (v === 1004) this.updateInputModes({ focusReporting: false });
+          if (v === 1005) this.updateInputModes({ mouseEncoding1005: false });
+          if (v === 1006) this.updateInputModes({ mouseEncoding1006: false });
+          if (v === 1015) this.updateInputModes({ mouseEncoding1015: false });
+          if (v === 1016) this.updateInputModes({ mouseEncoding1016: false });
+          if (v === 2004) this.updateInputModes({ bracketedPaste: false });
           if (v === 1049 || v === 1047 || v === 47) this.altScreenActive = false;
           if (v === 25) this.cursorHidden = true;
         }
@@ -371,18 +466,98 @@ export class PtyServer {
     this.terminal.parser.registerCsiHandler(
       { prefix: ">", final: "u" },
       (params) => {
-        const flags = typeof params[0] === "number" ? params[0] : params[0][0];
-        this.kittyKeyboardStack.push(flags);
+        const first = params[0];
+        const flags = first === undefined
+          ? 0
+          : typeof first === "number"
+            ? first
+            : first[0];
+        if (
+          this.inputModeState.kittyKeyboardFlags.length >=
+          MAX_KITTY_KEYBOARD_STACK_DEPTH
+        ) {
+          this.failMachineInputModes("kitty-keyboard-stack-overflow");
+          return false;
+        }
+        this.updateInputModes({
+          kittyKeyboardFlags: [...this.inputModeState.kittyKeyboardFlags, flags],
+        });
+        return false;
+      }
+    );
+    this.terminal.parser.registerCsiHandler(
+      { prefix: "=", final: "u" },
+      (params) => {
+        const first = params[0];
+        const flags = first === undefined
+          ? 0
+          : typeof first === "number"
+            ? first
+            : first[0];
+        const second = params[1];
+        const mode = second === undefined
+          ? 1
+          : typeof second === "number"
+            ? second
+            : second[0];
+        const stack = [...this.inputModeState.kittyKeyboardFlags];
+        const current = stack.at(-1) ?? 0;
+        const updated = mode === 2
+          ? current | flags
+          : mode === 3
+            ? current & ~flags
+            : flags;
+        if (stack.length === 0) stack.push(updated);
+        else stack[stack.length - 1] = updated;
+        this.updateInputModes({ kittyKeyboardFlags: stack });
+        return false;
+      }
+    );
+    this.terminal.parser.registerCsiHandler(
+      { prefix: ">", final: "m" },
+      (params) => {
+        const first = params[0];
+        const command = first === undefined
+          ? 0
+          : typeof first === "number"
+            ? first
+            : first[0];
+        if (command !== 4) return false;
+        const second = params[1];
+        const requested = second === undefined
+          ? 0
+          : typeof second === "number"
+            ? second
+            : second[0];
+        const level: 0 | 1 | 2 = requested === 1 ? 1 : requested === 2 ? 2 : 0;
+        this.updateInputModes({ modifyOtherKeys: level });
         return false;
       }
     );
     this.terminal.parser.registerCsiHandler(
       { prefix: "<", final: "u" },
-      () => {
-        this.kittyKeyboardStack.pop();
+      (params) => {
+        const first = params[0];
+        const requested = first === undefined
+          ? 1
+          : typeof first === "number"
+            ? first
+            : first[0];
+        const count = Math.max(1, Math.min(requested, MAX_KITTY_KEYBOARD_STACK_DEPTH));
+        this.updateInputModes({
+          kittyKeyboardFlags: this.inputModeState.kittyKeyboardFlags.slice(0, -count),
+        });
         return false;
       }
     );
+    this.terminal.parser.registerEscHandler({ final: "=" }, () => {
+      this.updateInputModes({ applicationKeypad: true });
+      return false;
+    });
+    this.terminal.parser.registerEscHandler({ final: ">" }, () => {
+      this.updateInputModes({ applicationKeypad: false });
+      return false;
+    });
 
     // Respond to DA1 (Primary Device Attribute) queries from the child process.
     // Shells like fish 4.x send ESC[c at startup and block for up to 10s waiting
@@ -555,11 +730,26 @@ export class PtyServer {
     // handlers above and must NOT be forwarded to clients — otherwise the
     // client's terminal responds and its response appears as garbage input.
     this.ptyProcess.onData((data: string) => {
-      this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
+      const inputModeRevision = this.inputModeState.revision;
       if (cleaned.length > 0) {
-        this.broadcast(MessageType.DATA, encodeData(cleaned));
+        this.broadcastLegacy(MessageType.DATA, encodeData(cleaned));
       }
+      this.terminal.write(data, () => {
+        if (cleaned.length > 0) {
+          this.broadcastMachine({ _tag: "Data", bytes: Buffer.from(cleaned) });
+        }
+        if (
+          this.inputModeState.revision > inputModeRevision &&
+          this.inputModeState.revision > this.lastBroadcastInputModeRevision
+        ) {
+          this.broadcastMachine({
+            _tag: "InputModes",
+            inputModes: this.inputModeSnapshot(),
+          });
+          this.lastBroadcastInputModeRevision = this.inputModeState.revision;
+        }
+      });
     });
 
     this.ptyProcess.onExit(({ exitCode, signal }) => {
@@ -571,7 +761,14 @@ export class PtyServer {
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
-      this.broadcast(MessageType.EXIT, encodeExit(code));
+      this.broadcastLegacy(MessageType.EXIT, encodeExit(code));
+      this.terminal.write("", () => {
+        this.broadcastMachine({
+          _tag: "Exited",
+          code,
+          signal: signal ? String(signal) : null,
+        });
+      });
       this.emitEvent(EventType.SESSION_EXIT, {
         exitCode: code,
         ...(signal ? { signal } : {}),
@@ -895,17 +1092,291 @@ export class PtyServer {
     }
   }
 
+  private inputModeSnapshot(): MachineInputModeSnapshotV1 {
+    const state = this.inputModeState;
+    const mouseTracking: MouseTrackingMode = state.mouseTracking1003
+      ? "any"
+      : state.mouseTracking1002
+        ? "button"
+        : state.mouseTracking1000
+          ? "click"
+          : state.mouseTracking9
+            ? "x10"
+          : "none";
+    const mouseEncoding: MouseEncodingMode = state.mouseEncoding1016
+      ? "sgr-pixels"
+      : state.mouseEncoding1006
+      ? "sgr"
+      : state.mouseEncoding1015
+        ? "urxvt"
+        : state.mouseEncoding1005
+          ? "utf8"
+          : "x10";
+    return {
+      revision: state.revision,
+      applicationCursorKeys: state.applicationCursorKeys,
+      applicationKeypad: state.applicationKeypad,
+      bracketedPaste: state.bracketedPaste,
+      focusReporting: state.focusReporting,
+      modifyOtherKeys: state.modifyOtherKeys,
+      mouseTracking,
+      mouseEncoding,
+      kittyKeyboardFlags: [...state.kittyKeyboardFlags],
+    };
+  }
+
+  private updateInputModes(
+    patch: Partial<Omit<TerminalInputModeState, "revision">>
+  ): void {
+    const current = this.inputModeState;
+    const next = { ...current, ...patch };
+    const unchanged =
+      current.applicationCursorKeys === next.applicationCursorKeys &&
+      current.applicationKeypad === next.applicationKeypad &&
+      current.bracketedPaste === next.bracketedPaste &&
+      current.focusReporting === next.focusReporting &&
+      current.modifyOtherKeys === next.modifyOtherKeys &&
+      current.mouseTracking9 === next.mouseTracking9 &&
+      current.mouseTracking1000 === next.mouseTracking1000 &&
+      current.mouseTracking1002 === next.mouseTracking1002 &&
+      current.mouseTracking1003 === next.mouseTracking1003 &&
+      current.mouseEncoding1005 === next.mouseEncoding1005 &&
+      current.mouseEncoding1006 === next.mouseEncoding1006 &&
+      current.mouseEncoding1015 === next.mouseEncoding1015 &&
+      current.mouseEncoding1016 === next.mouseEncoding1016 &&
+      current.kittyKeyboardFlags.length === next.kittyKeyboardFlags.length &&
+      current.kittyKeyboardFlags.every(
+        (flags, index) => flags === next.kittyKeyboardFlags[index]
+      );
+    if (unchanged) return;
+    this.inputModeState = { ...next, revision: current.revision + 1 };
+  }
+
+  private failMachineInputModes(reason: string): void {
+    for (const client of [...this.clients.values()]) {
+      if (client.role._tag !== "Machine" || client.role.phase === "ended") continue;
+      this.endMachineStream(client, {
+        _tag: "StreamFailure",
+        phase: client.role.phase === "syncing" ? "baseline" : "stream",
+        reason,
+      });
+    }
+  }
+
+  private rejectMachineOpen(
+    client: Client,
+    reason: "generation-mismatch" | "not-found" | "unsupported-capability" | "malformed-request",
+    detail?: string
+  ): void {
+    client.role = { _tag: "Rejected" };
+    client.socket.end(
+      encodeDaemonAdmissionV2({
+        _tag: "Rejected",
+        reason,
+        ...(detail === undefined ? {} : { detail }),
+      })
+    );
+  }
+
+  private handleMachineOpen(
+    client: Client,
+    frame: { readonly type: number; readonly payload: Buffer }
+  ): void {
+    if (client.role._tag !== "Command") {
+      this.rejectMachineOpen(client, "malformed-request", "OPEN_V2 requires a fresh command connection");
+      return;
+    }
+    let open;
+    try {
+      open = decodeDaemonOpenV2(frame);
+    } catch (error) {
+      this.rejectMachineOpen(
+        client,
+        "malformed-request",
+        error instanceof Error ? error.message : "invalid OPEN_V2"
+      );
+      return;
+    }
+    if (open.sessionId !== this.name) {
+      this.rejectMachineOpen(client, "not-found", "session id does not match socket");
+      return;
+    }
+    if (open.expectedGeneration !== this.generation) {
+      this.rejectMachineOpen(client, "generation-mismatch", "session generation changed");
+      return;
+    }
+    const unsupported = open.requiredCapabilities.find(
+      (capability) => !MACHINE_CAPABILITIES.includes(capability)
+    );
+    if (unsupported !== undefined) {
+      this.rejectMachineOpen(
+        client,
+        "unsupported-capability",
+        `unsupported capability: ${unsupported}`
+      );
+      return;
+    }
+
+    client.role = {
+      _tag: "MachineAwaitingSentinel",
+      rows: open.rows,
+      cols: open.cols,
+    };
+  }
+
+  private handleMachineRequest(
+    client: Client,
+    frame: { readonly type: number; readonly payload: Buffer }
+  ): void {
+    let request;
+    try {
+      request = decodeMachineRequest(frame);
+    } catch (error) {
+      this.endMachineStream(client, {
+        _tag: "StreamFailure",
+        phase:
+          client.role._tag === "Machine" && client.role.phase === "syncing"
+            ? "baseline"
+            : "stream",
+        reason: "malformed-request",
+        diagnostic: error instanceof Error ? error.message : "invalid request",
+      });
+      return;
+    }
+    if (
+      client.role._tag === "Machine" &&
+      client.role.phase === "syncing" &&
+      request._tag === "Detach"
+    ) {
+      this.endMachineStream(client, { _tag: "Detached" });
+      return;
+    }
+    if (client.role._tag !== "Machine" || client.role.phase !== "live") {
+      this.endMachineStream(client, {
+        _tag: "StreamFailure",
+        phase: "baseline",
+        reason: "request-before-ready",
+      });
+      return;
+    }
+    switch (request._tag) {
+      case "Open":
+        this.endMachineStream(client, {
+          _tag: "StreamFailure",
+          phase: "stream",
+          reason: "duplicate-open",
+        });
+        break;
+      case "Input":
+        if (!isUtf8(request.bytes)) {
+          this.endMachineStream(client, {
+            _tag: "StreamFailure",
+            phase: "stream",
+            reason: "invalid-utf8-input",
+          });
+          break;
+        }
+        if (!this.exited) this.ptyProcess.write(request.bytes.toString("utf8"));
+        break;
+      case "Resize":
+        client.role = {
+          _tag: "Machine",
+          phase: "live",
+          rows: request.rows,
+          cols: request.cols,
+          attachSeq: ++this.attachCounter,
+        };
+        this.negotiateSize();
+        break;
+      case "Detach":
+        this.endMachineStream(client, { _tag: "Detached" });
+        break;
+    }
+  }
+
+  private endMachineStream(
+    client: Client,
+    outcome: Extract<MachineResponse, { _tag: "Detached" | "StreamFailure" }>
+  ): void {
+    if (client.role._tag === "Machine" && client.role.phase === "ended") return;
+    const role = client.role;
+    const rows = role._tag === "Machine" || role._tag === "MachineAwaitingSentinel"
+      ? role.rows
+      : this.terminal.rows;
+    const cols = role._tag === "Machine" || role._tag === "MachineAwaitingSentinel"
+      ? role.cols
+      : this.terminal.cols;
+    const attachSeq = role._tag === "Machine" ? role.attachSeq : 0;
+    client.role = { _tag: "Machine", phase: "ended", rows, cols, attachSeq };
+    client.initialScreenGeneration++;
+    client.socket.end(encodeMachineResponse(outcome));
+    this.negotiateSize();
+  }
+
+  private admitWritableClient(
+    client: Client,
+    size: { readonly rows: number; readonly cols: number },
+    protocol: "legacy" | "machine-v2",
+    onCommitted?: () => void
+  ): void {
+    const sizeMatched =
+      size.rows === this.terminal.rows && size.cols === this.terminal.cols;
+    const attachSeq = ++this.attachCounter;
+    client.role = protocol === "machine-v2"
+      ? { _tag: "Machine", phase: "syncing", ...size, attachSeq }
+      : { _tag: "Legacy", phase: { _tag: "Settling" }, ...size, attachSeq };
+    const initialScreenGeneration = ++client.initialScreenGeneration;
+    const resized = this.negotiateSize();
+    if (!resized && protocol === "legacy") {
+      client.socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+    }
+    try {
+      mutateMetadataUnderLock(this.name, (meta) => {
+        meta.lastAttachAt = new Date().toISOString();
+        return true;
+      }, { expectedGeneration: this.generation });
+    } catch {}
+    onCommitted?.();
+
+    const sendScreen = () => {
+      this.beginInitialScreenCut(
+        client,
+        initialScreenGeneration,
+        () => protocol === "machine-v2"
+          ? encodeMachineResponse({
+              _tag: "Ready",
+              rows: this.terminal.rows,
+              cols: this.terminal.cols,
+              inputModes: this.inputModeSnapshot(),
+              screen: Buffer.from(this.serialize.serialize()),
+            })
+          : encodeScreen(this.getModePrefix(true) + this.serialize.serialize()),
+        () => {
+          if (!this.exited && !sizeMatched) this.nudgeRedraw();
+        }
+      );
+    };
+
+    if (!this.exited) {
+      const sinceLast = Date.now() - this.lastResizeTime;
+      const redrawSettleMs = 80;
+      if (resized || sinceLast < redrawSettleMs) {
+        const delay = resized ? redrawSettleMs : redrawSettleMs - sinceLast;
+        setTimeout(sendScreen, delay);
+      } else {
+        sendScreen();
+      }
+    } else {
+      sendScreen();
+    }
+  }
+
   private handleClient(socket: net.Socket): void {
     const client: Client = {
       socket,
       reader: new PacketReader(),
-      rows: this.terminal.rows,
-      cols: this.terminal.cols,
-      readonly: false,
-      attachSeq: 0,
-      initialScreenPhase: "live",
+      role: { _tag: "Command" },
       initialScreenGeneration: 0,
-      postCutPackets: [],
     };
     this.clients.set(socket, client);
 
@@ -921,78 +1392,53 @@ export class PtyServer {
         return;
       }
       for (const packet of packets) {
+        if (client.role._tag === "Rejected") continue;
+        if (client.role._tag === "MachineAwaitingSentinel") {
+          if (
+            Number(packet.type) === MessageType.STATUS &&
+            packet.payload.length === 0
+          ) {
+            const { rows, cols } = client.role;
+            this.admitWritableClient(
+              client,
+              { rows, cols },
+              "machine-v2",
+              () => client.socket.write(
+                encodeDaemonAdmissionV2({
+                  _tag: "Accepted",
+                  protocol: MACHINE_PROTOCOL_VERSION,
+                  generation: this.generation,
+                  capabilities: MACHINE_CAPABILITIES,
+                  build: { version: readPackageVersion(), dirty: false },
+                })
+              )
+            );
+            continue;
+          }
+          this.rejectMachineOpen(
+            client,
+            "malformed-request",
+            "STATUS sentinel must immediately follow OPEN_V2"
+          );
+          continue;
+        }
+        if (client.role._tag === "Machine") {
+          this.handleMachineRequest(client, packet);
+          continue;
+        }
+        if (Number(packet.type) === DaemonExtensionType.OPEN_V2) {
+          this.handleMachineOpen(client, packet);
+          continue;
+        }
         switch (packet.type) {
           case MessageType.ATTACH: {
             if (packet.payload.length < 4) break;
-            const size = decodeSize(packet.payload);
-            // Read before negotiateSize(): a smaller client shrinks the session
-            // to its own size, which would then look like it had matched.
-            const sizeMatched =
-              size.rows === this.terminal.rows && size.cols === this.terminal.cols;
-            client.readonly = false;
-            client.rows = size.rows;
-            client.cols = size.cols;
-            client.attachSeq = ++this.attachCounter;
-            client.initialScreenPhase = "settling";
-            client.postCutPackets = [];
-            const initialScreenGeneration = ++client.initialScreenGeneration;
-            const resized = this.negotiateSize();
-            if (!resized) {
-              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
-            }
-            // Best-effort: a concurrent metadata command wins this attach
-            // stamp, but neither writer can overwrite the other's snapshot.
-            try {
-              mutateMetadataUnderLock(this.name, (meta) => {
-                meta.lastAttachAt = new Date().toISOString();
-                return true;
-              }, { expectedGeneration: this.generation });
-            } catch {}
-
-            const sendScreen = () => {
-              this.beginInitialScreenCut(
-                client,
-                initialScreenGeneration,
-                () => this.getModePrefix(true) + this.serialize.serialize(),
-                () => {
-                  // The serialize addon's output is an approximation — ECH/CUF
-                  // sequences may not perfectly reproduce what the app originally
-                  // drew (e.g., background fills in ratatui). Nudge the child
-                  // with a SIGWINCH so it does a fresh full redraw, whose DATA
-                  // overwrites any serialize artifacts on the client.
-                  //
-                  // Skipped when the client attached at the size the session
-                  // already has: the child is drawn for that geometry, so the
-                  // nudge buys nothing and wakes an otherwise idle process every
-                  // time someone connects.
-                  if (!this.exited && !sizeMatched) this.nudgeRedraw();
-                }
-              );
-            };
-
-            if (!this.exited) {
-              // If the PTY was just resized (either by this attach or
-              // recently by another client), wait for the process to
-              // redraw before serializing. Without this delay, the client
-              // sees a transient mid-redraw state.
-              const sinceLast = Date.now() - this.lastResizeTime;
-              const REDRAW_SETTLE_MS = 80;
-              if (resized || sinceLast < REDRAW_SETTLE_MS) {
-                const delay = resized ? REDRAW_SETTLE_MS : REDRAW_SETTLE_MS - sinceLast;
-                setTimeout(sendScreen, delay);
-              } else {
-                sendScreen();
-              }
-            } else {
-              sendScreen();
-            }
+            this.admitWritableClient(client, decodeSize(packet.payload), "legacy");
             break;
           }
 
           case MessageType.PEEK: {
-            client.readonly = true;
-            client.initialScreenPhase = "settling";
-            client.postCutPackets = [];
+            client.role = { _tag: "Readonly", phase: { _tag: "Settling" } };
             const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
@@ -1004,28 +1450,36 @@ export class PtyServer {
 
             this.beginInitialScreenCut(client, initialScreenGeneration, () => {
               if (plain) {
-                return full ? this.getFullPlainScreen() : this.getPlainScreen();
+                return encodeScreen(
+                  full ? this.getFullPlainScreen() : this.getPlainScreen()
+                );
               }
               // scrollback: 0 for viewport only, omit for full scrollback
               const serializeOpts = full ? undefined : { scrollback: 0 };
-              return this.getModePrefix() + this.serialize.serialize(serializeOpts);
+              return encodeScreen(
+                this.getModePrefix() + this.serialize.serialize(serializeOpts)
+              );
             });
             break;
           }
 
           case MessageType.DATA: {
-            if (!this.exited && !client.readonly) {
+            if (!this.exited && client.role._tag !== "Readonly") {
               this.ptyProcess.write(packet.payload.toString());
             }
             break;
           }
 
           case MessageType.RESIZE: {
-            if (!client.readonly && client.attachSeq > 0 && packet.payload.length >= 4) {
+            if (client.role._tag === "Legacy" && packet.payload.length >= 4) {
               const size = decodeSize(packet.payload);
-              client.rows = size.rows;
-              client.cols = size.cols;
-              client.attachSeq = ++this.attachCounter;
+              client.role = {
+                _tag: "Legacy",
+                phase: client.role.phase,
+                rows: size.rows,
+                cols: size.cols,
+                attachSeq: ++this.attachCounter,
+              };
               this.negotiateSize();
             }
             break;
@@ -1064,12 +1518,23 @@ export class PtyServer {
     // TERMINAL_SANITIZE exits alt-screen on close. Attaching clients want
     // the alt buffer to persist for the duration of the attach.
     if (includeAltScreen && this.altScreenActive) prefix += "\x1b[?1049h";
-    if (this.mouseTracking1000) prefix += "\x1b[?1000h";
-    if (this.mouseTracking1002) prefix += "\x1b[?1002h";
-    if (this.mouseTracking1003) prefix += "\x1b[?1003h";
-    if (this.sgrMouseMode) prefix += "\x1b[?1006h";
+    if (this.inputModeState.applicationCursorKeys) prefix += "\x1b[?1h";
+    if (this.inputModeState.applicationKeypad) prefix += "\x1b=";
+    if (this.inputModeState.modifyOtherKeys > 0) {
+      prefix += `\x1b[>4;${this.inputModeState.modifyOtherKeys}m`;
+    }
+    if (this.inputModeState.mouseTracking9) prefix += "\x1b[?9h";
+    if (this.inputModeState.mouseTracking1000) prefix += "\x1b[?1000h";
+    if (this.inputModeState.mouseTracking1002) prefix += "\x1b[?1002h";
+    if (this.inputModeState.mouseTracking1003) prefix += "\x1b[?1003h";
+    if (this.inputModeState.focusReporting) prefix += "\x1b[?1004h";
+    if (this.inputModeState.mouseEncoding1005) prefix += "\x1b[?1005h";
+    if (this.inputModeState.mouseEncoding1006) prefix += "\x1b[?1006h";
+    if (this.inputModeState.mouseEncoding1015) prefix += "\x1b[?1015h";
+    if (this.inputModeState.mouseEncoding1016) prefix += "\x1b[?1016h";
+    if (this.inputModeState.bracketedPaste) prefix += "\x1b[?2004h";
     if (this.cursorHidden) prefix += "\x1b[?25l";
-    for (const flags of this.kittyKeyboardStack) {
+    for (const flags of this.inputModeState.kittyKeyboardFlags) {
       prefix += `\x1b[>${flags}u`;
     }
     return prefix;
@@ -1083,22 +1548,25 @@ export class PtyServer {
     let readOnly = 0;
     const connections: NonNullable<StatsResult["clients"]["connections"]> = [];
     for (const c of this.clients.values()) {
-      if (c.readonly) {
+      if (c.role._tag === "Readonly") {
         readOnly++;
         connections.push({
           role: "readonly",
           constrains: { rows: false, cols: false },
         });
-      } else if (c.attachSeq > 0) {
+      } else if (
+        c.role._tag === "Legacy" ||
+        (c.role._tag === "Machine" && c.role.phase !== "ended")
+      ) {
         attached++;
         connections.push({
           role: "writable",
-          rows: c.rows,
-          cols: c.cols,
-          lastRequestSequence: c.attachSeq,
+          rows: c.role.rows,
+          cols: c.role.cols,
+          lastRequestSequence: c.role.attachSeq,
           constrains: {
-            rows: c.rows === this.terminal.rows,
-            cols: c.cols === this.terminal.cols,
+            rows: c.role.rows === this.terminal.rows,
+            cols: c.role.cols === this.terminal.cols,
           },
         });
       }
@@ -1139,10 +1607,10 @@ export class PtyServer {
         connections,
       },
       modes: {
-        sgrMouse: this.sgrMouseMode,
+        sgrMouse: this.inputModeState.mouseEncoding1006,
         cursorHidden: this.cursorHidden,
-        kittyKeyboard: this.kittyKeyboardStack.length > 0,
-        kittyKeyboardFlags: [...this.kittyKeyboardStack],
+        kittyKeyboard: this.inputModeState.kittyKeyboardFlags.length > 0,
+        kittyKeyboardFlags: [...this.inputModeState.kittyKeyboardFlags],
       },
       uptimeSeconds,
       createdAt,
@@ -1156,9 +1624,13 @@ export class PtyServer {
     let cols = 0;
 
     for (const client of this.clients.values()) {
-      if (!client.readonly && client.attachSeq > 0) {
-        rows = rows === 0 ? client.rows : Math.min(rows, client.rows);
-        cols = cols === 0 ? client.cols : Math.min(cols, client.cols);
+      const role = client.role;
+      if (
+        role._tag === "Legacy" ||
+        (role._tag === "Machine" && role.phase !== "ended")
+      ) {
+        rows = rows === 0 ? role.rows : Math.min(rows, role.rows);
+        cols = cols === 0 ? role.cols : Math.min(cols, role.cols);
       }
     }
 
@@ -1175,10 +1647,13 @@ export class PtyServer {
   }
 
   private broadcastGeometry(rows: number, cols: number): void {
-    const packet = encodeGeometry(rows, cols);
+    const legacyPacket = encodeGeometry(rows, cols);
+    const machinePacket = encodeMachineResponse({ _tag: "Geometry", rows, cols });
     for (const client of this.clients.values()) {
-      if (client.attachSeq > 0 || client.readonly) {
-        client.socket.write(packet);
+      if (client.role._tag === "Legacy" || client.role._tag === "Readonly") {
+        client.socket.write(legacyPacket);
+      } else if (client.role._tag === "Machine" && client.role.phase === "live") {
+        client.socket.write(machinePacket);
       }
     }
   }
@@ -1207,15 +1682,23 @@ export class PtyServer {
   private beginInitialScreenCut(
     client: Client,
     generation: number,
-    getScreen: () => string,
+    getInitialPacket: () => Buffer,
     onLive?: () => void
   ): void {
     if (
       client.socket.destroyed ||
       client.initialScreenGeneration !== generation
     ) return;
+    if (
+      (client.role._tag === "Legacy" || client.role._tag === "Readonly") &&
+      client.role.phase._tag === "Settling"
+    ) {
+      client.role = {
+        ...client.role,
+        phase: { _tag: "Cutting", packets: [] },
+      };
+    }
 
-    client.initialScreenPhase = "cutting";
     /** xterm parses writes asynchronously. This empty write is an ordered
      *  marker: its callback runs after every earlier write and before later
      *  writes, giving SCREEN an exact parser cut. */
@@ -1225,38 +1708,58 @@ export class PtyServer {
         client.initialScreenGeneration !== generation
       ) return;
 
-      const postCutPackets = client.postCutPackets;
-      client.postCutPackets = [];
-      const hasPostCutExit = postCutPackets.some(
-        (pending) => pending.type === MessageType.EXIT
-      );
-
-      client.socket.write(encodeScreen(getScreen()));
-      client.initialScreenPhase = "live";
-      /** node-pty drains PTY data before its public exit event, so a queued
-       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
-       *  this queue and is synthesized only after any final post-cut DATA. */
-      for (const pending of postCutPackets) {
-        client.socket.write(pending.packet);
+      const role = client.role;
+      const pending =
+        (role._tag === "Legacy" || role._tag === "Readonly") &&
+        role.phase._tag === "Cutting"
+          ? role.phase.packets
+          : [];
+      const hasPendingExit = pending.some((item) => item.isExit);
+      client.socket.write(getInitialPacket());
+      if (role._tag === "Legacy") {
+        client.role = { ...role, phase: { _tag: "Live" } };
+      } else if (role._tag === "Readonly") {
+        client.role = { ...role, phase: { _tag: "Live" } };
+      } else if (role._tag === "Machine" && role.phase === "syncing") {
+        client.role = { ...role, phase: "live" };
       }
-      if (this.exited && !hasPostCutExit) {
-        client.socket.write(encodeExit(this.exitCode));
+      for (const item of pending) client.socket.write(item.packet);
+      if (this.exited && !hasPendingExit) {
+        client.socket.write(
+          client.role._tag === "Machine"
+            ? encodeMachineResponse({
+                _tag: "Exited",
+                code: this.exitCode,
+                signal: null,
+              })
+            : encodeExit(this.exitCode)
+        );
       }
       onLive?.();
     });
   }
 
-  private broadcast(
+  private broadcastLegacy(
     type: typeof MessageType.DATA | typeof MessageType.EXIT,
     packet: Buffer
   ): void {
     for (const client of this.clients.values()) {
-      if (client.initialScreenPhase === "settling") continue;
-      if (client.initialScreenPhase === "cutting") {
-        client.postCutPackets.push({ type, packet });
-        continue;
+      const role = client.role;
+      if (role._tag !== "Legacy" && role._tag !== "Readonly") continue;
+      if (role.phase._tag === "Live") {
+        client.socket.write(packet);
+      } else if (role.phase._tag === "Cutting") {
+        role.phase.packets.push({ isExit: type === MessageType.EXIT, packet });
       }
-      client.socket.write(packet);
+    }
+  }
+
+  private broadcastMachine(response: MachineResponse): void {
+    const packet = encodeMachineResponse(response);
+    for (const client of this.clients.values()) {
+      if (client.role._tag === "Machine" && client.role.phase === "live") {
+        client.socket.write(packet);
+      }
     }
   }
 

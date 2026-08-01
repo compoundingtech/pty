@@ -53,8 +53,8 @@ export type MachineRequest =
   | { readonly _tag: "Resize"; readonly rows: number; readonly cols: number }
   | { readonly _tag: "Detach" };
 
-export type MouseTrackingMode = "none" | "click" | "button" | "any";
-export type MouseEncodingMode = "x10" | "utf8" | "sgr" | "urxvt";
+export type MouseTrackingMode = "none" | "x10" | "click" | "button" | "any";
+export type MouseEncodingMode = "x10" | "utf8" | "sgr" | "urxvt" | "sgr-pixels";
 
 /** Complete child-input state at one ordered terminal-stream revision. */
 export interface MachineInputModeSnapshotV1 {
@@ -63,6 +63,7 @@ export interface MachineInputModeSnapshotV1 {
   readonly applicationKeypad: boolean;
   readonly bracketedPaste: boolean;
   readonly focusReporting: boolean;
+  readonly modifyOtherKeys: 0 | 1 | 2;
   readonly mouseTracking: MouseTrackingMode;
   readonly mouseEncoding: MouseEncodingMode;
   readonly kittyKeyboardFlags: readonly number[];
@@ -278,6 +279,7 @@ function inputModes(value: unknown): MachineInputModeSnapshotV1 {
       "applicationKeypad",
       "bracketedPaste",
       "focusReporting",
+      "modifyOtherKeys",
       "mouseTracking",
       "mouseEncoding",
       "kittyKeyboardFlags",
@@ -286,9 +288,9 @@ function inputModes(value: unknown): MachineInputModeSnapshotV1 {
   );
   const tracking = string(object.mouseTracking, "mouseTracking") as MouseTrackingMode;
   const encoding = string(object.mouseEncoding, "mouseEncoding") as MouseEncodingMode;
-  if (!["none", "click", "button", "any"].includes(tracking))
+  if (!["none", "x10", "click", "button", "any"].includes(tracking))
     throw new MachineProtocolError("unknown mouse tracking mode");
-  if (!["x10", "utf8", "sgr", "urxvt"].includes(encoding))
+  if (!["x10", "utf8", "sgr", "urxvt", "sgr-pixels"].includes(encoding))
     throw new MachineProtocolError("unknown mouse encoding mode");
   if (!Array.isArray(object.kittyKeyboardFlags) || object.kittyKeyboardFlags.length > MAX_KITTY_STACK_DEPTH) {
     throw new MachineProtocolError("kittyKeyboardFlags must be a bounded array");
@@ -299,6 +301,7 @@ function inputModes(value: unknown): MachineInputModeSnapshotV1 {
     applicationKeypad: boolean(object.applicationKeypad, "applicationKeypad"),
     bracketedPaste: boolean(object.bracketedPaste, "bracketedPaste"),
     focusReporting: boolean(object.focusReporting, "focusReporting"),
+    modifyOtherKeys: integer(object.modifyOtherKeys, "modifyOtherKeys", 0, 2) as 0 | 1 | 2,
     mouseTracking: tracking,
     mouseEncoding: encoding,
     kittyKeyboardFlags: object.kittyKeyboardFlags.map((flag) => integer(flag, "kitty keyboard flag", 0, 0xffffffff)),
@@ -554,11 +557,9 @@ export function decodeDaemonAdmissionV2(frame: MachineWireFrame): DaemonAdmissio
 
 export type MachineAttachState =
   | { readonly _tag: "AwaitAdmission" }
-  | { readonly _tag: "AwaitReady"; readonly hello: MachineHelloV2 }
+  | { readonly _tag: "AwaitReady" }
   | {
       readonly _tag: "Streaming";
-      readonly hello: MachineHelloV2;
-      readonly ready: MachineReadyV2;
       readonly inputModeRevision: number;
     }
   | { readonly _tag: "AwaitEof"; readonly outcome: MachineOutcome }
@@ -584,12 +585,12 @@ export function reduceMachineAttach(state: MachineAttachState, event: MachineAtt
   const frame = event.frame;
   switch (state._tag) {
     case "AwaitAdmission":
-      if (frame._tag === "Hello") return { _tag: "AwaitReady", hello: frame };
+      if (frame._tag === "Hello") return { _tag: "AwaitReady" };
       if (frame._tag === "AdmissionFailure") return { _tag: "AwaitEof", outcome: frame };
       return violation(`Expected HELLO or ADMISSION_FAILURE, received ${frame._tag}`);
     case "AwaitReady":
       if (frame._tag === "Ready") {
-        return { _tag: "Streaming", hello: state.hello, ready: frame, inputModeRevision: frame.inputModes.revision };
+        return { _tag: "Streaming", inputModeRevision: frame.inputModes.revision };
       }
       if (frame._tag === "Exited" || frame._tag === "Detached" || frame._tag === "StreamFailure") {
         return { _tag: "AwaitEof", outcome: frame };

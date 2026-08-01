@@ -180,10 +180,12 @@ The direction-specific frame schemas are:
 | adapter -> host | `EXITED` / `DETACHED` / `STREAM_FAILURE` | Exactly one terminal outcome, then EOF |
 
 The complete child-input mode snapshot contains application cursor keys,
-application keypad, bracketed paste, focus reporting, mouse tracking, mouse
-encoding, and the Kitty keyboard flag stack. It is state, not an inference from
-screen bytes. A mode change is ordered with `DATA` and sent as a complete
-`INPUT_MODES` replacement with an advancing revision.
+application keypad, bracketed paste, focus reporting, modifyOtherKeys level,
+mouse tracking (including DECSET 9), mouse encoding (including pixel SGR), and
+the Kitty keyboard active-flags stack. Kitty set/add/remove and push/pop-n
+operations update that one stack. The snapshot is state, not an inference from
+screen bytes. A mode change is ordered after the `DATA` that established it and
+sent as a complete `INPUT_MODES` replacement with an advancing revision.
 
 The adapter sends daemon packet `OPEN_V2` (reserved type 8) followed by a
 `STATUS` request on the same command-role socket. A v2 daemon answers first with
