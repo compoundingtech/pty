@@ -24,6 +24,7 @@ import {
 import {
   DaemonExtensionType,
   MACHINE_PROTOCOL_VERSION,
+  canonicalizeMachineInputModeSnapshotV1,
   decodeDaemonOpenV2,
   decodeMachineRequest,
   encodeDaemonAdmissionV2,
@@ -31,8 +32,6 @@ import {
   type MachineCapability,
   type MachineInputModeSnapshotV1,
   type MachineResponse,
-  type MouseEncodingMode,
-  type MouseTrackingMode,
 } from "./machine-protocol.ts";
 import { readPackageVersion } from "./version.ts";
 import {
@@ -82,6 +81,7 @@ import type { StatsResult } from "./client.ts";
 
 interface Client {
   socket: net.Socket;
+  output: BoundedClientOutput;
   reader: PacketReader;
   role:
     | { readonly _tag: "Command" }
@@ -92,7 +92,7 @@ interface Client {
           | { readonly _tag: "Settling" }
           | {
               readonly _tag: "Cutting";
-              readonly packets: Array<{ readonly isExit: boolean; readonly packet: Buffer }>;
+              readonly hasPendingExit: boolean;
             }
           | { readonly _tag: "Live" };
         readonly rows: number;
@@ -105,7 +105,7 @@ interface Client {
           | { readonly _tag: "Settling" }
           | {
               readonly _tag: "Cutting";
-              readonly packets: Array<{ readonly isExit: boolean; readonly packet: Buffer }>;
+              readonly hasPendingExit: boolean;
             }
           | { readonly _tag: "Live" };
       }
@@ -123,6 +123,132 @@ interface Client {
       };
   /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
   initialScreenGeneration: number;
+}
+
+/** One legal maximum-sized protocol frame plus its five-byte envelope. */
+export const DEFAULT_MAX_CLIENT_OUTPUT_BYTES = 32 * 1024 * 1024 + 5;
+/** Reserved independently so queue saturation can still produce a typed outcome. */
+export const CLIENT_TERMINAL_OUTCOME_RESERVE_BYTES = 64 * 1024 + 5;
+
+/**
+ * Owns all retained output for one client. Socket backpressure never pauses
+ * the PTY or another client: later frames wait here, in order, until `drain`.
+ * The normal byte limit includes Node's socket buffer, the live queue, and
+ * frames held behind an initial-screen cut; only a final typed outcome may use
+ * the additional fixed reserve.
+ */
+export class BoundedClientOutput {
+  private readonly queued: Buffer[] = [];
+  private queuedBytes = 0;
+  private readonly held: Buffer[] = [];
+  private heldBytes = 0;
+  private blocked = false;
+  private ending = false;
+  private closed = false;
+
+  constructor(
+    private readonly socket: net.Socket,
+    private readonly maxBufferedBytes = DEFAULT_MAX_CLIENT_OUTPUT_BYTES,
+  ) {
+    if (!Number.isSafeInteger(maxBufferedBytes) || maxBufferedBytes <= 0) {
+      throw new RangeError("maxBufferedBytes must be a positive safe integer");
+    }
+    socket.on("drain", () => this.flush());
+    socket.on("close", () => this.discard());
+  }
+
+  write(packet: Buffer): boolean {
+    if (!this.canRetain(packet.length, false)) return false;
+    this.enqueue(packet);
+    return true;
+  }
+
+  hold(packet: Buffer): boolean {
+    if (!this.canRetain(packet.length, false)) return false;
+    this.held.push(packet);
+    this.heldBytes += packet.length;
+    return true;
+  }
+
+  releaseHeld(initialPacket: Buffer): boolean {
+    if (!this.canRetain(initialPacket.length, false)) return false;
+    const held = this.held.splice(0);
+    this.heldBytes = 0;
+    this.enqueue(initialPacket);
+    for (const packet of held) this.enqueue(packet);
+    return true;
+  }
+
+  clearHeld(): void {
+    this.held.length = 0;
+    this.heldBytes = 0;
+  }
+
+  end(packet?: Buffer): boolean {
+    if (packet !== undefined) {
+      if (!this.canRetain(packet.length, true)) return false;
+      this.enqueue(packet);
+    }
+    this.ending = true;
+    this.finishEndIfReady();
+    return true;
+  }
+
+  destroy(): void {
+    this.discard();
+    this.socket.destroy();
+  }
+
+  private canRetain(additionalBytes: number, includeOutcomeReserve: boolean): boolean {
+    const limit = this.maxBufferedBytes +
+      (includeOutcomeReserve ? CLIENT_TERMINAL_OUTCOME_RESERVE_BYTES : 0);
+    return !this.closed && !this.ending && !this.socket.destroyed &&
+      this.socket.writableLength + this.queuedBytes + this.heldBytes + additionalBytes <=
+        limit;
+  }
+
+  private enqueue(packet: Buffer): void {
+    if (this.blocked || this.queued.length > 0) {
+      this.queued.push(packet);
+      this.queuedBytes += packet.length;
+      return;
+    }
+    try {
+      this.blocked = !this.socket.write(packet);
+    } catch {
+      this.destroy();
+    }
+  }
+
+  private flush(): void {
+    if (this.closed) return;
+    this.blocked = false;
+    while (!this.blocked && this.queued.length > 0) {
+      const packet = this.queued.shift()!;
+      this.queuedBytes -= packet.length;
+      try {
+        this.blocked = !this.socket.write(packet);
+      } catch {
+        this.destroy();
+        return;
+      }
+    }
+    this.finishEndIfReady();
+  }
+
+  private finishEndIfReady(): void {
+    if (!this.closed && this.ending && !this.blocked && this.queued.length === 0) {
+      this.closed = true;
+      this.socket.end();
+    }
+  }
+
+  private discard(): void {
+    this.closed = true;
+    this.queued.length = 0;
+    this.queuedBytes = 0;
+    this.clearHeld();
+  }
 }
 
 interface TerminalInputModeState {
@@ -165,6 +291,8 @@ export interface ServerOptions {
    *  Mutable via `pty rename`; `name` stays the immutable stable id. */
   displayName?: string;
   onExit?: (code: number) => void;
+  /** Maximum normal output retained per client, excluding the bounded terminal-outcome reserve. */
+  maxClientOutputBytes?: number;
   /** When true, spawn the child with a scrubbed environment containing only
    *  a small allow-list of variables (plus any entries in `extraEnv`).
    *  Intended for contexts where the daemon may have inherited secrets that
@@ -366,7 +494,8 @@ export class PtyServer {
     mouseEncoding1016: false,
     kittyKeyboardFlags: [],
   };
-  private lastBroadcastInputModeRevision = 0;
+  private lastCommittedInputModeRevision = 0;
+  private outputRevision = 0;
   // Alt-screen buffer state (DEC private modes ?1049 / ?1047 / ?47). Set when
   // the child process enters the alternate screen buffer; cleared when it
   // leaves. Replayed to attaching clients so the SCREEN snapshot lands in the
@@ -472,6 +601,10 @@ export class PtyServer {
           : typeof first === "number"
             ? first
             : first[0];
+        if (!Number.isInteger(flags) || flags < 0 || flags > 0xffffffff) {
+          this.failMachineInputModes("kitty-keyboard-flags-out-of-range");
+          return false;
+        }
         if (
           this.inputModeState.kittyKeyboardFlags.length >=
           MAX_KITTY_KEYBOARD_STACK_DEPTH
@@ -494,6 +627,10 @@ export class PtyServer {
           : typeof first === "number"
             ? first
             : first[0];
+        if (!Number.isInteger(flags) || flags < 0 || flags > 0xffffffff) {
+          this.failMachineInputModes("kitty-keyboard-flags-out-of-range");
+          return false;
+        }
         const second = params[1];
         const mode = second === undefined
           ? 1
@@ -503,9 +640,9 @@ export class PtyServer {
         const stack = [...this.inputModeState.kittyKeyboardFlags];
         const current = stack.at(-1) ?? 0;
         const updated = mode === 2
-          ? current | flags
+          ? (current | flags) >>> 0
           : mode === 3
-            ? current & ~flags
+            ? (current & ~flags) >>> 0
             : flags;
         if (stack.length === 0) stack.push(updated);
         else stack[stack.length - 1] = updated;
@@ -729,28 +866,7 @@ export class PtyServer {
     // Query sequences (OSC 10/11, DA1, etc.) are intercepted by parser
     // handlers above and must NOT be forwarded to clients — otherwise the
     // client's terminal responds and its response appears as garbage input.
-    this.ptyProcess.onData((data: string) => {
-      const cleaned = stripTerminalQueries(data);
-      const inputModeRevision = this.inputModeState.revision;
-      if (cleaned.length > 0) {
-        this.broadcastLegacy(MessageType.DATA, encodeData(cleaned));
-      }
-      this.terminal.write(data, () => {
-        if (cleaned.length > 0) {
-          this.broadcastMachine({ _tag: "Data", bytes: Buffer.from(cleaned) });
-        }
-        if (
-          this.inputModeState.revision > inputModeRevision &&
-          this.inputModeState.revision > this.lastBroadcastInputModeRevision
-        ) {
-          this.broadcastMachine({
-            _tag: "InputModes",
-            inputModes: this.inputModeSnapshot(),
-          });
-          this.lastBroadcastInputModeRevision = this.inputModeState.revision;
-        }
-      });
-    });
+    this.ptyProcess.onData((data: string) => this.handlePtyOutput(data));
 
     this.ptyProcess.onExit(({ exitCode, signal }) => {
       this.exited = true;
@@ -1094,35 +1210,36 @@ export class PtyServer {
 
   private inputModeSnapshot(): MachineInputModeSnapshotV1 {
     const state = this.inputModeState;
-    const mouseTracking: MouseTrackingMode = state.mouseTracking1003
-      ? "any"
+    const mouseTracking = state.mouseTracking1003
+      ? "AnyMotion" as const
       : state.mouseTracking1002
-        ? "button"
+        ? "ButtonMotion" as const
         : state.mouseTracking1000
-          ? "click"
+          ? "Click" as const
           : state.mouseTracking9
-            ? "x10"
-          : "none";
-    const mouseEncoding: MouseEncodingMode = state.mouseEncoding1016
-      ? "sgr-pixels"
-      : state.mouseEncoding1006
-      ? "sgr"
+            ? "X10Press" as const
+            : "Off" as const;
+    const mouseEncoding = state.mouseEncoding1016 || state.mouseEncoding1006
+      ? "Sgr" as const
       : state.mouseEncoding1015
-        ? "urxvt"
+        ? "Urxvt" as const
         : state.mouseEncoding1005
-          ? "utf8"
-          : "x10";
-    return {
+          ? "Utf8" as const
+          : "X10" as const;
+    return canonicalizeMachineInputModeSnapshotV1({
+      schema: "pty.input-mode.v1",
+      wireEncoder: "xterm-input.v1",
       revision: state.revision,
       applicationCursorKeys: state.applicationCursorKeys,
       applicationKeypad: state.applicationKeypad,
       bracketedPaste: state.bracketedPaste,
       focusReporting: state.focusReporting,
       modifyOtherKeys: state.modifyOtherKeys,
+      kittyKeyboardFlagsStack: [...state.kittyKeyboardFlags],
       mouseTracking,
       mouseEncoding,
-      kittyKeyboardFlags: [...state.kittyKeyboardFlags],
-    };
+      mouseCoordinates: state.mouseEncoding1016 ? "Pixel" : "Cell",
+    });
   }
 
   private updateInputModes(
@@ -1152,6 +1269,35 @@ export class PtyServer {
     this.inputModeState = { ...next, revision: current.revision + 1 };
   }
 
+  private handlePtyOutput(data: string): void {
+    const cleaned = stripTerminalQueries(data);
+    if (cleaned.length > 0) {
+      this.broadcastLegacy(MessageType.DATA, encodeData(cleaned));
+    }
+    this.terminal.write(data, () => {
+      if (cleaned.length === 0) return;
+      let inputModes: MachineInputModeSnapshotV1 | undefined;
+      if (this.inputModeState.revision > this.lastCommittedInputModeRevision) {
+        try {
+          inputModes = this.inputModeSnapshot();
+        } catch {
+          this.failMachineInputModes("unrepresentable-input-mode");
+          return;
+        }
+      }
+      const outputRevision = this.outputRevision + 1;
+      this.outputRevision = outputRevision;
+      this.broadcastMachine({
+        _tag: "Data",
+        bytes: Buffer.from(cleaned),
+        outputRevision,
+        inputModeRevision: this.inputModeState.revision,
+        ...(inputModes === undefined ? {} : { inputModes }),
+      });
+      this.lastCommittedInputModeRevision = this.inputModeState.revision;
+    });
+  }
+
   private failMachineInputModes(reason: string): void {
     for (const client of [...this.clients.values()]) {
       if (client.role._tag !== "Machine" || client.role.phase === "ended") continue;
@@ -1169,13 +1315,13 @@ export class PtyServer {
     detail?: string
   ): void {
     client.role = { _tag: "Rejected" };
-    client.socket.end(
+    if (!client.output.end(
       encodeDaemonAdmissionV2({
         _tag: "Rejected",
         reason,
         ...(detail === undefined ? {} : { detail }),
       })
-    );
+    )) client.output.destroy();
   }
 
   private handleMachineOpen(
@@ -1309,8 +1455,35 @@ export class PtyServer {
     const attachSeq = role._tag === "Machine" ? role.attachSeq : 0;
     client.role = { _tag: "Machine", phase: "ended", rows, cols, attachSeq };
     client.initialScreenGeneration++;
-    client.socket.end(encodeMachineResponse(outcome));
+    client.output.clearHeld();
+    if (!client.output.end(encodeMachineResponse(outcome))) client.output.destroy();
     this.negotiateSize();
+  }
+
+  private handleSlowConsumer(client: Client): void {
+    const role = client.role;
+    client.initialScreenGeneration++;
+    client.output.clearHeld();
+    if (role._tag === "Machine" && role.phase !== "ended") {
+      client.role = { ...role, phase: "ended" };
+      const failure = encodeMachineResponse({
+        _tag: "StreamFailure",
+        phase: role.phase === "syncing" ? "baseline" : "stream",
+        reason: "slow-consumer",
+      });
+      if (!client.output.end(failure)) client.output.destroy();
+      this.negotiateSize();
+      return;
+    }
+    this.clients.delete(client.socket);
+    client.output.destroy();
+    this.negotiateSize();
+  }
+
+  private writeClient(client: Client, packet: Buffer): boolean {
+    if (client.output.write(packet)) return true;
+    this.handleSlowConsumer(client);
+    return false;
   }
 
   private admitWritableClient(
@@ -1319,6 +1492,7 @@ export class PtyServer {
     protocol: "legacy" | "machine-v2",
     onCommitted?: () => void
   ): void {
+    client.output.clearHeld();
     const sizeMatched =
       size.rows === this.terminal.rows && size.cols === this.terminal.cols;
     const attachSeq = ++this.attachCounter;
@@ -1328,7 +1502,7 @@ export class PtyServer {
     const initialScreenGeneration = ++client.initialScreenGeneration;
     const resized = this.negotiateSize();
     if (!resized && protocol === "legacy") {
-      client.socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+      this.writeClient(client, encodeGeometry(this.terminal.rows, this.terminal.cols));
     }
     try {
       mutateMetadataUnderLock(this.name, (meta) => {
@@ -1347,6 +1521,7 @@ export class PtyServer {
               _tag: "Ready",
               rows: this.terminal.rows,
               cols: this.terminal.cols,
+              outputRevision: this.outputRevision,
               inputModes: this.inputModeSnapshot(),
               screen: Buffer.from(this.serialize.serialize()),
             })
@@ -1374,6 +1549,10 @@ export class PtyServer {
   private handleClient(socket: net.Socket): void {
     const client: Client = {
       socket,
+      output: new BoundedClientOutput(
+        socket,
+        this.options.maxClientOutputBytes ?? DEFAULT_MAX_CLIENT_OUTPUT_BYTES,
+      ),
       reader: new PacketReader(),
       role: { _tag: "Command" },
       initialScreenGeneration: 0,
@@ -1403,7 +1582,7 @@ export class PtyServer {
               client,
               { rows, cols },
               "machine-v2",
-              () => client.socket.write(
+              () => this.writeClient(client,
                 encodeDaemonAdmissionV2({
                   _tag: "Accepted",
                   protocol: MACHINE_PROTOCOL_VERSION,
@@ -1438,11 +1617,12 @@ export class PtyServer {
           }
 
           case MessageType.PEEK: {
+            client.output.clearHeld();
             client.role = { _tag: "Readonly", phase: { _tag: "Settling" } };
             const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
             if (!resized) {
-              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+              this.writeClient(client, encodeGeometry(this.terminal.rows, this.terminal.cols));
             }
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
@@ -1486,13 +1666,13 @@ export class PtyServer {
           }
 
           case MessageType.DETACH: {
-            socket.end();
+            client.output.end();
             break;
           }
 
           case MessageType.STATUS: {
             const stats = this.collectStats();
-            socket.write(encodeStatusResponse(JSON.stringify(stats)));
+            this.writeClient(client, encodeStatusResponse(JSON.stringify(stats)));
             break;
           }
         }
@@ -1651,9 +1831,9 @@ export class PtyServer {
     const machinePacket = encodeMachineResponse({ _tag: "Geometry", rows, cols });
     for (const client of this.clients.values()) {
       if (client.role._tag === "Legacy" || client.role._tag === "Readonly") {
-        client.socket.write(legacyPacket);
+        this.writeClient(client, legacyPacket);
       } else if (client.role._tag === "Machine" && client.role.phase === "live") {
-        client.socket.write(machinePacket);
+        this.writeClient(client, machinePacket);
       }
     }
   }
@@ -1695,7 +1875,7 @@ export class PtyServer {
     ) {
       client.role = {
         ...client.role,
-        phase: { _tag: "Cutting", packets: [] },
+        phase: { _tag: "Cutting", hasPendingExit: false },
       };
     }
 
@@ -1709,13 +1889,28 @@ export class PtyServer {
       ) return;
 
       const role = client.role;
-      const pending =
+      const hasPendingExit =
         (role._tag === "Legacy" || role._tag === "Readonly") &&
-        role.phase._tag === "Cutting"
-          ? role.phase.packets
-          : [];
-      const hasPendingExit = pending.some((item) => item.isExit);
-      client.socket.write(getInitialPacket());
+        role.phase._tag === "Cutting" && role.phase.hasPendingExit;
+      let initialPacket: Buffer;
+      try {
+        initialPacket = getInitialPacket();
+      } catch {
+        if (client.role._tag === "Machine") {
+          this.endMachineStream(client, {
+            _tag: "StreamFailure",
+            phase: "baseline",
+            reason: "unrepresentable-input-mode",
+          });
+        } else {
+          client.output.destroy();
+        }
+        return;
+      }
+      if (!client.output.releaseHeld(initialPacket)) {
+        this.handleSlowConsumer(client);
+        return;
+      }
       if (role._tag === "Legacy") {
         client.role = { ...role, phase: { _tag: "Live" } };
       } else if (role._tag === "Readonly") {
@@ -1723,9 +1918,8 @@ export class PtyServer {
       } else if (role._tag === "Machine" && role.phase === "syncing") {
         client.role = { ...role, phase: "live" };
       }
-      for (const item of pending) client.socket.write(item.packet);
       if (this.exited && !hasPendingExit) {
-        client.socket.write(
+        this.writeClient(client,
           client.role._tag === "Machine"
             ? encodeMachineResponse({
                 _tag: "Exited",
@@ -1747,9 +1941,16 @@ export class PtyServer {
       const role = client.role;
       if (role._tag !== "Legacy" && role._tag !== "Readonly") continue;
       if (role.phase._tag === "Live") {
-        client.socket.write(packet);
+        this.writeClient(client, packet);
       } else if (role.phase._tag === "Cutting") {
-        role.phase.packets.push({ isExit: type === MessageType.EXIT, packet });
+        if (!client.output.hold(packet)) {
+          this.handleSlowConsumer(client);
+        } else if (type === MessageType.EXIT && !role.phase.hasPendingExit) {
+          client.role = {
+            ...role,
+            phase: { _tag: "Cutting", hasPendingExit: true },
+          };
+        }
       }
     }
   }
@@ -1758,7 +1959,7 @@ export class PtyServer {
     const packet = encodeMachineResponse(response);
     for (const client of this.clients.values()) {
       if (client.role._tag === "Machine" && client.role.phase === "live") {
-        client.socket.write(packet);
+        this.writeClient(client, packet);
       }
     }
   }

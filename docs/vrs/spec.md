@@ -181,6 +181,21 @@ The direction-specific frame schemas are:
 The causal output frames are:
 
 ```ts
+type InputModeSnapshotV1 = {
+  schema: "pty.input-mode.v1"
+  wireEncoder: "xterm-input.v1"
+  revision: number
+  applicationCursorKeys: boolean
+  applicationKeypad: boolean
+  bracketedPaste: boolean
+  focusReporting: boolean
+  modifyOtherKeys: 0 | 1 | 2
+  kittyKeyboardFlagsStack: u32[]
+  mouseTracking: "Off" | "X10Press" | "Click" | "ButtonMotion" | "AnyMotion"
+  mouseEncoding: "X10" | "Utf8" | "Sgr" | "Urxvt"
+  mouseCoordinates: "Cell" | "Pixel"
+}
+
 type Ready = {
   outputRevision: number
   rows: number

@@ -11,7 +11,9 @@ import {
   decodeMachineResponse,
   encodeDaemonOpenV2,
   encodeMachineRequest,
+  encodeMachineResponse,
   type MachineOpenV2,
+  type MachineResponse,
   type MachineWireFrame,
 } from "../src/machine-protocol.ts";
 import { MessageType, PacketReader, encodeStatus } from "../src/protocol.ts";
@@ -50,6 +52,7 @@ async function startServer(
   command = "cat",
   args: string[] = [],
   generation = "generation-a",
+  maxClientOutputBytes?: number,
 ): Promise<PtyServer> {
   const server = new PtyServer({
     name,
@@ -60,6 +63,7 @@ async function startServer(
     cwd: testCwd,
     rows: 24,
     cols: 80,
+    maxClientOutputBytes,
   });
   servers.push(server);
   await server.ready;
@@ -235,7 +239,7 @@ describe("machine attach v2 daemon admission", () => {
     opened.socket.destroy();
   });
 
-  it("orders mode-establishing Data before one complete mode snapshot", async () => {
+  it("atomically stamps a mode-changing burst and omits unchanged snapshots", async () => {
     const name = uniqueName();
     const modeBytes = [
       "\x1b[?1h",
@@ -252,39 +256,155 @@ describe("machine attach v2 daemon admission", () => {
       "\x1b[>10u",
       "\x1b[<2u",
     ].join("");
-    const script = [
-      "process.stdin.once('data', () => process.stdout.write(Buffer.from(process.argv[1], 'base64')))",
-      "setInterval(() => {}, 1000)",
-    ].join(";");
-    await startServer(name, process.execPath, ["-e", script, Buffer.from(modeBytes).toString("base64")]);
+    const server = await startServer(name);
     const { socket, frames } = await openMachine(name);
-    socket.write(encodeMachineRequest({ _tag: "Input", bytes: Buffer.from("go\n") }));
-    await frames.waitFor((received) => received.some((frame, index) =>
-      index >= 2 && decodeMachineResponse(frame)._tag === "InputModes"
-    ));
+    const handlePtyOutput = (server as unknown as {
+      handlePtyOutput: (data: string) => void;
+    }).handlePtyOutput.bind(server);
+    handlePtyOutput(modeBytes);
+    handlePtyOutput("PLAIN_OUTPUT");
+    await frames.waitFor((received) => received.some((frame, index) => {
+      if (index < 2) return false;
+      const response = decodeMachineResponse(frame);
+      return response._tag === "Data" && response.inputModes !== undefined;
+    }));
 
+    const ready = decodeMachineResponse(frames.frames[1]);
+    if (ready._tag !== "Ready") throw new Error("expected Ready baseline");
     const responses = frames.frames.slice(2).map(decodeMachineResponse);
-    const inputModesIndex = responses.findIndex((response) => response._tag === "InputModes");
-    const establishingDataIndex = responses.findIndex((response) =>
+    const establishingData = responses.find((response) =>
       response._tag === "Data" && response.bytes.includes(Buffer.from("\x1b[?1h"))
     );
-    expect(establishingDataIndex).toBeGreaterThanOrEqual(0);
-    expect(inputModesIndex).toBeGreaterThan(establishingDataIndex);
-    expect(responses[inputModesIndex]).toMatchObject({
-      _tag: "InputModes",
+    expect(establishingData).toMatchObject({
+      _tag: "Data",
       inputModes: {
+        schema: "pty.input-mode.v1",
+        wireEncoder: "xterm-input.v1",
         applicationCursorKeys: true,
         applicationKeypad: true,
         bracketedPaste: true,
         focusReporting: true,
         modifyOtherKeys: 2,
-        mouseTracking: "x10",
-        mouseEncoding: "sgr-pixels",
-        kittyKeyboardFlags: [6],
+        mouseTracking: "X10Press",
+        mouseEncoding: "Sgr",
+        mouseCoordinates: "Pixel",
+        kittyKeyboardFlagsStack: [6],
       },
     });
-    expect(responses.filter((response) => response._tag === "InputModes")).toHaveLength(1);
+    if (establishingData?._tag !== "Data") throw new Error("expected mode-establishing Data");
+    expect(establishingData.outputRevision).toBe(ready.outputRevision + 1);
+    expect(establishingData.inputModeRevision).toBe(establishingData.inputModes?.revision);
+
+    await frames.waitFor((received) => received.some((frame, index) => {
+      if (index < 2) return false;
+      const response = decodeMachineResponse(frame);
+      return response._tag === "Data" && response.bytes.includes(Buffer.from("PLAIN_OUTPUT"));
+    }));
+    const unchangedData = frames.frames.slice(2).map(decodeMachineResponse).find((response) =>
+      response._tag === "Data" && response.bytes.includes(Buffer.from("PLAIN_OUTPUT"))
+    );
+    expect(unchangedData).toMatchObject({
+      _tag: "Data",
+      inputModeRevision: establishingData.inputModeRevision,
+    });
+    if (unchangedData?._tag !== "Data") throw new Error("expected unchanged-mode Data");
+    expect(unchangedData.outputRevision).toBe(establishingData.outputRevision + 1);
+    expect(unchangedData.inputModes).toBeUndefined();
     socket.destroy();
+  });
+
+  it("commits revisions at the parser cut and does not count stripped query output", async () => {
+    const name = uniqueName();
+    const script = [
+      "process.stdin.setRawMode(true)",
+      "process.stdin.on('data', chunk => {",
+      "  if (chunk.includes(0x71)) process.stdout.write('\\x1b[c')",
+      "  if (chunk.includes(0x76)) process.stdout.write('VISIBLE')",
+      "})",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    const server = await startServer(name, process.execPath, ["-e", script]);
+    const terminal = (server as unknown as { terminal: Terminal }).terminal;
+    const ptyProcess = (server as unknown as { ptyProcess: { write: (data: string) => void } }).ptyProcess;
+    const originalWrite = terminal.write.bind(terminal);
+    const pending: Array<{ data: string; callback?: () => void }> = [];
+    terminal.write = ((data: string, callback?: () => void) => {
+      pending.push({ data, callback });
+    }) as typeof terminal.write;
+
+    const socket = await connect(name);
+    const frames = recordFrames(socket);
+    try {
+      socket.write(Buffer.concat([encodeDaemonOpenV2(openRequest(name)), encodeStatus()]));
+      await frames.waitFor((received) => received.length >= 1);
+      ptyProcess.write("late");
+      await expect.poll(() => pending.some((item) => item.data.length > 0)).toBe(true);
+
+      const cut = pending.find((item) => item.data.length === 0);
+      const late = pending.find((item) => item.data.length > 0);
+      expect(cut).toBeDefined();
+      expect(late).toBeDefined();
+      cut!.callback?.();
+      await frames.waitFor((received) => received.length >= 2);
+      const ready = decodeMachineResponse(frames.frames[1]);
+      expect(ready).toMatchObject({ _tag: "Ready", outputRevision: 0 });
+
+      late!.callback?.();
+      await frames.waitFor((received) => received.length >= 3);
+      const lateData = decodeMachineResponse(frames.frames[2]);
+      expect(lateData).toMatchObject({ _tag: "Data", outputRevision: 1 });
+    } finally {
+      terminal.write = originalWrite;
+      socket.destroy();
+    }
+
+    const queryName = uniqueName();
+    const queryObserved = path.join(testCwd, `${queryName}-query-observed`);
+    const queryScript = [
+      "const fs = require('node:fs')",
+      "process.stdin.setRawMode(true)",
+      "let awaitingReply = false",
+      "process.stdout.write('RAW_READY')",
+      "process.stdin.on('data', chunk => {",
+      "  if (chunk.includes(0x71)) { awaitingReply = true; process.stdout.write('\\x1b[c'); return }",
+      "  if (awaitingReply && chunk.includes(0x1b)) { awaitingReply = false; fs.writeFileSync(process.argv[1], '') }",
+      "  if (chunk.includes(0x76)) process.stdout.write('VISIBLE')",
+      "})",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    const revisionServer = await startServer(
+      queryName,
+      process.execPath,
+      ["-e", queryScript, queryObserved],
+    );
+    const opened = await openMachine(queryName);
+    const baseline = decodeMachineResponse(opened.frames.frames[1]);
+    if (baseline._tag !== "Ready") throw new Error("expected Ready baseline");
+    await opened.frames.waitFor((received) => received.some((frame, index) => {
+      if (index < 1) return false;
+      const response = decodeMachineResponse(frame);
+      return (response._tag === "Ready" && response.screen.includes(Buffer.from("RAW_READY"))) ||
+        (response._tag === "Data" && response.bytes.includes(Buffer.from("RAW_READY")));
+    }));
+    const beforeQueryRevision = (revisionServer as unknown as { outputRevision: number }).outputRevision;
+    opened.socket.write(encodeMachineRequest({ _tag: "Input", bytes: Buffer.from("q") }));
+    await expect.poll(() => fs.existsSync(queryObserved)).toBe(true);
+    expect((revisionServer as unknown as { outputRevision: number }).outputRevision)
+      .toBe(beforeQueryRevision);
+    opened.socket.write(encodeMachineRequest({ _tag: "Input", bytes: Buffer.from("v") }));
+    await opened.frames.waitFor((received) => received.some((frame, index) => {
+      if (index < 2) return false;
+      const response = decodeMachineResponse(frame);
+      return response._tag === "Data" && response.bytes.includes(Buffer.from("VISIBLE"));
+    }));
+    const visible = opened.frames.frames.slice(2).map(decodeMachineResponse).find((response) =>
+      response._tag === "Data" && response.bytes.includes(Buffer.from("VISIBLE"))
+    );
+    expect(visible).toMatchObject({
+      _tag: "Data",
+      outputRevision: beforeQueryRevision + 1,
+    });
+    opened.socket.destroy();
   });
 
   it("allows explicit detach after admission while Ready is still syncing", async () => {
@@ -305,6 +425,99 @@ describe("machine attach v2 daemon admission", () => {
       socket.destroy();
     } finally {
       terminal.write = originalWrite;
+    }
+  });
+
+  it("fails only a slow machine consumer without pausing or reordering its peer", async () => {
+    const name = uniqueName();
+    const normalOutputLimit = 1024;
+    const dataEnvelopeBytes = encodeMachineResponse({
+      _tag: "Data",
+      bytes: Buffer.from([0x61]),
+      outputRevision: 1,
+      inputModeRevision: 0,
+    }).length - 1;
+    const firstResponse = {
+      _tag: "Data" as const,
+      bytes: Buffer.alloc(normalOutputLimit - dataEnvelopeBytes, 0x61),
+      outputRevision: 1,
+      inputModeRevision: 0,
+    };
+    expect(encodeMachineResponse(firstResponse)).toHaveLength(normalOutputLimit);
+    const server = await startServer(
+      name,
+      "cat",
+      [],
+      "generation-a",
+      normalOutputLimit,
+    );
+    const slow = await openMachine(name);
+    const healthy = await openMachine(name);
+    const clients = (server as unknown as {
+      clients: Map<net.Socket, { role: { _tag: string }; socket: net.Socket }>;
+      broadcastMachine: (response: { _tag: "Data"; bytes: Buffer }) => void;
+    }).clients;
+    const slowServerClient = [...clients.values()].find(
+      (client) => client.role._tag === "Machine" && client.socket.remotePort === slow.socket.localPort,
+    );
+    expect(slowServerClient).toBeDefined();
+
+    const socket = slowServerClient!.socket;
+    const captured: Buffer[] = [];
+    let simulatedWritableLength = 0;
+    let acceptWrites = false;
+    let ended = false;
+    const originalWrite = socket.write;
+    const originalEnd = socket.end;
+    Object.defineProperty(socket, "writableLength", {
+      configurable: true,
+      get: () => simulatedWritableLength,
+    });
+    socket.write = ((packet: string | Uint8Array) => {
+      const copy = Buffer.from(packet);
+      captured.push(copy);
+      simulatedWritableLength = acceptWrites ? 0 : simulatedWritableLength + copy.length;
+      return acceptWrites;
+    }) as typeof socket.write;
+    socket.end = (() => {
+      ended = true;
+      return socket;
+    }) as typeof socket.end;
+
+    try {
+      const broadcast = (server as unknown as {
+        broadcastMachine: (response: MachineResponse) => void;
+      }).broadcastMachine.bind(server);
+      broadcast(firstResponse);
+      broadcast({ _tag: "Data", bytes: Buffer.from("overflow"), outputRevision: 2, inputModeRevision: 0 });
+
+      await healthy.frames.waitFor((frames) =>
+        frames.slice(2).filter((frame) => decodeMachineResponse(frame)._tag === "Data").length >= 2
+      );
+      expect(
+        healthy.frames.frames.slice(2).map(decodeMachineResponse)
+          .filter((response) => response._tag === "Data")
+          .map((response) => response.bytes[0]),
+      ).toEqual([0x61, 0x6f]);
+      expect(captured).toHaveLength(1);
+
+      simulatedWritableLength = 0;
+      acceptWrites = true;
+      socket.emit("drain");
+      expect(captured.map((frame) => decodeMachineResponse({
+        type: frame.readUInt8(0),
+        payload: frame.subarray(5),
+      }))).toEqual([
+        firstResponse,
+        { _tag: "StreamFailure", phase: "stream", reason: "slow-consumer" },
+      ]);
+      expect(ended).toBe(true);
+    } finally {
+      socket.write = originalWrite;
+      socket.end = originalEnd;
+      delete (socket as unknown as { writableLength?: number }).writableLength;
+      slow.socket.destroy();
+      healthy.socket.destroy();
     }
   });
 });

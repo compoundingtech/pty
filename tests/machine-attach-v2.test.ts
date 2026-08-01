@@ -26,15 +26,24 @@ import {
 } from "../src/protocol.ts";
 
 const modes: MachineInputModeSnapshotV1 = {
+  schema: "pty.input-mode.v1",
+  wireEncoder: "xterm-input.v1",
   revision: 1,
   applicationCursorKeys: false,
   applicationKeypad: false,
   bracketedPaste: true,
   focusReporting: false,
   modifyOtherKeys: 0,
-  mouseTracking: "none",
-  mouseEncoding: "sgr",
-  kittyKeyboardFlags: [],
+  mouseTracking: "Off",
+  mouseEncoding: "Sgr",
+  mouseCoordinates: "Cell",
+  kittyKeyboardFlagsStack: [],
+};
+
+const advancedModes: MachineInputModeSnapshotV1 = {
+  ...modes,
+  revision: 2,
+  bracketedPaste: false,
 };
 
 const open: MachineOpenV2 = {
@@ -137,6 +146,7 @@ describe("machine-attach-v2 adapter", () => {
               }),
               encodeMachineResponse({
                 _tag: "Ready",
+                outputRevision: 0,
                 rows: open.rows,
                 cols: open.cols,
                 inputModes: modes,
@@ -145,8 +155,25 @@ describe("machine-attach-v2 adapter", () => {
             ]));
           } else {
             const request = decodeMachineRequest(packet);
-            if (request._tag === "Input") receivedInput.push(Buffer.from(request.bytes));
-            if (request._tag === "Resize") receivedSizes.push({ rows: request.rows, cols: request.cols });
+            if (request._tag === "Input") {
+              receivedInput.push(Buffer.from(request.bytes));
+              socket.write(encodeMachineResponse({
+                _tag: "Data",
+                outputRevision: 1,
+                inputModeRevision: modes.revision,
+                bytes: Buffer.from("echo"),
+              }));
+            }
+            if (request._tag === "Resize") {
+              receivedSizes.push({ rows: request.rows, cols: request.cols });
+              socket.write(encodeMachineResponse({
+                _tag: "Data",
+                outputRevision: 2,
+                inputModeRevision: advancedModes.revision,
+                inputModes: advancedModes,
+                bytes: Buffer.from("mode"),
+              }));
+            }
             if (request._tag === "Detach") socket.write(encodeMachineResponse({ _tag: "Detached" }));
           }
         }
@@ -165,7 +192,22 @@ describe("machine-attach-v2 adapter", () => {
     expect(openSeen).toBe(true);
     expect(Buffer.concat(receivedInput)).toEqual(bytes);
     expect(receivedSizes).toEqual([{ rows: 30, cols: 100 }]);
-    expect(run.responses.map((response) => response._tag)).toEqual(["Hello", "Ready", "Detached"]);
+    expect(run.responses.map((response) => response._tag)).toEqual(["Hello", "Ready", "Data", "Data", "Detached"]);
+    expect(run.responses.slice(2, 4)).toEqual([
+      {
+        _tag: "Data",
+        outputRevision: 1,
+        inputModeRevision: modes.revision,
+        bytes: Buffer.from("echo"),
+      },
+      {
+        _tag: "Data",
+        outputRevision: 2,
+        inputModeRevision: advancedModes.revision,
+        inputModes: advancedModes,
+        bytes: Buffer.from("mode"),
+      },
+    ]);
   });
 
   it("turns a same-connection generation rejection into one typed outcome", async () => {
@@ -315,6 +357,7 @@ describe("machine-attach-v2 adapter", () => {
               }),
               encodeMachineResponse({
                 _tag: "Ready",
+                outputRevision: 0,
                 rows: open.rows,
                 cols: open.cols,
                 inputModes: modes,

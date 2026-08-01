@@ -20,15 +20,18 @@ import {
 } from "../src/machine-protocol.ts";
 
 const modes: MachineInputModeSnapshotV1 = {
+  schema: "pty.input-mode.v1",
+  wireEncoder: "xterm-input.v1",
   revision: 7,
   applicationCursorKeys: true,
   applicationKeypad: false,
   bracketedPaste: true,
   focusReporting: false,
   modifyOtherKeys: 2,
-  mouseTracking: "any",
-  mouseEncoding: "sgr",
-  kittyKeyboardFlags: [1, 15],
+  mouseTracking: "AnyMotion",
+  mouseEncoding: "Sgr",
+  mouseCoordinates: "Cell",
+  kittyKeyboardFlagsStack: [1, 15],
 };
 
 const open: MachineOpenV2 = {
@@ -83,19 +86,13 @@ describe("machine attach v2 protocol", () => {
   it("preserves arbitrary bytes within the framed transport", () => {
     const bytes = Buffer.from([0x00, 0xff, 0x1b, 0x62, 0x1c]);
     for (const frame of [
-      { _tag: "Data" as const, bytes },
+      { _tag: "Data" as const, outputRevision: 8, inputModeRevision: 7, bytes },
       {
         _tag: "Ready" as const,
+        outputRevision: 7,
         rows: 24,
         cols: 80,
         inputModes: modes,
-        screen: bytes,
-      },
-      {
-        _tag: "Snapshot" as const,
-        rows: 30,
-        cols: 100,
-        inputModes: { ...modes, revision: 8 },
         screen: bytes,
       },
     ]) {
@@ -104,7 +101,7 @@ describe("machine attach v2 protocol", () => {
       const decoded = decodeMachineResponse(wireFrame);
       expect(decoded._tag).toBe(frame._tag);
       if (decoded._tag === "Data") expect(decoded.bytes).toEqual(bytes);
-      else if (decoded._tag === "Ready" || decoded._tag === "Snapshot") expect(decoded.screen).toEqual(bytes);
+      else if (decoded._tag === "Ready") expect(decoded.screen).toEqual(bytes);
       else throw new Error(`unexpected decoded frame ${decoded._tag}`);
     }
   });
@@ -162,25 +159,41 @@ describe("machine attach v2 protocol", () => {
     const [invalidFrame] = new MachineFrameReader().feed(invalidUtf8);
     expect(() => decodeMachineRequest(invalidFrame)).toThrow(/Invalid machine protocol JSON/);
 
-    const invalidModes = encodeMachineResponse({
-      _tag: "InputModes",
-      inputModes: { ...modes, modifyOtherKeys: 3 as 2 },
-    });
-    const [invalidModesFrame] = new MachineFrameReader().feed(invalidModes);
-    expect(() => decodeMachineResponse(invalidModesFrame)).toThrow(/modifyOtherKeys/);
+    expect(() =>
+      encodeMachineResponse({
+        _tag: "Data",
+        outputRevision: 8,
+        inputModeRevision: 7,
+        inputModes: { ...modes, modifyOtherKeys: 3 as 2 },
+        bytes: Buffer.from("x"),
+      }),
+    ).toThrow(/modifyOtherKeys/);
   });
 
   it("round-trips the complete key and mouse mode vocabulary", () => {
     const inputModes: MachineInputModeSnapshotV1 = {
       ...modes,
-      mouseTracking: "x10",
-      mouseEncoding: "sgr-pixels",
+      mouseTracking: "X10Press",
+      mouseEncoding: "Sgr",
+      mouseCoordinates: "Pixel",
       modifyOtherKeys: 1,
     };
     const [frame] = new MachineFrameReader().feed(
-      encodeMachineResponse({ _tag: "InputModes", inputModes })
+      encodeMachineResponse({
+        _tag: "Data",
+        outputRevision: 8,
+        inputModeRevision: inputModes.revision,
+        inputModes,
+        bytes: Buffer.from("mode-change"),
+      })
     );
-    expect(decodeMachineResponse(frame)).toEqual({ _tag: "InputModes", inputModes });
+    expect(decodeMachineResponse(frame)).toEqual({
+      _tag: "Data",
+      outputRevision: 8,
+      inputModeRevision: inputModes.revision,
+      inputModes,
+      bytes: Buffer.from("mode-change"),
+    });
   });
 
   it("accepts only HELLO then READY then updates then one outcome then EOF", () => {
@@ -191,8 +204,20 @@ describe("machine attach v2 protocol", () => {
       capabilities: ["framed-utf8-input", "typed-outcome", "input-mode-snapshot"],
       build: { version: "0.12.0", dirty: false },
     };
-    const ready = { _tag: "Ready" as const, rows: 24, cols: 80, inputModes: modes, screen: Buffer.from("$ ") };
-    const data = { _tag: "Data" as const, bytes: Buffer.from("ok") };
+    const ready = {
+      _tag: "Ready" as const,
+      outputRevision: 41,
+      rows: 24,
+      cols: 80,
+      inputModes: modes,
+      screen: Buffer.from("$ "),
+    };
+    const data = {
+      _tag: "Data" as const,
+      outputRevision: 42,
+      inputModeRevision: 7,
+      bytes: Buffer.from("ok"),
+    };
     const exited = { _tag: "Exited" as const, code: 0, signal: null };
 
     let state = reduceMachineAttach({ _tag: "AwaitAdmission" }, { _tag: "Frame", frame: hello });
@@ -230,7 +255,7 @@ describe("machine attach v2 protocol", () => {
     }
   });
 
-  it("orders input mode updates by their explicit revision", () => {
+  it("applies output and changed input mode as one causal DATA transition", () => {
     const hello: MachineHelloV2 = {
       _tag: "Hello" as const,
       protocol: MACHINE_PROTOCOL_VERSION,
@@ -241,18 +266,36 @@ describe("machine attach v2 protocol", () => {
     const awaitingReady = reduceMachineAttach({ _tag: "AwaitAdmission" }, { _tag: "Frame", frame: hello });
     const streaming = reduceMachineAttach(awaitingReady, {
       _tag: "Frame",
-      frame: { _tag: "Ready", rows: 24, cols: 80, inputModes: modes, screen: Buffer.alloc(0) },
+      frame: {
+        _tag: "Ready",
+        outputRevision: 41,
+        rows: 24,
+        cols: 80,
+        inputModes: modes,
+        screen: Buffer.alloc(0),
+      },
     });
-    expect(streaming).toEqual({ _tag: "Streaming", inputModeRevision: 7 });
+    expect(streaming).toEqual({ _tag: "Streaming", inputModeRevision: 7, outputRevision: 41 });
     const advanced = reduceMachineAttach(streaming, {
       _tag: "Frame",
-      frame: { _tag: "InputModes", inputModes: { ...modes, revision: 8 } },
+      frame: {
+        _tag: "Data",
+        outputRevision: 42,
+        inputModeRevision: 8,
+        inputModes: { ...modes, revision: 8 },
+        bytes: Buffer.from("set mode"),
+      },
     });
-    expect(advanced).toMatchObject({ _tag: "Streaming", inputModeRevision: 8 });
+    expect(advanced).toMatchObject({ _tag: "Streaming", inputModeRevision: 8, outputRevision: 42 });
     expect(
       reduceMachineAttach(advanced, {
         _tag: "Frame",
-        frame: { _tag: "InputModes", inputModes: { ...modes, revision: 8 } },
+        frame: {
+          _tag: "Data",
+          outputRevision: 43,
+          inputModeRevision: 9,
+          bytes: Buffer.from("missing mode"),
+        },
       }),
     ).toMatchObject({ _tag: "ProtocolViolation" });
   });
@@ -264,7 +307,10 @@ describe("machine attach v2 protocol", () => {
     expect(
       reduceMachineAttach(
         { _tag: "AwaitAdmission" },
-        { _tag: "Frame", frame: { _tag: "Data", bytes: Buffer.from("early") } },
+        {
+          _tag: "Frame",
+          frame: { _tag: "Data", outputRevision: 1, inputModeRevision: 0, bytes: Buffer.from("early") },
+        },
       ),
     ).toMatchObject({ _tag: "ProtocolViolation" });
   });

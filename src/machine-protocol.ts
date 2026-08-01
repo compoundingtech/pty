@@ -24,12 +24,10 @@ export const MachineResponseType = {
   READY: 2,
   DATA: 3,
   GEOMETRY: 4,
-  SNAPSHOT: 5,
-  EXITED: 6,
-  DETACHED: 7,
-  ADMISSION_FAILURE: 8,
-  STREAM_FAILURE: 9,
-  INPUT_MODES: 10,
+  EXITED: 5,
+  DETACHED: 6,
+  ADMISSION_FAILURE: 7,
+  STREAM_FAILURE: 8,
 } as const;
 
 /** Reserved packet types on the existing daemon socket. */
@@ -56,11 +54,14 @@ export type MachineRequest =
   | { readonly _tag: "Resize"; readonly rows: number; readonly cols: number }
   | { readonly _tag: "Detach" };
 
-export type MouseTrackingMode = "none" | "x10" | "click" | "button" | "any";
-export type MouseEncodingMode = "x10" | "utf8" | "sgr" | "urxvt" | "sgr-pixels";
+export type MouseTrackingMode = "Off" | "X10Press" | "Click" | "ButtonMotion" | "AnyMotion";
+export type MouseEncodingMode = "X10" | "Utf8" | "Sgr" | "Urxvt";
+export type MouseCoordinateMode = "Cell" | "Pixel";
 
 /** Complete child-input state at one ordered terminal-stream revision. */
 export interface MachineInputModeSnapshotV1 {
+  readonly schema: "pty.input-mode.v1";
+  readonly wireEncoder: "xterm-input.v1";
   readonly revision: number;
   readonly applicationCursorKeys: boolean;
   readonly applicationKeypad: boolean;
@@ -69,7 +70,8 @@ export interface MachineInputModeSnapshotV1 {
   readonly modifyOtherKeys: 0 | 1 | 2;
   readonly mouseTracking: MouseTrackingMode;
   readonly mouseEncoding: MouseEncodingMode;
-  readonly kittyKeyboardFlags: readonly number[];
+  readonly mouseCoordinates: MouseCoordinateMode;
+  readonly kittyKeyboardFlagsStack: readonly number[];
 }
 
 export interface MachineBuildInfo {
@@ -88,6 +90,7 @@ export interface MachineHelloV2 {
 
 export interface MachineReadyV2 {
   readonly _tag: "Ready";
+  readonly outputRevision: number;
   readonly rows: number;
   readonly cols: number;
   readonly inputModes: MachineInputModeSnapshotV1;
@@ -123,16 +126,14 @@ export type MachineOutcome =
 export type MachineResponse =
   | MachineHelloV2
   | MachineReadyV2
-  | { readonly _tag: "Data"; readonly bytes: Buffer }
-  | { readonly _tag: "Geometry"; readonly rows: number; readonly cols: number }
   | {
-      readonly _tag: "Snapshot";
-      readonly rows: number;
-      readonly cols: number;
-      readonly inputModes: MachineInputModeSnapshotV1;
-      readonly screen: Buffer;
+      readonly _tag: "Data";
+      readonly outputRevision: number;
+      readonly inputModeRevision: number;
+      readonly inputModes?: MachineInputModeSnapshotV1;
+      readonly bytes: Buffer;
     }
-  | { readonly _tag: "InputModes"; readonly inputModes: MachineInputModeSnapshotV1 }
+  | { readonly _tag: "Geometry"; readonly rows: number; readonly cols: number }
   | MachineOutcome;
 
 export type DaemonAdmissionV2 =
@@ -260,12 +261,14 @@ function size(value: unknown): { rows: number; cols: number } {
   };
 }
 
-function inputModes(value: unknown): MachineInputModeSnapshotV1 {
+export function canonicalizeMachineInputModeSnapshotV1(value: unknown): MachineInputModeSnapshotV1 {
   const object = record(value, "inputModes");
   exactKeys(
     object,
     [
       "revision",
+      "schema",
+      "wireEncoder",
       "applicationCursorKeys",
       "applicationKeypad",
       "bracketedPaste",
@@ -273,20 +276,27 @@ function inputModes(value: unknown): MachineInputModeSnapshotV1 {
       "modifyOtherKeys",
       "mouseTracking",
       "mouseEncoding",
-      "kittyKeyboardFlags",
+      "mouseCoordinates",
+      "kittyKeyboardFlagsStack",
     ],
     "inputModes",
   );
   const tracking = string(object.mouseTracking, "mouseTracking") as MouseTrackingMode;
   const encoding = string(object.mouseEncoding, "mouseEncoding") as MouseEncodingMode;
-  if (!["none", "x10", "click", "button", "any"].includes(tracking))
+  const coordinates = string(object.mouseCoordinates, "mouseCoordinates") as MouseCoordinateMode;
+  if (object.schema !== "pty.input-mode.v1") throw new MachineProtocolError("unknown input mode schema");
+  if (object.wireEncoder !== "xterm-input.v1") throw new MachineProtocolError("unknown input wire encoder");
+  if (!["Off", "X10Press", "Click", "ButtonMotion", "AnyMotion"].includes(tracking))
     throw new MachineProtocolError("unknown mouse tracking mode");
-  if (!["x10", "utf8", "sgr", "urxvt", "sgr-pixels"].includes(encoding))
+  if (!["X10", "Utf8", "Sgr", "Urxvt"].includes(encoding))
     throw new MachineProtocolError("unknown mouse encoding mode");
-  if (!Array.isArray(object.kittyKeyboardFlags) || object.kittyKeyboardFlags.length > MAX_KITTY_STACK_DEPTH) {
-    throw new MachineProtocolError("kittyKeyboardFlags must be a bounded array");
+  if (!["Cell", "Pixel"].includes(coordinates)) throw new MachineProtocolError("unknown mouse coordinate mode");
+  if (!Array.isArray(object.kittyKeyboardFlagsStack) || object.kittyKeyboardFlagsStack.length > MAX_KITTY_STACK_DEPTH) {
+    throw new MachineProtocolError("kittyKeyboardFlagsStack must be a bounded array");
   }
   return {
+    schema: "pty.input-mode.v1",
+    wireEncoder: "xterm-input.v1",
     revision: integer(object.revision, "input mode revision", 0, Number.MAX_SAFE_INTEGER),
     applicationCursorKeys: boolean(object.applicationCursorKeys, "applicationCursorKeys"),
     applicationKeypad: boolean(object.applicationKeypad, "applicationKeypad"),
@@ -295,7 +305,8 @@ function inputModes(value: unknown): MachineInputModeSnapshotV1 {
     modifyOtherKeys: integer(object.modifyOtherKeys, "modifyOtherKeys", 0, 2) as 0 | 1 | 2,
     mouseTracking: tracking,
     mouseEncoding: encoding,
-    kittyKeyboardFlags: object.kittyKeyboardFlags.map((flag) => integer(flag, "kitty keyboard flag", 0, 0xffffffff)),
+    mouseCoordinates: coordinates,
+    kittyKeyboardFlagsStack: object.kittyKeyboardFlagsStack.map((flag) => integer(flag, "kitty keyboard flag", 0, 0xffffffff)),
   };
 }
 
@@ -353,9 +364,10 @@ function optionalDetail(value: unknown, name: string): string | undefined {
 
 function snapshotPayload(metadata: Omit<MachineReadyV2, "_tag" | "screen">, screen: Buffer): Buffer {
   const encodedMetadata = structured({
+    outputRevision: metadata.outputRevision,
     rows: metadata.rows,
     cols: metadata.cols,
-    inputModes: metadata.inputModes,
+    inputModes: canonicalizeMachineInputModeSnapshotV1(metadata.inputModes),
   });
   const header = Buffer.alloc(4);
   header.writeUInt32BE(encodedMetadata.length, 0);
@@ -369,11 +381,59 @@ function decodeSnapshotPayload(payload: Buffer): Omit<MachineReadyV2, "_tag"> {
     throw new MachineProtocolError("Snapshot metadata is truncated or oversized");
   }
   const metadata = record(parseStructured(payload.subarray(4, 4 + metadataLength)), "snapshot metadata");
-  exactKeys(metadata, ["rows", "cols", "inputModes"], "snapshot metadata");
+  exactKeys(metadata, ["outputRevision", "rows", "cols", "inputModes"], "snapshot metadata");
   return {
+    outputRevision: integer(metadata.outputRevision, "outputRevision", 0, Number.MAX_SAFE_INTEGER),
     ...size(metadata),
-    inputModes: inputModes(metadata.inputModes),
+    inputModes: canonicalizeMachineInputModeSnapshotV1(metadata.inputModes),
     screen: Buffer.from(payload.subarray(4 + metadataLength)),
+  };
+}
+
+function dataPayload(
+  metadata: Omit<Extract<MachineResponse, { readonly _tag: "Data" }>, "_tag" | "bytes">,
+  bytes: Buffer,
+): Buffer {
+  if (bytes.length === 0) throw new MachineProtocolError("DATA bytes must be non-empty");
+  const canonicalInputModes = metadata.inputModes === undefined
+    ? undefined
+    : canonicalizeMachineInputModeSnapshotV1(metadata.inputModes);
+  if (canonicalInputModes !== undefined && canonicalInputModes.revision !== metadata.inputModeRevision) {
+    throw new MachineProtocolError("DATA inputModes revision does not match inputModeRevision");
+  }
+  const encodedMetadata = structured({
+    outputRevision: integer(metadata.outputRevision, "outputRevision", 0, Number.MAX_SAFE_INTEGER),
+    inputModeRevision: integer(metadata.inputModeRevision, "inputModeRevision", 0, Number.MAX_SAFE_INTEGER),
+    ...(canonicalInputModes === undefined ? {} : { inputModes: canonicalInputModes }),
+  });
+  const header = Buffer.allocUnsafe(4);
+  header.writeUInt32BE(encodedMetadata.length, 0);
+  return Buffer.concat([header, encodedMetadata, bytes]);
+}
+
+function decodeDataPayload(
+  payload: Buffer,
+): Omit<Extract<MachineResponse, { readonly _tag: "Data" }>, "_tag"> {
+  if (payload.length < 4) throw new MachineProtocolError("DATA metadata length is truncated");
+  const metadataLength = payload.readUInt32BE(0);
+  if (metadataLength > MAX_STRUCTURED_PAYLOAD_LENGTH || payload.length < 4 + metadataLength) {
+    throw new MachineProtocolError("DATA metadata is truncated or oversized");
+  }
+  const metadata = record(parseStructured(payload.subarray(4, 4 + metadataLength)), "DATA metadata");
+  exactKeys(metadata, ["outputRevision", "inputModeRevision", "inputModes"], "DATA metadata");
+  const decodedModes = metadata.inputModes === undefined
+    ? undefined
+    : canonicalizeMachineInputModeSnapshotV1(metadata.inputModes);
+  const inputModeRevision = integer(metadata.inputModeRevision, "inputModeRevision", 0, Number.MAX_SAFE_INTEGER);
+  if (decodedModes !== undefined && decodedModes.revision !== inputModeRevision) {
+    throw new MachineProtocolError("DATA inputModes revision does not match inputModeRevision");
+  }
+  if (payload.length === 4 + metadataLength) throw new MachineProtocolError("DATA bytes must be non-empty");
+  return {
+    outputRevision: integer(metadata.outputRevision, "outputRevision", 0, Number.MAX_SAFE_INTEGER),
+    inputModeRevision,
+    ...(decodedModes === undefined ? {} : { inputModes: decodedModes }),
+    bytes: Buffer.from(payload.subarray(4 + metadataLength)),
   };
 }
 
@@ -416,13 +476,9 @@ export function encodeMachineResponse(response: MachineResponse): Buffer {
     case "Ready":
       return encodeFrame(MachineResponseType.READY, snapshotPayload(response, response.screen));
     case "Data":
-      return encodeFrame(MachineResponseType.DATA, response.bytes);
+      return encodeFrame(MachineResponseType.DATA, dataPayload(response, response.bytes));
     case "Geometry":
       return encodeFrame(MachineResponseType.GEOMETRY, structured(size(response)));
-    case "Snapshot":
-      return encodeFrame(MachineResponseType.SNAPSHOT, snapshotPayload(response, response.screen));
-    case "InputModes":
-      return encodeFrame(MachineResponseType.INPUT_MODES, structured({ inputModes: response.inputModes }));
     case "Exited":
       return encodeFrame(MachineResponseType.EXITED, structured(response));
     case "Detached":
@@ -453,18 +509,11 @@ export function decodeMachineResponse(frame: MachineWireFrame): MachineResponse 
     case MachineResponseType.READY:
       return { _tag: "Ready", ...decodeSnapshotPayload(frame.payload) };
     case MachineResponseType.DATA:
-      return { _tag: "Data", bytes: Buffer.from(frame.payload) };
+      return { _tag: "Data", ...decodeDataPayload(frame.payload) };
     case MachineResponseType.GEOMETRY: {
       const value = record(parseStructured(frame.payload), "GEOMETRY");
       exactKeys(value, ["rows", "cols"], "GEOMETRY");
       return { _tag: "Geometry", ...size(value) };
-    }
-    case MachineResponseType.SNAPSHOT:
-      return { _tag: "Snapshot", ...decodeSnapshotPayload(frame.payload) };
-    case MachineResponseType.INPUT_MODES: {
-      const value = structuredPayload();
-      exactKeys(value, ["inputModes"], "INPUT_MODES");
-      return { _tag: "InputModes", inputModes: inputModes(value.inputModes) };
     }
     case MachineResponseType.EXITED: {
       const value = structuredPayload();
@@ -552,6 +601,7 @@ export type MachineAttachState =
   | {
       readonly _tag: "Streaming";
       readonly inputModeRevision: number;
+      readonly outputRevision: number;
     }
   | { readonly _tag: "AwaitEof"; readonly outcome: MachineOutcome }
   | { readonly _tag: "Complete"; readonly outcome: MachineOutcome }
@@ -581,24 +631,36 @@ export function reduceMachineAttach(state: MachineAttachState, event: MachineAtt
       return violation(`Expected HELLO or ADMISSION_FAILURE, received ${frame._tag}`);
     case "AwaitReady":
       if (frame._tag === "Ready") {
-        return { _tag: "Streaming", inputModeRevision: frame.inputModes.revision };
+        return {
+          _tag: "Streaming",
+          inputModeRevision: frame.inputModes.revision,
+          outputRevision: frame.outputRevision,
+        };
       }
       if (frame._tag === "Exited" || frame._tag === "Detached" || frame._tag === "StreamFailure") {
         return { _tag: "AwaitEof", outcome: frame };
       }
       return violation(`Expected READY or pre-ready outcome, received ${frame._tag}`);
     case "Streaming":
-      if (frame._tag === "Data" || frame._tag === "Geometry") return state;
-      if (frame._tag === "InputModes") {
-        return frame.inputModes.revision > state.inputModeRevision
-          ? { ...state, inputModeRevision: frame.inputModes.revision }
-          : violation("INPUT_MODES revision must advance");
+      if (frame._tag === "Data") {
+        const modeAdvanced = frame.inputModeRevision > state.inputModeRevision;
+        if (frame.outputRevision !== state.outputRevision + 1 || frame.inputModeRevision < state.inputModeRevision) {
+          return violation("DATA causal stamp did not advance monotonically");
+        }
+        if (modeAdvanced !== (frame.inputModes !== undefined)) {
+          return violation("DATA must carry inputModes if and only if its mode revision advances");
+        }
+        if (frame.inputModes !== undefined && frame.inputModes.revision !== frame.inputModeRevision) {
+          return violation("DATA inputModes revision must equal inputModeRevision");
+        }
+        if (frame.bytes.length === 0) return violation("DATA bytes must be non-empty");
+        return {
+          ...state,
+          inputModeRevision: frame.inputModeRevision,
+          outputRevision: frame.outputRevision,
+        };
       }
-      if (frame._tag === "Snapshot") {
-        return frame.inputModes.revision >= state.inputModeRevision
-          ? { ...state, inputModeRevision: frame.inputModes.revision }
-          : violation("SNAPSHOT input-mode revision moved backward");
-      }
+      if (frame._tag === "Geometry") return state;
       if (frame._tag === "Exited" || frame._tag === "Detached" || frame._tag === "StreamFailure") {
         return { _tag: "AwaitEof", outcome: frame };
       }
