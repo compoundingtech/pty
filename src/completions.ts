@@ -97,6 +97,10 @@ const COMMANDS: readonly CommandSpec[] = [
     ],
   },
   {
+    name: "machine-attach-v2",
+    desc: "Headless framed duplex attach for terminal hosts",
+  },
+  {
     name: "exec",
     desc: "Replace the current session process",
     takesPath: true,

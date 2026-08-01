@@ -17,6 +17,7 @@ _pty() {
     'run:Create a session and attach'
     'attach:Attach to an existing session'
     'a:Alias for attach'
+    'machine-attach-v2:Headless framed duplex attach for terminal hosts'
     'exec:Replace the current session process'
     'peek:Print current screen (or follow / wait-for-text)'
     'send:Send text or key events'
@@ -77,6 +78,8 @@ _pty() {
             '--remote[Attach a session on a fabric peer]' \
             '--attach-stream-fd-v1[Write framed machine events to an inherited fd]:fd:' \
             '1:session:_pty_sessions'
+          ;;
+        machine-attach-v2)
           ;;
         exec)
           _arguments \

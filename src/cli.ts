@@ -52,6 +52,7 @@ import {
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
+import { machineAttachV2 } from "./machine-attach.ts";
 import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
 import {
   RECOVERY_PROTOCOL,
@@ -150,6 +151,20 @@ Examples:
   pty attach -r myserver
   pty attach --no-restart myserver
   pty attach --remote hetzner myshell`,
+
+  "machine-attach-v2": `Usage: pty machine-attach-v2
+
+Open one headless, framed, duplex attachment. The first stdin frame identifies
+the exact stable session id and expected daemon generation. Responses are
+written only to stdout; diagnostics are written only to stderr.
+
+This protocol does not resolve display-name aliases, restart sessions, reserve
+input bytes, or fall back to legacy attach.
+Every successfully framed outcome exits zero; adapter/process failures exit
+non-zero. The framed outcome, not process status, is the session result.
+
+Example:
+  pty machine-attach-v2 < request.frames > response.frames`,
 
   exec: `Usage: pty exec -- <command> [args...]
 
@@ -473,6 +488,7 @@ Attach & interact:
   pty attach -r <ref>                     Attach, auto-restart if the session is exited
   pty attach --no-restart <ref>            Attach only; fail if the session is not running
   pty attach --remote <peer> <ref>        Attach a session on a fabric peer (over fabric)
+  pty machine-attach-v2                   Headless framed duplex attach for terminal hosts
   pty exec -- <command> [args...]         Replace the current session's process (inside a session)
   pty send <ref> "text"                   Send raw text (no implicit newline)
   pty send <ref> --seq "text" --seq key:return   Send an ordered sequence of chunks / key events
@@ -1014,6 +1030,15 @@ async function main(): Promise<void> {
         await cmdAttach(resolvedAttachName, restartPolicy, force, attachStreamFdV1);
       }
       break;
+    }
+
+    case "machine-attach-v2": {
+      if (args.length !== 1) {
+        console.error("Usage: pty machine-attach-v2");
+        process.exit(1);
+      }
+      await machineAttachV2();
+      process.exit(0);
     }
 
     case "exec": {

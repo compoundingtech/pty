@@ -44,6 +44,7 @@ complete -c pty -n __pty_needs_command -l filter-tag -x -d 'TUI: filter to k=v (
 complete -c pty -n __pty_needs_command -a run -d 'Create a session and attach'
 complete -c pty -n __pty_needs_command -a attach -d 'Attach to an existing session'
 complete -c pty -n __pty_needs_command -a a -d 'Attach to an existing session'
+complete -c pty -n __pty_needs_command -a machine-attach-v2 -d 'Headless framed duplex attach for terminal hosts'
 complete -c pty -n __pty_needs_command -a exec -d 'Replace the current session process'
 complete -c pty -n __pty_needs_command -a peek -d 'Print current screen (or follow / wait-for-text)'
 complete -c pty -n __pty_needs_command -a send -d 'Send text or key events'

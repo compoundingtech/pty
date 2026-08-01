@@ -65,3 +65,21 @@ export {
   PacketReader, MessageType,
   type Packet,
 } from "./protocol.ts";
+
+// Headless terminal-host attachment
+export {
+  machineAttachV2,
+  type MachineAttachV2Options,
+} from "./machine-attach.ts";
+export {
+  MACHINE_PROTOCOL_VERSION,
+  MachineFrameReader,
+  decodeMachineRequest,
+  decodeMachineResponse,
+  encodeMachineRequest,
+  encodeMachineResponse,
+  type MachineOpenV2,
+  type MachineRequest,
+  type MachineResponse,
+  type MachineOutcome,
+} from "./machine-protocol.ts";
