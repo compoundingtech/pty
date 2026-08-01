@@ -11,7 +11,6 @@
 
 import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -77,32 +76,6 @@ describe("pty completions <shell>", () => {
     const markers = { fish: "-l env", bash: "--env", zsh: "--env" } as const;
     for (const shell of ["fish", "bash", "zsh"] as const) {
       expect(gen(shell)).toContain(markers[shell]);
-    }
-  });
-
-  it("models --attach-stream-fd-v1 as consuming a required free-form value", () => {
-    expect(gen("fish")).toContain("-l attach-stream-fd-v1 -x ");
-    expect(gen("bash")).toContain('"${prev}" == "--attach-stream-fd-v1"');
-    expect(gen("zsh")).toMatch(/--attach-stream-fd-v1\[[^\]]+\]:fd:/);
-
-    const bash = which("bash");
-    if (!bash) return;
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pty-completion-fd-"));
-    try {
-      fs.writeFileSync(path.join(root, "target.json"), "{}");
-      const script = `${gen("bash")}
-COMP_WORDS=(pty attach --attach-stream-fd-v1 3 "")
-COMP_CWORD=4
-_pty
-printf '%s\n' "\${COMPREPLY[@]}"`;
-      const result = spawnSync(bash, ["-c", script], {
-        encoding: "utf8",
-        env: { ...process.env, PTY_ROOT: root },
-      });
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout.trim()).toBe("target");
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

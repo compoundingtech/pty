@@ -1,10 +1,8 @@
 import * as net from "node:net";
 import * as tty from "node:tty";
-import * as fs from "node:fs";
 import {
   MessageType,
   PacketReader,
-  encodePacket,
   encodeAttach,
   encodeData,
   encodeDetach,
@@ -406,26 +404,6 @@ export interface AttachOptions {
    *  A recoverable stall keeps the socket open (no close event), so reconnect
    *  fires only on a genuine close (fabric's loud give-up), never on a stall. */
   reconnect?: () => Promise<net.Socket | null>;
-  /** Write the ordered v1 machine attach stream to this caller-owned inherited
-   *  descriptor. stdin/stdout remain the controlling terminal for input and
-   *  geometry; terminal output is emitted only as framed protocol packets. */
-  attachStreamFdV1?: number;
-}
-
-/** Validate a dedicated inherited descriptor without taking ownership of it. */
-export function validateAttachStreamFdV1(fd: number): void {
-  if (!Number.isSafeInteger(fd) || fd < 3) {
-    throw new Error(
-      `--attach-stream-fd-v1 requires a dedicated inherited file descriptor >= 3 (got ${fd})`,
-    );
-  }
-  try {
-    fs.fstatSync(fd);
-    fs.writeSync(fd, Buffer.alloc(0));
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`--attach-stream-fd-v1 descriptor ${fd} is not writable: ${detail}`);
-  }
 }
 
 /** Backoff schedule for `attach --remote` reconnect attempts, then a cap. */
@@ -445,8 +423,6 @@ export function attach(options: AttachOptions): void {
   const stdin = process.stdin;
   const stdout = process.stdout;
   const canReconnect = !!options.reconnect;
-  const attachStreamFd = options.attachStreamFdV1;
-  if (attachStreamFd !== undefined) validateAttachStreamFdV1(attachStreamFd);
 
   // `socket` is mutable: the reconnect loop swaps in a fresh routed socket, and
   // the (once-wired) input handlers write to whichever socket is current.
@@ -464,11 +440,6 @@ export function attach(options: AttachOptions): void {
   let inputWired = false;
   let stdinDataHandler: ((data: Buffer) => void) | null = null;
   let resizeHandler: (() => void) | null = null;
-  let machineInitialState: "geometry" | "screen" | "ready" = "geometry";
-  let streamBackpressured = false;
-  const attachStream = attachStreamFd === undefined
-    ? null
-    : fs.createWriteStream("", { fd: attachStreamFd, autoClose: false });
 
   function enterRawMode(): void {
     if (stdin.isTTY && !stdin.isRaw) { stdin.setRawMode(true); rawWasSet = true; }
@@ -494,43 +465,19 @@ export function attach(options: AttachOptions): void {
     if (exitHandled) return;
     exitHandled = true;
     cleanExit();
-    if (attachStream && !attachStream.destroyed && !attachStream.writableEnded) {
-      attachStream.end(() => completeExit(code));
-    } else {
-      completeExit(code);
-    }
+    completeExit(code);
   }
   function finishDetach(): void {
     if (exitHandled) return;
     exitHandled = true;
     detaching = true;
-    const completeDetach = () => {
-      if (exitCompleted) return;
-      exitCompleted = true;
-      options.onDetach?.();
-    };
-    if (attachStream && !attachStream.destroyed && !attachStream.writableEnded) {
-      attachStream.write(encodeDetach());
-      try { socket.write(encodeDetach()); } catch {}
-      cleanExit();
-      attachStream.end(completeDetach);
-    } else {
-      try { socket.write(encodeDetach()); } catch {}
-      cleanExit();
-      stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
-      completeDetach();
-    }
+    try { socket.write(encodeDetach()); } catch {}
+    cleanExit();
+    stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
+    if (exitCompleted) return;
+    exitCompleted = true;
+    options.onDetach?.();
   }
-
-  attachStream?.on("error", (error) => {
-    console.error(`pty attach: machine stream descriptor ${attachStreamFd} failed: ${error.message}`);
-    if (exitHandled) {
-      cleanExit();
-      completeExit(1);
-    } else {
-      finish(1);
-    }
-  });
 
   // Wire stdin/resize forwarding ONCE. Handlers write to the CURRENT `socket`,
   // so they keep working after the reconnect loop swaps the socket.
@@ -593,52 +540,6 @@ export function attach(options: AttachOptions): void {
       return;
     }
     for (const packet of packets) {
-      if (attachStream) {
-        const isStreamEvent =
-          packet.type === MessageType.GEOMETRY ||
-          packet.type === MessageType.SCREEN ||
-          packet.type === MessageType.DATA ||
-          packet.type === MessageType.EXIT;
-        if (!isStreamEvent) continue;
-        if (machineInitialState === "geometry" && packet.type !== MessageType.GEOMETRY) {
-          console.error(
-            "pty attach: daemon does not support attach stream v1 (expected GEOMETRY before terminal events)",
-          );
-          finish(1);
-          return;
-        }
-        if (
-          machineInitialState === "screen" &&
-          packet.type !== MessageType.GEOMETRY &&
-          packet.type !== MessageType.SCREEN
-        ) {
-          console.error(
-            `pty attach: daemon does not support attach stream v1 (expected SCREEN before ${packet.type === MessageType.DATA ? "DATA" : "EXIT"})`,
-          );
-          finish(1);
-          return;
-        }
-        if (machineInitialState === "geometry" && packet.type === MessageType.GEOMETRY) {
-          machineInitialState = "screen";
-        } else if (machineInitialState === "screen" && packet.type === MessageType.SCREEN) {
-          machineInitialState = "ready";
-        }
-        if (!attachStream.write(encodePacket(packet.type, packet.payload)) && !streamBackpressured) {
-          streamBackpressured = true;
-          socket.pause();
-          attachStream.once("drain", () => {
-            streamBackpressured = false;
-            if (!socket.destroyed) socket.resume();
-          });
-        }
-        if (packet.type === MessageType.EXIT) {
-          exitCode = decodeExit(packet.payload);
-          sessionExited = true;
-          finish(exitCode);
-          return;
-        }
-        continue;
-      }
       switch (packet.type) {
         case MessageType.DATA:
           stdout.write(packet.payload);
@@ -664,11 +565,6 @@ export function attach(options: AttachOptions): void {
     // No reconnect: preserve the original not-found / exit-code behavior.
     if (err) {
       cleanExit();
-      if (attachStream && !sessionExited) {
-        console.error(`pty attach: machine stream truncated before EXIT: ${err.message}`);
-        finish(1);
-        return;
-      }
       const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
         || err.code === "ECONNRESET" || err.code === "EPIPE";
       if (notReachable) {
@@ -680,19 +576,12 @@ export function attach(options: AttachOptions): void {
       }
       finish(1);
     } else {
-      if (attachStream && !sessionExited) {
-        console.error("pty attach: machine stream truncated before EXIT: connection closed");
-        finish(1);
-      } else {
-        finish(exitCode);
-      }
+      finish(exitCode);
     }
   }
 
   function bindSocket(s: net.Socket, preConnected: boolean): void {
     reader = new PacketReader();
-    machineInitialState = "geometry";
-    if (streamBackpressured) s.pause();
     s.on("data", handleData);
     s.on("error", (err: NodeJS.ErrnoException) => handleDisconnect(err));
     s.on("close", () => handleDisconnect());
@@ -706,7 +595,7 @@ export function attach(options: AttachOptions): void {
   async function reconnectLoop(): Promise<void> {
     if (reconnecting) return;
     reconnecting = true;
-    const status = attachStream ? process.stderr : stdout;
+    const status = stdout;
     status.write(`\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n`);
     let attempt = 0;
     while (!detaching && !exitHandled) {
@@ -721,10 +610,8 @@ export function attach(options: AttachOptions): void {
         // (Transport failures resolve null, so we keep retrying below.)
         if (detaching || exitHandled) break;
         reconnecting = false;
-        status.write(attachStream
-          ? `[${options.name} session ended]\n`
-          : TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
-        finish(attachStream ? 1 : 0);
+        status.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
+        finish(0);
         return;
       }
       if (detaching || exitHandled) { try { fresh?.destroy(); } catch {} break; }
@@ -739,9 +626,7 @@ export function attach(options: AttachOptions): void {
       // ends it (besides the user's Ctrl-\ / Ctrl-C).
       if (++attempt >= RECONNECT_MAX_ATTEMPTS) {
         reconnecting = false;
-        status.write(attachStream
-          ? `[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\n`
-          : TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
+        status.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
         finish(1);
         return;
       }

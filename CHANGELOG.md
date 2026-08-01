@@ -84,18 +84,17 @@ notification because pty does not journal a cross-file transaction.
   fail closed while listing the candidate stable ids. Fabric remote routing uses
   the same rule on the target host.
 
-### Framed machine attach stream
+### Headless machine attach
 
-- `pty attach --attach-stream-fd-v1 <fd> <ref>` keeps stdin/stdout as the
-  controlling terminal while writing ordered, existing-protocol `GEOMETRY`,
-  `SCREEN`, and `DATA` packets plus a terminal `EXIT` or `DETACH` outcome to a
-  dedicated inherited descriptor. Intentional local detach is framed and
-  flushed even when it occurs before the initial daemon baseline, so consumers
-  can distinguish it from a truncated stream.
-  The descriptor remains caller-owned and must be closed by the caller for
-  consumers to observe EOF. Invalid descriptors, write failures, and daemons
-  that do not provide the v1 geometry-first contract fail clearly on stderr.
-- Ordinary interactive attach rendering and resize behavior are unchanged.
+- `pty machine-attach-v2` is the sole machine-facing attach API. It owns stdin
+  and stdout as bounded, direction-specific framed streams and admits one exact
+  stable session id and expected daemon generation on one socket. Successful
+  admission emits `HELLO`, an optional atomic `READY` baseline with ordered
+  terminal updates, one typed terminal outcome, and EOF. Admission failures
+  are typed separately from failures after `HELLO`.
+- The adapter never resolves display-name aliases, restarts a session, reserves
+  terminal input bytes, or falls back to interactive attach. `pty attach`
+  remains exclusively interactive.
 
 ### Stream-ordered effective geometry for embedded clients
 

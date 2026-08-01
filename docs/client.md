@@ -367,22 +367,24 @@ These functions use `process.stdin`/`process.stdout` directly and may call `proc
 
 Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to detach (double-tap to send through).
 
-Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
-machine mode. stdin and stdout remain the controlling terminal for input and
-resize events, but terminal output is written only to that descriptor using the
-existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, and
-`DATA` packets followed by one terminal outcome: `EXIT` when the session process
-ends or `DETACH` when the local user intentionally detaches. `DETACH` may be the
-first packet when the user detaches before the daemon supplies its initial
-baseline. Each initial attach or reconnect otherwise starts with `GEOMETRY`; a
-daemon that sends terminal data first is rejected as unsupported.
+This API is exclusively interactive. Terminal hosts use `machineAttachV2()` or
+the equivalent `pty machine-attach-v2` command instead.
 
-The descriptor remains caller-owned. `attach()` flushes its writer but does not
-close the descriptor, so a consumer sees EOF only when the caller closes its
-copy (or the process exits). A clean EOF follows a framed `EXIT` or `DETACH`;
-EOF without either outcome is a truncated stream. Descriptor errors fail the
-attach and are reported on stderr; stderr text is never written into the framed
-stream.
+### `machineAttachV2(options?: MachineAttachV2Options): Promise<MachineOutcome>`
+
+Bridge one headless, framed stdin/stdout stream to an exact running session.
+The first request is an `Open` frame containing the stable session id, expected
+daemon generation, initial geometry, and required capabilities. The adapter
+uses one daemon socket and never resolves aliases, restarts sessions, reserves
+input bytes, or falls back to interactive attach.
+
+After successful admission, responses are ordered as `Hello`, an optional
+atomic `Ready` baseline with zero or more `Data`/`Geometry` updates, one typed
+`Exited`, `Detached`, or `StreamFailure` outcome, then EOF. Rejection before
+`Hello` produces `AdmissionFailure`. Request and response frames are
+direction-specific; use `encodeMachineRequest`/`decodeMachineResponse` and
+`MachineFrameReader` from `@compoundingtech/pty/client` rather than the
+interactive packet protocol.
 
 ### `peek(options: PeekOptions): void`
 
@@ -501,11 +503,9 @@ const MessageType = {
 };
 ```
 
-`DETACH` always has an empty payload. On the session socket it requests that
-the client connection detach. On `--attach-stream-fd-v1`, it is the terminal
-outcome for an intentional local detach and is flushed before clean completion.
-Clean EOF follows either `DETACH` or `EXIT`; EOF without either outcome is a
-truncated stream.
+`DETACH` always has an empty payload. On the interactive session socket it
+requests that the client connection detach. Machine attach uses its own typed,
+direction-specific request and response frames.
 
 Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
 unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving

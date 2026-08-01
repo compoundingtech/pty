@@ -61,6 +61,16 @@ describe("pty --help — no drift", () => {
     expect(r.stdout).toMatch(/inherited environment variable \(repeatable\)/);
   });
 
+  it("keeps interactive and machine attach as separate commands", () => {
+    const interactive = help("attach");
+    const machine = help("machine-attach-v2");
+    expect(interactive.status).toBe(0);
+    expect(interactive.stdout).not.toContain("attach-stream-fd-v1");
+    expect(machine.status).toBe(0);
+    expect(machine.stdout).toMatch(/headless, framed, duplex attachment/i);
+    expect(machine.stdout).toMatch(/does not[\s\S]*fall back to legacy attach/i);
+  });
+
   it("every dispatch `case` is either a documented command or a known non-command", () => {
     // Extract every `case "X":` label from the dispatcher.
     const cases = [...cliSource.matchAll(/case\s+"([^"]+)":/g)].map((m) => m[1]);
