@@ -158,7 +158,7 @@ host                         adapter                         daemon
 Every machine frame uses the common five-byte header and the 32 MiB bound.
 Structured payloads are fatal UTF-8 JSON capped at 64 KiB with exact fields;
 unknown tags or fields are protocol errors. `DATA`, `INPUT`, and the screen
-suffixes of `READY` and `SNAPSHOT` remain byte payloads. `INPUT` reaches the
+suffix of `READY` retain byte payloads. `INPUT` reaches the
 node-pty string boundary only after one fatal UTF-8 validation. Valid UTF-8 and
 all C0/escape bytes, including `0x1c`, pass unchanged; invalid UTF-8 produces a
 typed failure rather than replacement characters (R07, R08).
@@ -172,20 +172,57 @@ The direction-specific frame schemas are:
 | host -> adapter | `RESIZE` | Non-zero rows/cols; only after `READY` |
 | host -> adapter | `DETACH` | Empty explicit intent after `HELLO`, including before `READY`; at most once |
 | adapter -> host | `HELLO` | Exact generation, negotiated capabilities, diagnostic daemon build identity |
-| adapter -> host | `READY` | Atomic effective geometry, complete input-mode snapshot, and screen baseline; at most once |
-| adapter -> host | `DATA` / `GEOMETRY` | Ordered terminal bytes or effective size after `READY` |
-| adapter -> host | `INPUT_MODES` | Complete input-mode state at a strictly increasing revision |
-| adapter -> host | `SNAPSHOT` | Atomic geometry, complete non-regressing input-mode state, and screen |
+| adapter -> host | `READY` | Atomic output revision, effective geometry, complete input-mode snapshot, and screen baseline; at most once |
+| adapter -> host | `DATA` | Atomic output revision, input-mode revision, optional complete changed input-mode snapshot, and terminal bytes after `READY` |
+| adapter -> host | `GEOMETRY` | Ordered effective size after `READY` |
 | adapter -> host | `ADMISSION_FAILURE` | Typed rejection before `HELLO`; no daemon attach mutation |
 | adapter -> host | `EXITED` / `DETACHED` / `STREAM_FAILURE` | Exactly one terminal outcome, then EOF |
+
+The causal output frames are:
+
+```ts
+type Ready = {
+  outputRevision: number
+  rows: number
+  cols: number
+  inputModes: InputModeSnapshotV1
+  screen: Uint8Array
+}
+
+type Data = {
+  outputRevision: number
+  inputModeRevision: number
+  inputModes?: InputModeSnapshotV1
+  bytes: Uint8Array
+}
+```
+
+`READY` is the authoritative baseline for one bound stream; its revision is read
+at the baseline cut after earlier parser callbacks commit and need not be
+contiguous with an earlier connection. Each subsequent `DATA` has non-empty bytes
+and `outputRevision = previous + 1`; stripped query-only or empty output emits no
+`DATA` and advances no output revision. `inputModes` is absent exactly when
+`inputModeRevision` equals the installed revision. A changed mode revision must
+strictly advance (it may jump after multiple transitions), and the same `DATA`
+carries the complete replacement snapshot whose revision it names. Bytes, causal
+stamps, and the optional snapshot form one envelope retained, delivered, and
+reduced atomically.
+
+Each client's bounded ordered writer retains a whole `DATA` envelope or rejects
+it and ends that machine stream as a slow consumer. It never splits causal
+metadata from bytes, pauses the PTY, or stalls another client.
 
 The complete child-input mode snapshot contains application cursor keys,
 application keypad, bracketed paste, focus reporting, modifyOtherKeys level,
 mouse tracking (including DECSET 9), mouse encoding (including pixel SGR), and
 the Kitty keyboard active-flags stack. Kitty set/add/remove and push/pop-n
 operations update that one stack. The snapshot is state, not an inference from
-screen bytes. A mode change is ordered after the `DATA` that established it and
-sent as a complete `INPUT_MODES` replacement with an advancing revision.
+screen bytes.
+
+Fractal or another input-capable host opens its input gate only after applying
+`READY`. For each `DATA`, it applies terminal bytes and any changed mode snapshot
+in one reducer transition before encoding further child input. It never encodes
+against a revision named by `DATA` but not yet installed.
 
 The adapter sends daemon packet `OPEN_V2` (reserved type 8) followed by a
 `STATUS` request on the same command-role socket. A v2 daemon answers first with
@@ -200,15 +237,15 @@ build identity are diagnostic; the three required capabilities are
 The host lifecycle grammar is (R08):
 
 ```text
-( HELLO ( READY (DATA | GEOMETRY | INPUT_MODES | SNAPSHOT)* STREAM_END
+( HELLO ( READY (DATA | GEOMETRY)* STREAM_END
         | STREAM_END )
 | ADMISSION_FAILURE ) EOF
 
 STREAM_END = EXITED | DETACHED | STREAM_FAILURE
 ```
 
-Bare EOF, a second outcome, a pre-`READY` update, a repeated `READY`, or a
-backward input-mode revision is a protocol violation. `AdmissionFailure`
+Bare EOF, a second outcome, a pre-`READY` update, a repeated `READY`, or a causal
+revision violation is a protocol error. `AdmissionFailure`
 includes unsupported daemon/capability, generation mismatch, missing or denied
 session, malformed request, and adapter transport failure before `HELLO`.
 `StreamFailure` covers baseline, streaming, or shutdown failure after `HELLO`.
