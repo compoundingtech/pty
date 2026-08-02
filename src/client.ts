@@ -23,8 +23,8 @@ import {
 } from "./machine-protocol.ts";
 
 const DETACH_KEY = 0x1c; // Ctrl+\ (legacy encoding)
-const DETACH_KEY_KITTY = "\x1b[92;5u"; // Ctrl+\ (Kitty keyboard protocol)
-const DETACH_KEY_KITTY_BYTES = Buffer.from(DETACH_KEY_KITTY);
+const DETACH_KEY_KITTY = Buffer.from("\x1b[92;5u");
+const DETACH_KEY_MODIFY_OTHER_KEYS = Buffer.from("\x1b[27;5;92~");
 
 interface InteractiveInputPolicyOptions {
   readonly onInput: (bytes: Buffer) => void;
@@ -42,10 +42,10 @@ export class InteractiveInputPolicy {
   private readonly onError: (error: Error) => void;
   private readonly ambiguityMs: number;
   private readonly doubleTapMs: number | null;
-  private kittyEnabled = false;
-  private kittyPrefix = Buffer.alloc(0);
+  private encodedDetachKeys: readonly Buffer[] = [];
+  private encodedPrefix = Buffer.alloc(0);
   private utf8Prefix = Buffer.alloc(0);
-  private kittyTimer: NodeJS.Timeout | null = null;
+  private encodedPrefixTimer: NodeJS.Timeout | null = null;
   private detachTimer: NodeJS.Timeout | null = null;
   private stopped = false;
 
@@ -54,25 +54,30 @@ export class InteractiveInputPolicy {
     this.onDetach = options.onDetach;
     this.onError = options.onError ?? (() => {});
     this.ambiguityMs = options.ambiguityMs ?? 25;
-    this.doubleTapMs = options.doubleTapMs ?? 300;
+    this.doubleTapMs = options.doubleTapMs === undefined ? 300 : options.doubleTapMs;
   }
 
   setInputModes(modes: MachineInputModeSnapshotV1): void {
-    const enabled = modes.kittyKeyboardFlagsStack.length > 0;
-    if (this.kittyEnabled && !enabled) this.flushKittyPrefix();
-    this.kittyEnabled = enabled;
+    const next = [
+      ...(modes.kittyKeyboardFlagsStack.length > 0 ? [DETACH_KEY_KITTY] : []),
+      ...(modes.modifyOtherKeys === 2 ? [DETACH_KEY_MODIFY_OTHER_KEYS] : []),
+    ];
+    const unchanged = next.length === this.encodedDetachKeys.length &&
+      next.every((key, index) => key.equals(this.encodedDetachKeys[index]));
+    if (!unchanged) this.flushEncodedPrefix();
+    this.encodedDetachKeys = next;
   }
 
   feed(chunk: Buffer): void {
     if (this.stopped || chunk.length === 0) return;
-    if (this.kittyTimer) {
-      clearTimeout(this.kittyTimer);
-      this.kittyTimer = null;
+    if (this.encodedPrefixTimer) {
+      clearTimeout(this.encodedPrefixTimer);
+      this.encodedPrefixTimer = null;
     }
-    const bytes = this.kittyPrefix.length === 0
+    const bytes = this.encodedPrefix.length === 0
       ? chunk
-      : Buffer.concat([this.kittyPrefix, chunk]);
-    this.kittyPrefix = Buffer.alloc(0);
+      : Buffer.concat([this.encodedPrefix, chunk]);
+    this.encodedPrefix = Buffer.alloc(0);
     const forward: Buffer[] = [];
     let literalStart = 0;
     const flushLiteral = (end: number) => {
@@ -92,20 +97,24 @@ export class InteractiveInputPolicy {
         literalStart = index;
         continue;
       }
-      if (this.kittyEnabled && bytes[index] === DETACH_KEY_KITTY_BYTES[0]) {
+      if (this.encodedDetachKeys.length > 0 && bytes[index] === 0x1b) {
         const remaining = bytes.subarray(index);
-        const compared = Math.min(remaining.length, DETACH_KEY_KITTY_BYTES.length);
-        if (remaining.subarray(0, compared).equals(DETACH_KEY_KITTY_BYTES.subarray(0, compared))) {
+        const candidates = this.encodedDetachKeys.filter((key) => {
+          const compared = Math.min(remaining.length, key.length);
+          return remaining.subarray(0, compared).equals(key.subarray(0, compared));
+        });
+        if (candidates.length > 0) {
           flushLiteral(index);
-          if (remaining.length < DETACH_KEY_KITTY_BYTES.length) {
-            this.kittyPrefix = Buffer.from(remaining);
+          const complete = candidates.find((key) => remaining.length >= key.length);
+          if (!complete) {
+            this.encodedPrefix = Buffer.from(remaining);
             literalStart = bytes.length;
-            this.kittyTimer = setTimeout(() => this.flushKittyPrefix(), this.ambiguityMs);
+            this.encodedPrefixTimer = setTimeout(() => this.flushEncodedPrefix(), this.ambiguityMs);
             break;
           }
           emitForward();
           this.handleDetachKey();
-          index += DETACH_KEY_KITTY_BYTES.length;
+          index += complete.length;
           literalStart = index;
           continue;
         }
@@ -118,26 +127,26 @@ export class InteractiveInputPolicy {
 
   end(): void {
     if (this.stopped) return;
-    this.flushKittyPrefix();
+    this.flushEncodedPrefix();
     if (this.utf8Prefix.length > 0) {
       this.fail(new Error("stdin ended with an incomplete UTF-8 sequence"));
     }
   }
 
   discardPendingInput(): void {
-    if (this.kittyTimer) clearTimeout(this.kittyTimer);
-    this.kittyTimer = null;
-    this.kittyPrefix = Buffer.alloc(0);
+    if (this.encodedPrefixTimer) clearTimeout(this.encodedPrefixTimer);
+    this.encodedPrefixTimer = null;
+    this.encodedPrefix = Buffer.alloc(0);
     this.utf8Prefix = Buffer.alloc(0);
   }
 
   dispose(): void {
     this.stopped = true;
-    if (this.kittyTimer) clearTimeout(this.kittyTimer);
+    if (this.encodedPrefixTimer) clearTimeout(this.encodedPrefixTimer);
     if (this.detachTimer) clearTimeout(this.detachTimer);
-    this.kittyTimer = null;
+    this.encodedPrefixTimer = null;
     this.detachTimer = null;
-    this.kittyPrefix = Buffer.alloc(0);
+    this.encodedPrefix = Buffer.alloc(0);
     this.utf8Prefix = Buffer.alloc(0);
   }
 
@@ -160,12 +169,12 @@ export class InteractiveInputPolicy {
     }, this.doubleTapMs);
   }
 
-  private flushKittyPrefix(): void {
-    if (this.kittyTimer) clearTimeout(this.kittyTimer);
-    this.kittyTimer = null;
-    if (this.kittyPrefix.length === 0) return;
-    const bytes = this.kittyPrefix;
-    this.kittyPrefix = Buffer.alloc(0);
+  private flushEncodedPrefix(): void {
+    if (this.encodedPrefixTimer) clearTimeout(this.encodedPrefixTimer);
+    this.encodedPrefixTimer = null;
+    if (this.encodedPrefix.length === 0) return;
+    const bytes = this.encodedPrefix;
+    this.encodedPrefix = Buffer.alloc(0);
     this.emitUtf8(bytes);
   }
 

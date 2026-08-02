@@ -554,6 +554,64 @@ describe("interactive attach input policy", () => {
     }
   });
 
+  it("recognizes modifyOtherKeys=2 Ctrl-\\ across every chunk partition", () => {
+    const encoded = Buffer.from("\x1b[27;5;92~");
+    const partitionCount = 1 << (encoded.length - 1);
+    for (let cuts = 0; cuts < partitionCount; cuts++) {
+      const emitted: Buffer[] = [];
+      let detachCount = 0;
+      const policy = new InteractiveInputPolicy({
+        onInput: (bytes) => emitted.push(bytes),
+        onDetach: () => { detachCount++; },
+        ambiguityMs: 10_000,
+        doubleTapMs: null,
+      });
+      policy.setInputModes({ ...modes, modifyOtherKeys: 2 });
+      let start = 0;
+      for (let offset = 1; offset < encoded.length; offset++) {
+        if ((cuts & (1 << (offset - 1))) === 0) continue;
+        policy.feed(encoded.subarray(start, offset));
+        start = offset;
+      }
+      policy.feed(encoded.subarray(start));
+      expect(detachCount, `partition mask ${cuts}`).toBe(1);
+      expect(Buffer.concat(emitted), `partition mask ${cuts}`).toEqual(Buffer.alloc(0));
+      policy.dispose();
+    }
+  });
+
+  it.each([0, 1] as const)(
+    "preserves modifyOtherKeys Ctrl-\\ bytes exactly at inactive level %i",
+    (modifyOtherKeys) => {
+      const bytes = Buffer.from("before\x1b[27;5;92~after");
+      const emitted: Buffer[] = [];
+      const policy = new InteractiveInputPolicy({
+        onInput: (value) => emitted.push(value),
+        onDetach: () => { throw new Error("unexpected detach"); },
+      });
+      policy.setInputModes({ ...modes, modifyOtherKeys });
+      for (const byte of bytes) policy.feed(Buffer.from([byte]));
+      policy.end();
+      expect(Buffer.concat(emitted)).toEqual(bytes);
+    },
+  );
+
+  it("releases a partial modifyOtherKeys chord when the installed mode disables it", () => {
+    const encoded = Buffer.from("\x1b[27;5;92~");
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (value) => emitted.push(value),
+      onDetach: () => { throw new Error("unexpected detach"); },
+      ambiguityMs: 10_000,
+    });
+    policy.setInputModes({ ...modes, modifyOtherKeys: 2 });
+    policy.feed(encoded.subarray(0, 5));
+    policy.setInputModes({ ...modes, modifyOtherKeys: 1 });
+    policy.feed(encoded.subarray(5));
+    policy.end();
+    expect(Buffer.concat(emitted)).toEqual(encoded);
+  });
+
   it("preserves causal byte order when ordinary input and a double detach chord are coalesced", () => {
     const emitted: Buffer[] = [];
     const policy = new InteractiveInputPolicy({

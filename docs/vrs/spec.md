@@ -151,8 +151,9 @@ core, not a second writable daemon protocol. It reads the exact local generation
 from metadata or the remote generation from route admission, requests the
 optional `host-terminal-replay` capability, and frames complete UTF-8 input,
 resize, and detach requests through `machine-attach-v2`. The local policy alone
-reserves Ctrl-\\: it recognizes both C0 and Kitty encodings across stream chunks,
-uses a bounded ambiguity deadline only for an incomplete Kitty prefix, and
+reserves Ctrl-\\: it recognizes C0, Kitty, and xterm modifyOtherKeys level 2
+encodings across stream chunks according to the installed input-mode snapshot,
+uses a bounded ambiguity deadline only for an incomplete active encoding, and
 otherwise preserves input bytes exactly. A second Ctrl-\\ within the documented
 double-tap window emits one C0 byte to the child.
 
