@@ -361,6 +361,119 @@ describe("exact-generation exit evidence", () => {
     });
   });
 
+  it.each([
+    ["numeric generation", { generation: 42 }],
+    ["empty generation", { generation: "" }],
+    ["string exit code", { exitCode: "17" }],
+    ["missing exit timestamp", { exitedAt: undefined }],
+    ["non-string tail entries", { lastLines: [7, { injected: true }] }],
+    ["tail above the persisted bound", {
+      lastLines: Array.from({ length: 201 }, (_, i) => `line-${i}`),
+    }],
+  ])("rejects %s in persisted evidence metadata", async (_case, override) => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const value = {
+      generation: "valid-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 17,
+      lastLines: ["valid evidence"],
+      tags: { keep: "true" },
+      futureCompatibleField: { preserved: true },
+      ...override,
+    };
+    fs.writeFileSync(
+      path.join(dir, `${name}.json`),
+      JSON.stringify(value),
+    );
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "invalid-metadata",
+      });
+      expect(await removeSessionGeneration(name, "valid-generation"))
+        .toEqual({ _tag: "invalid-metadata" });
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+  });
+
+  it.each(["malformed", "oversized", "directory", "symlink"])(
+    "fails closed on a %s metadata artifact",
+    async (artifact) => {
+      const dir = makeSessionDir();
+      const name = uniqueName();
+      const metadataPath = path.join(dir, `${name}.json`);
+      if (artifact === "malformed") {
+        fs.writeFileSync(metadataPath, "{not-json");
+      } else if (artifact === "oversized") {
+        fs.writeFileSync(metadataPath, JSON.stringify({
+          generation: "oversized-generation",
+          exitedAt: "2026-08-02T00:00:01.000Z",
+          exitCode: 17,
+          lastLines: ["valid evidence"],
+          padding: "x".repeat(2 * 1024 * 1024),
+        }));
+      } else if (artifact === "directory") {
+        fs.mkdirSync(metadataPath);
+      } else {
+        const target = path.join(dir, "symlink-target.json");
+        fs.writeFileSync(target, JSON.stringify({
+          generation: "symlink-generation",
+          exitedAt: "2026-08-02T00:00:01.000Z",
+          exitCode: 17,
+          lastLines: ["must not escape"],
+        }));
+        fs.symlinkSync(target, metadataPath);
+      }
+
+      await withApiRoot(dir, async () => {
+        expect(await getSessionExitEvidence(name)).toEqual({
+          _tag: "unavailable",
+          reason: "invalid-metadata",
+        });
+        expect(await removeSessionGeneration(name, "any-generation"))
+          .toEqual({ _tag: "invalid-metadata" });
+      });
+    },
+  );
+
+  it("accepts compatible unknown fields and nominal tags", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "compatible-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: ["compatible evidence"],
+      tags: { keep: "true", owner: "supervisor" },
+      futureCompatibleField: { preserved: true },
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          generation: "compatible-generation",
+          exitCode: 0,
+          tail: { _tag: "present", lastLines: ["compatible evidence"] },
+        },
+      });
+    });
+  });
+
   it("rejects unsafe identities before deriving evidence paths", async () => {
     for (const name of ["/absolute", "../traversal", "nested/path", ".", ".."] as const) {
       await expect(getSessionExitEvidence(name)).rejects.toThrow();

@@ -219,7 +219,7 @@ export type SessionExitEvidenceResult =
       | "running"
       | "busy"
       | "generation-unavailable"
-      | "exit-code-unavailable";
+      | "invalid-metadata";
   };
 
 export type RemoveSessionGenerationResult =
@@ -227,7 +227,11 @@ export type RemoveSessionGenerationResult =
   | { _tag: "missing" }
   | { _tag: "generation-mismatch" }
   | { _tag: "not-terminal" }
+  | { _tag: "invalid-metadata" }
   | { _tag: "busy" };
+
+export const SESSION_EXIT_LAST_LINES_LIMIT = 200;
+const SESSION_EXIT_EVIDENCE_METADATA_MAX_BYTES = 1024 * 1024;
 
 /** Semantic helper: session has metadata but no live daemon (either `exited`
  *  or `vanished`). Use this wherever the branch is "there's a record and we
@@ -1099,7 +1103,7 @@ export async function getSessionByName(name: string): Promise<SessionInfo | null
 
 async function isSessionGenerationAlive(
   name: string,
-  metadata: SessionMetadata,
+  metadata: ExitEvidenceMetadata,
 ): Promise<boolean> {
   const pids = new Set<number>();
   const sidecarPid = readSessionPid(name);
@@ -1109,6 +1113,123 @@ async function isSessionGenerationAlive(
 
   const socketPath = getSocketPath(name);
   return fs.existsSync(socketPath) && await isSocketReachable(socketPath);
+}
+
+interface ExitEvidenceMetadata {
+  generation: string;
+  daemonPid?: number;
+  exitedAt?: string;
+  exitCode?: number;
+  lastLines?: string[];
+}
+
+type ExitEvidenceMetadataRead =
+  | { _tag: "valid"; metadata: ExitEvidenceMetadata }
+  | { _tag: "missing" }
+  | { _tag: "generation-unavailable" }
+  | { _tag: "invalid" };
+
+function readExitEvidenceMetadata(name: string): ExitEvidenceMetadataRead {
+  const metadataPath = getMetadataPath(name);
+  let fd: number;
+  try {
+    fd = fs.openSync(
+      metadataPath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { _tag: "missing" }
+      : { _tag: "invalid" };
+  }
+
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > SESSION_EXIT_EVIDENCE_METADATA_MAX_BYTES) {
+      return { _tag: "invalid" };
+    }
+
+    const content = Buffer.alloc(SESSION_EXIT_EVIDENCE_METADATA_MAX_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < content.length) {
+      const read = fs.readSync(
+        fd,
+        content,
+        bytesRead,
+        content.length - bytesRead,
+        null,
+      );
+      if (read === 0) break;
+      bytesRead += read;
+    }
+    if (bytesRead > SESSION_EXIT_EVIDENCE_METADATA_MAX_BYTES) {
+      return { _tag: "invalid" };
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content.subarray(0, bytesRead).toString("utf8"));
+    } catch {
+      return { _tag: "invalid" };
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { _tag: "invalid" };
+    }
+
+    const record = parsed as Record<string, unknown>;
+    if (!("generation" in record)) return { _tag: "generation-unavailable" };
+    if (typeof record.generation !== "string" || record.generation.length === 0) {
+      return { _tag: "invalid" };
+    }
+    if (
+      record.daemonPid !== undefined &&
+      (!Number.isInteger(record.daemonPid) || (record.daemonPid as number) <= 0)
+    ) {
+      return { _tag: "invalid" };
+    }
+
+    const hasExitedAt = record.exitedAt !== undefined;
+    const hasExitCode = record.exitCode !== undefined;
+    if (hasExitedAt !== hasExitCode) return { _tag: "invalid" };
+    if (
+      hasExitedAt &&
+      (typeof record.exitedAt !== "string" || record.exitedAt.length === 0 ||
+        !Number.isInteger(record.exitCode))
+    ) {
+      return { _tag: "invalid" };
+    }
+    if (
+      record.lastLines !== undefined &&
+      (!Array.isArray(record.lastLines) ||
+        record.lastLines.length > SESSION_EXIT_LAST_LINES_LIMIT ||
+        !record.lastLines.every((line) => typeof line === "string"))
+    ) {
+      return { _tag: "invalid" };
+    }
+
+    return {
+      _tag: "valid",
+      metadata: {
+        generation: record.generation,
+        ...(record.daemonPid !== undefined
+          ? { daemonPid: record.daemonPid as number }
+          : {}),
+        ...(hasExitedAt
+          ? {
+            exitedAt: record.exitedAt as string,
+            exitCode: record.exitCode as number,
+          }
+          : {}),
+        ...(record.lastLines !== undefined
+          ? { lastLines: record.lastLines as string[] }
+          : {}),
+      },
+    };
+  } catch {
+    return { _tag: "invalid" };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Read the bounded retained terminal evidence for one exact daemon generation.
@@ -1124,36 +1245,33 @@ export async function getSessionExitEvidence(
   if (!acquireLock(name)) return { _tag: "unavailable", reason: "busy" };
 
   try {
-    const metadata = readMetadata(name);
-    if (!metadata) return { _tag: "unavailable", reason: "missing" };
-    if (!metadata.generation) {
+    const read = readExitEvidenceMetadata(name);
+    if (read._tag === "missing") {
+      return { _tag: "unavailable", reason: "missing" };
+    }
+    if (read._tag === "generation-unavailable") {
       return { _tag: "unavailable", reason: "generation-unavailable" };
     }
+    if (read._tag === "invalid") {
+      return { _tag: "unavailable", reason: "invalid-metadata" };
+    }
+    const metadata = read.metadata;
     if (await isSessionGenerationAlive(name, metadata)) {
       return { _tag: "unavailable", reason: "running" };
     }
 
-    const current = readMetadata(name);
-    if (!current) return { _tag: "unavailable", reason: "missing" };
-    if (current.generation !== metadata.generation) {
-      return { _tag: "unavailable", reason: "busy" };
-    }
-
-    const exited = typeof current.exitCode === "number";
-    if (!exited && current.exitedAt !== undefined) {
-      return { _tag: "unavailable", reason: "exit-code-unavailable" };
-    }
+    const exited = metadata.exitCode !== undefined;
 
     return {
       _tag: "snapshot",
       snapshot: {
         name,
-        generation: current.generation,
+        generation: metadata.generation,
         status: exited ? "exited" : "vanished",
-        exitCode: exited ? current.exitCode! : null,
+        exitCode: exited ? metadata.exitCode! : null,
         stream: "combined",
-        tail: Array.isArray(current.lastLines)
-          ? { _tag: "present", lastLines: [...current.lastLines] }
+        tail: metadata.lastLines !== undefined
+          ? { _tag: "present", lastLines: [...metadata.lastLines] }
           : { _tag: "unavailable" },
       },
     };
@@ -1188,8 +1306,13 @@ export async function removeSessionGeneration(
   }
 
   try {
-    let metadata = readMetadata(name);
-    if (!metadata) return { _tag: "missing" };
+    let read = readExitEvidenceMetadata(name);
+    if (read._tag === "missing") return { _tag: "missing" };
+    if (read._tag === "generation-unavailable") {
+      return { _tag: "generation-mismatch" };
+    }
+    if (read._tag !== "valid") return { _tag: "invalid-metadata" };
+    let metadata = read.metadata;
     if (metadata.generation !== expectedGeneration) {
       return { _tag: "generation-mismatch" };
     }
@@ -1197,8 +1320,13 @@ export async function removeSessionGeneration(
       return { _tag: "not-terminal" };
     }
 
-    metadata = readMetadata(name);
-    if (!metadata) return { _tag: "missing" };
+    read = readExitEvidenceMetadata(name);
+    if (read._tag === "missing") return { _tag: "missing" };
+    if (read._tag === "generation-unavailable") {
+      return { _tag: "generation-mismatch" };
+    }
+    if (read._tag !== "valid") return { _tag: "invalid-metadata" };
+    metadata = read.metadata;
     if (metadata.generation !== expectedGeneration) {
       return { _tag: "generation-mismatch" };
     }

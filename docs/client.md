@@ -32,16 +32,18 @@ bounded `lastLines`. An absent persisted tail is tagged `unavailable`; it is
 not reported as an empty tail.
 
 The operation fails closed with a tagged `unavailable` result when the session
-is missing, running, locked, lacks a generation, or has an exit marker without
-the required exit code.
+is missing, running, locked, lacks a generation, or has invalid metadata. The
+evidence reader rejects malformed, oversized, symlink, non-regular, type-invalid,
+and over-200-line metadata as `invalid-metadata`.
 
 ### `removeSessionGeneration(name: string, expectedGeneration: string): Promise<RemoveSessionGenerationResult>`
 
 Remove all PTY artifacts only when the retained metadata still belongs to the
 given opaque generation and its daemon is gone. Results distinguish `removed`,
-`missing`, `generation-mismatch`, `not-terminal`, and `busy`. A replacement
-generation is never removed. Cleanup errors other than absence are thrown, and
-metadata is removed last so failed cleanup retains the evidence for retry.
+`missing`, `generation-mismatch`, `not-terminal`, `invalid-metadata`, and
+`busy`. A replacement generation is never removed. Cleanup errors other than
+absence are thrown, and metadata is removed last so failed cleanup retains the
+evidence for retry.
 
 ### `validateName(name: string): void`
 

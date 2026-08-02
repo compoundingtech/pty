@@ -33,6 +33,7 @@ import {
   mutateMetadataUnderLock,
   shouldReapAtExit,
   reapOnExitDefault,
+  SESSION_EXIT_LAST_LINES_LIMIT,
   type SessionMetadata,
   type MetadataMutationResult,
 } from "./sessions.ts";
@@ -200,8 +201,6 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
   ensureChildTerm(env);
   return env;
 }
-
-const LAST_LINES_COUNT = 200;
 
 export interface ProcessResources {
   rssKb: number;       // Resident set size in KB
@@ -1299,7 +1298,7 @@ export class PtyServer {
     while (lines.length > 0 && lines[lines.length - 1] === "") {
       lines.pop();
     }
-    return lines.slice(-LAST_LINES_COUNT);
+    return lines.slice(-SESSION_EXIT_LAST_LINES_LIMIT);
   }
 
   private saveExitMetadata(exitCode: number): MetadataMutationResult["status"] {
