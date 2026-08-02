@@ -448,10 +448,13 @@ describe("exact-generation exit evidence", () => {
     });
   });
 
-  it("preserves terminal metadata when conditional cleanup fails", async () => {
+  it("retains terminal evidence after partial conditional cleanup", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     const metadataPath = path.join(dir, `${name}.json`);
+    const socketPath = path.join(dir, `${name}.sock`);
+    const pidPath = path.join(dir, `${name}.pid`);
+    const eventsPath = path.join(dir, `${name}.events.jsonl`);
     fs.writeFileSync(metadataPath, JSON.stringify({
       generation: "cleanup-failure-generation",
       daemonPid: 2147483647,
@@ -464,11 +467,16 @@ describe("exact-generation exit evidence", () => {
       exitCode: 17,
       lastLines: ["still available"],
     }));
-    fs.mkdirSync(path.join(dir, `${name}.events.jsonl`));
+    fs.writeFileSync(socketPath, "stale socket");
+    fs.writeFileSync(pidPath, "2147483647\n");
+    fs.mkdirSync(eventsPath);
 
     await withApiRoot(dir, async () => {
       await expect(removeSessionGeneration(name, "cleanup-failure-generation"))
         .rejects.toThrow();
+      expect(fs.existsSync(socketPath)).toBe(false);
+      expect(fs.existsSync(pidPath)).toBe(false);
+      expect(fs.existsSync(eventsPath)).toBe(true);
       expect(fs.existsSync(metadataPath)).toBe(true);
       expect(await getSessionExitEvidence(name)).toMatchObject({
         _tag: "snapshot",

@@ -188,10 +188,11 @@ bounded snapshot -- opaque generation --> durable consumer action
                                 conditional same-generation remove
                                              |
                          +-------------------+--------------------+
-                         |                                        |
-                      removed                          mismatch/live/failure
-                         |                                        |
-                  artifacts absent                       artifacts preserved
+                         |                   |                    |
+                      removed        semantic refusal     cleanup I/O failure
+                         |                   |                    |
+                  artifacts absent   artifacts untouched   metadata retained;
+                                                           cleanup may be partial
 ```
 
 The exported client API and machine CLI share these tagged result schemas:
@@ -269,9 +270,13 @@ creation mutation, then applies this order:
 6. remove metadata last, preserving evidence if an earlier cleanup step fails;
 7. release both locks.
 
-Missing artifacts are idempotent. Contention and semantic refusal return tagged
-results. Argument, metadata-cleanup I/O, and output-transport failures remain
-operational errors rather than success-shaped results. The CLI output law is:
+Steps 5 and 6 are not transactional. If step 5 fails, auxiliary artifacts
+removed earlier in the sequence remain absent, while metadata remains as
+retryable exact-generation evidence. No rollback is attempted. Missing
+artifacts are idempotent. Contention and semantic refusal happen before cleanup
+mutation and return tagged results. Argument, metadata-cleanup I/O, and
+output-transport failures remain operational errors rather than success-shaped
+results. The CLI output law is:
 
 | CLI outcome | stdout | stderr | exit status |
 | --- | --- | --- | --- |
