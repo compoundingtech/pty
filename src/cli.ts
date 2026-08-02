@@ -1983,7 +1983,7 @@ async function cmdPeekRemote(
 ): Promise<void> {
   let socket;
   try {
-    socket = await dialAndRoute(peer, name);
+    ({ socket } = await dialAndRoute(peer, name));
   } catch (e) {
     console.error(`pty peek --remote ${peer}: ${(e as Error).message}`);
     process.exit(1);
@@ -2011,7 +2011,7 @@ async function cmdSendRemote(
 ): Promise<void> {
   let socket;
   try {
-    socket = await dialAndRoute(peer, name);
+    ({ socket } = await dialAndRoute(peer, name));
   } catch (e) {
     console.error(`pty send --remote ${peer}: ${(e as Error).message}`);
     process.exit(1);
@@ -2029,25 +2029,26 @@ async function cmdSendRemote(
  *  socket over fabric, route it to the named remote session, and attach over
  *  that tunnel — the resilient shell is a long-lived remote pty you attach to. */
 async function cmdAttachRemote(peer: string, name: string): Promise<void> {
-  let socket;
+  let routed;
   try {
-    socket = await dialAndRoute(peer, name);
+    routed = await dialAndRoute(peer, name);
   } catch (e) {
     console.error(`pty attach --remote ${peer}: ${(e as Error).message}`);
     process.exit(1);
   }
   attach({
     name,
-    socket,
+    socket: routed.socket,
+    expectedGeneration: routed.generation,
     // On a loud fabric close, re-dial + re-route to the same remote session and
     // re-attach (the daemon replays its screen, so the session resumes). A
     // recoverable transport stall keeps the socket open, so it's just waited out.
     // Contract: null = transport failure (host unreachable) → attach keeps
     // retrying; throw = the host is reachable but the session is gone → attach
     // gives up cleanly.
-    reconnect: async () => {
+    reconnect: async (signal) => {
       try {
-        return await dialAndRoute(peer, name);
+        return (await dialAndRoute(peer, name, 10000, signal)).socket;
       } catch (e) {
         if (e instanceof RouteRefusedError) throw e; // reachable-but-gone → clean give-up
         return null; // transport failure → keep retrying (unlimited by default)

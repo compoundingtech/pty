@@ -1,31 +1,224 @@
 import * as net from "node:net";
 import * as tty from "node:tty";
+import { PassThrough, type Readable, type Writable } from "node:stream";
 import {
   MessageType,
   PacketReader,
-  encodeAttach,
   encodeData,
-  encodeDetach,
   encodePeek,
-  encodeResize,
   encodeStatus,
   decodeExit,
 } from "./protocol.ts";
-import { getSocketPath } from "./sessions.ts";
+import { getSocketPath, readMetadata } from "./sessions.ts";
 import { stripAnsi } from "./tui/colors.ts";
 import { BRACKETED_PASTE_START, BRACKETED_PASTE_END } from "./paste.ts";
+import { machineAttachV2 } from "./machine-attach.ts";
+import {
+  MACHINE_PROTOCOL_VERSION,
+  MachineFrameReader,
+  decodeMachineResponse,
+  encodeMachineRequest,
+  type MachineInputModeSnapshotV1,
+  type MachineResponse,
+} from "./machine-protocol.ts";
 
 const DETACH_KEY = 0x1c; // Ctrl+\ (legacy encoding)
 const DETACH_KEY_KITTY = "\x1b[92;5u"; // Ctrl+\ (Kitty keyboard protocol)
+const DETACH_KEY_KITTY_BYTES = Buffer.from(DETACH_KEY_KITTY);
 
-/** Replace Kitty keyboard protocol encoding of Ctrl+\ with the legacy byte
- *  so the rest of the detach logic can work with a single representation. */
-function normalizeDetachKey(data: Buffer): Buffer {
-  const str = data.toString();
-  if (!str.includes(DETACH_KEY_KITTY)) return data;
-  return Buffer.from(
-    str.replaceAll(DETACH_KEY_KITTY, String.fromCharCode(DETACH_KEY))
-  );
+interface InteractiveInputPolicyOptions {
+  readonly onInput: (bytes: Buffer) => void;
+  readonly onDetach: () => void;
+  readonly onError?: (error: Error) => void;
+  readonly ambiguityMs?: number;
+  readonly doubleTapMs?: number | null;
+}
+
+/** Stateful terminal-only policy layered above the framed machine transport.
+ * It reserves local detach without interpreting or re-encoding other bytes. */
+export class InteractiveInputPolicy {
+  private readonly onInput: (bytes: Buffer) => void;
+  private readonly onDetach: () => void;
+  private readonly onError: (error: Error) => void;
+  private readonly ambiguityMs: number;
+  private readonly doubleTapMs: number | null;
+  private kittyEnabled = false;
+  private kittyPrefix = Buffer.alloc(0);
+  private utf8Prefix = Buffer.alloc(0);
+  private kittyTimer: NodeJS.Timeout | null = null;
+  private detachTimer: NodeJS.Timeout | null = null;
+  private stopped = false;
+
+  constructor(options: InteractiveInputPolicyOptions) {
+    this.onInput = options.onInput;
+    this.onDetach = options.onDetach;
+    this.onError = options.onError ?? (() => {});
+    this.ambiguityMs = options.ambiguityMs ?? 25;
+    this.doubleTapMs = options.doubleTapMs ?? 300;
+  }
+
+  setInputModes(modes: MachineInputModeSnapshotV1): void {
+    const enabled = modes.kittyKeyboardFlagsStack.length > 0;
+    if (this.kittyEnabled && !enabled) this.flushKittyPrefix();
+    this.kittyEnabled = enabled;
+  }
+
+  feed(chunk: Buffer): void {
+    if (this.stopped || chunk.length === 0) return;
+    if (this.kittyTimer) {
+      clearTimeout(this.kittyTimer);
+      this.kittyTimer = null;
+    }
+    const bytes = this.kittyPrefix.length === 0
+      ? chunk
+      : Buffer.concat([this.kittyPrefix, chunk]);
+    this.kittyPrefix = Buffer.alloc(0);
+    const forward: Buffer[] = [];
+    let literalStart = 0;
+    const flushLiteral = (end: number) => {
+      if (end > literalStart) forward.push(bytes.subarray(literalStart, end));
+    };
+    const emitForward = () => {
+      if (forward.length === 0) return;
+      this.emitUtf8(Buffer.concat(forward));
+      forward.length = 0;
+    };
+    for (let index = 0; index < bytes.length;) {
+      if (bytes[index] === DETACH_KEY) {
+        flushLiteral(index);
+        emitForward();
+        this.handleDetachKey();
+        index++;
+        literalStart = index;
+        continue;
+      }
+      if (this.kittyEnabled && bytes[index] === DETACH_KEY_KITTY_BYTES[0]) {
+        const remaining = bytes.subarray(index);
+        const compared = Math.min(remaining.length, DETACH_KEY_KITTY_BYTES.length);
+        if (remaining.subarray(0, compared).equals(DETACH_KEY_KITTY_BYTES.subarray(0, compared))) {
+          flushLiteral(index);
+          if (remaining.length < DETACH_KEY_KITTY_BYTES.length) {
+            this.kittyPrefix = Buffer.from(remaining);
+            literalStart = bytes.length;
+            this.kittyTimer = setTimeout(() => this.flushKittyPrefix(), this.ambiguityMs);
+            break;
+          }
+          emitForward();
+          this.handleDetachKey();
+          index += DETACH_KEY_KITTY_BYTES.length;
+          literalStart = index;
+          continue;
+        }
+      }
+      index++;
+    }
+    flushLiteral(bytes.length);
+    emitForward();
+  }
+
+  end(): void {
+    if (this.stopped) return;
+    this.flushKittyPrefix();
+    if (this.utf8Prefix.length > 0) {
+      this.fail(new Error("stdin ended with an incomplete UTF-8 sequence"));
+    }
+  }
+
+  discardPendingInput(): void {
+    if (this.kittyTimer) clearTimeout(this.kittyTimer);
+    this.kittyTimer = null;
+    this.kittyPrefix = Buffer.alloc(0);
+    this.utf8Prefix = Buffer.alloc(0);
+  }
+
+  dispose(): void {
+    this.stopped = true;
+    if (this.kittyTimer) clearTimeout(this.kittyTimer);
+    if (this.detachTimer) clearTimeout(this.detachTimer);
+    this.kittyTimer = null;
+    this.detachTimer = null;
+    this.kittyPrefix = Buffer.alloc(0);
+    this.utf8Prefix = Buffer.alloc(0);
+  }
+
+  private handleDetachKey(): void {
+    if (this.doubleTapMs === null) {
+      this.stopped = true;
+      this.onDetach();
+      return;
+    }
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = null;
+      this.emitUtf8(Buffer.from([DETACH_KEY]));
+      return;
+    }
+    this.detachTimer = setTimeout(() => {
+      this.detachTimer = null;
+      this.stopped = true;
+      this.onDetach();
+    }, this.doubleTapMs);
+  }
+
+  private flushKittyPrefix(): void {
+    if (this.kittyTimer) clearTimeout(this.kittyTimer);
+    this.kittyTimer = null;
+    if (this.kittyPrefix.length === 0) return;
+    const bytes = this.kittyPrefix;
+    this.kittyPrefix = Buffer.alloc(0);
+    this.emitUtf8(bytes);
+  }
+
+  private emitUtf8(chunk: Buffer): void {
+    if (this.stopped || chunk.length === 0) return;
+    const bytes = this.utf8Prefix.length === 0
+      ? chunk
+      : Buffer.concat([this.utf8Prefix, chunk]);
+    let complete: number;
+    try {
+      complete = completeUtf8Prefix(bytes);
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    if (complete > 0) this.onInput(Buffer.from(bytes.subarray(0, complete)));
+    this.utf8Prefix = Buffer.from(bytes.subarray(complete));
+  }
+
+  private fail(error: Error): void {
+    this.dispose();
+    this.onError(error);
+  }
+}
+
+function completeUtf8Prefix(bytes: Buffer): number {
+  let index = 0;
+  const continuation = (offset: number, min = 0x80, max = 0xbf): boolean =>
+    offset < bytes.length && bytes[offset] >= min && bytes[offset] <= max;
+  while (index < bytes.length) {
+    const first = bytes[index];
+    if (first <= 0x7f) { index++; continue; }
+    let width: number;
+    let secondMin = 0x80;
+    let secondMax = 0xbf;
+    if (first >= 0xc2 && first <= 0xdf) width = 2;
+    else if (first >= 0xe0 && first <= 0xef) {
+      width = 3;
+      if (first === 0xe0) secondMin = 0xa0;
+      if (first === 0xed) secondMax = 0x9f;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      width = 4;
+      if (first === 0xf0) secondMin = 0x90;
+      if (first === 0xf4) secondMax = 0x8f;
+    } else throw new Error("stdin contained invalid UTF-8");
+    if (index + width > bytes.length) return index;
+    if (!continuation(index + 1, secondMin, secondMax)) throw new Error("stdin contained invalid UTF-8");
+    for (let offset = 2; offset < width; offset++) {
+      if (!continuation(index + offset)) throw new Error("stdin contained invalid UTF-8");
+    }
+    index += width;
+  }
+  return index;
 }
 
 // Reset terminal modes that programs may have enabled. This prevents
@@ -76,6 +269,8 @@ export function peek(options: PeekOptions): void {
   const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
   const stdout = process.stdout;
   const follow = options.follow ?? false;
+  let detachPolicy: InteractiveInputPolicy | null = null;
+  let followInput: ((raw: Buffer) => void) | null = null;
 
   const onReady = () => {
     socket.write(encodePeek(options.plain, options.full));
@@ -85,19 +280,32 @@ export function peek(options: PeekOptions): void {
       const stdin = process.stdin;
       if (stdin.isTTY) stdin.setRawMode(true);
 
-      stdin.on("data", (raw: Buffer) => {
-        const data = normalizeDetachKey(raw);
-        for (let i = 0; i < data.length; i++) {
-          if (data[i] === DETACH_KEY) {
-            if (stdin.isTTY) stdin.setRawMode(false);
-            socket.destroy();
-            stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
-            options.onDetach?.();
-            return;
-          }
-        }
-        // All other input is silently ignored (read-only)
+      detachPolicy = new InteractiveInputPolicy({
+        onInput: () => {},
+        onDetach: () => {
+          if (stdin.isTTY) stdin.setRawMode(false);
+          socket.destroy();
+          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
+          options.onDetach?.();
+        },
+        doubleTapMs: null,
       });
+      detachPolicy.setInputModes({
+        schema: "pty.input-mode.v1",
+        wireEncoder: "xterm-input.v1",
+        revision: 0,
+        applicationCursorKeys: false,
+        applicationKeypad: false,
+        bracketedPaste: false,
+        focusReporting: false,
+        modifyOtherKeys: 0,
+        mouseTracking: "Off",
+        mouseEncoding: "X10",
+        mouseCoordinates: "Cell",
+        kittyKeyboardFlagsStack: [0],
+      });
+      followInput = (raw: Buffer) => detachPolicy?.feed(Buffer.from(raw));
+      stdin.on("data", followInput);
       stdin.resume();
     }
   };
@@ -175,6 +383,8 @@ export function peek(options: PeekOptions): void {
   });
 
   socket.on("close", () => {
+    detachPolicy?.dispose();
+    if (followInput) process.stdin.removeListener("data", followInput);
     if (process.stdin.isTTY && process.stdin.isRaw) {
       process.stdin.setRawMode(false);
     }
@@ -389,8 +599,15 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
 
 export interface AttachOptions {
   name: string;
+  /** Exact daemon incarnation. Local attaches read it from metadata; routed
+   *  attaches receive it from the route admission response. */
+  expectedGeneration?: string | null;
   onExit?: (code: number) => void;
   onDetach?: () => void;
+  /** Injectable terminal streams keep the interactive adapter usable as a
+   *  library component. Production callers use the process terminal. */
+  input?: Readable & Partial<Pick<tty.ReadStream, "isTTY" | "isRaw" | "setRawMode">>;
+  output?: Writable & Partial<Pick<tty.WriteStream, "rows" | "columns">>;
   /** Attach over this ALREADY-CONNECTED socket instead of dialing the local
    *  `<name>.sock`. Used by `attach --remote`: a fabric-dialed, control-server-
    *  routed socket. When set, `name` is only used for display. */
@@ -404,7 +621,7 @@ export interface AttachOptions {
    *   - REJECT → clean give-up: the host is reachable but the session is gone.
    *  A recoverable stall keeps the socket open (no close event), so reconnect
    *  fires only on a genuine close (fabric's loud give-up), never on a stall. */
-  reconnect?: () => Promise<net.Socket | null>;
+  reconnect?: (signal: AbortSignal) => Promise<net.Socket | null>;
 }
 
 /** Backoff schedule for `attach --remote` reconnect attempts, then a cap. */
@@ -412,7 +629,7 @@ const RECONNECT_BACKOFF_MS = [100, 250, 500, 1000, 2000, 5000, 10000];
 const RECONNECT_BACKOFF_CAP_MS = 15000;
 /** Consecutive transport-failure attempts before giving up. Default: UNLIMITED
  *  while the terminal is open — the faithful roaming behavior (close the laptop,
- *  travel, reopen, and it comes back; the user stops it with Ctrl-\ / Ctrl-C).
+ *  travel, reopen, and it comes back; the user stops it with Ctrl-\).
  *  A reachable-but-gone session gives up cleanly regardless (a rejected reconnect,
  *  see AttachOptions.reconnect). Env-overridable for a finite bound in scripts. */
 const RECONNECT_MAX_ATTEMPTS = (() => {
@@ -421,218 +638,295 @@ const RECONNECT_MAX_ATTEMPTS = (() => {
 })();
 
 export function attach(options: AttachOptions): void {
-  const stdin = process.stdin;
-  const stdout = process.stdout;
+  const stdin = options.input ?? process.stdin;
+  const stdout = options.output ?? process.stdout;
   const canReconnect = !!options.reconnect;
+  const expectedGeneration = options.socket
+    ? options.expectedGeneration
+    : options.expectedGeneration ?? readMetadata(options.name)?.generation;
+  if (!expectedGeneration) {
+    try { options.socket?.destroy(); } catch {}
+    console.error(`Session "${options.name}" has no daemon generation; restart it before attaching.`);
+    if (options.onExit) options.onExit(1); else process.exit(1);
+    return;
+  }
+  const generation = expectedGeneration;
 
-  // `socket` is mutable: the reconnect loop swaps in a fresh routed socket, and
-  // the (once-wired) input handlers write to whichever socket is current.
-  let socket: net.Socket = options.socket ?? net.createConnection(getSocketPath(options.name));
-  const firstPreConnected = !!options.socket;
-  let reader = new PacketReader();
+  type Size = { readonly rows: number; readonly cols: number };
+  type AttachPhase =
+    | { readonly _tag: "Opening"; readonly controller: AbortController; readonly requests: PassThrough; readonly sentSize: Size }
+    | { readonly _tag: "Ready"; readonly controller: AbortController; readonly requests: PassThrough; readonly sentSize: Size }
+    | { readonly _tag: "Reconnecting"; readonly controller: AbortController }
+    | { readonly _tag: "Detaching"; readonly controller: AbortController | null; readonly requests: PassThrough | null }
+    | { readonly _tag: "Ended" };
 
-  let detaching = false;
+  const terminalSize = (): Size => ({
+    rows: (stdout as tty.WriteStream).rows ?? 24,
+    cols: (stdout as tty.WriteStream).columns ?? 80,
+  });
+  const sameSize = (left: Size, right: Size): boolean =>
+    left.rows === right.rows && left.cols === right.cols;
+
+  let phase: AttachPhase = { _tag: "Ended" };
+  let desiredSize = terminalSize();
+  let adapterSequence = 0;
   let rawWasSet = false;
-  let exitCode = 0;
-  let exitHandled = false;
-  let exitCompleted = false;
-  let sessionExited = false; // saw an EXIT packet — the session really ended; don't reconnect
-  let reconnecting = false;
-  let inputWired = false;
   let stdinDataHandler: ((data: Buffer) => void) | null = null;
+  let stdinEndHandler: (() => void) | null = null;
   let resizeHandler: (() => void) | null = null;
 
+  const phaseController = (value: AttachPhase): AbortController | null =>
+    value._tag === "Opening" || value._tag === "Ready" || value._tag === "Reconnecting" || value._tag === "Detaching"
+      ? value.controller
+      : null;
+  function transition(next: AttachPhase): void {
+    const outgoing = phaseController(phase);
+    const incoming = phaseController(next);
+    phase = next;
+    if (outgoing && outgoing !== incoming) outgoing.abort();
+  }
+
   function enterRawMode(): void {
-    if (stdin.isTTY && !stdin.isRaw) { stdin.setRawMode(true); rawWasSet = true; }
+    if (stdin.isTTY && !stdin.isRaw && stdin.setRawMode) { stdin.setRawMode(true); rawWasSet = true; }
   }
   function exitRawMode(): void {
-    if (rawWasSet && stdin.isTTY) stdin.setRawMode(false);
+    if (rawWasSet && stdin.isTTY && stdin.setRawMode) stdin.setRawMode(false);
   }
   function teardownInput(): void {
     if (stdinDataHandler) { stdin.removeListener("data", stdinDataHandler); stdinDataHandler = null; }
-    if (resizeHandler && stdout instanceof tty.WriteStream) { stdout.removeListener("resize", resizeHandler); resizeHandler = null; }
+    if (stdinEndHandler) { stdin.removeListener("end", stdinEndHandler); stdinEndHandler = null; }
+    if (resizeHandler) { stdout.removeListener("resize", resizeHandler); resizeHandler = null; }
   }
-  function cleanExit(): void {
+  function cleanExit(requests: PassThrough | null): void {
     teardownInput();
+    inputPolicy.dispose();
     exitRawMode();
-    try { socket.destroy(); } catch {}
+    try { requests?.destroy(); } catch {}
   }
   function completeExit(code: number): void {
-    if (exitCompleted) return;
-    exitCompleted = true;
     if (options.onExit) options.onExit(code); else process.exit(code);
   }
   function finish(code: number): void {
-    if (exitHandled) return;
-    exitHandled = true;
-    cleanExit();
+    if (phase._tag === "Ended") return;
+    const requests = phase._tag === "Opening" || phase._tag === "Ready" || phase._tag === "Detaching"
+      ? phase.requests
+      : null;
+    transition({ _tag: "Ended" });
+    cleanExit(requests);
     completeExit(code);
   }
-  function finishDetach(): void {
-    if (exitHandled) return;
-    exitHandled = true;
-    detaching = true;
-    try { socket.write(encodeDetach()); } catch {}
-    cleanExit();
+  function completeDetach(): void {
+    if (phase._tag === "Ended") return;
+    const requests = phase._tag === "Opening" || phase._tag === "Ready" || phase._tag === "Detaching"
+      ? phase.requests
+      : null;
+    transition({ _tag: "Ended" });
+    cleanExit(requests);
     stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
-    if (exitCompleted) return;
-    exitCompleted = true;
     options.onDetach?.();
   }
 
-  // Wire stdin/resize forwarding ONCE. Handlers write to the CURRENT `socket`,
-  // so they keep working after the reconnect loop swaps the socket.
-  function wireInput(): void {
-    if (inputWired) return;
-    inputWired = true;
-    let lastDetachKeyTime = 0;
-    const DOUBLE_TAP_MS = 300;
-    stdinDataHandler = (raw: Buffer) => {
-      const data = normalizeDetachKey(raw);
-      // Fast path: no detach key in this chunk
-      if (data.indexOf(DETACH_KEY) === -1) { try { socket.write(encodeData(data.toString())); } catch {} return; }
-      // Slow path: detach key found — process byte by byte
-      const forward: number[] = [];
-      for (let i = 0; i < data.length; i++) {
-        if (data[i] === DETACH_KEY) {
-          const now = Date.now();
-          if (now - lastDetachKeyTime < DOUBLE_TAP_MS) {
-            // Double-tap: send Ctrl+\ to the process, reset timer
-            lastDetachKeyTime = 0;
-            forward.push(DETACH_KEY);
-          } else {
-            // First tap: schedule detach (will fire if no second tap)
-            lastDetachKeyTime = now;
-            setTimeout(() => {
-              if (lastDetachKeyTime === now) {
-                finishDetach();
-              }
-            }, DOUBLE_TAP_MS);
-          }
-        } else {
-          forward.push(data[i]);
-        }
+  const writeRequest = (request: Parameters<typeof encodeMachineRequest>[0]): void => {
+    if (phase._tag !== "Opening" && phase._tag !== "Ready" && phase._tag !== "Detaching") return;
+    if (!phase.requests || phase.requests.destroyed) return;
+    try { phase.requests.write(encodeMachineRequest(request)); } catch {}
+  };
+  const inputPolicy = new InteractiveInputPolicy({
+    onInput: (bytes) => {
+      if (phase._tag === "Ready") writeRequest({ _tag: "Input", bytes });
+    },
+    onDetach: () => {
+      if (phase._tag === "Ended" || phase._tag === "Detaching") return;
+      if (phase._tag === "Reconnecting" || phase._tag === "Opening") {
+        const current = phase;
+        transition({
+          _tag: "Detaching",
+          controller: current.controller,
+          requests: current._tag === "Opening" ? current.requests : null,
+        });
+        completeDetach();
+        return;
       }
-      if (forward.length > 0) { try { socket.write(encodeData(Buffer.from(forward).toString())); } catch {} }
-    };
-    stdin.on("data", stdinDataHandler);
-    // Explicitly resume stdin — see the note on readline leaving flowing=false.
-    stdin.resume();
-    if (stdout instanceof tty.WriteStream) {
-      resizeHandler = () => { try { socket.write(encodeResize(stdout.rows, stdout.columns)); } catch {} };
-      stdout.on("resize", resizeHandler);
-    }
-  }
-
-  function onReady(): void {
-    enterRawMode();
-    const rows = (stdout as tty.WriteStream).rows ?? 24;
-    const cols = (stdout as tty.WriteStream).columns ?? 80;
-    try { socket.write(encodeAttach(rows, cols)); } catch {}
-    wireInput();
-  }
-
-  function handleData(data: Buffer): void {
-    let packets;
-    try { packets = reader.feed(data); }
-    catch (err: any) {
-      console.error(`pty client: dropping connection — ${err.message}`);
-      try { socket.destroy(); } catch {}
-      return;
-    }
-    for (const packet of packets) {
-      switch (packet.type) {
-        case MessageType.DATA:
-          stdout.write(packet.payload);
-          break;
-        case MessageType.SCREEN:
-          // Clear screen and write the replayed buffer (also how a reconnect resumes).
-          stdout.write("\x1b[2J\x1b[H");
-          stdout.write(packet.payload);
-          break;
-        case MessageType.EXIT:
-          exitCode = decodeExit(packet.payload);
-          sessionExited = true; // real exit — never reconnect past it
-          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} exited with code ${exitCode}]\r\n`);
-          finish(exitCode);
-          return;
-      }
-    }
-  }
-
-  function handleDisconnect(err?: NodeJS.ErrnoException): void {
-    if (exitHandled || detaching || reconnecting) return;
-    if (canReconnect && !sessionExited) { void reconnectLoop(); return; }
-    // No reconnect: preserve the original not-found / exit-code behavior.
-    if (err) {
-      cleanExit();
-      const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
-        || err.code === "ECONNRESET" || err.code === "EPIPE";
-      if (notReachable) {
-        console.error(options.socket
-          ? `Remote session "${options.name}" not found or not running.`
-          : `Session "${options.name}" not found or not running.`);
-      } else {
-        console.error(`Connection error: ${err.message}`);
-      }
+      transition({ _tag: "Detaching", controller: phase.controller, requests: phase.requests });
+      stdin.pause();
+      writeRequest({ _tag: "Detach" });
+    },
+    onError: (error) => {
+      console.error(`pty attach: ${error.message}`);
       finish(1);
-    } else {
-      finish(exitCode);
+    },
+  });
+
+  function wireInput(): void {
+    if (stdinDataHandler) return;
+    stdinDataHandler = (raw: Buffer) => inputPolicy.feed(Buffer.from(raw));
+    stdinEndHandler = () => inputPolicy.end();
+    stdin.on("data", stdinDataHandler);
+    stdin.on("end", stdinEndHandler);
+    resizeHandler = () => {
+      desiredSize = terminalSize();
+      if (phase._tag !== "Ready" || sameSize(phase.sentSize, desiredSize)) return;
+      const { controller, requests } = phase;
+      transition({ _tag: "Ready", controller, requests, sentSize: desiredSize });
+      writeRequest({ _tag: "Resize", ...desiredSize });
+    };
+    stdout.on("resize", resizeHandler);
+  }
+
+  function handleResponse(response: MachineResponse): void {
+    switch (response._tag) {
+      case "Hello":
+        break;
+      case "Ready": {
+        if (phase._tag !== "Opening") return;
+        const { requests, sentSize } = phase;
+        transition({ _tag: "Ready", controller: phase.controller, requests, sentSize });
+        inputPolicy.setInputModes(response.inputModes);
+        stdout.write("\x1b[2J\x1b[H");
+        stdout.write(response.screen);
+        if (!sameSize(sentSize, desiredSize)) {
+          transition({ _tag: "Ready", controller: phase.controller, requests, sentSize: desiredSize });
+          writeRequest({ _tag: "Resize", ...desiredSize });
+        }
+        stdin.resume();
+        break;
+      }
+      case "Data":
+        if (phase._tag !== "Ready") return;
+        if (response.inputModes) inputPolicy.setInputModes(response.inputModes);
+        stdout.write(response.bytes);
+        break;
+      case "Geometry":
+        break;
+      case "Exited":
+        stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} exited with code ${response.code}]\r\n`);
+        finish(response.code);
+        break;
+      case "Detached":
+        completeDetach();
+        break;
+      case "AdmissionFailure":
+        console.error(`pty attach: ${response.reason}${response.detail ? `: ${response.detail}` : ""}`);
+        finish(1);
+        break;
+      case "StreamFailure":
+        if (phase._tag === "Detaching") {
+          completeDetach();
+        } else if (canReconnect && (phase._tag === "Opening" || phase._tag === "Ready")) {
+          beginReconnect();
+        } else if (phase._tag !== "Ended") {
+          console.error(`pty attach: ${response.reason}${response.diagnostic ? `: ${response.diagnostic}` : ""}`);
+          finish(1);
+        }
+        break;
     }
   }
 
-  function bindSocket(s: net.Socket, preConnected: boolean): void {
-    reader = new PacketReader();
-    s.on("data", handleData);
-    s.on("error", (err: NodeJS.ErrnoException) => handleDisconnect(err));
-    s.on("close", () => handleDisconnect());
-    if (preConnected) process.nextTick(onReady);
-    else s.on("connect", onReady);
+  function startAdapter(socket?: net.Socket): void {
+    const sequence = ++adapterSequence;
+    const controller = new AbortController();
+    inputPolicy.discardPendingInput();
+    const requests = new PassThrough();
+    const responses = new PassThrough();
+    const responseReader = new MachineFrameReader();
+    desiredSize = terminalSize();
+    transition({ _tag: "Opening", controller, requests, sentSize: desiredSize });
+    stdin.resume();
+    responses.on("data", (chunk: Buffer) => {
+      if (sequence !== adapterSequence || phase._tag === "Ended") return;
+      for (const frame of responseReader.feed(Buffer.from(chunk))) {
+        handleResponse(decodeMachineResponse(frame));
+      }
+    });
+    responses.once("end", () => {
+      if (sequence !== adapterSequence || phase._tag === "Ended") return;
+      if (phase._tag === "Detaching") completeDetach();
+    });
+    void machineAttachV2({
+      input: requests,
+      output: responses,
+      ...(socket ? { connect: () => socket, preconnected: true } : {}),
+      signal: controller.signal,
+    }).catch((error) => {
+      if (sequence !== adapterSequence || controller.signal.aborted || phase._tag === "Ended") return;
+      console.error(`pty attach: ${error instanceof Error ? error.message : String(error)}`);
+      finish(1);
+    });
+    requests.write(encodeMachineRequest({
+      _tag: "Open",
+      protocol: MACHINE_PROTOCOL_VERSION,
+      sessionId: options.name,
+      expectedGeneration: generation,
+      rows: desiredSize.rows,
+      cols: desiredSize.cols,
+      requiredCapabilities: [
+        "framed-utf8-input",
+        "typed-outcome",
+        "input-mode-snapshot",
+        "host-terminal-replay",
+      ],
+    }));
   }
 
   // Re-establish the routed socket on a loud disconnect and re-attach; the
   // daemon replays screen+modes so the session resumes. Only reached when
   // `options.reconnect` is set (attach --remote) and the session didn't EXIT.
-  async function reconnectLoop(): Promise<void> {
-    if (reconnecting) return;
-    reconnecting = true;
-    const status = stdout;
-    status.write(`\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n`);
+  function beginReconnect(): void {
+    if (phase._tag !== "Opening" && phase._tag !== "Ready") return;
+    adapterSequence++;
+    const controller = new AbortController();
+    transition({ _tag: "Reconnecting", controller });
+    inputPolicy.discardPendingInput();
+    stdout.write(`\r\n[reconnecting… — Ctrl-\\ to stop]\r\n`);
+    stdin.resume();
+    void reconnectLoop(controller);
+  }
+
+  async function reconnectLoop(controller: AbortController): Promise<void> {
     let attempt = 0;
-    while (!detaching && !exitHandled) {
+    while (phase._tag === "Reconnecting" && !controller.signal.aborted) {
       const delay = RECONNECT_BACKOFF_MS[attempt] ?? RECONNECT_BACKOFF_CAP_MS;
-      await new Promise((r) => setTimeout(r, delay));
-      if (detaching || exitHandled) break;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(done, delay);
+        function done(): void {
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", done);
+          resolve();
+        }
+        controller.signal.addEventListener("abort", done, { once: true });
+      });
+      if (phase._tag !== "Reconnecting" || controller.signal.aborted) return;
       let fresh: net.Socket | null = null;
       try {
-        fresh = await options.reconnect!();
+        fresh = await options.reconnect!(controller.signal);
       } catch {
         // Reject = reachable host that says the session is gone → clean give-up.
         // (Transport failures resolve null, so we keep retrying below.)
-        if (detaching || exitHandled) break;
-        reconnecting = false;
-        status.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
+        if (phase._tag !== "Reconnecting" || controller.signal.aborted) return;
+        stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
         finish(0);
         return;
       }
-      if (detaching || exitHandled) { try { fresh?.destroy(); } catch {} break; }
+      if (phase._tag !== "Reconnecting" || controller.signal.aborted) {
+        try { fresh?.destroy(); } catch {}
+        return;
+      }
       if (fresh) {
-        socket = fresh; // input handlers now target the fresh socket
-        reconnecting = false;
-        bindSocket(fresh, true); // pre-connected; onReady → encodeAttach → daemon SCREEN replay
+        startAdapter(fresh);
         return;
       }
       // Transport failure (host unreachable) — retry, unlimited by default so a
       // laptop closed for hours still reconnects on reopen. Only a finite env cap
-      // ends it (besides the user's Ctrl-\ / Ctrl-C).
+      // ends it (besides the user's Ctrl-\).
       if (++attempt >= RECONNECT_MAX_ATTEMPTS) {
-        reconnecting = false;
-        status.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
+        stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
         finish(1);
         return;
       }
     }
   }
 
-  bindSocket(socket, firstPreConnected);
+  enterRawMode();
+  wireInput();
+  startAdapter(options.socket);
 }

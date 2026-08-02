@@ -254,6 +254,91 @@ describe("pty attach --no-restart", () => {
     expect(readEventCount(root, name, "session_start")).toBe(1);
   }, 20_000);
 
+  it("forwards exact fragmented terminal bytes through v2 and keeps detach local", async () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "bytes-"));
+    const name = "byte-safe-target";
+    const childScript = [
+      "process.stdin.setRawMode?.(true)",
+      "process.stdin.resume()",
+      "process.stdout.write('\\x1b[>1uRAW_READY\\r\\n')",
+      "let received = Buffer.alloc(0)",
+      "process.stdin.on('data', chunk => {",
+      "  received = Buffer.concat([received, chunk])",
+      "  if (received.length >= 7) process.stdout.write(`HEX:${received.subarray(0, 7).toString('hex')}\\r\\n`)",
+      "})",
+      "setInterval(() => {}, 1000)",
+    ].join(";");
+    const created = runCli(root, [
+      "run", "-d", "--id", name, "--tag", "keep=true",
+      "--", nodeBin, "-e", childScript,
+    ]);
+    expect(created.status, created.stderr).toBe(0);
+    const daemonPid = Number(fs.readFileSync(path.join(root, `${name}.pid`), "utf8").trim());
+    daemonPids.add(daemonPid);
+
+    const attached = nodePty.spawn(nodeBin, [cliPath, "attach", "--no-restart", name], {
+      name: "xterm-256color",
+      cols: 100,
+      rows: 30,
+      env: env(root),
+    });
+    let output = "";
+    attached.onData((data) => { output += data; });
+    const exited = new Promise<{ exitCode: number; signal?: number }>((resolve) => attached.onExit(resolve));
+    await waitForTerminalText(() => output, "RAW_READY");
+
+    attached.write("😀");
+    attached.write("\x1bb");
+    for (const chunk of ["\x1b[9", "2;", "5u", "\x1b[92;5u"]) attached.write(chunk);
+    await waitForTerminalText(() => output, "HEX:f09f98801b621c");
+
+    attached.write("\x1c");
+    const result = await Promise.race([
+      exited,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`attach did not detach\n${output}`)), 8_000)),
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(output).toContain("[detached]");
+  }, 20_000);
+
+  it("reconciles a resize that lands after OPEN but before READY", async () => {
+    const root = fs.mkdtempSync(path.join(testRoot, "opening-resize-"));
+    const name = "opening-resize-target";
+    const created = runCli(root, [
+      "run", "-d", "--id", name, "--tag", "keep=true",
+      "--", "sh", "-c", "printf 'RESIZE_READY\\r\\n'; while IFS= read -r line; do sh -c \"$line\"; done",
+    ]);
+    expect(created.status, created.stderr).toBe(0);
+    const daemonPid = Number(fs.readFileSync(path.join(root, `${name}.pid`), "utf8").trim());
+    daemonPids.add(daemonPid);
+
+    const attached = nodePty.spawn(nodeBin, [cliPath, "attach", "--no-restart", name], {
+      name: "xterm-256color",
+      cols: 60,
+      rows: 20,
+      env: env(root),
+    });
+    let output = "";
+    attached.onData((data) => { output += data; });
+    try {
+      await waitForCondition(() => {
+        try {
+          return typeof JSON.parse(fs.readFileSync(path.join(root, `${name}.json`), "utf8")).lastAttachAt === "string";
+        } catch {
+          return false;
+        }
+      });
+      attached.resize(100, 40);
+      await waitForTerminalText(() => output, "RESIZE_READY");
+      attached.write("stty size\r");
+      await waitForTerminalText(() => output, "40 100");
+      attached.write("\x1c");
+      await waitForTerminalText(() => output, "[detached]");
+    } finally {
+      try { attached.kill(); } catch {}
+    }
+  }, 20_000);
+
   it("preserves the default prompt-and-restart behavior", async () => {
     const root = fs.mkdtempSync(path.join(testRoot, "legacy-"));
     const marker = path.join(root, "invocations");
@@ -285,3 +370,19 @@ describe("pty attach --no-restart", () => {
     expect(readEventCount(root, name, "session_start")).toBe(1);
   });
 });
+
+async function waitForTerminalText(read: () => string, text: string): Promise<void> {
+  const started = Date.now();
+  while (!read().includes(text)) {
+    if (Date.now() - started > 8_000) throw new Error(`terminal did not contain ${text}\n${read()}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function waitForCondition(predicate: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > 8_000) throw new Error("condition did not become true");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}

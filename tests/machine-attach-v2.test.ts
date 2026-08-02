@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { machineAttachV2 } from "../src/machine-attach.ts";
+import { attach, InteractiveInputPolicy } from "../src/client.ts";
 import {
   MACHINE_PROTOCOL_VERSION,
   DaemonExtensionType,
@@ -97,6 +98,14 @@ async function waitForResponse(
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   throw new Error(`Timed out waiting for ${tag}`);
+}
+
+async function waitFor(predicate: () => boolean, description: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
 }
 
 describe("machine-attach-v2 adapter", () => {
@@ -511,5 +520,262 @@ describe("machine-attach-v2 adapter", () => {
     expect(responses[0]).toMatchObject({ _tag: "AdmissionFailure", reason: "unsupported-daemon" });
     expect(Buffer.concat(stderr).toString()).toBe("");
     fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("interactive attach input policy", () => {
+  it("preserves UTF-8 and control bytes across arbitrary stdin fragmentation", () => {
+    const expected = Buffer.from("A😀\x1b[1;3D終");
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (bytes) => emitted.push(bytes),
+      onDetach: () => { throw new Error("unexpected detach"); },
+    });
+    for (const byte of expected) policy.feed(Buffer.from([byte]));
+    policy.end();
+    expect(Buffer.concat(emitted)).toEqual(expected);
+  });
+
+  it("recognizes Kitty Ctrl-\\ across every chunk boundary and forwards a double tap exactly", () => {
+    const kitty = Buffer.from("\x1b[92;5u");
+    for (let split = 1; split < kitty.length; split++) {
+      const emitted: Buffer[] = [];
+      const policy = new InteractiveInputPolicy({
+        onInput: (bytes) => emitted.push(bytes),
+        onDetach: () => { throw new Error("unexpected detach"); },
+        ambiguityMs: 10_000,
+      });
+      policy.setInputModes({ ...modes, kittyKeyboardFlagsStack: [1] });
+      policy.feed(kitty.subarray(0, split));
+      policy.feed(kitty.subarray(split));
+      policy.feed(kitty);
+      expect(Buffer.concat(emitted)).toEqual(Buffer.from([0x1c]));
+      policy.dispose();
+    }
+  });
+
+  it("preserves causal byte order when ordinary input and a double detach chord are coalesced", () => {
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (bytes) => emitted.push(bytes),
+      onDetach: () => { throw new Error("unexpected detach"); },
+    });
+    policy.setInputModes({ ...modes, kittyKeyboardFlagsStack: [1] });
+    policy.feed(Buffer.from("😀\x1bb\x1b[92;5u\x1b[92;5u"));
+    expect(Buffer.concat(emitted)).toEqual(Buffer.from("😀\x1bb\x1c"));
+    policy.dispose();
+  });
+
+  it("does not reserve Kitty-looking bytes when Kitty keyboard mode is inactive", () => {
+    const bytes = Buffer.from("before\x1b[92;5uafter");
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (value) => emitted.push(value),
+      onDetach: () => { throw new Error("unexpected detach"); },
+    });
+    policy.feed(bytes);
+    policy.end();
+    expect(Buffer.concat(emitted)).toEqual(bytes);
+  });
+
+  it("releases an ambiguous Kitty prefix byte-for-byte when its deadline expires", async () => {
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (value) => emitted.push(value),
+      onDetach: () => { throw new Error("unexpected detach"); },
+      ambiguityMs: 1,
+    });
+    policy.setInputModes({ ...modes, kittyKeyboardFlagsStack: [1] });
+    policy.feed(Buffer.from("\x1b["));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    policy.feed(Buffer.from("1;3D"));
+    policy.end();
+    expect(Buffer.concat(emitted)).toEqual(Buffer.from("\x1b[1;3D"));
+  });
+
+  it("discards only incomplete ordinary input at an uncertain transport boundary", () => {
+    const emitted: Buffer[] = [];
+    const policy = new InteractiveInputPolicy({
+      onInput: (value) => emitted.push(value),
+      onDetach: () => { throw new Error("unexpected detach"); },
+    });
+    policy.feed(Buffer.from("😀").subarray(0, 2));
+    policy.discardPendingInput();
+    policy.feed(Buffer.from("A"));
+    policy.end();
+    expect(Buffer.concat(emitted)).toEqual(Buffer.from("A"));
+  });
+});
+
+describe("interactive attach lifecycle", () => {
+  it("cancels the admitted socket when local detach wins during Opening", async () => {
+    let serverSocketClosed = false;
+    const connect = await listen((socket) => {
+      socket.once("close", () => { serverSocketClosed = true; });
+      const reader = new MachineFrameReader();
+      let opened: MachineOpenV2 | null = null;
+      socket.on("data", (chunk) => {
+        for (const packet of reader.feed(Buffer.from(chunk))) {
+          if (packet.type === DaemonExtensionType.OPEN_V2) {
+            opened = decodeDaemonOpenV2(packet);
+          } else if (packet.type === MessageType.STATUS) {
+            if (!opened) throw new Error("STATUS arrived before OPEN_V2");
+            socket.write(encodeDaemonAdmissionV2({
+              _tag: "Accepted",
+              protocol: MACHINE_PROTOCOL_VERSION,
+              generation: opened.expectedGeneration,
+              capabilities: opened.requiredCapabilities,
+              build: { version: "test", dirty: false },
+            }));
+          }
+        }
+      });
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let detached = false;
+    const exitCodes: number[] = [];
+    attach({
+      name: "test-session",
+      expectedGeneration: "generation-a",
+      socket: connect("ignored"),
+      input,
+      output,
+      onDetach: () => { detached = true; },
+      onExit: (code) => { exitCodes.push(code); },
+    });
+    input.write(Buffer.from([0x1c]));
+    await waitFor(() => detached, "Opening detach callback");
+    await waitFor(() => serverSocketClosed, "admitted socket close");
+    expect(exitCodes).toEqual([]);
+    input.destroy();
+    output.destroy();
+  });
+
+  it("completes detach locally when transport fails after the detach request", async () => {
+    const connect = await listen((socket) => {
+      const reader = new MachineFrameReader();
+      let opened: MachineOpenV2 | null = null;
+      socket.on("data", (chunk) => {
+        for (const packet of reader.feed(Buffer.from(chunk))) {
+          if (packet.type === DaemonExtensionType.OPEN_V2) {
+            opened = decodeDaemonOpenV2(packet);
+            continue;
+          }
+          if (packet.type === MessageType.STATUS) {
+            if (!opened) throw new Error("STATUS arrived before OPEN_V2");
+            socket.write(Buffer.concat([
+              encodeDaemonAdmissionV2({
+                _tag: "Accepted",
+                protocol: MACHINE_PROTOCOL_VERSION,
+                generation: opened.expectedGeneration,
+                capabilities: opened.requiredCapabilities,
+                build: { version: "test", dirty: false },
+              }),
+              encodeMachineResponse({
+                _tag: "Ready",
+                outputRevision: 0,
+                rows: opened.rows,
+                cols: opened.cols,
+                inputModes: modes,
+                screen: Buffer.from("READY"),
+              }),
+            ]));
+            continue;
+          }
+          if (decodeMachineRequest(packet)._tag === "Detach") socket.destroy();
+        }
+      });
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let rendered = "";
+    output.on("data", (chunk) => { rendered += chunk.toString(); });
+    let detached = false;
+    const exitCodes: number[] = [];
+    attach({
+      name: "test-session",
+      expectedGeneration: "generation-a",
+      socket: connect("ignored"),
+      input,
+      output,
+      onDetach: () => { detached = true; },
+      onExit: (code) => { exitCodes.push(code); },
+    });
+    await waitFor(() => rendered.includes("READY"), "interactive READY");
+    input.write(Buffer.from([0x1c]));
+    await waitFor(() => detached, "local detach after transport failure");
+    expect(rendered).toContain("[detached]");
+    expect(exitCodes).toEqual([]);
+    input.destroy();
+    output.destroy();
+  });
+
+  it("aborts an in-flight reconnect before invoking a library detach callback", async () => {
+    let drop: (() => void) | null = null;
+    const connect = await listen((socket) => {
+      drop = () => socket.destroy();
+      const reader = new MachineFrameReader();
+      let opened: MachineOpenV2 | null = null;
+      socket.on("data", (chunk) => {
+        for (const packet of reader.feed(Buffer.from(chunk))) {
+          if (packet.type === DaemonExtensionType.OPEN_V2) {
+            opened = decodeDaemonOpenV2(packet);
+          } else if (packet.type === MessageType.STATUS) {
+            if (!opened) throw new Error("STATUS arrived before OPEN_V2");
+            socket.write(Buffer.concat([
+              encodeDaemonAdmissionV2({
+                _tag: "Accepted",
+                protocol: MACHINE_PROTOCOL_VERSION,
+                generation: opened.expectedGeneration,
+                capabilities: opened.requiredCapabilities,
+                build: { version: "test", dirty: false },
+              }),
+              encodeMachineResponse({
+                _tag: "Ready",
+                outputRevision: 0,
+                rows: opened.rows,
+                cols: opened.cols,
+                inputModes: modes,
+                screen: Buffer.from("READY"),
+              }),
+            ]));
+          }
+        }
+      });
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let rendered = "";
+    output.on("data", (chunk) => { rendered += chunk.toString(); });
+    let reconnectSignal: AbortSignal | null = null;
+    let reconnectAborted = false;
+    let detached = false;
+    attach({
+      name: "test-session",
+      expectedGeneration: "generation-a",
+      socket: connect("ignored"),
+      input,
+      output,
+      reconnect: (signal) => new Promise((resolve) => {
+        reconnectSignal = signal;
+        signal.addEventListener("abort", () => {
+          reconnectAborted = true;
+          resolve(null);
+        }, { once: true });
+      }),
+      onDetach: () => { detached = true; },
+      onExit: (code) => { throw new Error(`unexpected exit ${code}`); },
+    });
+    await waitFor(() => rendered.includes("READY"), "interactive READY");
+    drop!();
+    await waitFor(() => reconnectSignal !== null, "in-flight reconnect");
+    input.write(Buffer.from([0x1c]));
+    await waitFor(() => detached, "library detach callback");
+    expect(reconnectSignal!.aborted).toBe(true);
+    expect(reconnectAborted).toBe(true);
+    expect(rendered).toContain("[detached]");
+    input.destroy();
+    output.destroy();
   });
 });

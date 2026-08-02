@@ -185,6 +185,25 @@ describe("attach --remote reconnect harness", () => {
     }
   }, 40000);
 
+  it("completes local detach while the transport is between incarnations", async () => {
+    const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
+      rows: 24, cols: 80,
+      env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
+    });
+    try {
+      await session.waitForText("RECONNECT_READY", 8000);
+      proxy.block();
+      proxy.drop();
+      await session.waitForText("reconnecting", 8000);
+      session.sendKeys("\x1c");
+      await session.waitForText("[detached]", 3000);
+      await session.waitFor(() => session.hasExited, 3000, "attach process to exit after detach");
+    } finally {
+      proxy.unblock();
+      await session.close();
+    }
+  }, 25000);
+
   it("survives a LONG transport outage (unlimited retry) and reconnects when the peer returns", async () => {
     const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
       rows: 24, cols: 80,
@@ -199,6 +218,8 @@ describe("attach --remote reconnect harness", () => {
       proxy.block();
       proxy.drop();
       await session.waitForText("reconnecting", 8000);       // shows the reconnecting indicator
+      const suppressedSentinel = `MUST_NOT_REACH_CHILD_${rand()}`;
+      session.sendKeys(`${suppressedSentinel}\r`);
       await new Promise((r) => setTimeout(r, 6000));         // outage spanning several failed retries
 
       // Peer reachable again → the next retry succeeds → session resumes.
@@ -206,6 +227,9 @@ describe("attach --remote reconnect harness", () => {
       await new Promise((r) => setTimeout(r, 6000));         // let a retry land + re-attach
       session.sendKeys("AFTER_OUTAGE\r");
       await session.waitForText("AFTER_OUTAGE", 12000);      // reconnected + resumed after the outage
+      // The child is `cat`, so any delivered sentinel would be visible after
+      // replay. Input typed between incarnations is intentionally discarded.
+      expect(session.screenshot().text).not.toContain(suppressedSentinel);
     } finally {
       proxy.unblock();
       await session.close();

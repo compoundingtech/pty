@@ -36,7 +36,11 @@ export const DaemonExtensionType = {
   ADMISSION_V2: 9,
 } as const;
 
-export type MachineCapability = "framed-utf8-input" | "typed-outcome" | "input-mode-snapshot";
+export type MachineCapability =
+  | "framed-utf8-input"
+  | "typed-outcome"
+  | "input-mode-snapshot"
+  | "host-terminal-replay";
 
 export interface MachineOpenV2 {
   readonly _tag: "Open";
@@ -237,7 +241,12 @@ function boolean(value: unknown, name: string): boolean {
   return value;
 }
 
-const CAPABILITIES = new Set<MachineCapability>(["framed-utf8-input", "typed-outcome", "input-mode-snapshot"]);
+const CAPABILITIES = new Set<MachineCapability>([
+  "framed-utf8-input",
+  "typed-outcome",
+  "input-mode-snapshot",
+  "host-terminal-replay",
+]);
 
 function capabilities(value: unknown): MachineCapability[] {
   if (!Array.isArray(value) || value.length > MAX_CAPABILITIES) {

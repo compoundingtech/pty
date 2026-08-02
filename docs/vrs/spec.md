@@ -121,6 +121,13 @@ needs reconstructable terminal state must first send `ATTACH` or `PEEK`. Public
 stats omit command sockets and expose the writable-attached role with the
 compatibility string `"writable"`.
 
+The unadmitted `ATTACH` writable path is compatibility-only. New interactive or
+embedded consumers must use machine attach v2; no new consumer may depend on
+the legacy writable role. The compatibility path is removed once
+`SessionConnection`, the TUI builder transport, and the server-backed testing
+session have migrated to v2 and their legacy protocol parity fixtures have been
+replaced.
+
 For writable-attached request set `W`, shared geometry is (R06):
 
 ```text
@@ -138,6 +145,16 @@ the last writable-attached client leaves the last effective geometry stable.
 protocol. It does not allocate a controlling terminal, inherit a side-channel
 descriptor, interpret an interactive detach key, or fall back to machine attach
 v1 (R08, R11).
+
+Human `pty attach` is an interactive policy adapter over that same behavioral
+core, not a second writable daemon protocol. It reads the exact local generation
+from metadata or the remote generation from route admission, requests the
+optional `host-terminal-replay` capability, and frames complete UTF-8 input,
+resize, and detach requests through `machine-attach-v2`. The local policy alone
+reserves Ctrl-\\: it recognizes both C0 and Kitty encodings across stream chunks,
+uses a bounded ambiguity deadline only for an incomplete Kitty prefix, and
+otherwise preserves input bytes exactly. A second Ctrl-\\ within the documented
+double-tap window emits one C0 byte to the child.
 
 ```text
 host                         adapter                         daemon
@@ -248,6 +265,10 @@ status sentinel so no legacy status response enters the accepted stream.
 Rejection leaves the command role unchanged. Version and
 build identity are diagnostic; the three required capabilities are
 `framed-utf8-input`, `typed-outcome`, and `input-mode-snapshot` (R07).
+`host-terminal-replay` is an optional presentation capability: when requested,
+the daemon prefixes `READY.screen` with its current host-terminal mode state.
+Machine hosts that reconstruct presentation from the typed input-mode snapshot
+do not request it.
 
 The host lifecycle grammar is (R08):
 
@@ -339,7 +360,7 @@ input, resize, and multi-client geometry without mocks.
 | R08 | [machine protocol](../../src/machine-protocol.ts), [machine adapter](../../src/machine-attach.ts), [CLI](../../src/cli.ts), [entrypoint](../../bin/pty) | [machine protocol](../../tests/machine-protocol.test.ts), [machine adapter](../../tests/machine-attach-v2.test.ts), [machine process and socket](../../tests/machine-attach-v2-e2e.test.ts), [signals](../../tests/wrapper-signal-forwarding.test.ts) |
 | R09 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [recovery](../../src/recovery.ts), [CLI](../../src/cli.ts) | [root](../../tests/pty-root.test.ts), [display name](../../tests/display-name.test.ts), [status](../../tests/stats-cli.test.ts), [list purity](../../tests/list-purity.test.ts), [recovery](../../tests/recovery.test.ts) |
 | R10 | [sessions](../../src/sessions.ts), [events](../../src/events.ts), [recovery](../../src/recovery.ts), [protocol](../../src/protocol.ts) | [atomic writes](../../tests/atomic-writes.test.ts), [metadata events](../../tests/metadata-events.test.ts), [events](../../tests/events.test.ts), [recovery](../../tests/recovery.test.ts), [disk layout](../../tests/disk-layout-docs.test.ts) |
-| R11 | [CLI](../../src/cli.ts), [client API](../../src/client-api.ts), [remote](../../src/remote.ts), [testing API](../../src/testing/index.ts) | [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [remote](../../tests/remote-fabric.test.ts), [screenshots](../../tests/screenshot.test.ts), [keys](../../tests/keys.test.ts) |
+| R11 | [CLI](../../src/cli.ts), [client](../../src/client.ts), [client API](../../src/client-api.ts), [remote](../../src/remote.ts), [testing API](../../src/testing/index.ts) | [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [interactive attach](../../tests/attach-no-restart.test.ts), [remote](../../tests/remote-fabric.test.ts), [screenshots](../../tests/screenshot.test.ts), [keys](../../tests/keys.test.ts) |
 
 `node scripts/verify-docs.ts --vrs-only` validates this two-document shape,
 sequential requirement IDs, links, and complete requirement references.

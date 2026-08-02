@@ -19,7 +19,7 @@ import { captureScreenshot } from "./screenshot.ts";
 import type { Screenshot, SpawnOptions, ServerOptions } from "./types.ts";
 
 type Backend =
-  | { kind: "spawn"; ptyProcess: pty.IPty }
+  | { kind: "spawn"; ptyProcess: pty.IPty; exitCode: number | null }
   | { kind: "server"; server: PtyServer; ownsServer: boolean; socket: net.Socket; reader: PacketReader; screenCallbacks: Array<() => void>; exitCode: number | null; name: string };
 
 let nameCounter = 0;
@@ -128,7 +128,8 @@ export class Session {
       terminal.write(data);
     });
 
-    const backend: Backend = { kind: "spawn", ptyProcess: proc };
+    const backend: Backend = { kind: "spawn", ptyProcess: proc, exitCode: null };
+    proc.onExit(({ exitCode }) => { backend.exitCode = exitCode; });
     return new Session(terminal, serialize, backend, rows, cols);
   }
 
@@ -235,12 +236,9 @@ export class Session {
     return this._cols;
   }
 
-  /** Whether the process has exited. Server-mode only; always false for spawn-mode. */
+  /** Whether the spawned process or server-backed session has exited. */
   get hasExited(): boolean {
-    if (this.backend.kind === "server") {
-      return this.backend.exitCode !== null;
-    }
-    return false;
+    return this.backend.exitCode !== null;
   }
 
   /** The PtyServer instance (server-mode only). */

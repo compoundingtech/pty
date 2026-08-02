@@ -110,7 +110,11 @@ function recordFrames(socket: net.Socket): {
   };
 }
 
-function openRequest(name: string, generation = "generation-a"): MachineOpenV2 {
+function openRequest(
+  name: string,
+  generation = "generation-a",
+  hostTerminalReplay = false,
+): MachineOpenV2 {
   return {
     _tag: "Open",
     protocol: MACHINE_PROTOCOL_VERSION,
@@ -122,6 +126,7 @@ function openRequest(name: string, generation = "generation-a"): MachineOpenV2 {
       "framed-utf8-input",
       "typed-outcome",
       "input-mode-snapshot",
+      ...(hostTerminalReplay ? ["host-terminal-replay" as const] : []),
     ],
   };
 }
@@ -189,6 +194,29 @@ describe("machine attach v2 daemon admission", () => {
     expect(frames.frames.slice(0, 2).map((frame) => frame.type)).toEqual([9, 2]);
     expect(frames.frames.some((frame) => frame.type === 4)).toBe(false);
     expect(readMetadata(name)?.lastAttachAt).toBeTypeOf("string");
+    socket.destroy();
+  });
+
+  it("prefixes the Ready screen only when a human host requests terminal replay", async () => {
+    const name = uniqueName();
+    const server = await startServer(name);
+    const handlePtyOutput = (server as unknown as {
+      handlePtyOutput: (data: string) => void;
+    }).handlePtyOutput.bind(server);
+    handlePtyOutput("\x1b[?2004h\x1b[>1uHOST_READY");
+
+    const socket = await connect(name);
+    const frames = recordFrames(socket);
+    socket.write(Buffer.concat([
+      encodeDaemonOpenV2(openRequest(name, "generation-a", true)),
+      encodeStatus(),
+    ]));
+    await frames.waitFor((received) => received.length >= 2);
+    const ready = decodeMachineResponse(frames.frames[1]);
+    if (ready._tag !== "Ready") throw new Error("expected Ready baseline");
+    expect(ready.screen.subarray(0, "\x1b[?2004h\x1b[>1u".length).toString()).toBe(
+      "\x1b[?2004h\x1b[>1u",
+    );
     socket.destroy();
   });
 

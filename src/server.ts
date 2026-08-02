@@ -113,6 +113,7 @@ interface Client {
         readonly _tag: "MachineAwaitingSentinel";
         readonly rows: number;
         readonly cols: number;
+        readonly hostTerminalReplay: boolean;
       }
     | {
         readonly _tag: "Machine";
@@ -273,6 +274,7 @@ const MACHINE_CAPABILITIES = [
   "framed-utf8-input",
   "typed-outcome",
   "input-mode-snapshot",
+  "host-terminal-replay",
 ] as const satisfies readonly MachineCapability[];
 const MAX_KITTY_KEYBOARD_STACK_DEPTH = 64;
 
@@ -1367,6 +1369,7 @@ export class PtyServer {
       _tag: "MachineAwaitingSentinel",
       rows: open.rows,
       cols: open.cols,
+      hostTerminalReplay: open.requiredCapabilities.includes("host-terminal-replay"),
     };
   }
 
@@ -1490,7 +1493,8 @@ export class PtyServer {
     client: Client,
     size: { readonly rows: number; readonly cols: number },
     protocol: "legacy" | "machine-v2",
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    hostTerminalReplay = false,
   ): void {
     client.output.clearHeld();
     const sizeMatched =
@@ -1523,7 +1527,10 @@ export class PtyServer {
               cols: this.terminal.cols,
               outputRevision: this.outputRevision,
               inputModes: this.inputModeSnapshot(),
-              screen: Buffer.from(this.serialize.serialize()),
+              screen: Buffer.from(
+                (hostTerminalReplay ? this.getModePrefix(true) : "") +
+                this.serialize.serialize()
+              ),
             })
           : encodeScreen(this.getModePrefix(true) + this.serialize.serialize()),
         () => {
@@ -1577,7 +1584,7 @@ export class PtyServer {
             Number(packet.type) === MessageType.STATUS &&
             packet.payload.length === 0
           ) {
-            const { rows, cols } = client.role;
+            const { rows, cols, hostTerminalReplay } = client.role;
             this.admitWritableClient(
               client,
               { rows, cols },
@@ -1590,7 +1597,8 @@ export class PtyServer {
                   capabilities: MACHINE_CAPABILITIES,
                   build: { version: readPackageVersion(), dirty: false },
                 })
-              )
+              ),
+              hostTerminalReplay,
             );
             continue;
           }

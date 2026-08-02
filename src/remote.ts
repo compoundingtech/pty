@@ -1,6 +1,6 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { listSessions, getSession, getSocketPath, type SessionInfo } from "./sessions.ts";
 
@@ -45,7 +45,10 @@ export interface RemoteListResponse {
 /** Route handshake ack line the server sends once it has connected to the target
  *  session, right before it starts splicing. `dialAndRoute` waits for this so a
  *  routed command reliably knows the route succeeded (or, on `{error}`, failed).*/
-const ROUTE_OK = JSON.stringify({ ok: true });
+export interface RoutedSession {
+  readonly socket: net.Socket;
+  readonly generation: string | null;
+}
 
 /** The dial reached the peer's control server but it REFUSED the route — the
  *  host is reachable and reports the session is gone/absent. Distinct from a
@@ -148,7 +151,10 @@ export function handleRemoteConnection(input: Readable, output: Writable, done: 
     target.on("connect", () => {
       // ACK the route BEFORE splicing so the client knows it succeeded (the
       // per-session protocol has no ack). Then wire the bidirectional splice.
-      output.write(ROUTE_OK + "\n");
+      output.write(JSON.stringify({
+        ok: true,
+        generation: session.metadata?.generation ?? null,
+      }) + "\n");
       if (residual.length > 0) target.write(residual);
       input.pipe(target);
       target.pipe(output, { end: false }); // `finish` owns the final teardown
@@ -201,67 +207,108 @@ export function runRemoteServeStdio(): void {
  *  remote session. The resolved socket is a transparent pipe to that session's
  *  daemon socket, ready for the ordinary per-session protocol (attach/peek/send
  *  client code runs over it unchanged). */
-export function dialAndRoute(peer: string, name: string, timeoutMs = 10000): Promise<net.Socket> {
+export function dialAndRoute(
+  peer: string,
+  name: string,
+  timeoutMs = 10000,
+  signal?: AbortSignal,
+): Promise<RoutedSession> {
   return new Promise((resolve, reject) => {
-    let dialSock: string;
-    try {
-      dialSock = execFileSync(FABRIC_BIN, ["dial", peer, PTY_REMOTE_ALPN], {
-        encoding: "utf-8",
-        timeout: timeoutMs,
-      }).trim();
-    } catch (e) {
-      reject(e instanceof Error ? e : new Error(String(e)));
-      return;
-    }
-    if (!dialSock) {
-      reject(new Error(`fabric dial ${peer} returned no socket`));
-      return;
-    }
-    const sock = net.createConnection(dialSock);
+    let sock: net.Socket | null = null;
+    let settled = false;
     let acked = false;
     let buf: Buffer = Buffer.alloc(0);
-    const timer = setTimeout(() => {
-      if (!acked) { sock.destroy(); reject(new Error("route handshake timed out")); }
-    }, timeoutMs);
+    let timer: NodeJS.Timeout | null = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { sock?.destroy(); } catch {}
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const succeed = (routed: RoutedSession) => {
+      if (settled) {
+        try { routed.socket.destroy(); } catch {}
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(routed);
+    };
+    const onAbort = () => fail(signal?.reason ?? new Error("remote dial cancelled"));
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    execFile(FABRIC_BIN, ["dial", peer, PTY_REMOTE_ALPN], {
+      encoding: "utf-8",
+      timeout: timeoutMs,
+      signal,
+    }, (error, stdout) => {
+      if (settled) return;
+      if (error) {
+        fail(error);
+        return;
+      }
+      const dialSock = stdout.trim();
+      if (!dialSock) {
+        fail(new Error(`fabric dial ${peer} returned no socket`));
+        return;
+      }
+      connect(dialSock);
+    });
+
+    const connect = (dialSock: string) => {
+      if (settled) return;
+      sock = net.createConnection(dialSock);
+      timer = setTimeout(() => {
+        if (!acked) fail(new Error("route handshake timed out"));
+      }, timeoutMs);
     const onData = (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       const nl = buf.indexOf(0x0a);
       if (nl === -1) return; // wait for the full ack line
       acked = true;
-      clearTimeout(timer);
-      sock.removeListener("data", onData);
+      if (timer) clearTimeout(timer);
+      timer = null;
+      sock!.removeListener("data", onData);
       const line = buf.subarray(0, nl).toString("utf-8");
       const rest = buf.subarray(nl + 1); // bytes after the ack (normally none)
-      let resp: { ok?: boolean; error?: string };
+      let resp: { ok?: boolean; error?: string; generation?: string | null };
       try {
         resp = JSON.parse(line);
       } catch {
-        sock.destroy();
-        reject(new Error(`bad route response: ${line.slice(0, 80)}`));
+        fail(new Error(`bad route response: ${line.slice(0, 80)}`));
         return;
       }
       if (resp.error || !resp.ok) {
         // Reached the host; it refused the route (session gone). Distinct from a
         // transport failure so reconnect can give up cleanly vs retry forever.
-        sock.destroy();
-        reject(new RouteRefusedError(resp.error ?? "route refused"));
+        fail(new RouteRefusedError(resp.error ?? "route refused"));
         return;
       }
       // Hand back anything that arrived after the ack line so the caller's
       // per-session protocol sees it (defensive — the server splices only after
       // acking, so in practice `rest` is empty).
-      if (rest.length > 0) sock.unshift(rest);
-      resolve(sock);
+      if (rest.length > 0) sock!.unshift(rest);
+      succeed({ socket: sock!, generation: resp.generation ?? null });
     };
     sock.once("connect", () => {
-      sock.write(JSON.stringify({ op: "route", name }) + "\n");
+      sock!.write(JSON.stringify({ op: "route", name }) + "\n");
     });
     sock.on("data", onData);
-    sock.on("error", (e) => { clearTimeout(timer); if (!acked) reject(e); });
+    sock.on("error", (e) => { if (!acked) fail(e); });
     sock.on("close", () => {
-      clearTimeout(timer);
-      if (!acked) reject(new Error(`remote session "${name}" not reachable`));
+      if (!acked) fail(new Error(`remote session "${name}" not reachable`));
     });
+    };
   });
 }
 

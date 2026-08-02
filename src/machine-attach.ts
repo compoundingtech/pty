@@ -28,6 +28,9 @@ export interface MachineAttachV2Options {
   readonly output?: Writable;
   readonly diagnostics?: Writable;
   readonly connect?: (socketPath: string) => net.Socket;
+  /** The injected socket is already connected (for example, a routed fabric
+   *  tunnel). The default local connector still waits for `connect`. */
+  readonly preconnected?: boolean;
   readonly signal?: AbortSignal;
 }
 
@@ -333,12 +336,14 @@ export function machineAttachV2(options: MachineAttachV2Options = {}): Promise<M
         try {
           socket = connect(getSocketPath(request.sessionId));
           bindDaemon(socket);
-          socket.once("connect", () => {
+          const connected = () => {
             if (isClosing()) return;
             phase = "await-admission";
             enqueueDaemon(encodeDaemonOpenV2(request));
             enqueueDaemon(encodeStatus());
-          });
+          };
+          if (options.preconnected) process.nextTick(connected);
+          else socket.once("connect", connected);
         } catch (error) {
           finishFailure("admission", "daemon-transport-failed", (error as Error).message);
         }
