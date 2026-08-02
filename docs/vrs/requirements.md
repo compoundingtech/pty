@@ -100,3 +100,11 @@ implementation contract and validation map live in [spec.md](./spec.md).
   remote routing preserve the applicable runtime, stream, geometry, registry,
   and lifecycle contracts. A surface rejects unsupported capabilities instead
   of silently weakening them; tests use real PTYs and processes.
+- **R12 Exact-generation retained exit evidence:** Supported client and CLI
+  surfaces expose one bounded, tagged snapshot of retained terminal evidence
+  for an exact stable id and opaque generation, distinguishing exited,
+  vanished, live, missing, busy, unavailable, and invalid state. Conditional
+  cleanup removes artifacts only while that same terminal generation remains;
+  it never removes a live or replacement generation. Semantic outcomes and
+  operational failures are machine-distinguishable, and validation covers the
+  snapshot-to-cleanup race with real processes.
