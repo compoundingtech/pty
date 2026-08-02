@@ -129,7 +129,31 @@ _pty() {
       COMPREPLY=($(compgen -W "--id" -- "${cur}"))
       ;;
     evidence)
-      COMPREPLY=($(compgen -W "--id --expected-generation" -- "${cur}"))
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "snapshot remove" -- "${cur}"))
+        return
+      fi
+      case "${COMP_WORDS[2]}" in
+        snapshot)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+          fi
+          ;;
+        remove)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${prev}" == "--expected-generation" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id --expected-generation" -- "${cur}"))
+          fi
+          ;;
+      esac
       ;;
     up)
       COMPREPLY=($(compgen -o dirnames -- "${cur}"))

@@ -33,6 +33,16 @@ function __pty_using_command
     test (count $cmd) -ge 2; and test "$cmd[2]" = "$argv[1]"
 end
 
+function __pty_needs_subcommand
+    set -l cmd (commandline -opc)
+    test (count $cmd) -eq 2; and test "$cmd[2]" = "$argv[1]"
+end
+
+function __pty_using_subcommand
+    set -l cmd (commandline -opc)
+    test (count $cmd) -ge 3; and test "$cmd[2]" = "$argv[1]"; and test "$cmd[3]" = "$argv[2]"
+end
+
 complete -c pty -f
 
 # ── Global flags ───────────────────────────────────────────────────────
@@ -143,9 +153,11 @@ complete -c pty -n '__pty_using_command rename' -l clear -d 'Remove displayName'
 complete -c pty -n '__pty_using_command rename' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command metadata' -l id -d 'Exact stable session id'
 complete -c pty -n '__pty_using_command metadata' -x -a 'patch' -d 'Value'
-complete -c pty -n '__pty_using_command evidence' -l id -x -d 'Exact stable session id'
-complete -c pty -n '__pty_using_command evidence' -l expected-generation -x -d 'Opaque generation returned by evidence snapshot'
-complete -c pty -n '__pty_using_command evidence' -x -a 'snapshot remove' -d 'Value'
+complete -c pty -n '__pty_needs_subcommand evidence' -a snapshot -d 'Read retained evidence for one exact generation'
+complete -c pty -n '__pty_using_subcommand evidence snapshot' -l id -x -d 'Exact stable session id'
+complete -c pty -n '__pty_needs_subcommand evidence' -a remove -d 'Remove only the matching terminal generation'
+complete -c pty -n '__pty_using_subcommand evidence remove' -l id -x -d 'Exact stable session id'
+complete -c pty -n '__pty_using_subcommand evidence remove' -l expected-generation -x -d 'Opaque generation returned by evidence snapshot'
 complete -c pty -n '__pty_using_command up' -F
 complete -c pty -n '__pty_using_command down' -F
 complete -c pty -n '__pty_using_command test' -l t -d 'Run matching tests'

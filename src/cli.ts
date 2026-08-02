@@ -448,6 +448,23 @@ Examples:
   pty test -t "peek"`,
 };
 
+const EVIDENCE_LEAF_HELP = {
+  snapshot: `Usage: pty evidence snapshot --id <stable-id>
+
+Emit one tagged JSON snapshot of retained terminal evidence for the exact
+stable session id.
+
+Example:
+  pty evidence snapshot --id a1b2c3d4`,
+  remove: `Usage: pty evidence remove --id <stable-id> --expected-generation <opaque>
+
+Remove one terminal session only when it still carries the opaque generation
+returned by an earlier snapshot. Emits one tagged JSON result.
+
+Example:
+  pty evidence remove --id a1b2c3d4 --expected-generation 7f44b35e`,
+} as const;
+
 /** Print a subcommand's focused help. Resolves aliases; returns false for an
  *  unknown command so the caller can fall through. */
 function printCommandHelp(cmd: string): boolean {
@@ -2851,6 +2868,13 @@ async function cmdEvidence(rawArgs: string[]): Promise<void> {
     console.error("  Usage: pty evidence snapshot --id <stable-id>");
     console.error("         pty evidence remove --id <stable-id> --expected-generation <opaque>");
     process.exit(1);
+  }
+  if (
+    rawArgs.length === 2 &&
+    (rawArgs[1] === "-h" || rawArgs[1] === "--help")
+  ) {
+    console.log(EVIDENCE_LEAF_HELP[operation]);
+    return;
   }
 
   let id: string | null = null;

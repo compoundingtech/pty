@@ -60,6 +60,21 @@ describe("completion spec parity with COMMAND_HELP", () => {
     const missing = [...documented].filter((k) => !specNames.has(k));
     expect(missing, `documented commands missing from completions spec: ${missing.join(", ")}`).toEqual([]);
   });
+
+  it("models evidence as leaf-specific snapshot and remove commands", () => {
+    expect(COMMANDS.find((command) => command.name === "evidence")).toMatchObject({
+      subcommands: [
+        {
+          name: "snapshot",
+          flags: [{ name: "id" }],
+        },
+        {
+          name: "remove",
+          flags: [{ name: "id" }, { name: "expected-generation" }],
+        },
+      ],
+    });
+  });
 });
 
 describe("pty completions <shell>", () => {
@@ -78,6 +93,63 @@ describe("pty completions <shell>", () => {
     for (const shell of ["fish", "bash", "zsh"] as const) {
       expect(gen(shell)).toContain(markers[shell]);
     }
+  });
+
+  it("completes evidence modes and leaf-specific flags in bash", () => {
+    const bash = which("bash");
+    if (!bash) return;
+    const complete = (words: string, cword: number) => {
+      const result = spawnSync(bash, ["-c", `${gen("bash")}
+COMP_WORDS=(${words})
+COMP_CWORD=${cword}
+_pty
+printf '%s\\n' "\${COMPREPLY[@]}"`], { encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim().split("\n").filter(Boolean).sort();
+    };
+
+    expect(complete('pty evidence ""', 2)).toEqual(["remove", "snapshot"]);
+    expect(complete('pty evidence snapshot "--"', 3)).toEqual(["--id"]);
+    expect(complete('pty evidence remove "--"', 3)).toEqual([
+      "--expected-generation",
+      "--id",
+    ]);
+  });
+
+  it("completes evidence modes and leaf-specific flags in fish", () => {
+    const fish = which("fish");
+    if (!fish) return;
+    const complete = (line: string) => {
+      const result = spawnSync(fish, ["-c", `${gen("fish")}
+complete -C '${line}'`], { encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim().split("\n").filter(Boolean)
+        .map((entry) => entry.split(/\s+/)[0]).sort();
+    };
+
+    expect(complete("pty evidence ")).toEqual(["remove", "snapshot"]);
+    expect(complete("pty evidence snapshot --")).toEqual(["--id"]);
+    expect(complete("pty evidence remove --")).toEqual([
+      "--expected-generation",
+      "--id",
+    ]);
+  });
+
+  it("generates nested evidence leaves with isolated flags for zsh", () => {
+    const output = gen("zsh");
+    const start = output.indexOf("        evidence)");
+    const end = output.indexOf("        up)", start);
+    const block = output.slice(start, end);
+    const snapshotStart = block.indexOf("snapshot)");
+    const removeStart = block.indexOf("remove)");
+    const snapshot = block.slice(snapshotStart, removeStart);
+    const remove = block.slice(removeStart);
+
+    expect(block).toContain("snapshot remove");
+    expect(snapshot).toContain("--id");
+    expect(snapshot).not.toContain("--expected-generation");
+    expect(remove).toContain("--id");
+    expect(remove).toContain("--expected-generation");
   });
 
   it("models --attach-stream-fd-v1 as consuming a required free-form value", () => {

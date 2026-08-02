@@ -186,10 +186,21 @@ _pty() {
             '1:mode:(patch)'
           ;;
         evidence)
-          _arguments \
-            '--id[Exact stable session id]:id:' \
-            '--expected-generation[Opaque generation returned by evidence snapshot]:generation:' \
-            '1:mode:(snapshot remove)'
+          if (( CURRENT == 3 )); then
+            _values 'operation' snapshot remove
+          else
+            case ${words[2]} in
+              snapshot)
+                _arguments \
+                  '--id[Exact stable session id]:id:'
+                ;;
+              remove)
+                _arguments \
+                  '--id[Exact stable session id]:id:' \
+                  '--expected-generation[Opaque generation returned by evidence snapshot]:generation:'
+                ;;
+            esac
+          fi
           ;;
         up)
           _arguments \

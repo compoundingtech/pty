@@ -49,6 +49,25 @@ describe("pty --help — per-subcommand help", () => {
       expect(r.stdout).not.toMatch(/^\[/);
     });
   }
+
+  for (const leaf of ["snapshot", "remove"] as const) {
+    it(`\`pty evidence ${leaf} --help\` prints leaf-specific help and exits 0`, () => {
+      const r = spawnSync(nodeBin, [cliPath, "evidence", leaf, "--help"], {
+        encoding: "utf8",
+        timeout: 15000,
+        env: { ...process.env, PTY_ROOT_LEGACY_SILENT: "1" },
+      });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toBe("");
+      expect(r.stdout).toMatch(new RegExp(`^Usage: pty evidence ${leaf} `));
+      expect(r.stdout).toContain("--id <stable-id>");
+      if (leaf === "snapshot") {
+        expect(r.stdout).not.toContain("--expected-generation");
+      } else {
+        expect(r.stdout).toContain("--expected-generation <opaque>");
+      }
+    });
+  }
 });
 
 describe("pty --help — no drift", () => {
