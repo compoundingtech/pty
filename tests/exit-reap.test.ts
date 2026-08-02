@@ -19,7 +19,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
 import {
   getSessionExitEvidence,
   removeSessionGeneration,
@@ -100,6 +100,24 @@ function runCli(sessionDir: string, ...args: string[]): { stdout: string; status
   } catch (err: any) {
     return { stdout: (err.stdout ?? "") + (err.stderr ?? ""), status: err.status ?? 1 };
   }
+}
+
+function runEvidenceCli(sessionDir: string, ...args: string[]) {
+  return spawnSync(nodeBin, [cliPath, "evidence", ...args], {
+    env: {
+      ...process.env,
+      PTY_ROOT: sessionDir,
+      PTY_ROOT_LEGACY_SILENT: "1",
+    },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+}
+
+function parseSemanticEvidenceResult(result: ReturnType<typeof runEvidenceCli>): unknown {
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  return JSON.parse(result.stdout);
 }
 
 function sessionFiles(dir: string, name: string): string[] {
@@ -183,6 +201,108 @@ afterEach(async () => {
 });
 
 describe("exact-generation exit evidence", () => {
+  it("exposes the exact-generation lifecycle through one tagged JSON document per CLI operation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const stdoutSentinel = `cli-stdout-${name}`;
+    const stderrSentinel = `cli-stderr-${name}`;
+    const oldPid = await startDaemon(
+      dir,
+      name,
+      "sh",
+      ["-c", `printf '${stdoutSentinel}\\n'; printf '${stderrSentinel}\\n' >&2; exit 23`],
+      { tags: { keep: "true" } },
+    );
+
+    await waitForDaemonExit(oldPid);
+    await waitForRuntimeTeardown(dir, name);
+
+    const captured = parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    ) as Awaited<ReturnType<typeof getSessionExitEvidence>>;
+    expect(captured._tag).toBe("snapshot");
+    if (captured._tag !== "snapshot") return;
+    expect(captured.snapshot).toMatchObject({
+      name,
+      status: "exited",
+      exitCode: 23,
+      stream: "combined",
+      tail: { _tag: "present" },
+    });
+    if (captured.snapshot.tail._tag !== "present") return;
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+    );
+    expect(captured.snapshot.tail.lastLines).toEqual(persisted.lastLines);
+    expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stdoutSentinel);
+    expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stderrSentinel);
+
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      captured.snapshot.generation,
+    ))).toEqual({ _tag: "removed" });
+    expect(parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    )).toEqual({ _tag: "unavailable", reason: "missing" });
+
+    const replacementPid = await startDaemon(
+      dir,
+      name,
+      "cat",
+      [],
+      { tags: { keep: "true" } },
+    );
+    const replacement = JSON.parse(
+      fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+    );
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      captured.snapshot.generation,
+    ))).toEqual({ _tag: "generation-mismatch" });
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      replacement.generation,
+    ))).toEqual({ _tag: "not-terminal" });
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+  }, 20_000);
+
+  it.each([
+    { args: [] },
+    { args: ["snapshot"] },
+    { args: ["snapshot", "--id"] },
+    { args: ["snapshot", "--id", "one", "--id", "two"] },
+    { args: ["snapshot", "--id", "one", "unexpected"] },
+    { args: ["snapshot", "--id", "one", "--expected-generation", "gen"] },
+    { args: ["remove", "--id", "one"] },
+    { args: ["remove", "--id", "one", "--expected-generation"] },
+    { args: ["remove", "--id", "one", "--expected-generation", "gen", "--expected-generation", "gen2"] },
+    { args: ["unknown", "--id", "one"] },
+  ])("rejects invalid evidence CLI arguments without success JSON: $args", ({ args }) => {
+    const result = runEvidenceCli(makeSessionDir(), ...args);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toBe("");
+    expect(result.stdout).toBe("");
+  });
+
   it("captures the retained combined tail before conditionally removing only that generation", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
@@ -359,6 +479,19 @@ describe("exact-generation exit evidence", () => {
         },
       });
     });
+
+    const result = runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      "cleanup-failure-generation",
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toBe("");
+    expect(result.stdout).toBe("");
+    expect(fs.existsSync(metadataPath)).toBe(true);
   });
 
   it.each([
@@ -402,6 +535,18 @@ describe("exact-generation exit evidence", () => {
         .toEqual({ _tag: "invalid-metadata" });
       expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
     });
+    expect(parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    )).toEqual({ _tag: "unavailable", reason: "invalid-metadata" });
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      "valid-generation",
+    ))).toEqual({ _tag: "invalid-metadata" });
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
   });
 
   it.each(["malformed", "oversized", "directory", "symlink"])(
@@ -441,6 +586,18 @@ describe("exact-generation exit evidence", () => {
         expect(await removeSessionGeneration(name, "any-generation"))
           .toEqual({ _tag: "invalid-metadata" });
       });
+      expect(parseSemanticEvidenceResult(
+        runEvidenceCli(dir, "snapshot", "--id", name),
+      )).toEqual({ _tag: "unavailable", reason: "invalid-metadata" });
+      expect(parseSemanticEvidenceResult(runEvidenceCli(
+        dir,
+        "remove",
+        "--id",
+        name,
+        "--expected-generation",
+        "any-generation",
+      ))).toEqual({ _tag: "invalid-metadata" });
+      expect(fs.existsSync(metadataPath)).toBe(true);
     },
   );
 
@@ -478,11 +635,26 @@ describe("exact-generation exit evidence", () => {
     for (const name of ["/absolute", "../traversal", "nested/path", ".", ".."] as const) {
       await expect(getSessionExitEvidence(name)).rejects.toThrow();
       await expect(removeSessionGeneration(name, "generation")).rejects.toThrow();
+      for (const args of [
+        ["snapshot", "--id", name],
+        ["remove", "--id", name, "--expected-generation", "generation"],
+      ]) {
+        const result = runEvidenceCli(makeSessionDir(), ...args);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).not.toBe("");
+        expect(result.stdout).toBe("");
+      }
     }
     await expect(getSessionExitEvidence("normal.dotted-task-id")).resolves.toEqual({
       _tag: "unavailable",
       reason: "missing",
     });
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      makeSessionDir(),
+      "snapshot",
+      "--id",
+      "normal.dotted-task-id",
+    ))).toEqual({ _tag: "unavailable", reason: "missing" });
   });
 });
 

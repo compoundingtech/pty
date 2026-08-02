@@ -244,6 +244,23 @@ const COMMANDS: readonly CommandSpec[] = [
     positionalValues: ["patch"],
   },
   {
+    name: "evidence",
+    desc: "Read or remove exact-generation retained exit evidence",
+    flags: [
+      {
+        name: "id",
+        desc: "Exact stable session id",
+        argument: { _tag: "free", name: "id" },
+      },
+      {
+        name: "expected-generation",
+        desc: "Opaque generation returned by evidence snapshot",
+        argument: { _tag: "free", name: "generation" },
+      },
+    ],
+    positionalValues: ["snapshot", "remove"],
+  },
+  {
     name: "up",
     desc: "Start sessions from pty.toml",
     takesPath: true,

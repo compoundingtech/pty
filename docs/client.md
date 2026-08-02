@@ -45,6 +45,19 @@ given opaque generation and its daemon is gone. Results distinguish `removed`,
 absence are thrown, and metadata is removed last so failed cleanup retains the
 evidence for retry.
 
+Rust and other non-TypeScript consumers can use the equivalent machine-only
+CLI boundary. Both operations address only an immutable stable id, emit exactly
+one tagged JSON document on stdout, and exit 0 for semantic outcomes:
+
+```sh
+pty evidence snapshot --id a1b2c3d4
+pty evidence remove --id a1b2c3d4 --expected-generation 7f44b35e
+```
+
+Invalid arguments and operational failures exit nonzero with a diagnostic on
+stderr. A reconciler should durably consume the snapshot before passing its
+opaque generation to `remove`; a mismatch must leave the replacement intact.
+
 ### `validateName(name: string): void`
 
 Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]`, cannot be

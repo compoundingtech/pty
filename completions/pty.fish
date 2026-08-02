@@ -62,6 +62,7 @@ complete -c pty -n __pty_needs_command -a tag-multi -d 'Bulk tag ops across sess
 complete -c pty -n __pty_needs_command -a emit -d 'Publish a user.* event'
 complete -c pty -n __pty_needs_command -a rename -d 'Set / show / clear displayName'
 complete -c pty -n __pty_needs_command -a metadata -d 'Atomically patch presentation metadata by stable id'
+complete -c pty -n __pty_needs_command -a evidence -d 'Read or remove exact-generation retained exit evidence'
 complete -c pty -n __pty_needs_command -a up -d 'Start sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a down -d 'Stop sessions from pty.toml'
 complete -c pty -n __pty_needs_command -a test -d 'Run the pty test suite (vitest)'
@@ -142,6 +143,9 @@ complete -c pty -n '__pty_using_command rename' -l clear -d 'Remove displayName'
 complete -c pty -n '__pty_using_command rename' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command metadata' -l id -d 'Exact stable session id'
 complete -c pty -n '__pty_using_command metadata' -x -a 'patch' -d 'Value'
+complete -c pty -n '__pty_using_command evidence' -l id -x -d 'Exact stable session id'
+complete -c pty -n '__pty_using_command evidence' -l expected-generation -x -d 'Opaque generation returned by evidence snapshot'
+complete -c pty -n '__pty_using_command evidence' -x -a 'snapshot remove' -d 'Value'
 complete -c pty -n '__pty_using_command up' -F
 complete -c pty -n '__pty_using_command down' -F
 complete -c pty -n '__pty_using_command test' -l t -d 'Run matching tests'
