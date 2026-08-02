@@ -20,6 +20,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
+import {
+  getSessionExitEvidence,
+  removeSessionGeneration,
+} from "../src/client-api.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -132,6 +136,38 @@ async function waitForDaemonExit(pid: number, budgetMs = 6000): Promise<void> {
   }
 }
 
+async function waitForRuntimeTeardown(
+  dir: string,
+  name: string,
+  budgetMs = 6000,
+): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (
+    Date.now() < deadline &&
+    (fs.existsSync(path.join(dir, `${name}.sock`)) ||
+      fs.existsSync(path.join(dir, `${name}.pid`)))
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(false);
+  expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(false);
+}
+
+async function withApiRoot<T>(dir: string, run: () => Promise<T>): Promise<T> {
+  const previousRoot = process.env.PTY_ROOT;
+  const previousLegacyRoot = process.env.PTY_SESSION_DIR;
+  process.env.PTY_ROOT = dir;
+  delete process.env.PTY_SESSION_DIR;
+  try {
+    return await run();
+  } finally {
+    if (previousRoot === undefined) delete process.env.PTY_ROOT;
+    else process.env.PTY_ROOT = previousRoot;
+    if (previousLegacyRoot === undefined) delete process.env.PTY_SESSION_DIR;
+    else process.env.PTY_SESSION_DIR = previousLegacyRoot;
+  }
+}
+
 afterEach(async () => {
   // Only pids this file spawned are ever signalled.
   await terminateAndWait(bgPids);
@@ -144,6 +180,197 @@ afterEach(async () => {
     } catch {}
   }
   sessionDirs = [];
+});
+
+describe("exact-generation exit evidence", () => {
+  it("captures the retained combined tail before conditionally removing only that generation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const stdoutSentinel = `stdout-${name}`;
+    const stderrSentinel = `stderr-${name}`;
+    const oldPid = await startDaemon(
+      dir,
+      name,
+      "sh",
+      ["-c", `printf '${stdoutSentinel}\\n'; printf '${stderrSentinel}\\n' >&2; exit 23`],
+      { tags: { keep: "true" } },
+    );
+
+    await waitForDaemonExit(oldPid);
+    await waitForRuntimeTeardown(dir, name);
+
+    await withApiRoot(dir, async () => {
+      const captured = await getSessionExitEvidence(name);
+      expect(captured._tag).toBe("snapshot");
+      if (captured._tag !== "snapshot") return;
+
+      expect(captured.snapshot).toMatchObject({
+        name,
+        status: "exited",
+        exitCode: 23,
+        stream: "combined",
+        tail: { _tag: "present" },
+      });
+      expect(captured.snapshot.generation).toEqual(expect.any(String));
+      if (captured.snapshot.tail._tag !== "present") return;
+      const persisted = JSON.parse(
+        fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+      );
+      expect(captured.snapshot.tail.lastLines).toEqual(persisted.lastLines);
+      expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stdoutSentinel);
+      expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stderrSentinel);
+
+      expect(await removeSessionGeneration(name, captured.snapshot.generation))
+        .toEqual({ _tag: "removed" });
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "missing",
+      });
+
+      const replacementPid = await startDaemon(
+        dir,
+        name,
+        "cat",
+        [],
+        { tags: { keep: "true" } },
+      );
+      const replacement = JSON.parse(
+        fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+      );
+      expect(await removeSessionGeneration(name, replacement.generation))
+        .toEqual({ _tag: "not-terminal" });
+      expect(await removeSessionGeneration(name, captured.snapshot.generation))
+        .toEqual({ _tag: "generation-mismatch" });
+      expect(isAlive(replacementPid)).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+  }, 20_000);
+
+  it("keeps an absent persisted tail explicit for a vanished generation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "vanished-generation",
+      daemonPid: 2147483647,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "snapshot",
+        snapshot: {
+          name,
+          generation: "vanished-generation",
+          status: "vanished",
+          exitCode: null,
+          stream: "combined",
+          tail: { _tag: "unavailable" },
+        },
+      });
+    });
+  });
+
+  it("preserves a persisted empty tail instead of calling it unavailable", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "empty-tail-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: [],
+    }));
+
+    await withApiRoot(dir, async () => {
+      const captured = await getSessionExitEvidence(name);
+      expect(captured).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          status: "exited",
+          exitCode: 0,
+          tail: { _tag: "present", lastLines: [] },
+        },
+      });
+    });
+  });
+
+  it("refuses cleanup when exact generation ownership is unavailable", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: ["legacy evidence"],
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "generation-unavailable",
+      });
+      expect(await removeSessionGeneration(name, "expected-generation"))
+        .toEqual({ _tag: "generation-mismatch" });
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+  });
+
+  it("preserves terminal metadata when conditional cleanup fails", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const metadataPath = path.join(dir, `${name}.json`);
+    fs.writeFileSync(metadataPath, JSON.stringify({
+      generation: "cleanup-failure-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 17,
+      lastLines: ["still available"],
+    }));
+    fs.mkdirSync(path.join(dir, `${name}.events.jsonl`));
+
+    await withApiRoot(dir, async () => {
+      await expect(removeSessionGeneration(name, "cleanup-failure-generation"))
+        .rejects.toThrow();
+      expect(fs.existsSync(metadataPath)).toBe(true);
+      expect(await getSessionExitEvidence(name)).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          generation: "cleanup-failure-generation",
+          exitCode: 17,
+          tail: { _tag: "present", lastLines: ["still available"] },
+        },
+      });
+    });
+  });
+
+  it("rejects unsafe identities before deriving evidence paths", async () => {
+    for (const name of ["/absolute", "../traversal", "nested/path", ".", ".."] as const) {
+      await expect(getSessionExitEvidence(name)).rejects.toThrow();
+      await expect(removeSessionGeneration(name, "generation")).rejects.toThrow();
+    }
+    await expect(getSessionExitEvidence("normal.dotted-task-id")).resolves.toEqual({
+      _tag: "unavailable",
+      reason: "missing",
+    });
+  });
 });
 
 describe("exit-time reap: sessions that clean themselves up", () => {

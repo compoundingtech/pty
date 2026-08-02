@@ -35,6 +35,9 @@ export function validateName(name: string): void {
   if (!name || name.length === 0) {
     throw new Error("Session name cannot be empty.");
   }
+  if (name === "." || name === "..") {
+    throw new Error(`Invalid session name "${name}". Names cannot be "." or "..".`);
+  }
   if (name.length > 255) {
     throw new Error("Session name too long (max 255 characters).");
   }
@@ -193,6 +196,38 @@ export interface SessionInfo {
   status: "running" | "exited" | "vanished";
   metadata: SessionMetadata | null;
 }
+
+export type SessionExitEvidenceTail =
+  | { _tag: "present"; lastLines: string[] }
+  | { _tag: "unavailable" };
+
+export interface SessionExitEvidence {
+  name: string;
+  generation: string;
+  status: "exited" | "vanished";
+  exitCode: number | null;
+  stream: "combined";
+  tail: SessionExitEvidenceTail;
+}
+
+export type SessionExitEvidenceResult =
+  | { _tag: "snapshot"; snapshot: SessionExitEvidence }
+  | {
+    _tag: "unavailable";
+    reason:
+      | "missing"
+      | "running"
+      | "busy"
+      | "generation-unavailable"
+      | "exit-code-unavailable";
+  };
+
+export type RemoveSessionGenerationResult =
+  | { _tag: "removed" }
+  | { _tag: "missing" }
+  | { _tag: "generation-mismatch" }
+  | { _tag: "not-terminal" }
+  | { _tag: "busy" };
 
 /** Semantic helper: session has metadata but no live daemon (either `exited`
  *  or `vanished`). Use this wherever the branch is "there's a record and we
@@ -1060,6 +1095,124 @@ export function reapOnExitDefault(
 export async function getSessionByName(name: string): Promise<SessionInfo | null> {
   const sessions = await listSessions();
   return sessions.find((s) => s.name === name) ?? null;
+}
+
+async function isSessionGenerationAlive(
+  name: string,
+  metadata: SessionMetadata,
+): Promise<boolean> {
+  const pids = new Set<number>();
+  const sidecarPid = readSessionPid(name);
+  if (sidecarPid !== null) pids.add(sidecarPid);
+  if (metadata.daemonPid !== undefined) pids.add(metadata.daemonPid);
+  if ([...pids].some(isProcessAlive)) return true;
+
+  const socketPath = getSocketPath(name);
+  return fs.existsSync(socketPath) && await isSocketReachable(socketPath);
+}
+
+/** Read the bounded retained terminal evidence for one exact daemon generation.
+ *
+ * The per-name creation lock keeps a replacement from publishing between the
+ * generation read and the returned snapshot. `lastLines` is copied exactly as
+ * persisted; absence remains explicit instead of being synthesized as an empty
+ * combined stream. */
+export async function getSessionExitEvidence(
+  name: string,
+): Promise<SessionExitEvidenceResult> {
+  validateName(name);
+  if (!acquireLock(name)) return { _tag: "unavailable", reason: "busy" };
+
+  try {
+    const metadata = readMetadata(name);
+    if (!metadata) return { _tag: "unavailable", reason: "missing" };
+    if (!metadata.generation) {
+      return { _tag: "unavailable", reason: "generation-unavailable" };
+    }
+    if (await isSessionGenerationAlive(name, metadata)) {
+      return { _tag: "unavailable", reason: "running" };
+    }
+
+    const current = readMetadata(name);
+    if (!current) return { _tag: "unavailable", reason: "missing" };
+    if (current.generation !== metadata.generation) {
+      return { _tag: "unavailable", reason: "busy" };
+    }
+
+    const exited = typeof current.exitCode === "number";
+    if (!exited && current.exitedAt !== undefined) {
+      return { _tag: "unavailable", reason: "exit-code-unavailable" };
+    }
+
+    return {
+      _tag: "snapshot",
+      snapshot: {
+        name,
+        generation: current.generation,
+        status: exited ? "exited" : "vanished",
+        exitCode: exited ? current.exitCode! : null,
+        stream: "combined",
+        tail: Array.isArray(current.lastLines)
+          ? { _tag: "present", lastLines: [...current.lastLines] }
+          : { _tag: "unavailable" },
+      },
+    };
+  } finally {
+    releaseLock(name);
+  }
+}
+
+function unlinkIfPresent(target: string): void {
+  try {
+    fs.unlinkSync(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+/** Remove one terminal session only if the retained record still carries the
+ * caller's opaque generation. I/O failures propagate, and metadata is removed
+ * last so a failed cleanup retains the evidence needed for a retry. */
+export async function removeSessionGeneration(
+  name: string,
+  expectedGeneration: string,
+): Promise<RemoveSessionGenerationResult> {
+  validateName(name);
+  if (expectedGeneration.length === 0) {
+    throw new Error("Expected session generation cannot be empty.");
+  }
+  if (!acquireEventLock(name)) return { _tag: "busy" };
+  if (!acquireLock(name)) {
+    releaseEventLock(name);
+    return { _tag: "busy" };
+  }
+
+  try {
+    let metadata = readMetadata(name);
+    if (!metadata) return { _tag: "missing" };
+    if (metadata.generation !== expectedGeneration) {
+      return { _tag: "generation-mismatch" };
+    }
+    if (await isSessionGenerationAlive(name, metadata)) {
+      return { _tag: "not-terminal" };
+    }
+
+    metadata = readMetadata(name);
+    if (!metadata) return { _tag: "missing" };
+    if (metadata.generation !== expectedGeneration) {
+      return { _tag: "generation-mismatch" };
+    }
+
+    unlinkIfPresent(getSocketPath(name));
+    unlinkIfPresent(getPidPath(name));
+    unlinkIfPresent(getEventsPath(name));
+    unlinkIfPresent(recoveryRevisionPath(path.resolve(getSessionDir()), name));
+    unlinkIfPresent(getMetadataPath(name));
+    return { _tag: "removed" };
+  } finally {
+    releaseLock(name);
+    releaseEventLock(name);
+  }
 }
 
 /** Look up a session by either its stable `name` (immutable id) or its mutable
