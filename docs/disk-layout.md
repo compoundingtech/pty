@@ -15,6 +15,8 @@ For non-Node tools that want to read pty's state without paying Node startup. Th
 | `<name>.sock` | daemon IPC socket (Unix) | 2 |
 | `<name>.pid` | daemon pid (decimal) | 2 |
 | `<name>.lock` | creation-race lock | 2 |
+| `.recovery/` | authenticated request/result exchange for supported live daemons | 2 |
+| `<name>.events.lock` | event append/retention lock | 2 |
 | `theme` | last-selected TUI theme | 2 |
 | `gc.log` | stdout/stderr of `pty gc` when run by launchd/cron (only present after auto-running gc is installed) | 2 |
 | `<name>.json.tmp.<pid>.<rand>` | atomic-write tmp — readers MUST ignore | n/a |
@@ -35,6 +37,17 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 {
   generation?: string;       // opaque daemon generation; guards cleanup ownership
   daemonPid?: number;        // daemon owning this generation, retained after child exit
+  recovery?: {               // signal-free live-registry recovery capability
+    protocol: 1;
+    secret: string;          // opaque request-authentication key
+    processStartToken: string;
+    launchIdentity: string;
+    rootDevice: number;
+    rootInode: number;
+    recoveryDirDevice: number;
+    recoveryDirInode: number;
+    metadataRevision: string; // exact revision bound to retained recovery state
+  };
   command: string;            // resolved binary path
   args: string[];
   displayCommand: string;     // command as the user typed it
@@ -44,6 +57,7 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
   ephemeral?: boolean;
   isolateEnv?: boolean;
   extraEnv?: { [k: string]: string }; // explicit inherited-env overlay (`--env`)
+  unsetEnv?: string[];         // inherited env keys removed before `extraEnv`
   env?: { [k: string]: string };      // exact child env for programmatic callers
   createdAt: string;          // ISO 8601
   exitCode?: number;          // present after clean exit
@@ -55,11 +69,31 @@ Pretty-printed JSON. Source of truth: `SessionMetadata` in `src/sessions.ts`.
 }
 ```
 
+`unsetEnv` and `extraEnv` form the persisted inherited-environment policy.
+Removals are applied first and explicit assignments second, so an assignment
+wins when both mention the same key. Older metadata without `unsetEnv` keeps
+the historical ambient-inheritance behavior.
+
 - Status (`running` / `exited` / `vanished`) is *derived* from socket + pid, not stored.
 - `generation` and `daemonPid` are internal lifecycle guards. A daemon only
   removes files still owned by its generation, and `pty rm` waits for that
   daemon to finish deferred shutdown before it reports success. Readers should
   treat the generation token as opaque.
+- `recovery` is present only when the daemon can prove its OS process-start
+  identity and the selected root is owned by the daemon user with no
+  group/other permissions. A snapshot containing this capability can authenticate
+  `pty recover` after the socket, pid, and metadata paths are externally
+  unlinked. The root is mode `0700`; treat the embedded secret as opaque and
+  do not publish snapshots. The root and `.recovery` directory identities and
+  permissions are revalidated before recovery state is exchanged. A signed
+  retained revision rejects older snapshots after tags, display name, attach
+  state, or other metadata changes. The signed revision advances before changed
+  metadata is renamed into place: a partial publication may disable recovery,
+  but never re-authorizes the previous snapshot. Successful recovery rotates
+  the secret.
+- `displayName` is mutable presentation metadata and is not unique. Stable
+  identity remains the `<name>` filename stem; consumers must not use
+  `displayName` as a durable key.
 - Reserved tag keys (`ptyfile*`, `strategy`, anything starting with `:`) are pty/tool-internal; hidden from `pty list` unless `--tags`.
 - User-facing tags that drive pty behavior but are visible by default:
   - `strategy=permanent` — `pty gc` respawns the session when its daemon exits (the historic supervisor's role; now stateless and run on a cron).
@@ -91,9 +125,15 @@ Envelope: `{ session: string; type: string; ts: string; ...payload }`. Event typ
 | `session_flapping` | `counter, limit, window` — (`pty gc` flipped a permanent session to `strategy.status=flapping` after N consecutive fast-fail respawns; subsequent ticks skip it) |
 | `display_name_change` | `previous: string\|null, value: string\|null` |
 | `tags_change` | `previous, value` (full snapshots) |
+| `metadata_change` | `previous, value` containing only changed `displayName` and tag keys; absent tag values are `null` |
 | `user.<name>` | `data?, text?` — free-form, via `pty emit` |
 
-A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins are well under. Keep large `user.*` payloads out of the event stream.
+All event writers and retention rewrites are serialized by the per-session
+event lock. A complete JSONL record is therefore published without relying on
+an operating-system write-size limit, and retention cannot discard an append
+that races its atomic rewrite. Async writers wait up to five seconds for a live
+holder; synchronous writers fail immediately. Lock files are removed on release,
+and a dead holder's stale lock is reclaimed by the next writer or cleanup.
 
 ## Reading from outside pty
 
@@ -101,4 +141,4 @@ A single line ≤ `PIPE_BUF` (~4 KB) is atomic per POSIX `O_APPEND`. Built-ins a
 jq -r '.tags["role"] // empty' "$PTY_ROOT/myserver.json"
 ```
 
-For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `tags_change` / `display_name_change` / `session_*` fire on every mutation.
+For live updates, tail `<name>.events.jsonl` via `inotify` / `kqueue`. Subscribe instead of polling — `metadata_change` / `tags_change` / `display_name_change` / `session_*` fire on every mutation.

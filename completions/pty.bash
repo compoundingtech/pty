@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill rm remove gc tag tag-multi emit rename up down test remote-serve"
+  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -24,11 +24,14 @@ _pty() {
 
   case "${COMP_WORDS[1]}" in
     run)
-      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --cwd --isolate-env --force" -- "${cur}"))
+      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force" -- "${cur}"))
       ;;
     attach|a)
+      if [[ "${prev}" == "--attach-stream-fd-v1" ]]; then
+        return
+      fi
       if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "-r --auto-restart --no-restart --force --remote" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-r --auto-restart --no-restart --force --remote --attach-stream-fd-v1" -- "${cur}"))
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
@@ -81,6 +84,9 @@ _pty() {
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
       ;;
+    recover)
+      COMPREPLY=($(compgen -W "--snapshot" -- "${cur}"))
+      ;;
     rm|remove)
       if [[ "${cur}" == -* ]]; then
         COMPREPLY=($(compgen -W "" -- "${cur}"))
@@ -118,6 +124,9 @@ _pty() {
       else
         COMPREPLY=($(compgen -W "${names}" -- "${cur}"))
       fi
+      ;;
+    metadata)
+      COMPREPLY=($(compgen -W "--id" -- "${cur}"))
       ;;
     up)
       COMPREPLY=($(compgen -o dirnames -- "${cur}"))

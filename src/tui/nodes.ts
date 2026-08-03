@@ -271,7 +271,8 @@ export interface PtyCell {
 export interface PtyHandle {
   /** Write raw input to the child process. */
   write(data: string): void;
-  /** Resize the child PTY. Called automatically by the layout engine. */
+  /** Request a child PTY size. For an attached shared session, `cols`/`rows`
+   * update when the daemon reports the authoritative effective geometry. */
   resize(cols: number, rows: number): void;
   /**
    * Read the terminal's cell grid directly. Full fidelity — every attribute
@@ -292,7 +293,7 @@ export interface PtyHandle {
    * @param scrollOffset Lines to scroll back into history (0 = live viewport).
    */
   readWrappedFlags(scrollOffset?: number): boolean[];
-  /** Current PTY dimensions. */
+  /** Current effective PTY dimensions. */
   cols: number;
   rows: number;
   /** Kill the child process / detach from server. */

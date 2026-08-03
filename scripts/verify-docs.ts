@@ -7,6 +7,72 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.join(__dirname, "..");
 const docsPath = path.join(projectRoot, "docs", "testing.md");
+const vrsRoot = path.join(projectRoot, "docs", "vrs");
+
+function verifyVrs(): void {
+  if (!fs.existsSync(vrsRoot)) {
+    console.error("VRS verification failed:\n- docs/vrs is missing");
+    process.exit(1);
+  }
+
+  const expected = ["requirements.md", "spec.md"];
+  const actual = fs.readdirSync(vrsRoot).sort();
+  const requirementsPath = path.join(vrsRoot, "requirements.md");
+  const specPath = path.join(vrsRoot, "spec.md");
+  const errors: string[] = [];
+
+  if (actual.join("\n") !== expected.join("\n")) {
+    errors.push(`docs/vrs must contain only ${expected.join(" and ")}`);
+  }
+  if (!fs.existsSync(requirementsPath) || !fs.existsSync(specPath)) {
+    errors.push("docs/vrs requires requirements.md and spec.md");
+  } else {
+    const requirements = fs.readFileSync(requirementsPath, "utf-8");
+    const spec = fs.readFileSync(specPath, "utf-8");
+    const ids = [...requirements.matchAll(/^- \*\*(R\d{2}) [^*]+:\*\*/gm)].map(
+      (match) => match[1],
+    );
+
+    if (ids.length === 0) errors.push("requirements.md defines no requirement IDs");
+    if (!ids.every((id, index) => id === `R${String(index + 1).padStart(2, "0")}`)) {
+      errors.push("requirement IDs must be sequential in document order");
+    }
+    if (!spec.includes("[requirements.md](./requirements.md)")) {
+      errors.push("spec.md must link its requirements.md");
+    }
+    if (!spec.includes("## Status")) errors.push("spec.md must declare Status");
+
+    const references = new Set([...spec.matchAll(/\bR\d{2}\b/g)].map((match) => match[0]));
+    for (const id of ids) {
+      if (!references.has(id)) errors.push(`spec.md does not reference ${id}`);
+    }
+    for (const id of references) {
+      if (!ids.includes(id)) errors.push(`spec.md references unknown requirement ${id}`);
+    }
+
+    for (const [file, content] of [
+      [requirementsPath, requirements],
+      [specPath, spec],
+    ] as const) {
+      for (const match of content.matchAll(/\]\(([^)#]+)(?:#[^)]+)?\)/g)) {
+        if (/^[a-z]+:/i.test(match[1])) continue;
+        if (!fs.existsSync(path.resolve(path.dirname(file), match[1]))) {
+          errors.push(`${path.relative(projectRoot, file)} has broken link ${match[1]}`);
+        }
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    console.error(`VRS verification failed:\n${errors.map((error) => `- ${error}`).join("\n")}`);
+    process.exit(1);
+  }
+  console.log("Verified 2 VRS documents and 11 requirement IDs");
+}
+
+verifyVrs();
+
+if (process.argv.includes("--vrs-only")) process.exit(0);
 
 const content = fs.readFileSync(docsPath, "utf-8");
 

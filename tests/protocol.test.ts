@@ -14,10 +14,13 @@ import {
   encodeStatus,
   encodeStatusResponse,
   encodeActivity,
+  encodeGeometry,
   decodeSize,
+  decodeGeometry,
   decodeExit,
 } from "../src/protocol.ts";
 import { Buffer } from "node:buffer";
+import type { StatsResult } from "../src/client.ts";
 
 describe("protocol", () => {
   describe("encodePacket / PacketReader", () => {
@@ -259,15 +262,94 @@ describe("protocol", () => {
 
     it("round-trips a STATUS response (JSON payload)", () => {
       const reader = new PacketReader();
-      const json = JSON.stringify({ name: "test", terminal: { cols: 80, rows: 24 } });
+      const response = {
+        name: "test",
+        terminal: { cols: 80, rows: 24 },
+        clients: {
+          total: 1,
+          attached: 1,
+          readOnly: 0,
+          connections: [{
+            role: "writable",
+            rows: 24,
+            cols: 80,
+            lastRequestSequence: 1,
+            constrains: { rows: true, cols: true },
+          }],
+        },
+      };
+      const json = JSON.stringify(response);
       const encoded = encodeStatusResponse(json);
       const packets = reader.feed(encoded);
       expect(packets).toHaveLength(1);
       expect(packets[0].type).toBe(MessageType.STATUS);
-      expect(JSON.parse(packets[0].payload.toString())).toEqual({
-        name: "test",
-        terminal: { cols: 80, rows: 24 },
+      expect(JSON.parse(packets[0].payload.toString())).toEqual(response);
+    });
+
+    it("round-trips an effective GEOMETRY packet", () => {
+      const reader = new PacketReader();
+      const packets = reader.feed(encodeGeometry(24, 80));
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.GEOMETRY);
+      expect(decodeGeometry(packets[0].payload)).toEqual({
+        rows: 24,
+        cols: 80,
       });
+    });
+
+    it("lets an older client ignore an unknown framed type and continue DATA", () => {
+      const reader = new PacketReader();
+      const packets = reader.feed(Buffer.concat([
+        encodeGeometry(24, 80),
+        encodeData("after-unknown"),
+      ]));
+      let received = "";
+      for (const packet of packets) {
+        // This intentionally models the pre-GEOMETRY client switch.
+        if (packet.type === MessageType.DATA) {
+          received += packet.payload.toString();
+        }
+      }
+      expect(received).toBe("after-unknown");
+    });
+
+    it("accepts an old-daemon STATUS response without connection details", () => {
+      const response = {
+        name: "legacy",
+        terminal: {
+          cols: 80,
+          rows: 24,
+          cursorX: 0,
+          cursorY: 0,
+          scrollbackUsed: 24,
+          scrollbackCapacity: 10024,
+        },
+        process: { alive: true, exitCode: null, pid: 123, resources: null },
+        daemon: { pid: 456, resources: null },
+        clients: { total: 2, attached: 2, readOnly: 0 },
+        modes: {
+          alternateScreen: false,
+          sgrMouse: false,
+          cursorHidden: false,
+          kittyKeyboard: false,
+          kittyKeyboardFlags: [],
+        },
+        activity: {
+          state: "unknown" as const,
+          generation: "generation-legacy",
+          producerEpoch: null,
+          sequence: 0,
+        },
+        uptimeSeconds: 10,
+        createdAt: "2026-07-31T00:00:00.000Z",
+      } satisfies StatsResult;
+
+      const reader = new PacketReader();
+      const packets = reader.feed(encodeStatusResponse(JSON.stringify(response)));
+      const decoded = JSON.parse(packets[0].payload.toString()) as StatsResult;
+
+      expect(decoded.clients).toEqual({ total: 2, attached: 2, readOnly: 0 });
+      expect(decoded.clients.connections).toBeUndefined();
     });
   });
 

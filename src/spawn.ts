@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as tty from "node:tty";
 import { fileURLToPath } from "node:url";
-import { getSocketPath } from "./sessions.ts";
+import {
+  acquireLock, getEventsPath, getSocketPath, readMetadata, releaseLock,
+  validateDisplayName,
+} from "./sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -36,12 +39,14 @@ export interface SpawnDaemonOptions {
   /** Additional `KEY=VALUE` env entries overlaid on the inherited child
    *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Environment keys removed from inheritance before `extraEnv` is applied. */
+  unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
    *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
    *  injected on top so nesting detection and `pty exec` keep working.
    *
-   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
-   *  together with either will throw at daemon startup. */
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
+   *  `env` together with inherited-environment policy will throw at startup. */
   env?: Record<string, string>;
   /** Override the runtime used to launch the detached daemon process.
    *
@@ -131,9 +136,29 @@ function resolveSpawnStrategy(): SpawnStrategy {
 }
 
 export async function spawnDaemon(options: SpawnDaemonOptions): Promise<void> {
+  if (options.displayName !== undefined) validateDisplayName(options.displayName);
+  if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
+    throw new Error(
+      "SpawnDaemonOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
+        "Use env for verbatim control, or inherited environment policy options — not both.",
+    );
+  }
   const strategy = resolveSpawnStrategy();
   if (strategy.kind === "cli") return spawnViaCli(options);
   return spawnViaNode(options, strategy.serverModule);
+}
+
+/** @internal Own the creation lease through daemon publication. */
+export async function spawnDaemonWithCreationLock(
+  options: SpawnDaemonOptions,
+): Promise<boolean> {
+  if (!acquireLock(options.name)) return false;
+  try {
+    await spawnDaemon({ ...options, creationLockOwnerPid: process.pid });
+    return true;
+  } finally {
+    releaseLock(options.name);
+  }
 }
 
 async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): Promise<void> {
@@ -154,6 +179,7 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
     ...(options.displayName ? { displayName: options.displayName } : {}),
     ...(options.isolateEnv ? { isolateEnv: true } : {}),
     ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+    ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
     ...(options.env ? { env: options.env } : {}),
   });
 
@@ -186,18 +212,50 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
   child.unref();
 
   try {
-    await waitForSocket(options.name, options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, () => {
+    const timeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    const startedAt = Date.now();
+    const checkEarlyExit = () => {
       if (earlyExit) {
         const details = stderrOutput.trim();
         const msg = `Daemon process exited immediately (code ${earlyExitCode ?? "unknown"}).`;
         throw new Error(details ? `${msg}\n${details}` : `${msg} Is the command valid?`);
       }
-    });
+    };
+    await waitForSocket(options.name, timeoutMs, checkEarlyExit);
+    while (true) {
+      const metadata = readMetadata(options.name);
+      const startPublished = metadata !== null &&
+        metadata.daemonPid === child.pid &&
+        hasPublishedSessionStart(options.name, metadata.createdAt);
+      if (startPublished) break;
+      checkEarlyExit();
+      if (Date.now() - startedAt >= timeoutMs) {
+        throw new Error(`Timed out waiting for daemon publication for session "${options.name}".`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   } catch (err) {
     if (!earlyExit && child.pid) {
       try { process.kill(child.pid, "SIGTERM"); } catch {}
     }
     throw err;
+  }
+}
+
+function hasPublishedSessionStart(name: string, createdAt: string): boolean {
+  try {
+    return fs.readFileSync(getEventsPath(name), "utf8")
+      .trimEnd()
+      .split("\n")
+      .some((line) => {
+        const event = JSON.parse(line);
+        return event.session === name &&
+          event.type === "session_start" &&
+          typeof event.ts === "string" &&
+          event.ts >= createdAt;
+      });
+  } catch {
+    return false;
   }
 }
 
@@ -207,12 +265,13 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
  * Only the inputs that the CLI surface supports are passed through. Initial
  * size, an alternate display command, an exact replacement env, and a custom
  * launcher remain Node-path-only; the restart-relevant CLI settings
- * (ephemeral, cwd, display name, tags, isolation, and env overlay) all have
- * lossless flag equivalents.
+ * (ephemeral, cwd, display name, tags, isolation, env overlay, and env
+ * removal) all have lossless flag equivalents.
  *
  * `isolateEnv` maps to `--isolate-env`. `cwd` to `--cwd`. `tags` to
  * repeated `--tag k=v`. `name` to `--id` (the on-disk identifier under the
- * decoupled name/displayName model). `displayName` to `--name` if present.
+ * decoupled name/displayName model). `displayName` maps to `--name`, and
+ * `unsetEnv` to repeated `--unset-env KEY`.
  * The session command is positional after `--`.
  */
 function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
@@ -231,6 +290,9 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
     for (const [k, v] of Object.entries(options.extraEnv)) {
       cliArgs.push("--env", `${k}=${v}`);
     }
+  }
+  for (const key of options.unsetEnv ?? []) {
+    cliArgs.push("--unset-env", key);
   }
   if (options.tags) {
     for (const [k, v] of Object.entries(options.tags)) {

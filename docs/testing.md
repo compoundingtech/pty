@@ -335,6 +335,11 @@ Resize the terminal dimensions:
 session.resize(40, 120);
 ```
 
+In server mode this requests a size from the daemon. `session.rows` and
+`session.cols` update when the daemon reports the effective min-wins geometry;
+another smaller writable client can keep the effective grid below the requested
+size. Geometry is applied before affected screen/output bytes are parsed.
+
 ### connectToExisting(session)
 
 Create a second client attached to the same server process:
@@ -356,7 +361,7 @@ await session2.waitForText("shared");
 - `session.hasExited` — whether the process has exited (always `false` for spawn-mode)
 - `session.name` — the session name (server-mode only)
 - `session.server` — the underlying `PtyServer` instance (server-mode only)
-- `session.rows` / `session.cols` — current terminal dimensions
+- `session.rows` / `session.cols` — current effective terminal dimensions
 
 ## Running Tests
 

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   cleanupObservedSession,
+  commitObservedFlapping,
   respawnPermanent,
   type SessionInfo,
   type SessionMetadata,
@@ -46,6 +47,53 @@ afterEach(async () => {
 });
 
 describe("gc generation compare-and-swap", () => {
+  it("preserves a concurrent presentation update while committing flapping", () => {
+    const root = makeRoot();
+    const name = "flap-presentation";
+    const observed = metadata(root, "same-generation", { strategy: "permanent" });
+    fs.writeFileSync(path.join(root, `${name}.json`), JSON.stringify({
+      ...observed,
+      displayName: "new presentation",
+      tags: { ...observed.tags, presentation: "current" },
+    }));
+
+    expect(commitObservedFlapping(
+      name,
+      observed,
+      { "strategy.status": "flapping" },
+      { counter: 3, limit: 3, window: 60 },
+    )).toBe(true);
+    const current = JSON.parse(fs.readFileSync(path.join(root, `${name}.json`), "utf-8"));
+    expect(current.displayName).toBe("new presentation");
+    expect(current.tags).toMatchObject({
+      presentation: "current",
+      "strategy.status": "flapping",
+    });
+    const events = fs.readFileSync(path.join(root, `${name}.events.jsonl`), "utf-8")
+      .trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.type === "session_flapping")).toHaveLength(1);
+  });
+
+  it("does not mark or emit against a replacement generation", () => {
+    const root = makeRoot();
+    const name = "flap-replacement";
+    const observed = metadata(root, "old", { strategy: "permanent" });
+    const replacement = metadata(root, "replacement", {
+      strategy: "permanent",
+      presentation: "replacement",
+    });
+    fs.writeFileSync(path.join(root, `${name}.json`), JSON.stringify(replacement));
+
+    expect(commitObservedFlapping(
+      name,
+      observed,
+      { "strategy.status": "flapping" },
+      { counter: 3, limit: 3, window: 60 },
+    )).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(root, `${name}.json`), "utf-8"))).toEqual(replacement);
+    expect(fs.existsSync(path.join(root, `${name}.events.jsonl`))).toBe(false);
+  });
+
   it("does not residual-sweep a replacement generation", async () => {
     const root = makeRoot();
     const name = "residual";

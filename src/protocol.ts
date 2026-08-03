@@ -3,13 +3,15 @@ import { Buffer } from "node:buffer";
 export const MessageType = {
   DATA: 0, // Terminal data (bidirectional)
   ATTACH: 1, // Client → Server: attaching with terminal size
-  DETACH: 2, // Client → Server: detaching
+  DETACH: 2, // Client → Server: detach; machine stream → caller: intentional detach outcome
   RESIZE: 3, // Client → Server: terminal resized
   EXIT: 4, // Server → Client: process exited
   SCREEN: 5, // Server → Client: screen buffer replay on attach
   PEEK: 6, // Client → Server: read-only attach (no input, no resize)
   STATUS: 7, // Client → Server: request stats; Server → Client: JSON stats response
   ACTIVITY: 8, // Bidirectional: generic activity lease commands/responses
+  // Value 9 is reserved for an independent protocol extension.
+  GEOMETRY: 10, // Server → Client: effective shared rows/cols
 } as const;
 
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
@@ -70,6 +72,13 @@ export function encodeResize(rows: number, cols: number): Buffer {
   return encodePacket(MessageType.RESIZE, payload);
 }
 
+export function encodeGeometry(rows: number, cols: number): Buffer {
+  const payload = Buffer.alloc(4);
+  payload.writeUInt16BE(rows, 0);
+  payload.writeUInt16BE(cols, 2);
+  return encodePacket(MessageType.GEOMETRY, payload);
+}
+
 export function encodeExit(code: number): Buffer {
   const payload = Buffer.alloc(4);
   payload.writeInt32BE(code, 0);
@@ -107,6 +116,10 @@ export function decodeSize(payload: Buffer): { rows: number; cols: number } {
     rows: payload.readUInt16BE(0),
     cols: payload.readUInt16BE(2),
   };
+}
+
+export function decodeGeometry(payload: Buffer): { rows: number; cols: number } {
+  return decodeSize(payload);
 }
 
 export function decodeExit(payload: Buffer): number {

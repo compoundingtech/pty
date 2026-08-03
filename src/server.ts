@@ -1,5 +1,6 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as pty from "node-pty";
@@ -17,6 +18,7 @@ import {
   encodeScreen,
   encodeStatusResponse,
   encodeActivity,
+  encodeGeometry,
   decodeSize,
 } from "./protocol.ts";
 import { ActivityLease, parseActivityCommand } from "./activity.ts";
@@ -24,16 +26,46 @@ import {
   getSocketPath,
   getPidPath,
   getMetadataPath,
+  getSessionDir,
   ensureSessionDir,
   cleanupOwnedSocket,
   cleanupOwnedAll,
   writeMetadata,
   readMetadata,
+  mutateMetadataUnderLock,
   shouldReapAtExit,
   reapOnExitDefault,
   type SessionMetadata,
+  type MetadataMutationResult,
 } from "./sessions.ts";
 import { EventWriter, clearEvents, EventType, type EventRecord } from "./events.ts";
+import {
+  RECOVERY_PROTOCOL,
+  assertPrivateRecoveryPaths,
+  atomicWritePrivate,
+  ensureRecoveryDir,
+  launchIdentity,
+  metadataRevision,
+  publishPrivateNoReplace,
+  readBoundedJson,
+  readProcessStartToken,
+  recoveryDir,
+  recoveryLockContents,
+  recoveryLockIdentity,
+  recoveryRequestPath,
+  recoveryRevisionPath,
+  recoveryResultPath,
+  signRecoveryRevision,
+  signRecoveryResult,
+  stampRecoveryMetadata,
+  verifyRecoveryRequest,
+  verifyRecoveryRevision,
+  type RecoveryCapability,
+  type RecoveryRequest,
+  type RecoveryRevision,
+  type RecoveryResultPayload,
+} from "./recovery.ts";
+import type { StatsResult } from "./client.ts";
 
 interface Client {
   socket: net.Socket;
@@ -42,6 +74,14 @@ interface Client {
   cols: number;
   readonly: boolean;
   attachSeq: number;
+  /** DATA/EXIT must not overtake the SCREEN baseline for ATTACH or PEEK. */
+  initialScreenPhase: "live" | "settling" | "cutting";
+  /** Invalidates a delayed SCREEN when the same socket changes attach mode. */
+  initialScreenGeneration: number;
+  postCutPackets: Array<{
+    type: typeof MessageType.DATA | typeof MessageType.EXIT;
+    packet: Buffer;
+  }>;
 }
 
 export interface ServerOptions {
@@ -68,14 +108,18 @@ export interface ServerOptions {
   /** Additional `KEY=VALUE` env entries overlaid on the inherited child
    *  environment, or on the safe allow-list when `isolateEnv` is true. */
   extraEnv?: Record<string, string>;
+  /** Environment keys removed from the inherited child environment. Applied
+   *  before `extraEnv`, so an explicit assignment wins when both mention a key. */
+  unsetEnv?: string[];
   /** Use this env dict verbatim for the spawned child — no inheritance from
-   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` is always
-   *  injected on top so nesting detection and `pty exec` keep working.
+   *  the daemon's `process.env`, no allow-list. `PTY_SESSION` and the opaque
+   *  `PTY_SESSION_GENERATION` owner token are always injected on top so
+   *  nesting detection and generation-safe `pty exec` keep working.
    *
-   *  Mutually exclusive with `isolateEnv` / `extraEnv` — passing `env`
-   *  together with either throws. Use this when the caller wants total
-   *  control of the child environment (e.g., pty-layout's launcher shell
-   *  that injects a shim tmux on `PATH`). */
+   *  Mutually exclusive with `isolateEnv` / `extraEnv` / `unsetEnv` — passing
+   *  `env` together with inherited-environment policy throws. Use this when
+   *  the caller wants total control of the child environment (e.g., a
+   *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
 }
 
@@ -108,21 +152,22 @@ function ensureChildTerm(env: Record<string, string>): void {
 
 function buildChildEnv(options: ServerOptions): Record<string, string> {
   // Mutual exclusion: `env` (explicit, verbatim) can't be combined with the
-  // allow-list-based `isolateEnv`/`extraEnv` path. If you want total control
-  // you pass `env`; if you want scrub+extras you pass `isolateEnv`. Picking
+  // inherited-environment policy path. If you want total control you pass
+  // `env`; otherwise isolation/removals/assignments compose explicitly. Picking
   // one implicitly would hide intent.
-  if (options.env && (options.isolateEnv || options.extraEnv)) {
+  if (options.env && (options.isolateEnv || options.extraEnv || options.unsetEnv?.length)) {
     throw new Error(
-      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv. " +
-      "Use env for verbatim control, or isolateEnv (+ optional extraEnv) for allow-list semantics — not both."
+      "ServerOptions.env is mutually exclusive with isolateEnv/extraEnv/unsetEnv. " +
+      "Use env for verbatim control, or inherited environment policy options — not both."
     );
   }
 
-  // Explicit verbatim env. No inheritance. Only PTY_SESSION is forced on
-  // top so internal pty tooling (nesting prevention, `pty exec`) works.
+  // Explicit verbatim env. No inheritance. PTY's identity and owner token are
+  // forced on top so internal tooling can fail closed across same-id reuse.
   if (options.env) {
     const env = { ...options.env };
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -133,10 +178,12 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     // Legacy behaviour: full inheritance, minus the server-config handoff.
     const env = { ...source };
     delete env.PTY_SERVER_CONFIG;
+    for (const key of options.unsetEnv ?? []) delete env[key];
     if (options.extraEnv) {
       for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
     }
     env.PTY_SESSION = options.name;
+    if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
     ensureChildTerm(env);
     return env;
   }
@@ -146,10 +193,12 @@ function buildChildEnv(options: ServerOptions): Record<string, string> {
     if (v === undefined) continue;
     if (ISOLATED_ENV_ALLOWLIST.has(k) || k.startsWith("LC_")) env[k] = v;
   }
+  for (const key of options.unsetEnv ?? []) delete env[key];
   if (options.extraEnv) {
     for (const [k, v] of Object.entries(options.extraEnv)) env[k] = v;
   }
   env.PTY_SESSION = options.name;
+  if (options.generation) env.PTY_SESSION_GENERATION = options.generation;
   ensureChildTerm(env);
   return env;
 }
@@ -226,6 +275,7 @@ export class PtyServer {
   private serialize: SerializeAddon;
   private ptyProcess: pty.IPty;
   private socketServer: net.Server;
+  private retiredSocketServers: net.Server[] = [];
   private clients = new Map<net.Socket, Client>();
   private exited = false;
   private exitCode = 0;
@@ -254,6 +304,10 @@ export class PtyServer {
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private generation: string;
+  private recoveryCapability: RecoveryCapability | null = null;
+  private recoveryRoot = "";
+  private recoveryInFlight = false;
+  private recoveryWatcher: fs.FSWatcher | null = null;
   private lastTitle = "";
   private activity: ActivityLease<net.Socket>;
   readonly ready: Promise<void>;
@@ -463,7 +517,7 @@ export class PtyServer {
     // Spawn the child process in a PTY via a shell, so that shell scripts,
     // symlinks, and shebangs all work reliably (like tmux/screen do).
     // `exec "$@"` replaces the shell with the actual process.
-    const childEnv = buildChildEnv(options);
+    const childEnv = buildChildEnv({ ...options, generation: this.generation });
 
     const invalidCwd = describeInvalidCwd(options.cwd);
     if (invalidCwd !== undefined) {
@@ -508,7 +562,7 @@ export class PtyServer {
       this.terminal.write(data);
       const cleaned = stripTerminalQueries(data);
       if (cleaned.length > 0) {
-        this.broadcast(encodeData(cleaned));
+        this.broadcast(MessageType.DATA, encodeData(cleaned));
       }
     });
 
@@ -521,7 +575,7 @@ export class PtyServer {
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
-      this.broadcast(encodeExit(code));
+      this.broadcast(MessageType.EXIT, encodeExit(code));
       this.emitEvent(EventType.SESSION_EXIT, {
         exitCode: code,
         ...(signal ? { signal } : {}),
@@ -530,13 +584,47 @@ export class PtyServer {
       // in pty list during the cleanup window. lastLines may be incomplete
       // here since PTY data could still be in-flight — close() will
       // update with the final output.
-      this.saveExitMetadata(code);
+      const exitMetadataStatus = this.saveExitMetadata(code);
+      if (exitMetadataStatus === "busy" || exitMetadataStatus === "stale") {
+        // Startup may still hold the creation lock for this generation. Retry
+        // within the existing 500ms client grace so exit metadata is observable
+        // before shutdown cleanup, while close() retains the final bounded retry.
+        void this.saveExitMetadataUntilSettled(code, 400).catch(() => {});
+      }
       this.resolveChildExited();
       options.onExit?.(code);
     });
 
     // Create Unix socket server
     ensureSessionDir();
+    this.recoveryRoot = path.resolve(getSessionDir());
+    const processStartToken = readProcessStartToken(process.pid);
+    try {
+      ensureRecoveryDir(this.recoveryRoot);
+      const paths = assertPrivateRecoveryPaths(this.recoveryRoot);
+      if (processStartToken === null) throw new Error("process start identity unavailable");
+      const identity = launchIdentity({
+        command: options.command,
+        args: options.args,
+        displayCommand: options.displayCommand,
+        cwd: options.cwd,
+        rows: options.rows,
+        cols: options.cols,
+        ephemeral: options.ephemeral,
+        isolateEnv: options.isolateEnv,
+        extraEnv: options.extraEnv,
+        env: options.env,
+      });
+      this.recoveryCapability = {
+        protocol: RECOVERY_PROTOCOL,
+        secret: randomBytes(32).toString("hex"),
+        processStartToken,
+        launchIdentity: identity,
+        ...paths,
+        metadataRevision: "",
+      };
+      this.startRecoveryWatcher();
+    } catch {}
     clearEvents(this.name);
     const socketPath = getSocketPath(this.name);
 
@@ -565,6 +653,7 @@ export class PtyServer {
         writeMetadata(this.name, {
           generation: this.generation,
           daemonPid: process.pid,
+          ...(this.recoveryCapability ? { recovery: this.recoveryCapability } : {}),
           command: options.command,
           args: options.args,
           displayCommand: options.displayCommand,
@@ -577,6 +666,7 @@ export class PtyServer {
           ...(options.displayName ? { displayName: options.displayName } : {}),
           ...(options.isolateEnv ? { isolateEnv: true } : {}),
           ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
+          ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
           ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
@@ -597,6 +687,218 @@ export class PtyServer {
     });
   }
 
+  private startRecoveryWatcher(): void {
+    const requestPath = recoveryRequestPath(this.recoveryRoot, this.name);
+    this.recoveryWatcher = fs.watch(
+      recoveryDir(this.recoveryRoot),
+      { persistent: false },
+      (_event, filename) => {
+        if (
+          filename === path.basename(requestPath) &&
+          fs.existsSync(requestPath) &&
+          !this.recoveryInFlight
+        ) {
+          void this.handleRecoveryRequest();
+        }
+      },
+    );
+  }
+
+  private recoveryMetadata(
+    observed: SessionMetadata,
+    capability: RecoveryCapability,
+  ): SessionMetadata {
+    return stampRecoveryMetadata({
+      ...observed,
+      generation: this.generation,
+      daemonPid: process.pid,
+      recovery: capability,
+    });
+  }
+
+  private async handleRecoveryRequest(): Promise<void> {
+    const capability = this.recoveryCapability;
+    if (!capability || this.recoveryInFlight) return;
+    this.recoveryInFlight = true;
+    const requestPath = recoveryRequestPath(this.recoveryRoot, this.name);
+    const resultPath = recoveryResultPath(this.recoveryRoot, this.name);
+    let request: RecoveryRequest | null = null;
+    let result: RecoveryResultPayload | null = null;
+    try {
+      assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+      request = readBoundedJson<RecoveryRequest>(requestPath);
+      const currentStart = readProcessStartToken(process.pid);
+      const metadataCapability = request.metadata?.recovery;
+      const lockPath = path.join(this.recoveryRoot, `${this.name}.lock`);
+      const lockContents = recoveryLockContents(process.pid, request.lockIdentity);
+      const expectedLockIdentity = recoveryLockIdentity({
+        name: request.name,
+        daemonPid: request.daemonPid,
+        processStartToken: request.processStartToken,
+        rootDevice: request.rootDevice,
+        rootInode: request.rootInode,
+        recoveryDirDevice: capability.recoveryDirDevice,
+        recoveryDirInode: capability.recoveryDirInode,
+      });
+      const revision = readBoundedJson<RecoveryRevision>(
+        recoveryRevisionPath(this.recoveryRoot, this.name),
+      );
+      const exact =
+        request.protocol === RECOVERY_PROTOCOL &&
+        request.name === this.name &&
+        request.daemonPid === process.pid &&
+        request.generation === this.generation &&
+        request.processStartToken === capability.processStartToken &&
+        request.launchIdentity === capability.launchIdentity &&
+        request.rootDevice === capability.rootDevice &&
+        request.rootInode === capability.rootInode &&
+        currentStart === capability.processStartToken &&
+        request.lockIdentity === expectedLockIdentity &&
+        fs.readFileSync(lockPath, "utf8") === lockContents &&
+        metadataCapability?.protocol === capability.protocol &&
+        metadataCapability.secret === capability.secret &&
+        metadataCapability.processStartToken === capability.processStartToken &&
+        metadataCapability.launchIdentity === capability.launchIdentity &&
+        metadataCapability.rootDevice === capability.rootDevice &&
+        metadataCapability.rootInode === capability.rootInode &&
+        metadataCapability.recoveryDirDevice === capability.recoveryDirDevice &&
+        metadataCapability.recoveryDirInode === capability.recoveryDirInode &&
+        metadataCapability.metadataRevision === metadataRevision(request.metadata) &&
+        revision.protocol === RECOVERY_PROTOCOL &&
+        revision.name === this.name &&
+        revision.generation === this.generation &&
+        revision.metadataRevision === metadataCapability.metadataRevision &&
+        verifyRecoveryRevision(capability.secret, revision) &&
+        verifyRecoveryRequest(capability.secret, request);
+      if (!exact) throw new Error("recovery identity or authentication mismatch");
+
+      const socketPath = getSocketPath(this.name);
+      const pidPath = getPidPath(this.name);
+      const metadataPath = getMetadataPath(this.name);
+      for (const target of [socketPath, pidPath, metadataPath]) {
+        if (fs.existsSync(target)) throw new Error("recovery target is no longer empty");
+      }
+
+      const replacement = net.createServer((socket) => this.handleClient(socket));
+      await new Promise<void>((resolve, reject) => {
+        replacement.once("error", reject);
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+        replacement.listen(socketPath, resolve);
+      });
+      replacement.on("error", (error) => {
+        console.error(`Socket server error: ${error.message}`);
+      });
+      let socketIdentity: { dev: number; ino: number } | null = null;
+      let publishedPid = false;
+      let publishedMetadata = false;
+      let rotatedCapability: RecoveryCapability | null = null;
+      try {
+        fs.chmodSync(socketPath, 0o600);
+        const socketStat = fs.lstatSync(socketPath);
+        socketIdentity = { dev: socketStat.dev, ino: socketStat.ino };
+        if (fs.existsSync(pidPath) || fs.existsSync(metadataPath)) {
+          throw new Error("recovery sidecar appeared during publication");
+        }
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+        const rotated: RecoveryCapability = {
+          ...capability,
+          secret: randomBytes(32).toString("hex"),
+          metadataRevision: "",
+        };
+        const recoveredMetadata = this.recoveryMetadata(request.metadata, rotated);
+        rotatedCapability = recoveredMetadata.recovery!;
+        // Advance the authoritative signed revision before any rotated
+        // capability-bearing metadata becomes visible. A later publication
+        // failure intentionally leaves recovery unavailable rather than
+        // allowing the old snapshot/secret to roll metadata back.
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+        atomicWritePrivate(
+          recoveryRevisionPath(this.recoveryRoot, this.name),
+          signRecoveryRevision(rotatedCapability.secret, {
+            protocol: RECOVERY_PROTOCOL,
+            name: this.name,
+            generation: this.generation,
+            metadataRevision: rotatedCapability.metadataRevision,
+          }),
+        );
+        publishPrivateNoReplace(pidPath, process.pid.toString());
+        publishedPid = true;
+        publishPrivateNoReplace(metadataPath, JSON.stringify(recoveredMetadata, null, 2));
+        publishedMetadata = true;
+        const finalSocket = fs.lstatSync(socketPath);
+        if (finalSocket.dev !== socketIdentity.dev || finalSocket.ino !== socketIdentity.ino) {
+          throw new Error("recovery pathname was replaced during publication");
+        }
+
+        const previous = this.socketServer;
+        this.socketServer = replacement;
+        this.recoveryCapability = rotatedCapability;
+        // Node remembers a Unix server's pathname and unlinks it on close.
+        // The old listener still remembers the same string even though its
+        // inode was externally unlinked; closing it now would unlink the new
+        // listener. Keep the unreachable fd unref'd until daemon shutdown.
+        previous.unref();
+        this.retiredSocketServers.push(previous);
+        result = {
+          protocol: RECOVERY_PROTOCOL,
+          name: this.name,
+          nonce: request.nonce,
+          ok: true,
+          daemonPid: process.pid,
+          generation: this.generation,
+          processStartToken: capability.processStartToken,
+          launchIdentity: capability.launchIdentity,
+        };
+      } catch (error) {
+        try { replacement.close(); } catch {}
+        if (publishedMetadata && rotatedCapability) {
+          try {
+            const current = readMetadata(this.name);
+            if (current?.recovery?.secret === rotatedCapability.secret) {
+              fs.unlinkSync(metadataPath);
+            }
+          } catch {}
+        }
+        if (publishedPid) {
+          try {
+            if (fs.readFileSync(pidPath, "utf8").trim() === String(process.pid)) {
+              fs.unlinkSync(pidPath);
+            }
+          } catch {}
+        }
+        if (socketIdentity) {
+          try {
+            const current = fs.lstatSync(socketPath);
+            if (current.dev === socketIdentity.dev && current.ino === socketIdentity.ino) {
+              fs.unlinkSync(socketPath);
+            }
+          } catch {}
+        }
+        throw error;
+      }
+    } catch (error) {
+      result = {
+        protocol: RECOVERY_PROTOCOL,
+        name: this.name,
+        nonce: request?.nonce ?? "",
+        ok: false,
+        error: error instanceof Error ? error.message : "recovery refused",
+      };
+    } finally {
+      try {
+        assertPrivateRecoveryPaths(this.recoveryRoot, capability);
+        if (result) {
+          atomicWritePrivate(
+            resultPath,
+            signRecoveryResult(capability.secret, result),
+          );
+        }
+        fs.unlinkSync(requestPath);
+      } catch {}
+      this.recoveryInFlight = false;
+    }
+  }
+
   private handleClient(socket: net.Socket): void {
     const client: Client = {
       socket,
@@ -605,6 +907,9 @@ export class PtyServer {
       cols: this.terminal.cols,
       readonly: false,
       attachSeq: 0,
+      initialScreenPhase: "live",
+      initialScreenGeneration: 0,
+      postCutPackets: [],
     };
     this.clients.set(socket, client);
 
@@ -628,45 +933,45 @@ export class PtyServer {
             // to its own size, which would then look like it had matched.
             const sizeMatched =
               size.rows === this.terminal.rows && size.cols === this.terminal.cols;
+            client.readonly = false;
             client.rows = size.rows;
             client.cols = size.cols;
             client.attachSeq = ++this.attachCounter;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
             const resized = this.negotiateSize();
-            // Stamp the last-attach timestamp so `pty gc --idle-days N`
-            // (and per-session `strategy.idle-days=N` tags) can detect
-            // abandonment. Best-effort — if the metadata file was
-            // concurrently mutated by another writer (`pty tag`,
-            // `pty rename`), our read-modify-write may lose a field, but
-            // that's the same last-write-wins semantic every other
-            // metadata mutation carries. Wrapped in try so a torn read
-            // never crashes the daemon on attach.
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
+            // Best-effort: a concurrent metadata command wins this attach
+            // stamp, but neither writer can overwrite the other's snapshot.
             try {
-              const meta = readMetadata(this.name);
-              if (meta) {
+              mutateMetadataUnderLock(this.name, (meta) => {
                 meta.lastAttachAt = new Date().toISOString();
-                writeMetadata(this.name, meta);
-              }
+                return true;
+              }, { expectedGeneration: this.generation });
             } catch {}
 
             const sendScreen = () => {
-              if (socket.destroyed) return;
-              const screen = this.getModePrefix(true) + this.serialize.serialize();
-              socket.write(encodeScreen(screen));
-              if (this.exited) {
-                socket.write(encodeExit(this.exitCode));
-              } else {
-                // The serialize addon's output is an approximation — ECH/CUF
-                // sequences may not perfectly reproduce what the app originally
-                // drew (e.g., background fills in ratatui). Nudge the child
-                // with a SIGWINCH so it does a fresh full redraw, whose DATA
-                // overwrites any serialize artifacts on the client.
-                //
-                // Skipped when the client attached at the size the session
-                // already has: the child is drawn for that geometry, so the
-                // nudge buys nothing and wakes an otherwise idle process every
-                // time someone connects.
-                if (!sizeMatched) this.nudgeRedraw();
-              }
+              this.beginInitialScreenCut(
+                client,
+                initialScreenGeneration,
+                () => this.getModePrefix(true) + this.serialize.serialize(),
+                () => {
+                  // The serialize addon's output is an approximation — ECH/CUF
+                  // sequences may not perfectly reproduce what the app originally
+                  // drew (e.g., background fills in ratatui). Nudge the child
+                  // with a SIGWINCH so it does a fresh full redraw, whose DATA
+                  // overwrites any serialize artifacts on the client.
+                  //
+                  // Skipped when the client attached at the size the session
+                  // already has: the child is drawn for that geometry, so the
+                  // nudge buys nothing and wakes an otherwise idle process every
+                  // time someone connects.
+                  if (!this.exited && !sizeMatched) this.nudgeRedraw();
+                }
+              );
             };
 
             if (!this.exited) {
@@ -690,22 +995,25 @@ export class PtyServer {
 
           case MessageType.PEEK: {
             client.readonly = true;
+            client.initialScreenPhase = "settling";
+            client.postCutPackets = [];
+            const initialScreenGeneration = ++client.initialScreenGeneration;
+            const resized = this.negotiateSize();
+            if (!resized) {
+              socket.write(encodeGeometry(this.terminal.rows, this.terminal.cols));
+            }
             const flags = packet.payload.length > 0 ? packet.payload.readUInt8(0) : 0;
             const plain = (flags & 1) !== 0;
             const full = (flags & 2) !== 0;
 
-            if (plain) {
-              socket.write(encodeScreen(full ? this.getFullPlainScreen() : this.getPlainScreen()));
-            } else {
+            this.beginInitialScreenCut(client, initialScreenGeneration, () => {
+              if (plain) {
+                return full ? this.getFullPlainScreen() : this.getPlainScreen();
+              }
               // scrollback: 0 for viewport only, omit for full scrollback
               const serializeOpts = full ? undefined : { scrollback: 0 };
-              const peekScreen = this.getModePrefix() + this.serialize.serialize(serializeOpts);
-              socket.write(encodeScreen(peekScreen));
-            }
-
-            if (this.exited) {
-              socket.write(encodeExit(this.exitCode));
-            }
+              return this.getModePrefix() + this.serialize.serialize(serializeOpts);
+            });
             break;
           }
 
@@ -717,7 +1025,7 @@ export class PtyServer {
           }
 
           case MessageType.RESIZE: {
-            if (!client.readonly && packet.payload.length >= 4) {
+            if (!client.readonly && client.attachSeq > 0 && packet.payload.length >= 4) {
               const size = decodeSize(packet.payload);
               client.rows = size.rows;
               client.cols = size.cols;
@@ -787,15 +1095,33 @@ export class PtyServer {
     return prefix;
   }
 
-  private collectStats(): object {
+  private collectStats(): StatsResult {
     const buf = this.terminal.buffer.active;
     const meta = readMetadata(this.name);
 
     let attached = 0;
     let readOnly = 0;
+    const connections: NonNullable<StatsResult["clients"]["connections"]> = [];
     for (const c of this.clients.values()) {
-      if (c.readonly) readOnly++;
-      else if (c.attachSeq > 0) attached++;
+      if (c.readonly) {
+        readOnly++;
+        connections.push({
+          role: "readonly",
+          constrains: { rows: false, cols: false },
+        });
+      } else if (c.attachSeq > 0) {
+        attached++;
+        connections.push({
+          role: "writable",
+          rows: c.rows,
+          cols: c.cols,
+          lastRequestSequence: c.attachSeq,
+          constrains: {
+            rows: c.rows === this.terminal.rows,
+            cols: c.cols === this.terminal.cols,
+          },
+        });
+      }
     }
 
     const createdAt = meta?.createdAt ?? null;
@@ -830,6 +1156,7 @@ export class PtyServer {
         total: attached + readOnly,
         attached,
         readOnly,
+        connections,
       },
       modes: {
         alternateScreen: this.altScreenActive,
@@ -859,13 +1186,23 @@ export class PtyServer {
 
     if (rows > 0 && cols > 0) {
       if (rows !== this.terminal.rows || cols !== this.terminal.cols) {
-        this.ptyProcess.resize(cols, rows);
         this.terminal.resize(cols, rows);
+        this.broadcastGeometry(rows, cols);
+        this.ptyProcess.resize(cols, rows);
         this.lastResizeTime = Date.now();
         return true;
       }
     }
     return false;
+  }
+
+  private broadcastGeometry(rows: number, cols: number): void {
+    const packet = encodeGeometry(rows, cols);
+    for (const client of this.clients.values()) {
+      if (client.attachSeq > 0 || client.readonly) {
+        client.socket.write(packet);
+      }
+    }
   }
 
   /** Briefly resize the PTY by 1 column and back to trigger SIGWINCH,
@@ -889,9 +1226,59 @@ export class PtyServer {
     } as EventRecord);
   }
 
-  private broadcast(data: Buffer): void {
+  private beginInitialScreenCut(
+    client: Client,
+    generation: number,
+    getScreen: () => string,
+    onLive?: () => void
+  ): void {
+    if (
+      client.socket.destroyed ||
+      client.initialScreenGeneration !== generation
+    ) return;
+
+    client.initialScreenPhase = "cutting";
+    /** xterm parses writes asynchronously. This empty write is an ordered
+     *  marker: its callback runs after every earlier write and before later
+     *  writes, giving SCREEN an exact parser cut. */
+    this.terminal.write("", () => {
+      if (
+        client.socket.destroyed ||
+        client.initialScreenGeneration !== generation
+      ) return;
+
+      const postCutPackets = client.postCutPackets;
+      client.postCutPackets = [];
+      const hasPostCutExit = postCutPackets.some(
+        (pending) => pending.type === MessageType.EXIT
+      );
+
+      client.socket.write(encodeScreen(getScreen()));
+      client.initialScreenPhase = "live";
+      /** node-pty drains PTY data before its public exit event, so a queued
+       *  EXIT is already source-ordered after DATA. A pre-cut EXIT is not in
+       *  this queue and is synthesized only after any final post-cut DATA. */
+      for (const pending of postCutPackets) {
+        client.socket.write(pending.packet);
+      }
+      if (this.exited && !hasPostCutExit) {
+        client.socket.write(encodeExit(this.exitCode));
+      }
+      onLive?.();
+    });
+  }
+
+  private broadcast(
+    type: typeof MessageType.DATA | typeof MessageType.EXIT,
+    packet: Buffer
+  ): void {
     for (const client of this.clients.values()) {
-      client.socket.write(data);
+      if (client.initialScreenPhase === "settling") continue;
+      if (client.initialScreenPhase === "cutting") {
+        client.postCutPackets.push({ type, packet });
+        continue;
+      }
+      client.socket.write(packet);
     }
   }
 
@@ -937,43 +1324,40 @@ export class PtyServer {
     return lines.slice(-LAST_LINES_COUNT);
   }
 
-  private saveExitMetadata(exitCode: number): void {
-    // Don't resurrect a session whose metadata was already removed. On teardown
-    // the daemon re-flushes exit metadata during its (possibly watchdog-delayed)
-    // shutdown; if a caller already `pty rm`'d the session, re-creating its
-    // `.json` here would leave a stray registry file (and its atomic tmp) behind.
-    if (!fs.existsSync(getMetadataPath(this.name))) return;
-    const existing = readMetadata(this.name);
-    if (
-      existing?.generation !== undefined &&
-      existing.generation !== this.generation
-    ) {
-      return;
+  private saveExitMetadata(exitCode: number): MetadataMutationResult["status"] {
+    const result = mutateMetadataUnderLock(this.name, (metadata) => {
+      metadata.exitCode = exitCode;
+      metadata.exitedAt = new Date().toISOString();
+      metadata.lastLines = this.getLastLines();
+      return true;
+    }, { expectedGeneration: this.generation });
+    return result.status;
+  }
+
+  private async saveExitMetadataUntilSettled(
+    exitCode: number,
+    waitMs = 2_000,
+  ): Promise<void> {
+    const deadline = Date.now() + waitMs;
+    while (true) {
+      const status = this.saveExitMetadata(exitCode);
+      if (
+        status === "changed" ||
+        status === "unchanged" ||
+        status === "missing" ||
+        status === "generation-mismatch"
+      ) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    writeMetadata(this.name, {
-      generation: this.generation,
-      daemonPid: process.pid,
-      command: this.options.command,
-      args: this.options.args,
-      displayCommand: this.options.displayCommand,
-      cwd: this.options.cwd,
-      rows: this.options.rows,
-      cols: this.options.cols,
-      ephemeral: this.options.ephemeral === true,
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
-      exitCode,
-      exitedAt: new Date().toISOString(),
-      lastLines: this.getLastLines(),
-      ...(existing?.tags ? { tags: existing.tags } : {}),
-      ...(existing?.displayName ? { displayName: existing.displayName } : {}),
-      ...(this.options.isolateEnv ? { isolateEnv: true } : {}),
-      ...(this.options.extraEnv && Object.keys(this.options.extraEnv).length > 0 ? { extraEnv: this.options.extraEnv } : {}),
-      ...(this.options.env ? { env: this.options.env } : {}),
-    });
   }
 
   /** Clean up resources. Does not call process.exit(). */
   close(): Promise<void> {
+    if (this.recoveryRoot) {
+      try { this.recoveryWatcher?.close(); } catch {}
+      this.recoveryWatcher = null;
+    }
     // Update exit metadata with final output — by the time close() runs,
     // all PTY data has been delivered to the terminal buffer. This overwrites
     // the initial save from onExit which may have had incomplete lastLines.
@@ -984,6 +1368,9 @@ export class PtyServer {
     return new Promise((resolve) => {
       for (const client of this.clients.values()) {
         client.socket.destroy();
+      }
+      for (const retired of this.retiredSocketServers.splice(0)) {
+        try { retired.close(); } catch {}
       }
       this.socketServer.close(async () => {
         cleanupOwnedSocket(this.name, {
@@ -1002,6 +1389,7 @@ export class PtyServer {
           this.childExited,
           new Promise<void>((r) => setTimeout(r, 2000)),
         ]);
+        if (this.exited) await this.saveExitMetadataUntilSettled(this.exitCode);
         try { await this.eventWriter.flush(); } catch {}
         resolve();
       });
@@ -1182,6 +1570,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     displayName: config.displayName,
     isolateEnv: config.isolateEnv === true,
     extraEnv: config.extraEnv,
+    unsetEnv: config.unsetEnv,
     env: config.env,
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down

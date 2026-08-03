@@ -6,6 +6,9 @@ Persistent terminal sessions. Run a process, detach, reconnect later. From anywh
 
 Uses [@xterm/headless](https://github.com/xtermjs/xterm.js/tree/master/headless) internally.
 
+The durable system contract lives in
+[docs/vrs](docs/vrs/spec.md).
+
 ## Install
 
 ```sh
@@ -55,6 +58,7 @@ pty run -a -- node server.js                       # create or attach if already
 pty run -e -- npm test                             # ephemeral: reap even on `pty kill` / permanent
 pty run --tag owner=forge -- node srv.js           # tag a session with metadata
 pty run --env PORT=3000 --env MODE=dev -- node srv.js # persisted child env overlay
+pty run --unset-env NO_COLOR -- node srv.js           # persisted inherited-env removal
 pty run --tag keep=true -- npm test                # keep it even past a gc sweep, until you rm it
 pty run --cwd /path -- node server.js              # run in a specific directory
 
@@ -62,6 +66,7 @@ pty rename my-label                       # inside a session: add/change its dis
 pty rename <ref> my-label                 # outside: set displayName on <ref>
 pty rename --show <ref>                   # show current displayName
 pty rename --clear [ref]                  # remove displayName
+pty metadata patch --id myserver < patch.json # atomically patch displayName/tags by exact id
 
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
@@ -73,6 +78,7 @@ pty list --filter-tag role=web            # show only sessions with matching tag
 pty attach myserver                       # reconnect to a session
 pty attach -r myserver                    # reconnect, auto-restart if exited
 pty attach --no-restart myserver          # attach only; fail if not running
+pty attach --attach-stream-fd-v1 3 myserver 3>events.bin  # framed machine stream
 pty exec -- codex                         # replace this session's process (inside a session)
 pty peek myserver                         # print current screen and exit
 pty peek --plain myserver                 # print as plain text (no ANSI)
@@ -89,7 +95,7 @@ pty send myserver --paste "$(cat prompt.md)"           # wrap as bracketed paste
 
 pty stats                                 # live metrics for all sessions
 pty stats myserver                        # stats for a specific session
-pty stats --json                          # stats as JSON (includes CPU, memory, PIDs)
+pty stats --json                          # effective geometry, anonymous clients, CPU/memory/PIDs
 
 pty events myserver                       # follow events in real-time
 pty events --all                          # follow events from all sessions
@@ -102,6 +108,7 @@ pty emit myserver user.note --text "checkpoint reached"     # with a text payloa
 
 pty restart myserver                      # restart an exited session (must have been preserved)
 pty kill myserver                         # terminate a running session
+pty --root /state/pty recover myserver --snapshot ./myserver.json  # rebind a live supporting daemon after external unlink
 pty rm myserver                           # remove an exited session's metadata
 pty gc                                    # reconcile: kill orphan children, respawn permanents, sweep vanished
 pty gc --dry-run                          # preview what gc would do without changing anything
@@ -119,6 +126,26 @@ pty down                                  # stop all sessions from ./pty.toml
 pty down claude                           # stop specific sessions
 ```
 
+Session ids are stable and unique. Display names are mutable presentation
+labels and may be shared by multiple sessions. A command reference resolves an
+exact stable id first, then a display name only when that label has one match.
+Ambiguous display names fail without acting and print the candidate stable ids.
+Use stable ids in scripts and automation.
+
+For automation that must update presentation metadata without alias fallback,
+`pty metadata patch --id <stable-id>` reads one merge-style JSON object from
+stdin and returns `{ changed, metadata }` as JSON:
+
+```sh
+printf '%s' '{"displayName":"Worker","tags":{"role":"worker","old":null}}' \
+  | pty metadata patch --id a1b2c3d4
+```
+
+`displayName` and individual tag values use strings to set and `null` to clear;
+omitted fields and tag keys remain unchanged. The operation holds the session's
+metadata lock across one read/merge/atomic-write cycle. It fails if the exact id
+is absent, even when a display name has the same text.
+
 ### Remote over fabric
 
 `pty list --remote <peer>` lists another machine's sessions over [fabric](https://github.com/compoundingtech/fabric), which hands consumers a plain local Unix socket — pty never touches iroh. The remote machine serves a small control protocol that fabric exposes under the `pty-remote` ALPN. The recommended form is **on-demand**: fabric spawns the handler per dial, pipes the connection to its stdin/stdout, and owns persistence + roaming (no persistent pty daemon):
@@ -128,7 +155,8 @@ pty down claude                           # stop specific sessions
 fabric expose pty-remote --exec -- pty remote-serve --stdio
 ```
 
-From any trusted peer, the ordinary session commands take `--remote <peer>` — `<ref>` is the session's name/id **on the remote**:
+From any trusted peer, the ordinary session commands take `--remote <peer>` —
+`<ref>` is a stable id or unambiguous display name **on the remote**:
 
 ```sh
 pty list --remote <peer>                  # list the peer's sessions
@@ -173,6 +201,21 @@ Two per-session flags override the configured default either way:
 `strategy=permanent` sessions are always preserved (their supervisor reconciles
 against the dead metadata to respawn them). `pty kill` also preserves — it is
 stop-and-keep, deliberately distinct from `pty rm`.
+
+If an external cleanup unlinks a live session's socket, pid, and metadata
+paths, do not rerun its launch command: that can create a second provider.
+New daemons advertise a recovery capability in metadata when their selected
+root is private to the daemon user. Capture that complete metadata before the
+unlink, then use `pty recover <name> --snapshot <file>`
+against the same `PTY_ROOT`. Recovery authenticates the original daemon and
+rebinds its listener without signaling, restarting, or disconnecting existing
+clients. Missing, legacy, stale, tampered, wrong-root, and occupied-path
+snapshots fail closed.
+Recovery also rejects a snapshot captured before any later metadata mutation,
+and rechecks that both the root and its recovery directory are still private
+before exchanging authenticated state. An interrupted recover command can be
+resumed with the same valid snapshot; it never probes, signals, or relaunches
+the supporting daemon.
 
 ```sh
 pty run -d -- npm test                          # shipped default: reaped when it finishes
@@ -262,7 +305,7 @@ display_name = "My Web Server"   # override the default `<prefix>-<sessionKey>` 
 cwd = "packages/web"             # working directory (default: the manifest's dir)
 ```
 
-`id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` is permissive (≤ 500 chars, any printable text); omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
+`id` is validated like a `pty run --id` value (charset, sock-path length, uniqueness); omitted → pty generates a short random id at spawn time. `display_name` must be nonempty, already trimmed, single-line, free of Unicode control characters, and at most 160 Unicode scalar values; `/` and `\` are allowed because the value is metadata, not a path. Omitted → defaults to `<prefix>-<sessionKey>` (or just `<sessionKey>` if no prefix). The two fields decouple the human label from the kernel-constrained filename — long prefixes that would have blown past `sockaddr_un.sun_path` (~104 bytes) now work because the actual sock filename is just the short id.
 
 `cwd` sets the session's working directory. An absolute path is used as-is; a relative path resolves against the manifest's directory. Omitted → the session runs in the manifest's directory (the default). This decouples where a session runs from where its `pty.toml` lives — so a manifest kept in a subdirectory (e.g. `.convoy/pty.toml`, to keep a repo root pristine) can still run its sessions in the repo root with `cwd = ".."`. The declared `cwd` is honored on the initial `pty up` and preserved across manual and `strategy=permanent` respawns.
 
@@ -277,7 +320,11 @@ PORT = "8080"
 LOG_LEVEL = "debug"
 ```
 
-The values are overlaid on the session child's inherited environment before its `/bin/sh -c` command runs. The effective overlay is stored with the other launch settings, so `pty restart` preserves it exactly; `strategy=permanent` respawns re-read the manifest and pick up edits. The equivalent direct-launch flag is repeatable `pty run --env KEY=VALUE` (later entries for the same key win). Ambient process-environment inheritance remains unchanged.
+The values are overlaid on the session child's inherited environment before its `/bin/sh -c` command runs. The effective overlay is stored with the other launch settings, so `pty restart` preserves it exactly; `strategy=permanent` respawns re-read the manifest and pick up edits. The equivalent direct-launch flag is repeatable `pty run --env KEY=VALUE` (later entries for the same key win).
+
+Direct launches can also persist removals from the inherited environment with repeatable `pty run --unset-env KEY`. Removals are applied before `--env` overlays, so an explicit assignment wins when both mention the same key, regardless of flag order. Both policies survive manual and permanent restart. Metadata created before `unsetEnv` was introduced retains the historical ambient-inheritance behavior.
+
+Two child invariants are applied after that policy: `PTY_SESSION` is always set to the session's stable id, and an absent `TERM` receives the existing `xterm-256color` default. Consequently, `--unset-env PTY_SESSION` cannot remove the session marker, and `--unset-env TERM` selects the default rather than leaving `TERM` absent. An explicit `--env TERM=...` assignment is preserved.
 
 ### Permanent sessions
 
@@ -414,10 +461,14 @@ resets to `unknown` when that connection or daemon generation ends.
 
 ```typescript
 const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
-const initialScreen = await conn.connect();
 
+conn.on("geometry", ({ rows, cols }) => myTerminalView.resize(cols, rows));
 conn.on("data", (data) => myTerminalView.write(data));
 conn.on("exit", (code) => console.log(`Exited: ${code}`));
+
+const initialScreen = await conn.connect();
+myTerminalView.resize(conn.effectiveCols, conn.effectiveRows);
+myTerminalView.write(initialScreen);
 
 conn.write("hello\r");
 conn.press("ctrl+c");
