@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { describe, it, expect, afterEach, afterAll, vi } from "vitest";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -12,6 +12,8 @@ import {
   encodeAttach,
   encodeData,
   encodeDetach,
+  encodeExit,
+  encodePacket,
   encodePeek,
   encodeResize,
   encodeStatus,
@@ -29,6 +31,9 @@ import {
 } from "../src/sessions.ts";
 import { queryStats } from "../src/client.ts";
 import { connectActivityPublisher } from "../src/activity-client.ts";
+
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
 
 // All tests run in a tmp directory to avoid polluting the project
 const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pty-int-"));
@@ -113,6 +118,82 @@ function collectPackets(
 
     socket.on("data", onData);
   });
+}
+
+function recordPackets(socket: net.Socket): {
+  packets: Packet[];
+  waitFor: (
+    predicate: (packets: Packet[]) => boolean,
+    timeoutMs?: number
+  ) => Promise<void>;
+} {
+  const reader = new PacketReader();
+  const packets: Packet[] = [];
+  let wake: (() => void) | undefined;
+
+  socket.on("data", (data: Buffer) => {
+    packets.push(...reader.feed(data));
+    wake?.();
+  });
+
+  return {
+    packets,
+    async waitFor(predicate, timeoutMs = 3000) {
+      const deadline = performance.now() + timeoutMs;
+      while (!predicate(packets)) {
+        await new Promise<void>((resolve, reject) => {
+          const remaining = Math.max(0, deadline - performance.now());
+          const timer = realSetTimeout(() => {
+            wake = undefined;
+            reject(new Error(`Timed out waiting for recorded packets`));
+          }, remaining);
+          wake = () => {
+            realClearTimeout(timer);
+            resolve();
+          };
+        });
+        wake = undefined;
+      }
+    },
+  };
+}
+
+function holdTerminalWrites(server: PtyServer): {
+  pendingWrites: Array<{ data: string | Uint8Array; callback?: () => void }>;
+  releaseWrites: () => Promise<void>;
+  restore: () => void;
+} {
+  const terminal = (server as unknown as { terminal: Terminal }).terminal;
+  const originalWrite = terminal.write.bind(terminal);
+  const pendingWrites: Array<{
+    data: string | Uint8Array;
+    callback?: () => void;
+  }> = [];
+  terminal.write = (data, callback) => {
+    pendingWrites.push({ data, callback });
+  };
+
+  return {
+    pendingWrites,
+    releaseWrites: () =>
+      new Promise<void>((resolve) => {
+        const releaseNext = () => {
+          const pending = pendingWrites.shift();
+          if (!pending) {
+            resolve();
+            return;
+          }
+          originalWrite(pending.data, () => {
+            pending.callback?.();
+            releaseNext();
+          });
+        };
+        releaseNext();
+      }),
+    restore: () => {
+      terminal.write = originalWrite;
+    },
+  };
 }
 
 /** Wait for a specific message type. */
@@ -353,6 +434,604 @@ describe("integration", () => {
 
     client1.destroy();
     client2.destroy();
+  });
+
+  it("sends SCREEN before live DATA produced during attach synchronization", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      liveClient.write(encodeData("during-initial-sync\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("during-initial-sync")
+        )
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+      await vi.runAllTimersAsync();
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+      expect(
+        attachingPackets.packets.find((packet) => packet.type === MessageType.SCREEN)?.payload.toString()
+      ).toContain("during-initial-sync");
+
+      attachingClient.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("does not lose pre-cut DATA waiting in xterm's parser queue", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "sh", ["-c", "stty -echo; cat"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    const heldWrites = holdTerminalWrites(server);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      liveClient.write(encodeData("parser-backlog\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("parser-backlog")
+        )
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+
+      const releaseWrites = heldWrites.releaseWrites();
+      await vi.runAllTimersAsync();
+      await releaseWrites;
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      const reconstructed = attachingPackets.packets
+        .filter(
+          (packet) =>
+            packet.type === MessageType.SCREEN || packet.type === MessageType.DATA
+        )
+        .map((packet) => packet.payload.toString())
+        .join("");
+      expect(reconstructed).toContain("parser-backlog");
+
+      attachingClient.destroy();
+    } finally {
+      heldWrites.restore();
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("flushes post-cut DATA before a post-cut EXIT", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "sh", [
+      "-c",
+      "stty -echo; read value; printf 'post-cut-data'; exit 7",
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    const heldWrites = holdTerminalWrites(server);
+    let attachingClient: net.Socket | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+      await vi.advanceTimersByTimeAsync(80);
+      expect(
+        heldWrites.pendingWrites.some(
+          (pending) => pending.data.length === 0 && pending.callback !== undefined
+        )
+      ).toBe(true);
+
+      attachingClient.write(encodeResize(24, 80));
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.filter((packet) => packet.type === MessageType.GEOMETRY).length === 2
+      );
+      liveClient.write(encodeData("go\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("post-cut-data")
+        ) && packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      const releaseWrites = heldWrites.releaseWrites();
+      await vi.runAllTimersAsync();
+      await releaseWrites;
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.some((packet) => packet.type === MessageType.SCREEN) &&
+          packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+        MessageType.DATA,
+        MessageType.EXIT,
+      ]);
+      expect(
+        attachingPackets.packets.find((packet) => packet.type === MessageType.DATA)?.payload.toString()
+      ).toContain("post-cut-data");
+      const exitPackets = attachingPackets.packets.filter(
+        (packet) => packet.type === MessageType.EXIT
+      );
+      expect(exitPackets).toHaveLength(1);
+      expect(decodeExit(exitPackets[0].payload)).toBe(7);
+    } finally {
+      heldWrites.restore();
+      vi.useRealTimers();
+    }
+
+    const liveClosed = new Promise<void>((resolve) => liveClient.once("close", resolve));
+    liveClient.destroy();
+    await liveClosed;
+    if (attachingClient) {
+      const attachingClosed = new Promise<void>((resolve) =>
+        attachingClient!.once("close", resolve)
+      );
+      attachingClient.destroy();
+      await attachingClosed;
+    }
+  });
+
+  it("flushes final post-cut DATA before synthesizing a pre-cut EXIT", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    const heldWrites = holdTerminalWrites(server);
+    const internals = server as unknown as {
+      exited: boolean;
+      exitCode: number;
+      broadcast: (
+        type: typeof MessageType.DATA | typeof MessageType.EXIT,
+        packet: Buffer
+      ) => void;
+    };
+    let attachingClient: net.Socket | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+
+      internals.exited = true;
+      internals.exitCode = 7;
+      internals.broadcast(MessageType.EXIT, encodeExit(7));
+      await vi.advanceTimersByTimeAsync(80);
+      expect(
+        heldWrites.pendingWrites.some(
+          (pending) => pending.data.length === 0 && pending.callback !== undefined
+        )
+      ).toBe(true);
+
+      internals.broadcast(
+        MessageType.DATA,
+        encodeData("final-post-cut-data")
+      );
+      const releaseWrites = heldWrites.releaseWrites();
+      await vi.runAllTimersAsync();
+      await releaseWrites;
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.some((packet) => packet.type === MessageType.SCREEN) &&
+          packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+        MessageType.DATA,
+        MessageType.EXIT,
+      ]);
+      expect(
+        attachingPackets.packets.find((packet) => packet.type === MessageType.DATA)?.payload.toString()
+      ).toContain("final-post-cut-data");
+      const exitPackets = attachingPackets.packets.filter(
+        (packet) => packet.type === MessageType.EXIT
+      );
+      expect(exitPackets).toHaveLength(1);
+      expect(decodeExit(exitPackets[0].payload)).toBe(7);
+    } finally {
+      heldWrites.restore();
+      vi.useRealTimers();
+    }
+
+    const liveClosed = new Promise<void>((resolve) => liveClient.once("close", resolve));
+    liveClient.destroy();
+    await liveClosed;
+    if (attachingClient) {
+      const attachingClosed = new Promise<void>((resolve) =>
+        attachingClient!.once("close", resolve)
+      );
+      attachingClient.destroy();
+      await attachingClosed;
+    }
+  });
+
+  it("sends one EXIT after SCREEN when the child exits during attach synchronization", async () => {
+    const name = uniqueName();
+    await startServer(name, "sh");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    let attachingClient: net.Socket | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      attachingClient = await connect(name);
+      const attachingPackets = recordPackets(attachingClient);
+      const livePackets = recordPackets(liveClient);
+
+      attachingClient.write(encodeAttach(20, 70));
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.GEOMETRY)
+      );
+      attachingClient.write(encodeResize(24, 80));
+      await attachingPackets.waitFor(
+        (packets) =>
+          packets.filter((packet) => packet.type === MessageType.GEOMETRY).length === 2
+      );
+
+      liveClient.write(encodeData("exit 7\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.EXIT)
+      );
+
+      await vi.advanceTimersByTimeAsync(80);
+      await vi.runAllTimersAsync();
+      await attachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(attachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+        MessageType.EXIT,
+      ]);
+      const exitPackets = attachingPackets.packets.filter(
+        (packet) => packet.type === MessageType.EXIT
+      );
+      expect(exitPackets).toHaveLength(1);
+      expect(decodeExit(exitPackets[0].payload)).toBe(7);
+    } finally {
+      vi.useRealTimers();
+    }
+    const liveClosed = new Promise<void>((resolve) => liveClient.once("close", resolve));
+    liveClient.destroy();
+    await liveClosed;
+    if (attachingClient) {
+      const attachingClosed = new Promise<void>((resolve) =>
+        attachingClient!.once("close", resolve)
+      );
+      attachingClient.destroy();
+      await attachingClosed;
+    }
+  });
+
+  it("supersedes an earlier pending ATTACH on the same client", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const reattachingClient = await connect(name);
+      const reattachingPackets = recordPackets(reattachingClient);
+
+      reattachingClient.write(encodeAttach(20, 70));
+      await reattachingPackets.waitFor((packets) => packets.length >= 1);
+      reattachingClient.write(encodeAttach(18, 60));
+      await reattachingPackets.waitFor((packets) => packets.length >= 2);
+
+      await vi.advanceTimersByTimeAsync(80);
+      await vi.runAllTimersAsync();
+      await reattachingPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(reattachingPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+
+      reattachingClient.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("cancels pending attach synchronization when the client switches to PEEK", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const liveClient = await connect(name);
+    const liveReader = new PacketReader();
+    liveClient.write(encodeAttach(24, 80));
+    await waitForType(liveClient, liveReader, MessageType.SCREEN);
+
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const peeker = await connect(name);
+      const peekPackets = recordPackets(peeker);
+      const livePackets = recordPackets(liveClient);
+
+      peeker.write(encodeAttach(20, 70));
+      await peekPackets.waitFor((packets) => packets.length >= 1);
+      peeker.write(encodePeek());
+      await vi.runAllTimersAsync();
+      await peekPackets.waitFor((packets) =>
+        packets.some((packet) => packet.type === MessageType.SCREEN)
+      );
+
+      expect(peekPackets.packets.map((packet) => packet.type)).toEqual([
+        MessageType.GEOMETRY,
+        MessageType.GEOMETRY,
+        MessageType.SCREEN,
+      ]);
+
+      liveClient.write(encodeData("peek-is-live\n"));
+      await livePackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("peek-is-live")
+        )
+      );
+      await peekPackets.waitFor((packets) =>
+        packets.some(
+          (packet) =>
+            packet.type === MessageType.DATA &&
+            packet.payload.toString().includes("peek-is-live")
+        )
+      );
+
+      peeker.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+    liveClient.destroy();
+  });
+
+  it("replaces a same-socket PEEK role with ATTACH", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const client = await connect(name);
+    const packets = recordPackets(client);
+    client.write(encodePeek());
+    await packets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+
+    client.write(encodeAttach(20, 70));
+    await packets.waitFor(
+      (received) =>
+        received.filter((packet) => packet.type === MessageType.SCREEN).length === 2
+    );
+    client.write(encodeData("writable-again\n"));
+    await packets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("writable-again")
+      )
+    );
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+    const status = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+    expect(stats.clients).toMatchObject({ attached: 1, readOnly: 0 });
+
+    client.write(encodeResize(18, 60));
+    await packets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.GEOMETRY &&
+          packet.payload.readUInt16BE(0) === 18 &&
+          packet.payload.readUInt16BE(2) === 60
+      )
+    );
+
+    client.destroy();
+    statsClient.destroy();
+  });
+
+  it("replaces a same-socket ATTACH role with PEEK", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const client = await connect(name);
+    const clientPackets = recordPackets(client);
+    client.write(encodeAttach(20, 70));
+    await clientPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    client.write(encodePeek());
+    await clientPackets.waitFor(
+      (received) =>
+        received.filter((packet) => packet.type === MessageType.SCREEN).length === 2
+    );
+
+    client.write(
+      Buffer.concat([
+        encodeResize(18, 60),
+        encodeData("must-not-reach-cat\n"),
+        encodeStatus(),
+      ])
+    );
+    await clientPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const status = clientPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({ attached: 0, readOnly: 1 });
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+
+    const observer = await connect(name);
+    const observerPackets = recordPackets(observer);
+    observer.write(encodeAttach(20, 70));
+    await observerPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    observer.write(encodeData("accepted-by-cat\n"));
+    await observerPackets.waitFor((received) =>
+      received.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("accepted-by-cat")
+      )
+    );
+    const observedOutput = observerPackets.packets
+      .filter(
+        (packet) =>
+          packet.type === MessageType.SCREEN || packet.type === MessageType.DATA
+      )
+      .map((packet) => packet.payload.toString())
+      .join("");
+    expect(observedOutput).not.toContain("must-not-reach-cat");
+
+    client.destroy();
+    observer.destroy();
+  });
+
+  it("does not change either role for a malformed ATTACH payload", async () => {
+    const name = uniqueName();
+    const server = await startServer(name, "cat");
+    const terminalWrites = holdTerminalWrites(server);
+
+    const peeker = await connect(name);
+    const peekPackets = recordPackets(peeker);
+    peeker.write(encodePeek());
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.GEOMETRY)
+    );
+    expect(terminalWrites.pendingWrites).toHaveLength(1);
+    peeker.write(
+      Buffer.concat([
+        encodePacket(MessageType.ATTACH, Buffer.alloc(2)),
+        encodeStatus(),
+      ])
+    );
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const peekStatus = peekPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    expect(JSON.parse(peekStatus.payload.toString()).clients).toMatchObject({
+      attached: 0,
+      readOnly: 1,
+    });
+    await terminalWrites.releaseWrites();
+    await peekPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    terminalWrites.restore();
+
+    const attached = await connect(name);
+    const attachedPackets = recordPackets(attached);
+    attached.write(encodeAttach(20, 70));
+    await attachedPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.SCREEN)
+    );
+    attached.write(
+      Buffer.concat([
+        encodePacket(MessageType.ATTACH, Buffer.alloc(2)),
+        encodeStatus(),
+      ])
+    );
+    await attachedPackets.waitFor((received) =>
+      received.some((packet) => packet.type === MessageType.STATUS)
+    );
+    const status = attachedPackets.packets
+      .filter((packet) => packet.type === MessageType.STATUS)
+      .at(-1)!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({ attached: 1, readOnly: 1 });
+    expect(stats.terminal).toMatchObject({ rows: 20, cols: 70 });
+
+    peeker.destroy();
+    attached.destroy();
   });
 
   it("skips the redraw SIGWINCH nudge at the session's current size", async () => {
@@ -1397,6 +2076,160 @@ describe("STATUS message", () => {
 
     c1.destroy();
     peeker.destroy();
+    statsClient.destroy();
+  });
+
+  it("ignores RESIZE from a command socket until that socket attaches", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const attached = await connect(name);
+    const attachedPackets = recordPackets(attached);
+    attached.write(encodeAttach(24, 80));
+    await attachedPackets.waitFor((packets) =>
+      packets.some((packet) => packet.type === MessageType.SCREEN)
+    );
+
+    const command = await connect(name);
+    const commandPackets = recordPackets(command);
+    command.write(
+      Buffer.concat([
+        encodeData("command-input-remains-valid\n"),
+        encodeResize(13, 37),
+        encodeStatus(),
+      ])
+    );
+    await commandPackets.waitFor((packets) =>
+      packets.some((packet) => packet.type === MessageType.STATUS)
+    );
+    await attachedPackets.waitFor((packets) =>
+      packets.some(
+        (packet) =>
+          packet.type === MessageType.DATA &&
+          packet.payload.toString().includes("command-input-remains-valid")
+      )
+    );
+
+    const status = commandPackets.packets.find(
+      (packet) => packet.type === MessageType.STATUS
+    )!;
+    const stats = JSON.parse(status.payload.toString());
+    expect(stats.clients).toMatchObject({
+      total: 1,
+      attached: 1,
+      readOnly: 0,
+    });
+    expect(stats.terminal).toMatchObject({ rows: 24, cols: 80 });
+    expect(
+      commandPackets.packets.some((packet) => packet.type === MessageType.GEOMETRY)
+    ).toBe(false);
+    expect(
+      commandPackets.packets.some((packet) => packet.type === MessageType.SCREEN)
+    ).toBe(false);
+
+    attached.destroy();
+    command.destroy();
+  });
+
+  it("reports anonymous client geometry and per-axis constraints", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat");
+
+    const tall = await connect(name);
+    const tallReader = new PacketReader();
+    tall.write(encodeAttach(50, 80));
+    await waitForType(tall, tallReader, MessageType.SCREEN);
+
+    const wide = await connect(name);
+    const wideReader = new PacketReader();
+    wide.write(encodeAttach(30, 120));
+    await waitForType(wide, wideReader, MessageType.SCREEN);
+
+    const peeker = await connect(name);
+    const peekReader = new PacketReader();
+    peeker.write(encodePeek());
+    await waitForType(peeker, peekReader, MessageType.SCREEN);
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+
+    const packet = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.terminal).toMatchObject({ rows: 30, cols: 80 });
+    expect(stats.clients.connections).toHaveLength(3);
+    expect(stats.clients.connections).toEqual(expect.arrayContaining([
+      {
+        role: "writable",
+        rows: 50,
+        cols: 80,
+        lastRequestSequence: 1,
+        constrains: { rows: false, cols: true },
+      },
+      {
+        role: "writable",
+        rows: 30,
+        cols: 120,
+        lastRequestSequence: 2,
+        constrains: { rows: true, cols: false },
+      },
+      {
+        role: "readonly",
+        constrains: { rows: false, cols: false },
+      },
+    ]));
+
+    tall.destroy();
+    wide.destroy();
+    peeker.destroy();
+    statsClient.destroy();
+  });
+
+  it("relinquishes a writable client's geometry constraints when it peeks", async () => {
+    const name = uniqueName();
+    await startServer(name, "cat", [], { rows: 50, cols: 120 });
+
+    const smaller = await connect(name);
+    const smallerReader = new PacketReader();
+    smaller.write(encodeAttach(30, 80));
+    await waitForType(smaller, smallerReader, MessageType.SCREEN);
+
+    const larger = await connect(name);
+    const largerReader = new PacketReader();
+    larger.write(encodeAttach(50, 120));
+    await waitForType(larger, largerReader, MessageType.SCREEN);
+
+    const screenPromise = waitForType(smaller, smallerReader, MessageType.SCREEN);
+    const geometryPromise = waitForType(larger, largerReader, MessageType.GEOMETRY);
+    smaller.write(encodePeek());
+    const [, geometry] = await Promise.all([screenPromise, geometryPromise]);
+    expect(geometry.payload.readUInt16BE(0)).toBe(50);
+    expect(geometry.payload.readUInt16BE(2)).toBe(120);
+
+    const statsClient = await connect(name);
+    const statsReader = new PacketReader();
+    statsClient.write(encodeStatus());
+    const packet = await waitForType(statsClient, statsReader, MessageType.STATUS);
+    const stats = JSON.parse(packet.payload.toString());
+
+    expect(stats.terminal).toMatchObject({ rows: 50, cols: 120 });
+    expect(stats.clients.connections).toEqual(expect.arrayContaining([
+      {
+        role: "readonly",
+        constrains: { rows: false, cols: false },
+      },
+      {
+        role: "writable",
+        rows: 50,
+        cols: 120,
+        lastRequestSequence: 2,
+        constrains: { rows: true, cols: true },
+      },
+    ]));
+
+    smaller.destroy();
+    larger.destroy();
     statsClient.destroy();
   });
 

@@ -4,39 +4,48 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { attach, peek, send, queryStats, resolveSeqDelayMs, type StatsResult } from "./client.ts";
+import { attach, peek, send, queryStats, resolveSeqDelayMs, validateAttachStreamFdV1, type StatsResult } from "./client.ts";
 import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
   listSessions,
   getSession,
+  getSessionByName,
   gc,
   pruneOrphanLayoutTags,
   isGone,
   cleanupAll,
+  cleanupAllWhileLocked,
   cleanupSocket,
   cleanupOwnedAll,
   waitForProcessExit,
   validateName,
   validateDisplayName,
   acquireLock,
+  acquireRecoveryLock,
   isLockOwnedByPid,
   releaseLock,
+  releaseRecoveryLock,
   updateTags,
   setDisplayName,
-  allRefs,
+  patchMetadataById,
+  mutateMetadataUnderLock,
+  allSessionNames,
   readMetadata,
   readSessionPid,
   writeMetadata,
   atomicWriteFileSync,
   getSessionDir,
+  getSocketPath,
+  getPidPath,
+  getMetadataPath,
   DEFAULT_SESSION_DIR,
   type SessionInfo,
   type SessionMetadata,
 } from "./sessions.ts";
 import { spawnDaemon, resolveCommand } from "./spawn.ts";
 import {
-  EventFollower, EventWriter, EventType,
+  acquireEventLock, appendEventSyncLocked, EventFollower, EventWriter, EventType, releaseEventLock,
   readRecentEvents, formatEvent,
   emitUserEvent,
 } from "./events.ts";
@@ -44,6 +53,20 @@ import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
 import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
 import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import {
+  RECOVERY_PROTOCOL,
+  assertPrivateRecoveryPaths,
+  atomicWritePrivate,
+  readBoundedJson,
+  readProcessStartToken,
+  recoveryLockContents,
+  recoveryLockIdentity,
+  recoveryRequestPath,
+  recoveryResultPath,
+  signRecoveryRequest,
+  verifyRecoveryResult,
+  type RecoveryResult,
+} from "./recovery.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -88,7 +111,7 @@ Create a session and attach to it (use -d to leave it running in the background)
 
 Flags:
   --id <id>            Pin the on-disk id (sock/json filename; charset-validated, ≤ 104-byte sock path)
-  --name <label>       Explicit display label (any printable text, ≤ 500 chars)
+  --name <label>       Display label (trimmed, single-line, ≤ 160 Unicode scalars)
   --no-display-name    Skip the auto cwd+command label — just the id
   -d, --detach         Create in the background; don't attach
   -a, --attach         Create, OR attach if a session with the same id already exists
@@ -96,6 +119,7 @@ Flags:
                        (non-permanent sessions already self-remove by default)
   --tag key=value      Tag the session (repeatable)
   --env KEY=VALUE      Overlay a child environment variable (repeatable)
+  --unset-env KEY      Remove an inherited environment variable (repeatable)
   --tag keep=true      Exempt from reaping: keep metadata/logs after exit
   --cwd <path>         Working directory for the command
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
@@ -105,7 +129,7 @@ Examples:
   pty run -- node server.js
   pty run -d --name "API" --tag role=web --env PORT=3000 -- node server.js`,
 
-  attach: `Usage: pty attach [-r|--no-restart] [--force] [--remote <peer>] <ref>
+  attach: `Usage: pty attach [-r|--no-restart] [--force] [--remote <peer>] [--attach-stream-fd-v1 <fd>] <ref>
 
 Reconnect to a session (alias: pty a). Detach again with Ctrl+\\.
 
@@ -116,6 +140,10 @@ Flags:
   --force              Attach even from inside another pty session (nested)
   --remote <peer>      Attach a session on a fabric peer (over fabric); <ref> is
                        the session's name/id ON THE REMOTE
+  --attach-stream-fd-v1 <fd>
+                       Machine mode for a running session. Write ordered framed
+                       GEOMETRY, SCREEN, DATA, and terminal EXIT or DETACH outcome
+                       to inherited fd (>= 3); keep stdin/stdout controlling TTY
 
 Examples:
   pty attach myserver
@@ -266,6 +294,17 @@ SIGTERM a running session's daemon. Metadata is kept — restart or \`pty rm\` i
 Examples:
   pty kill myserver`,
 
+  recover: `Usage: pty recover <name> --snapshot <metadata.json>
+
+Ask the original supporting daemon to republish an externally unlinked socket
+and registry without signaling or restarting its PTY child.
+
+The snapshot must have been captured from the same selected PTY_ROOT before
+the registry was unlinked and must advertise a recovery capability.
+
+Example:
+  pty --root /state/pty recover myserver --snapshot ./myserver.json`,
+
   rm: `Usage: pty rm <ref>
 
 Remove an exited session's files (socket/pid/json/events) (alias: pty remove).
@@ -347,12 +386,27 @@ Examples:
        pty rename --show <ref>                Show the current displayName
        pty rename --clear [ref]               Clear the displayName
 
-displayName is a mutable alias; the session's stable id (name) never changes.
+displayName is a mutable, non-unique label; the session's stable id (name) never changes.
+An ambiguous displayName must be replaced with one of the reported stable ids.
 
 Examples:
   pty rename my-friendly-name
   pty rename webapp "Web Frontend"
   pty rename --show webapp`,
+
+  metadata: `Usage: pty metadata patch --id <stable-id>
+
+Atomically merge displayName and tags for one exact stable session id. Reads
+one JSON object from stdin; it never resolves display-name aliases.
+
+Patch fields:
+  displayName   string to set, null to clear, omitted to preserve
+  tags          object of string values to set and null values to remove
+
+Examples:
+  pty metadata patch --id a1b2c3d4 < patch.json
+  printf '%s' '{"displayName":"Worker","tags":{"role":"worker"}}' | pty metadata patch --id a1b2c3d4
+  printf '%s' '{"displayName":null,"tags":{"temporary":null}}' | pty metadata patch --id a1b2c3d4`,
 
   up: `Usage: pty up [<dir>] [<name>...]
 
@@ -400,13 +454,14 @@ function usage(): void {
 Create sessions:
   pty run -- <command> [args...]          Create a session and attach (random id + auto display label)
   pty run --id <id> -- <command>          Pin the on-disk id (sock / json filename; charset-validated)
-  pty run --name <label> -- <command>     Set an explicit display label (any printable, ≤ 500 chars)
+  pty run --name <label> -- <command>     Set a trimmed, single-line display label (≤ 160 Unicode scalars)
   pty run --no-display-name -- <cmd>      Skip the friendly cwd+command label (just an id)
   pty run -d -- <command>                 Create in the background (detached)
   pty run -a -- <command>                 Create OR attach if a session with the same id already exists
   pty run -e -- <command>                 Ephemeral: auto-remove metadata on clean exit
   pty run --tag key=value -- <command>    Tag a session (repeatable)
   pty run --env KEY=VALUE -- <command>    Overlay child environment (repeatable; persisted for restart)
+  pty run --unset-env KEY -- <command>    Remove inherited environment (repeatable; persisted for restart)
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
@@ -450,6 +505,7 @@ Observe:
   pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 
 Modify:
+  pty metadata patch --id <id>            Atomically merge displayName/tags from JSON stdin
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName
@@ -468,6 +524,7 @@ Lifecycle:
   pty restart <ref>                       SIGTERM + respawn using stored metadata (prompts if running)
   pty restart -y <ref>                    Same, no prompt
   pty kill <ref>                          SIGTERM a running session's daemon
+  pty recover <name> --snapshot <file>    Rebind a supporting live daemon after registry unlink
   pty rm <ref>                            Remove an exited session's metadata (alias: pty remove)
   pty gc                                  Reconciliation pass: orphan-kill, abandoned-reap,
                                           permanent-respawn, exited-sweep
@@ -496,8 +553,9 @@ Global:
   pty test [watch | -t "pattern"]         Run the pty test suite (vitest passthrough)
 
 Session references (<ref>): the on-disk id (validated: [A-Za-z0-9._-], ≤ 255 chars,
-socket path ≤ 104 bytes), or a displayName. Inside a session, most commands default
-to $PTY_SESSION when the ref is omitted (see 'pty rename', 'pty exec', 'pty emit').
+socket path ≤ 104 bytes), or a displayName. Stable ids always win; a displayName
+resolves only when unique. Inside a session, most commands default to $PTY_SESSION
+when the ref is omitted (see 'pty rename', 'pty exec', 'pty emit').
 
 Env:
   PTY_ROOT                Registry dir (default ~/.local/state/pty). Canonical.
@@ -690,6 +748,7 @@ async function main(): Promise<void> {
       let cwd: string | null = null;
       const tags: Record<string, string> = {};
       const extraEnv: Record<string, string> = {};
+      const unsetEnv: string[] = [];
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
@@ -718,6 +777,15 @@ async function main(): Promise<void> {
             process.exit(1);
           }
           extraEnv[assignment.slice(0, eq)] = assignment.slice(eq + 1);
+          i += 2;
+        }
+        else if (args[i] === "--unset-env" && i + 1 < args.length) {
+          const key = args[i + 1];
+          if (key.length === 0 || key.includes("=")) {
+            console.error(`Invalid env key: "${key}". Use --unset-env KEY`);
+            process.exit(1);
+          }
+          if (!unsetEnv.includes(key)) unsetEnv.push(key);
           i += 2;
         }
         else break;
@@ -788,7 +856,9 @@ async function main(): Promise<void> {
         // --force path above is the documented way to override that.
         const lookupRef = explicitId ?? explicitDisplayName;
         if (attachExisting && lookupRef) {
-          const existing = await getSession(lookupRef);
+          const existing = explicitId
+            ? await getSessionByName(explicitId)
+            : await getSession(lookupRef);
           if (existing && existing.status === "running") {
             ensureNotNested("run -a", {
               force: false,
@@ -801,18 +871,21 @@ async function main(): Promise<void> {
         console.error(
           `Already inside pty session "${process.env.PTY_SESSION}", running directly.`
         );
+        const directEnv = { ...process.env };
+        for (const key of unsetEnv) delete directEnv[key];
+        Object.assign(directEnv, extraEnv);
         const result = spawnSync(cmd, cmdArgs, {
           stdio: "inherit",
-          env: { ...process.env, ...extraEnv },
+          env: directEnv,
         });
         process.exit(result.status ?? 1);
       }
 
-      const existingRefs = await allRefs();
+      const existingNames = await allSessionNames();
 
       // Resolve `name` (the on-disk id). If --id was passed, validate and use
       // it verbatim; otherwise generate a short random id. Charset, length,
-      // and uniqueness checks are all done up front so automation fails
+      // and stable-id uniqueness checks are all done up front so automation fails
       // loudly rather than hitting EINVAL/ENAMETOOLONG deep in spawn.
       //
       // Uniqueness exception: under `-a` (attach-or-create), a collision
@@ -826,8 +899,8 @@ async function main(): Promise<void> {
           console.error(e.message);
           process.exit(1);
         }
-        if (existingRefs.has(explicitId) && !attachExisting) {
-          console.error(`Session id "${explicitId}" is already in use (as a name or displayName).`);
+        if (existingNames.has(explicitId) && !attachExisting) {
+          console.error(`Session id "${explicitId}" is already in use.`);
           process.exit(1);
         }
         name = explicitId;
@@ -835,7 +908,7 @@ async function main(): Promise<void> {
         let candidate: string | null = null;
         for (let attempt = 0; attempt < 8; attempt++) {
           const c = randomSessionName();
-          if (!existingRefs.has(c)) { candidate = c; break; }
+          if (!existingNames.has(c)) { candidate = c; break; }
         }
         if (!candidate) {
           console.error("Could not generate a unique session id after 8 attempts.");
@@ -846,9 +919,8 @@ async function main(): Promise<void> {
 
       // Resolve `displayName`. Precedence:
       //   1. --no-display-name → null
-      //   2. --name <x>         → x (validated permissively, deduped only
-      //                            against existing refs)
-      //   3. otherwise          → auto cwd+cmd label (sanitized + deduped)
+      //   2. --name <x>         → x (validated permissively)
+      //   3. otherwise          → auto cwd+cmd label (sanitized)
       let displayName: string | null = null;
       if (!noDisplayName) {
         if (explicitDisplayName) {
@@ -858,31 +930,17 @@ async function main(): Promise<void> {
             console.error(`Invalid displayName: ${e.message}`);
             process.exit(1);
           }
-          if (explicitDisplayName === name) {
-            console.error(`displayName cannot equal the session's id ("${name}").`);
-            process.exit(1);
-          }
-          if (existingRefs.has(explicitDisplayName)) {
-            console.error(`"${explicitDisplayName}" is already in use by another session (as a name or displayName).`);
-            process.exit(1);
-          }
           displayName = explicitDisplayName;
         } else {
           let candidate = autoName(autoNameCmd, cmdArgs);
           candidate = candidate.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-          if (existingRefs.has(candidate) || candidate === name) {
-            for (let n = 2; ; n++) {
-              const c = `${candidate}-${n}`;
-              if (!existingRefs.has(c) && c !== name) { candidate = c; break; }
-            }
-          }
           displayName = candidate;
         }
       }
 
       await cmdRun(
         name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral,
-        tags, cwd, isolateEnv, displayName, extraEnv,
+        tags, cwd, isolateEnv, displayName, extraEnv, unsetEnv,
       );
       break;
     }
@@ -894,12 +952,20 @@ async function main(): Promise<void> {
       let force = false;
       let attachName: string | null = null;
       let attachRemotePeer: string | null = null;
+      let attachStreamFdV1: number | undefined;
       for (let ai = 1; ai < args.length; ai++) {
         const a = args[ai];
         if (a === "--auto-restart" || a === "-r") autoRestart = true;
         else if (a === "--no-restart") noRestart = true;
         else if (a === "--force") force = true;
         else if (a === "--remote" && ai + 1 < args.length) { attachRemotePeer = args[++ai]; }
+        else if (a === "--attach-stream-fd-v1") {
+          if (ai + 1 >= args.length) {
+            console.error("pty attach: --attach-stream-fd-v1 requires a file descriptor");
+            process.exit(1);
+          }
+          attachStreamFdV1 = Number(args[++ai]);
+        }
         else if (!attachName) attachName = a;
         else {
           console.error(`pty attach: unexpected argument "${a}"`);
@@ -913,6 +979,18 @@ async function main(): Promise<void> {
       if (autoRestart && noRestart) {
         console.error("pty attach: --auto-restart and --no-restart are mutually exclusive");
         process.exit(1);
+      }
+      if (attachStreamFdV1 !== undefined) {
+        try {
+          validateAttachStreamFdV1(attachStreamFdV1);
+        } catch (error) {
+          console.error(`pty attach: ${(error as Error).message}`);
+          process.exit(1);
+        }
+        if (autoRestart) {
+          console.error("pty attach: --attach-stream-fd-v1 and --auto-restart are mutually exclusive");
+          process.exit(1);
+        }
       }
       // Nesting guard runs BEFORE name validation / ref resolution. A nested
       // caller gets the informative nesting message even if they mistyped
@@ -928,12 +1006,12 @@ async function main(): Promise<void> {
       });
       if (attachRemotePeer) {
         // The name is the session's id ON THE REMOTE — don't resolve locally.
-        await cmdAttachRemote(attachRemotePeer, attachName);
+        await cmdAttachRemote(attachRemotePeer, attachName, attachStreamFdV1);
       } else {
         const resolvedAttachName = await resolveRef(attachName);
         const restartPolicy: AttachRestartPolicy =
-          noRestart ? "never" : autoRestart ? "always" : "prompt";
-        await cmdAttach(resolvedAttachName, restartPolicy, force);
+          attachStreamFdV1 !== undefined || noRestart ? "never" : autoRestart ? "always" : "prompt";
+        await cmdAttach(resolvedAttachName, restartPolicy, force, attachStreamFdV1);
       }
       break;
     }
@@ -1277,6 +1355,23 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "recover": {
+      const recoverName = args[1];
+      const snapshotIndex = args.indexOf("--snapshot");
+      const snapshotPath = snapshotIndex >= 0 ? args[snapshotIndex + 1] : null;
+      if (!recoverName || !snapshotPath) {
+        console.error("Usage: pty recover <name> --snapshot <metadata.json>");
+        process.exit(1);
+      }
+      try {
+        await cmdRecover(recoverName, snapshotPath);
+      } catch (error) {
+        console.error(`pty recover: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+      }
+      break;
+    }
+
     case "gc": {
       const gcArgs = args.slice(1);
       const dryRun = gcArgs.some((a) => a === "--dry-run" || a === "-n");
@@ -1460,6 +1555,11 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "metadata": {
+      await cmdMetadata(args.slice(1));
+      break;
+    }
+
     case "rm":
     case "remove": {
       if (args.length < 2) {
@@ -1533,9 +1633,44 @@ async function cmdRun(
   isolateEnv = false,
   displayName: string | null = null,
   extraEnv: Record<string, string> = {},
+  unsetEnv: string[] = [],
 ): Promise<void> {
-  const session = await getSession(name);
+  let session = await getSessionByName(name);
+
+  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
+  const inheritedCreationLock =
+    Number.isSafeInteger(delegatedOwner) &&
+    isLockOwnedByPid(name, delegatedOwner);
+  // This is a one-hop control value for the CLI process, not session env.
+  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
+  let ownsEventLock = false;
+  let ownsCreationLock = false;
+  if (!inheritedCreationLock) {
+    if (!acquireEventLock(name)) {
+      console.error(`Session "${name}" event log is busy. Try again.`);
+      process.exit(1);
+    }
+    ownsEventLock = true;
+    if (!acquireLock(name)) {
+      releaseEventLock(name);
+      console.error(
+        `Session "${name}" is being created by another process. Try again.`
+      );
+      process.exit(1);
+    }
+    ownsCreationLock = true;
+    session = await getSessionByName(name);
+  }
+
   if (session?.status === "running") {
+    if (ownsCreationLock) {
+      releaseLock(name);
+      ownsCreationLock = false;
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     if (attachExisting) {
       console.log(`Session "${name}" already running, attaching.`);
       doAttach(name);
@@ -1547,29 +1682,20 @@ async function cmdRun(
     process.exit(1);
   }
 
-  const delegatedOwner = Number(process.env.PTY_CREATION_LOCK_OWNER_PID);
-  const inheritedCreationLock =
-    Number.isSafeInteger(delegatedOwner) &&
-    isLockOwnedByPid(name, delegatedOwner);
-  // This is a one-hop control value for the CLI process, not session env.
-  delete process.env.PTY_CREATION_LOCK_OWNER_PID;
-  if (!inheritedCreationLock && !acquireLock(name)) {
-    console.error(
-      `Session "${name}" is being created by another process. Try again.`
-    );
-    process.exit(1);
-  }
-
   // Clean up any dead session with the same name, but preserve cwd and tags
   // so that `run -a` re-creates the session in the original directory with original tags.
   const previousCwd = session && isGone(session.status) ? session.metadata?.cwd : undefined;
   const previousTags = session && isGone(session.status) ? session.metadata?.tags : undefined;
   const previousExtraEnv = session && isGone(session.status) ? session.metadata?.extraEnv : undefined;
-  if (session && isGone(session.status)) {
-    cleanupAll(name);
-  }
-
+  const previousUnsetEnv = session && isGone(session.status) ? session.metadata?.unsetEnv : undefined;
   try {
+    if (session && isGone(session.status) && !inheritedCreationLock) {
+      cleanupAllWhileLocked(name);
+    }
+    if (ownsEventLock) {
+      releaseEventLock(name);
+      ownsEventLock = false;
+    }
     const tagOpt = Object.keys(tags).length > 0 ? tags : previousTags;
     const cwdOpt = explicitCwd ?? previousCwd;
     // If the session had a previous displayName (e.g., it was renamed before
@@ -1578,14 +1704,18 @@ async function cmdRun(
     const prevDisplayName = session && isGone(session.status) ? session.metadata?.displayName : undefined;
     const displayNameOpt = displayName ?? prevDisplayName;
     const extraEnvOpt = Object.keys(extraEnv).length > 0 ? extraEnv : previousExtraEnv;
+    const unsetEnvOpt = unsetEnv.length > 0 ? unsetEnv : previousUnsetEnv;
     await spawnDaemon({
       name, command, args, displayCommand, cwd: cwdOpt, ephemeral, tags: tagOpt,
+      creationLockOwnerPid: inheritedCreationLock ? delegatedOwner : process.pid,
       ...(displayNameOpt ? { displayName: displayNameOpt } : {}),
       ...(isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
+      ...(unsetEnvOpt && unsetEnvOpt.length > 0 ? { unsetEnv: unsetEnvOpt } : {}),
     });
   } finally {
-    if (!inheritedCreationLock) releaseLock(name);
+    if (ownsEventLock) releaseEventLock(name);
+    if (ownsCreationLock) releaseLock(name);
   }
 
   console.log(`Session "${name}" created.`);
@@ -1603,6 +1733,7 @@ async function cmdAttach(
   name: string,
   restartPolicy: AttachRestartPolicy = "prompt",
   _force = false,
+  attachStreamFdV1?: number,
 ): Promise<void> {
   // Nesting guard runs in the dispatcher (before name resolution) so the
   // user gets the nesting hint even for typo'd refs. cmdAttach itself is
@@ -1617,7 +1748,7 @@ async function cmdAttach(
   }
 
   if (session.status === "running") {
-    doAttach(name);
+    doAttach(name, attachStreamFdV1);
     return;
   }
 
@@ -1681,9 +1812,10 @@ async function handleDeadSession(
   doAttach(session.name);
 }
 
-function doAttach(name: string): void {
+function doAttach(name: string, attachStreamFdV1?: number): void {
   attach({
     name,
+    ...(attachStreamFdV1 !== undefined ? { attachStreamFdV1 } : {}),
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
   });
@@ -1695,16 +1827,16 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     console.error("pty exec: not inside a pty session (PTY_SESSION not set).");
     process.exit(1);
   }
+  const ownerGeneration = process.env.PTY_SESSION_GENERATION;
+  if (!ownerGeneration) {
+    throw new Error(
+      "pty exec: current session has no generation owner token; restart it before using pty exec.",
+    );
+  }
 
   const meta = readMetadata(sessionName);
   if (!meta) {
     console.error(`pty exec: session "${sessionName}" metadata not found.`);
-    process.exit(1);
-  }
-
-  if (meta.tags?.ptyfile) {
-    console.error(`pty exec: session "${sessionName}" is managed by ${meta.tags.ptyfile}`);
-    console.error("Edit the pty.toml to change the command instead.");
     process.exit(1);
   }
 
@@ -1717,26 +1849,45 @@ async function cmdExec(command: string, cmdArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Update metadata with the new command
-  const previousCommand = meta.displayCommand ?? [meta.command, ...(meta.args ?? [])].join(" ");
   const displayCommand = [command, ...cmdArgs].join(" ");
-  writeMetadata(sessionName, {
-    ...meta,
-    command: resolved,
-    args: cmdArgs,
-    displayCommand,
-  });
+  if (!acquireEventLock(sessionName)) {
+    throw new Error(`pty exec: session "${sessionName}" event log is busy; retry the operation.`);
+  }
+  try {
+    let previousCommand = "";
+    const result = mutateMetadataUnderLock(sessionName, (current) => {
+      if (current.tags?.ptyfile) {
+        throw new Error(
+          `pty exec: session "${sessionName}" is managed by ${current.tags.ptyfile}. ` +
+          "Edit the pty.toml to change the command instead.",
+        );
+      }
+      previousCommand = current.displayCommand ??
+        [current.command, ...(current.args ?? [])].join(" ");
+      current.command = resolved;
+      current.args = cmdArgs;
+      current.displayCommand = displayCommand;
+      return true;
+    }, {
+      expectedGeneration: ownerGeneration,
+      onPublished: () => appendEventSyncLocked(sessionName, {
+        session: sessionName,
+        type: EventType.SESSION_EXEC,
+        ts: new Date().toISOString(),
+        previousCommand,
+        command: displayCommand,
+      }),
+    });
 
-  // Emit exec event
-  const writer = new EventWriter(sessionName);
-  writer.append({
-    session: sessionName,
-    type: EventType.SESSION_EXEC,
-    ts: new Date().toISOString(),
-    previousCommand,
-    command: displayCommand,
-  } as any);
-  await writer.flush();
+    if (result.status !== "changed") {
+      const reason = result.status === "generation-mismatch"
+        ? "belongs to a replacement generation"
+        : `could not be updated (${result.status})`;
+      throw new Error(`pty exec: session "${sessionName}" ${reason}; command was not run.`);
+    }
+  } finally {
+    releaseEventLock(sessionName);
+  }
 
   // Replace this process with the new command
   const result = spawnSync(resolved, cmdArgs, {
@@ -1878,7 +2029,7 @@ async function cmdSendRemote(
 /** `pty attach --remote <peer> <name>`: dial the peer's exposed pty control
  *  socket over fabric, route it to the named remote session, and attach over
  *  that tunnel — the resilient shell is a long-lived remote pty you attach to. */
-async function cmdAttachRemote(peer: string, name: string): Promise<void> {
+async function cmdAttachRemote(peer: string, name: string, attachStreamFdV1?: number): Promise<void> {
   let socket;
   try {
     socket = await dialAndRoute(peer, name);
@@ -1889,6 +2040,7 @@ async function cmdAttachRemote(peer: string, name: string): Promise<void> {
   attach({
     name,
     socket,
+    ...(attachStreamFdV1 !== undefined ? { attachStreamFdV1 } : {}),
     // On a loud fabric close, re-dial + re-route to the same remote session and
     // re-attach (the daemon replays its screen, so the session resumes). A
     // recoverable transport stall keeps the socket open, so it's just waited out.
@@ -2475,10 +2627,206 @@ async function cmdKill(name: string): Promise<void> {
   }
 }
 
+async function cmdRecover(name: string, snapshotPath: string): Promise<void> {
+  validateName(name);
+  const root = path.resolve(getSessionDir());
+  const snapshot = readBoundedJson<SessionMetadata>(path.resolve(snapshotPath));
+  const capability = snapshot.recovery;
+  if (
+    capability?.protocol !== RECOVERY_PROTOCOL ||
+    typeof capability.secret !== "string" ||
+    typeof capability.metadataRevision !== "string" ||
+    capability.metadataRevision.length === 0 ||
+    !snapshot.generation ||
+    !snapshot.daemonPid
+  ) {
+    throw new Error("snapshot does not advertise supported recovery");
+  }
+  assertPrivateRecoveryPaths(root, capability);
+  if (readProcessStartToken(snapshot.daemonPid) !== capability.processStartToken) {
+    throw new Error("daemon PID/start identity no longer matches the snapshot");
+  }
+  const lockIdentity = recoveryLockIdentity({
+    name,
+    daemonPid: snapshot.daemonPid,
+    processStartToken: capability.processStartToken,
+    rootDevice: capability.rootDevice,
+    rootInode: capability.rootInode,
+    recoveryDirDevice: capability.recoveryDirDevice,
+    recoveryDirInode: capability.recoveryDirInode,
+  });
+  const lockContents = recoveryLockContents(snapshot.daemonPid, lockIdentity);
+  if (!acquireRecoveryLock(name, lockContents)) {
+    throw new Error(`session "${name}" is being created by another process`);
+  }
+
+  const requestPath = recoveryRequestPath(root, name);
+  const resultPath = recoveryResultPath(root, name);
+  try {
+    const targets = [
+      getSocketPath(name),
+      getPidPath(name),
+      getMetadataPath(name),
+    ];
+    if (targets.some((target) => fs.existsSync(target))) {
+      const current = readMetadata(name);
+      if (
+        !targets.every((target) => fs.existsSync(target)) ||
+        !current ||
+        current.daemonPid !== snapshot.daemonPid ||
+        current.generation !== snapshot.generation ||
+        current.recovery?.processStartToken !== capability.processStartToken ||
+        current.recovery.launchIdentity !== capability.launchIdentity
+      ) {
+        throw new Error("recovery target is no longer empty");
+      }
+      const stats = await queryStats(name);
+      if (stats.daemon.pid !== snapshot.daemonPid) {
+        throw new Error("republished socket reached a different daemon");
+      }
+      console.log(`Session "${name}" registry recovered without restart.`);
+      return;
+    }
+    assertPrivateRecoveryPaths(root, capability);
+    try { fs.unlinkSync(resultPath); } catch {}
+    const nonce = randomBytes(16).toString("hex");
+    const request = signRecoveryRequest(capability.secret, {
+      protocol: RECOVERY_PROTOCOL,
+      name,
+      daemonPid: snapshot.daemonPid,
+      generation: snapshot.generation,
+      processStartToken: capability.processStartToken,
+      launchIdentity: capability.launchIdentity,
+      rootDevice: capability.rootDevice,
+      rootInode: capability.rootInode,
+      lockIdentity,
+      nonce,
+      metadata: snapshot,
+    });
+    assertPrivateRecoveryPaths(root, capability);
+    atomicWritePrivate(requestPath, request);
+
+    const deadline = Date.now() + 7000;
+    let nextNotify = Date.now() + 250;
+    let result: RecoveryResult | null = null;
+    while (Date.now() < deadline) {
+      try {
+        const candidate = readBoundedJson<RecoveryResult>(resultPath);
+        if (candidate.nonce === nonce) {
+          result = candidate;
+          break;
+        }
+      } catch {}
+      if (Date.now() >= nextNotify) {
+        assertPrivateRecoveryPaths(root, capability);
+        atomicWritePrivate(requestPath, request);
+        nextNotify = Date.now() + 250;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!result) throw new Error("supporting daemon did not answer recovery request");
+    if (!verifyRecoveryResult(capability.secret, result)) {
+      throw new Error("daemon recovery response authentication failed");
+    }
+    if (!result.ok) throw new Error(result.error ?? "daemon refused recovery");
+    if (
+      result.daemonPid !== snapshot.daemonPid ||
+      result.generation !== snapshot.generation ||
+      result.processStartToken !== capability.processStartToken ||
+      result.launchIdentity !== capability.launchIdentity
+    ) {
+      throw new Error("daemon recovery response changed identity");
+    }
+
+    const current = readMetadata(name);
+    if (
+      !current ||
+      current.daemonPid !== snapshot.daemonPid ||
+      current.generation !== snapshot.generation ||
+      current.recovery?.processStartToken !== capability.processStartToken ||
+      current.recovery.launchIdentity !== capability.launchIdentity
+    ) {
+      throw new Error("republished metadata changed identity");
+    }
+    const stats = await queryStats(name);
+    if (stats.daemon.pid !== snapshot.daemonPid) {
+      throw new Error("republished socket reached a different daemon");
+    }
+    console.log(`Session "${name}" registry recovered without restart.`);
+  } finally {
+    try {
+      assertPrivateRecoveryPaths(root, capability);
+      try { fs.unlinkSync(requestPath); } catch {}
+      try { fs.unlinkSync(resultPath); } catch {}
+    } catch {}
+    releaseRecoveryLock(name, lockContents);
+  }
+}
+
 function renameUsage(): void {
   // Single source of truth: the same text `pty rename --help` prints, to stderr
   // for the error paths.
   console.error(COMMAND_HELP.rename);
+}
+
+async function cmdMetadata(rawArgs: string[]): Promise<void> {
+  if (rawArgs[0] === "patch" && (rawArgs[1] === "-h" || rawArgs[1] === "--help")) {
+    printCommandHelp("metadata");
+    return;
+  }
+  if (rawArgs[0] !== "patch") {
+    console.error('pty metadata: expected subcommand "patch".');
+    console.error("  Usage: pty metadata patch --id <stable-id>");
+    process.exit(1);
+  }
+
+  let id: string | null = null;
+  for (let i = 1; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === "--id") {
+      const value = rawArgs[++i];
+      if (!value) {
+        console.error("pty metadata patch: --id requires a stable session id.");
+        process.exit(1);
+      }
+      if (id !== null) {
+        console.error("pty metadata patch: --id may only be provided once.");
+        process.exit(1);
+      }
+      id = value;
+    } else {
+      console.error(`pty metadata patch: unexpected argument "${arg}".`);
+      console.error("  Usage: pty metadata patch --id <stable-id>");
+      process.exit(1);
+    }
+  }
+  if (id === null) {
+    console.error("pty metadata patch: missing required --id <stable-id>.");
+    process.exit(1);
+  }
+
+  const input = fs.readFileSync(0, "utf-8").trim();
+  if (input.length === 0) {
+    console.error("pty metadata patch: expected one JSON patch object on stdin.");
+    console.error('  Example: printf \'%s\' \'{"displayName":"Worker"}\' | pty metadata patch --id a1b2c3d4');
+    process.exit(1);
+  }
+
+  let patch: unknown;
+  try {
+    patch = JSON.parse(input);
+  } catch (e) {
+    console.error(`pty metadata patch: invalid JSON on stdin: ${(e as Error).message}`);
+    process.exit(1);
+  }
+
+  try {
+    const result = await patchMetadataById(id, patch as any);
+    console.log(JSON.stringify(result));
+  } catch (e) {
+    console.error(`pty metadata patch: ${(e as Error).message}`);
+    process.exit(1);
+  }
 }
 
 async function cmdRename(rawArgs: string[]): Promise<void> {
@@ -2573,25 +2921,12 @@ async function cmdRename(rawArgs: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Display names can be arbitrary printable text (spaces, punctuation, any
-  // length up to 500 chars). The on-disk id (`name`) carries the strict
-  // charset and the sock-path-length constraint; display names don't.
+  // Display names are bounded, single-line presentation metadata. The on-disk
+  // id (`name`) carries the strict charset and sock-path-length constraint.
   try {
     validateDisplayName(newDisplay);
   } catch (e: any) {
     console.error(`Invalid displayName: ${e.message}`);
-    process.exit(1);
-  }
-
-  // Uniqueness across (name ∪ displayName), excluding the target session itself.
-  const refs = await allRefs();
-  const currentDn = (await getSession(targetName))?.metadata?.displayName;
-  if (newDisplay === targetName) {
-    console.error(`displayName cannot equal the session's id ("${targetName}").`);
-    process.exit(1);
-  }
-  if (refs.has(newDisplay) && newDisplay !== currentDn) {
-    console.error(`"${newDisplay}" is already in use by another session (as a name or displayName).`);
     process.exit(1);
   }
 
@@ -2682,6 +3017,12 @@ async function cmdGc(
       : a.reason;
     console.log(`${abandonVerb}: ${a.name} (${detail})`);
   }
+  for (const skipped of result.reapSkipped) {
+    const phase = skipped.signalled ? "after signalling" : "before signalling";
+    console.log(
+      `Skipped ${skipped.operation} reap: ${skipped.name} (${skipped.reason}, ${phase})`,
+    );
+  }
   for (const r of result.respawned) {
     const note = r.ptyfileReread ? " (pty.toml re-read)" : "";
     console.log(`${respawnVerb}: ${r.name}${note}`);
@@ -2718,6 +3059,7 @@ async function cmdGc(
   const totalActions =
     result.killedOrphanChildren.length +
     result.abandoned.length +
+    result.reapSkipped.length +
     result.respawned.length +
     result.respawnFailed.length +
     result.flapped.length +
@@ -2736,6 +3078,9 @@ async function cmdGc(
   }
   if (result.abandoned.length > 0) {
     parts.push(`${result.abandoned.length} abandoned`);
+  }
+  if (result.reapSkipped.length > 0) {
+    parts.push(`${result.reapSkipped.length} reap skip${result.reapSkipped.length === 1 ? "" : "s"}`);
   }
   if (result.respawned.length > 0) {
     parts.push(`${result.respawned.length} respawn${result.respawned.length === 1 ? "" : "s"}`);
@@ -2798,8 +3143,8 @@ function printLaunchdPlist(interval: number): void {
   const escape = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  // We point ProgramArguments at node + the resolved CLI script so the
-  // plist doesn't depend on the `pty` shim staying on PATH at launchd's
+  // We point ProgramArguments at node + the invoked launcher or CLI script so
+  // the plist doesn't depend on the `pty` shim staying on PATH at launchd's
   // (minimal) shell. EnvironmentVariables still carries PATH so the
   // spawned children (and any `which` inside pty itself) find the user's
   // tools. PTY_ROOT (canonical) pins the target registry.
@@ -3184,7 +3529,7 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
     s.metadata?.tags?.ptyfile === tomlPath &&
     s.metadata?.tags?.["ptyfile.session"] === shortName
   );
-  const allRefSet = await allRefs();
+  const allNameSet = await allSessionNames();
 
   let started = 0;
   let skipped = 0;
@@ -3260,7 +3605,14 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
 
     // Clean up an exited bound session so its slot can be reused.
     if (bound && isGone(bound.status)) {
-      cleanupAll(bound.name);
+      const label = bound.metadata?.displayName ?? bound.name;
+      try {
+        cleanupAll(bound.name);
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+        skipped++;
+        continue;
+      }
     }
 
     // Pick the on-disk id: honor the pty.toml's `id = "..."` if set,
@@ -3274,17 +3626,17 @@ async function cmdUp(dir: string | undefined, names: string[]): Promise<void> {
         console.error(`  ✗ ${sess.displayName}: ${e.message}`);
         continue;
       }
-      if (allRefSet.has(sess.id)) {
-        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use (as a name or displayName).`);
+      if (allNameSet.has(sess.id)) {
+        console.error(`  ✗ ${sess.displayName}: id "${sess.id}" is already in use.`);
         continue;
       }
       name = sess.id;
-      allRefSet.add(sess.id);
+      allNameSet.add(sess.id);
     } else {
       let candidate: string | null = null;
       for (let attempt = 0; attempt < 8; attempt++) {
         const c = randomSessionName();
-        if (!allRefSet.has(c)) { candidate = c; allRefSet.add(c); break; }
+        if (!allNameSet.has(c)) { candidate = c; allNameSet.add(c); break; }
       }
       if (!candidate) {
         console.error(`  ✗ ${sess.displayName}: could not generate a unique session id after 8 attempts.`);
@@ -3375,9 +3727,13 @@ async function cmdDown(dir: string | undefined, names: string[]): Promise<void> 
       }
       cleanupSocket(existingSession.name);
     } else if (isGone(existingSession.status)) {
-      cleanupAll(existingSession.name);
-      console.log(`  ○ ${label} (cleaned up)`);
-      stopped++;
+      try {
+        cleanupAll(existingSession.name);
+        console.log(`  ○ ${label} (cleaned up)`);
+        stopped++;
+      } catch (error) {
+        console.error(`  ✗ ${label}: ${(error as Error).message}`);
+      }
     }
   }
 
@@ -3428,6 +3784,7 @@ function persistedLaunchOptions(meta: SessionMetadata) {
     ...(meta.ephemeral !== undefined ? { ephemeral: meta.ephemeral } : {}),
     ...(meta.isolateEnv ? { isolateEnv: true } : {}),
     ...(meta.extraEnv && Object.keys(meta.extraEnv).length > 0 ? { extraEnv: meta.extraEnv } : {}),
+    ...(meta.unsetEnv && meta.unsetEnv.length > 0 ? { unsetEnv: meta.unsetEnv } : {}),
     ...(meta.env ? { env: meta.env } : {}),
   };
 }

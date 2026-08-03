@@ -11,6 +11,7 @@ import {
   encodeAttach,
   encodeData,
   encodeResize,
+  decodeGeometry,
 } from "../protocol.ts";
 import { getSocketPath } from "../sessions.ts";
 import { resolveKey } from "../keys.ts";
@@ -64,6 +65,8 @@ export class Session {
   private backend: Backend;
   private _rows: number;
   private _cols: number;
+  private _requestedRows: number;
+  private _requestedCols: number;
 
   private constructor(
     terminal: Terminal,
@@ -77,6 +80,8 @@ export class Session {
     this.backend = backend;
     this._rows = rows;
     this._cols = cols;
+    this._requestedRows = rows;
+    this._requestedCols = cols;
   }
 
   // ── Factories ──
@@ -190,8 +195,8 @@ export class Session {
       throw new Error("connectToExisting() requires a server-mode session");
     }
 
-    const rows = opts.rows ?? existing._rows;
-    const cols = opts.cols ?? existing._cols;
+    const rows = opts.rows ?? existing._requestedRows;
+    const cols = opts.cols ?? existing._requestedCols;
 
     const terminal = new xterm.Terminal({
       rows,
@@ -357,7 +362,7 @@ export class Session {
         resolve();
       });
     });
-    backend.socket.write(encodeAttach(this._rows, this._cols));
+    backend.socket.write(encodeAttach(this._requestedRows, this._requestedCols));
     await screenPromise;
   }
 
@@ -378,10 +383,9 @@ export class Session {
     if (this.backend.kind !== "server") {
       throw new Error("resize() is only available in server mode");
     }
-    this._rows = rows;
-    this._cols = cols;
+    this._requestedRows = rows;
+    this._requestedCols = cols;
     this.backend.socket.write(encodeResize(rows, cols));
-    this.terminal.resize(cols, rows);
   }
 
   // ── Lifecycle ──
@@ -426,6 +430,13 @@ export class Session {
       }
       for (const packet of packets) {
         switch (packet.type) {
+          case MessageType.GEOMETRY: {
+            const geometry = decodeGeometry(packet.payload);
+            this._rows = geometry.rows;
+            this._cols = geometry.cols;
+            this.terminal.resize(geometry.cols, geometry.rows);
+            break;
+          }
           case MessageType.SCREEN:
             this.terminal.reset();
             this.terminal.write(packet.payload.toString(), () => {

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { readRecentEvents } from "../src/events.ts";
+import { acquireLock, releaseLock } from "../src/sessions.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -75,6 +76,27 @@ function readMeta(sessionDir: string, name: string): any {
   } catch { return null; }
 }
 
+function readEvents(sessionDir: string, name: string): any[] {
+  try {
+    return fs.readFileSync(path.join(sessionDir, `${name}.events.jsonl`), "utf-8")
+      .trimEnd()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function execEnv(sessionDir: string, name: string, generation?: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PTY_SESSION_DIR: sessionDir,
+    PTY_SESSION: name,
+    PTY_SESSION_GENERATION: generation ?? readMeta(sessionDir, name).generation,
+  };
+}
+
 afterEach(async () => {
   await terminateAndWait(bgPids);
   bgPids = [];
@@ -94,7 +116,7 @@ describe("pty exec", () => {
 
     // Run pty exec inside the session (simulate via PTY_SESSION env var)
     const result = spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "hello-from-exec"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -132,7 +154,7 @@ describe("pty exec", () => {
     });
 
     const result = spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "hi"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -147,7 +169,7 @@ describe("pty exec", () => {
     await startDaemon(dir, name, "bash", [], { role: "dev", strategy: "permanent" });
 
     spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "tagged"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -164,7 +186,7 @@ describe("pty exec", () => {
     await startDaemon(dir, name, "bash");
 
     const result = spawnSync(nodeBin, [cliPath, "exec", "--", "sh", "-c", "exit 42"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -190,7 +212,7 @@ describe("pty exec", () => {
 
     process.env.PTY_SESSION_DIR = dir;
     spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "swapped"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -210,12 +232,74 @@ describe("pty exec", () => {
     await startDaemon(dir, name, "bash");
 
     const result = spawnSync(nodeBin, [cliPath, "exec", "--", "/nonexistent/cmd"], {
-      env: { ...process.env, PTY_SESSION_DIR: dir, PTY_SESSION: name },
+      env: execEnv(dir, name),
       encoding: "utf-8",
       timeout: 10000,
     });
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("not found");
+  }, 15000);
+
+  it("does not overwrite a concurrent metadata writer while its lock is held", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "bash", [], { role: "original" });
+    const previousRoot = process.env.PTY_SESSION_DIR;
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireLock(name)).toBe(true);
+    try {
+      const current = readMeta(dir, name);
+      fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+        ...current,
+        displayName: "concurrent-label",
+        tags: { ...current.tags, role: "concurrent" },
+      }));
+      const result = spawnSync(nodeBin, [cliPath, "exec", "--", "echo", "must-not-run"], {
+        env: execEnv(dir, name),
+        encoding: "utf-8",
+        timeout: 10000,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("busy");
+      expect(readMeta(dir, name)).toMatchObject({
+        displayName: "concurrent-label",
+        tags: { role: "concurrent" },
+        displayCommand: "bash",
+      });
+    } finally {
+      releaseLock(name);
+      if (previousRoot === undefined) delete process.env.PTY_SESSION_DIR;
+      else process.env.PTY_SESSION_DIR = previousRoot;
+    }
+  }, 15000);
+
+  it("refuses to mutate or execute against a replacement generation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name, "bash", [], { role: "old" });
+    const oldGeneration = readMeta(dir, name).generation;
+    const marker = path.join(dir, "replacement-race-marker");
+    const replacement = {
+      ...readMeta(dir, name),
+      generation: "replacement-generation",
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      displayCommand: "replacement command",
+      displayName: "replacement label",
+      tags: { role: "replacement" },
+    };
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify(replacement));
+
+    const result = spawnSync(
+      nodeBin,
+      [cliPath, "exec", "--", "/bin/sh", "-c", `touch ${JSON.stringify(marker)}`],
+      { env: execEnv(dir, name, oldGeneration), encoding: "utf-8", timeout: 10000 },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("replacement generation");
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(readMeta(dir, name)).toEqual(replacement);
+    expect(readEvents(dir, name).filter((event) => event.type === "session_exec")).toHaveLength(0);
   }, 15000);
 });

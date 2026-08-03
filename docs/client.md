@@ -16,13 +16,46 @@ import { PacketReader, MessageType } from "@compoundingtech/pty/protocol";
 List all retained sessions without mutating the registry. Cleanup is owned by
 explicit lifecycle operations such as `gc()` and `cleanupAll()`.
 
-### `getSession(name: string): Promise<SessionInfo | null>`
+### `getSession(ref: string): Promise<SessionInfo | null>`
 
-Get a single session by name.
+Resolve a stable session id or display name. An exact stable id always wins. A
+display name resolves only when it has exactly one match; multiple matches throw
+an error that lists the candidate stable ids. Returns `null` when no session
+matches. Resolve once, then pass `session.name` to socket-oriented APIs.
 
 ### `validateName(name: string): void`
 
 Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]` and be at most 255 characters.
+
+### `patchMetadataById(id: string, patch: MetadataPatch): Promise<MetadataPatchResult>`
+
+Atomically merge presentation metadata for one exact stable id. This API never
+falls back to a matching display name. It holds the session metadata lock across
+one read, merge, validation, and atomic write; unrelated tags are preserved and
+a no-op returns `changed: false` without writing or emitting an event.
+
+```typescript
+const result = await patchMetadataById("a1b2c3d4", {
+  displayName: "Worker",
+  tags: { role: "worker", temporary: null },
+});
+
+interface MetadataPatch {
+  displayName?: string | null;
+  tags?: Record<string, string | null>;
+}
+
+interface MetadataPatchResult {
+  changed: boolean;
+  metadata: SessionMetadata;
+}
+```
+
+Strings set values, `null` clears them, and omitted fields or tag keys remain
+unchanged. A successful change emits one `metadata_change` event containing
+only effective changes as `previous` and `value` snapshots. The existing
+`setDisplayName` and `updateTags` APIs retain their specialized event types for
+compatibility.
 
 ### `getSessionDir(): string`
 
@@ -94,7 +127,11 @@ Remove a session's `.sock` and `.pid` files.
 
 ### `cleanupAll(name: string): void`
 
-Remove all files for a session (socket, pid, metadata, events, lock).
+Remove all files for a session (socket, pid, metadata, and events). Cleanup is
+serialized by acquiring the event lock before the metadata/creation lock. It
+throws when either lock has a live holder, changes no session files in that
+case, and removes only locks acquired by the cleanup call. Dead holders' stale
+locks are reclaimed.
 
 ### Types
 
@@ -120,6 +157,11 @@ interface SessionMetadata {
   exitedAt?: string;
   lastLines?: string[];
   tags?: Record<string, string>;
+  displayName?: string; // mutable, non-unique presentation label
+  isolateEnv?: boolean;
+  extraEnv?: Record<string, string>;
+  unsetEnv?: string[];
+  env?: Record<string, string>;
 }
 ```
 
@@ -142,8 +184,17 @@ interface SpawnDaemonOptions {
   rows?: number;                     // defaults to process.stdout.rows ?? 24
   cols?: number;                     // defaults to process.stdout.columns ?? 80
   tags?: Record<string, string>;     // key-value metadata (e.g. { owner: "forge" })
+  isolateEnv?: boolean;              // inherit only the safe allow-list
+  extraEnv?: Record<string, string>; // explicit assignments applied last
+  unsetEnv?: string[];               // inherited keys removed before assignments
+  env?: Record<string, string>;      // exact child env; mutually exclusive with the above
 }
 ```
+
+`unsetEnv` removals run before `extraEnv` assignments. The server then forces
+`PTY_SESSION` to the stable session id and fills an absent `TERM` with
+`xterm-256color`; naming either key in `unsetEnv` does not suppress those
+invariants. An explicit `extraEnv.TERM` value is preserved.
 
 ### `resolveCommand(cmd: string): string`
 
@@ -186,25 +237,38 @@ Bidirectional, event-driven connection to a session.
 
 ```typescript
 const conn = new SessionConnection({ name: "myserver", rows: 24, cols: 80 });
-const initialScreen = await conn.connect();
 
+conn.on("geometry", ({ rows, cols }) => {
+  // Resize your emulator before the following screen/data bytes are parsed.
+  terminal.resize(cols, rows);
+});
 conn.on("data", (data: string) => { /* terminal output */ });
 conn.on("exit", (code: number) => { /* process exited */ });
 conn.on("close", () => { /* connection closed */ });
 conn.on("error", (err: Error) => { /* connection error */ });
 
+const initialScreen = await conn.connect();
+// Initial GEOMETRY is stream-ordered before SCREEN. The effective getters are
+// therefore authoritative before applying the returned replay.
+terminal.resize(conn.effectiveCols, conn.effectiveRows);
+terminal.write(initialScreen);
+
 conn.write("hello\r");          // send raw data
 conn.press("ctrl+c");           // send named key
-conn.resize(30, 100);           // resize terminal
+conn.resize(30, 100);           // request a shared-grid size
 conn.disconnect();               // close connection
 ```
 
 **Properties:**
 - `connected: boolean` — whether the connection is active
+- `effectiveRows: number` / `effectiveCols: number` — current authoritative
+  shared-grid dimensions. These can differ from the client's requested size
+  when another writable client is smaller.
 
 **Events:**
 | Event | Payload | Description |
 |---|---|---|
+| `geometry` | `{ rows, cols }` | Effective shared geometry, ordered before affected `screen`/`data` |
 | `data` | `string` | Terminal output from the session |
 | `screen` | `string` | Initial screen replay on connect |
 | `exit` | `number` | Session process exited with code |
@@ -233,7 +297,11 @@ const plain = await peekScreen({ name: "myserver", plain: true }); // plain text
 
 ### `queryStats(name: string, timeoutMs?: number): Promise<StatsResult>`
 
-Query live metrics from a running session.
+Query live metrics from a running session without attaching. The matching
+`pty stats --json` command uses the same non-attaching STATUS request.
+`terminal.rows` and `terminal.cols` are the current effective shared geometry;
+`clients` includes aggregate counts plus anonymous connection details showing
+each writable client's requested size and which min-wins axes it constrains.
 
 ```typescript
 interface StatsResult {
@@ -254,7 +322,21 @@ interface StatsResult {
     pid: number;
     resources: ProcessResources | null;
   };
-  clients: { total: number; attached: number; readOnly: number };
+  clients: {
+    total: number; attached: number; readOnly: number;
+    connections?: Array<
+      | {
+          role: "writable";
+          rows: number; cols: number;
+          lastRequestSequence: number;
+          constrains: { rows: boolean; cols: boolean };
+        }
+      | {
+          role: "readonly";
+          constrains: { rows: false; cols: false };
+        }
+    >;
+  };
   modes: {
     alternateScreen: boolean;
     sgrMouse: boolean; cursorHidden: boolean;
@@ -342,6 +424,16 @@ malformed updates, skipped sequences, stale epochs, and daemon replacement all
 fail closed to `unknown`. Rejected competing sockets do not disturb the current
 publisher.
 
+Connection details are anonymous and their order is unspecified. They are a
+point-in-time explanation of the current min-wins result, not an event stream;
+polling stats cannot order geometry changes relative to attached-session DATA.
+`lastRequestSequence` is a daemon-local counter for the writable connection's
+most recent attach or resize request, not a connection identity or timestamp.
+Older daemons omit `connections`; the aggregate counts remain authoritative and
+must not be reconstructed as an empty connection list. The daemon does not
+retain a durable client identity; socket and packet-parser state are transport
+internals and are not exposed.
+
 ## Session Interaction (CLI-oriented)
 
 These functions use `process.stdin`/`process.stdout` directly and may call `process.exit()`. They are re-exported for tools that want CLI-like behavior.
@@ -349,6 +441,23 @@ These functions use `process.stdin`/`process.stdout` directly and may call `proc
 ### `attach(options: AttachOptions): void`
 
 Interactive attach with bidirectional I/O. Takes over stdin/stdout. Ctrl+\ to detach (double-tap to send through).
+
+Set `attachStreamFdV1` to a writable inherited descriptor (3 or greater) for
+machine mode. stdin and stdout remain the controlling terminal for input and
+resize events, but terminal output is written only to that descriptor using the
+existing protocol framing. Version 1 emits ordered `GEOMETRY`, `SCREEN`, and
+`DATA` packets followed by one terminal outcome: `EXIT` when the session process
+ends or `DETACH` when the local user intentionally detaches. `DETACH` may be the
+first packet when the user detaches before the daemon supplies its initial
+baseline. Each initial attach or reconnect otherwise starts with `GEOMETRY`; a
+daemon that sends terminal data first is rejected as unsupported.
+
+The descriptor remains caller-owned. `attach()` flushes its writer but does not
+close the descriptor, so a consumer sees EOF only when the caller closes its
+copy (or the process exits). A clean EOF follows a framed `EXIT` or `DETACH`;
+EOF without either outcome is a truncated stream. Descriptor errors fail the
+attach and are reported on stderr; stderr text is never written into the framed
+stream.
 
 ### `peek(options: PeekOptions): void`
 
@@ -412,6 +521,10 @@ Each extends `EventBase { session: string; type: EventType; ts: string }`.
 `NotificationEvent` adds `title?`, `body?`, `source?: "osc9" | "osc99" | "osc777"`.
 `TitleChangeEvent` adds `value: string`.
 
+`MetadataChangeEvent` has type `"metadata_change"` and carries `previous` and
+`value` objects. Only the changed `displayName` field and changed tag keys are
+present; `null` represents an absent or cleared value.
+
 ## Keys (also available via `@compoundingtech/pty/keys`)
 
 These functions are also available as a standalone browser-safe import via `@compoundingtech/pty/keys` (zero dependencies).
@@ -453,7 +566,7 @@ socket.on("data", (raw) => {
 const MessageType = {
   DATA: 0,     // Terminal output / input
   ATTACH: 1,   // Client attach with size
-  DETACH: 2,   // Client detach
+  DETACH: 2,   // Client → server request; machine stream → caller outcome
   RESIZE: 3,   // Terminal resize
   EXIT: 4,     // Process exited
   SCREEN: 5,   // Screen replay
@@ -461,8 +574,43 @@ const MessageType = {
   STATUS: 7,   // Stats query/response
   ACTIVITY: 8, // Generic activity lease commands/responses
   GUARDED_DATA: 9, // Generation/revision-conditional input
+  GEOMETRY: 10, // Effective shared rows/cols (server → client)
 };
 ```
+
+`DETACH` always has an empty payload. On the session socket it requests that
+the client connection detach. On `--attach-stream-fd-v1`, it is the terminal
+outcome for an intentional local detach and is flushed before clean completion.
+Clean EOF follows either `DETACH` or `EXIT`; EOF without either outcome is a
+truncated stream.
+
+Packet types are length-delimited. Clients predating `GEOMETRY` ignore the
+unknown bounded packet and continue with following `SCREEN`/`DATA`, preserving
+their historical raw-byte behavior. Embedders that reconstruct a terminal grid
+must handle `GEOMETRY`.
+
+For each `ATTACH` or `PEEK`, the server establishes a new synchronization
+generation with this public stream order:
+
+```text
+GEOMETRY -> SCREEN -> DATA / EXIT
+```
+
+`GEOMETRY` is sent immediately. The server then takes an ordered xterm parser
+cut: output before that cut is represented by `SCREEN`, while later `DATA` and
+`EXIT` packets are queued and released after the screen baseline. If the child
+exits before the cut, the server emits one `EXIT` after any final queued data.
+A later `ATTACH` or `PEEK` on the same socket cancels the unfinished generation,
+including writable-to-readonly mode changes, so stale screen or queued output
+from the previous mode is not emitted. A reconnect starts the same ordering
+contract again with a fresh `GEOMETRY` and `SCREEN`.
+
+Each valid `ATTACH` or `PEEK` also replaces the socket's current role rather
+than accumulating state. `ATTACH` makes the socket writable, installs its
+requested geometry, and restores `DATA`/`RESIZE` handling and shared-grid
+participation. `PEEK` makes it read-only and removes its geometry constraint.
+A malformed `ATTACH` payload leaves the prior role and synchronization
+generation unchanged.
 
 ### `TERMINAL_SANITIZE: string`
 

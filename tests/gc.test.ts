@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
 const cliPath = path.join(__dirname, "..", "dist", "cli.js");
+const binPath = path.join(__dirname, "..", "bin", "pty");
 const serverModule = path.join(__dirname, "..", "dist", "server.js");
 
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pty-gc-"));
@@ -297,6 +298,17 @@ describe("pty gc", () => {
     // Phase-2: emitted env var is PTY_ROOT (canonical). Legacy
     // PTY_SESSION_DIR readers migrate via the alias in getSessionDir().
     expect(result.stdout).toContain("<key>PTY_ROOT</key>");
+  });
+
+  it("--print-launchd-plist preserves the invoked bin launcher", () => {
+    const dir = makeSessionDir();
+    const result = spawnSync(nodeBin, [binPath, "gc", "--print-launchd-plist"], {
+      env: { ...process.env, PTY_SESSION_DIR: dir },
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`<string>${binPath}</string>`);
   });
 
   it("--print-launchd-plist --interval=N sets the interval", () => {

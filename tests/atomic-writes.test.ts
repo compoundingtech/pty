@@ -19,9 +19,12 @@ import { spawn, spawnSync } from "node:child_process";
 import { terminateAndWait } from "./setup/processes.ts";
 import {
   atomicWriteFileSync, atomicWriteFile,
-  updateTags, readMetadata,
+  acquireLock, cleanupAll, releaseLock, updateTags, readMetadata,
 } from "../src/sessions.ts";
-import { appendEventSync, readRecentEvents } from "../src/events.ts";
+import {
+  acquireEventLock, appendEvent, appendEventSync, readRecentEvents, releaseEventLock,
+  waitForEventLock,
+} from "../src/events.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -203,6 +206,141 @@ describe("concurrent pty tag via multiple CLI processes", () => {
 });
 
 describe("event log truncation vs concurrent reader", () => {
+  it("cannot clean through a live metadata lock holder", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    const metadataPath = path.join(dir, `${name}.json`);
+    const eventsPath = path.join(dir, `${name}.events.jsonl`);
+    fs.writeFileSync(metadataPath, JSON.stringify({ name }));
+    fs.writeFileSync(eventsPath, `${JSON.stringify({ type: "user.keep" })}\n`);
+    const metadataBefore = fs.readFileSync(metadataPath);
+    const eventsBefore = fs.readFileSync(eventsPath);
+    expect(acquireLock(name)).toBe(true);
+
+    try {
+      expect(() => cleanupAll(name)).toThrow(/metadata is busy/i);
+      expect(fs.readFileSync(metadataPath)).toEqual(metadataBefore);
+      expect(fs.readFileSync(eventsPath)).toEqual(eventsBefore);
+      expect(acquireLock(name)).toBe(false);
+    } finally {
+      releaseLock(name);
+    }
+
+    cleanupAll(name);
+    expect(fs.existsSync(metadataPath)).toBe(false);
+    expect(fs.existsSync(eventsPath)).toBe(false);
+  });
+
+  it("reclaims a stale event lock during full cleanup", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    fs.writeFileSync(path.join(dir, `${name}.events.jsonl`), "");
+    fs.writeFileSync(path.join(dir, `${name}.events.lock`), "2147483647");
+
+    cleanupAll(name);
+
+    expect(fs.existsSync(path.join(dir, `${name}.events.jsonl`))).toBe(false);
+    expect(fs.existsSync(path.join(dir, `${name}.events.lock`))).toBe(false);
+  });
+
+  it("queues an async writer until the event lock is released", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireEventLock(name)).toBe(true);
+    const pending = appendEvent(name, {
+      session: name,
+      type: "user.queued",
+      ts: new Date().toISOString(),
+      data: { complete: true },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(readRecentEvents(name)).toEqual([]);
+
+    releaseEventLock(name);
+    await pending;
+    expect(readRecentEvents(name)).toMatchObject([{
+      type: "user.queued",
+      data: { complete: true },
+    }]);
+  });
+
+  it("bounds async event-lock contention", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireEventLock(name)).toBe(true);
+
+    try {
+      await expect(waitForEventLock(name, 0)).rejects.toThrow(/event log is busy/i);
+    } finally {
+      releaseEventLock(name);
+    }
+  });
+
+  it("preserves concurrent records and an oversized metadata event across retention", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    await startDaemon(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    const previousDescription = "😀".repeat(1000);
+    const nextDescription = "🫠".repeat(1000);
+    updateTags(name, { description: previousDescription });
+
+    const eventsPath = path.join(dir, `${name}.events.jsonl`);
+    const prime = Array.from({ length: 999 }, (_, i) => JSON.stringify({
+      session: name,
+      type: "user.prime",
+      ts: new Date().toISOString(),
+      data: { i },
+    })).join("\n") + "\n";
+    fs.writeFileSync(eventsPath, prime);
+
+    const markers = Array.from({ length: 16 }, (_, i) => `marker-${i}`);
+    const children = markers.map((marker) => spawn(nodeBin, [
+      cliPath, "emit", name, "user.concurrent", "--json", JSON.stringify({ marker }),
+    ], {
+      env: { ...process.env, PTY_SESSION_DIR: dir },
+      stdio: "ignore",
+    }));
+    const patchOnce = () => {
+      const child = spawn(nodeBin, [cliPath, "metadata", "patch", "--id", name], {
+        env: { ...process.env, PTY_SESSION_DIR: dir },
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      child.stdin!.end(JSON.stringify({ tags: { description: nextDescription } }));
+      return new Promise<number | null>((resolve) => child.once("exit", resolve));
+    };
+    const patchEventually = async () => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (await patchOnce() === 0) return;
+      }
+      throw new Error("metadata patch remained busy after concurrent writers completed");
+    };
+    const patchResult = patchEventually();
+    const statuses = await Promise.all(children.map((child) => new Promise<number | null>(
+      (resolve) => child.once("exit", resolve),
+    )));
+    expect(statuses).toEqual(Array(children.length).fill(0));
+    await patchResult;
+
+    const lines = fs.readFileSync(eventsPath, "utf8").trimEnd().split("\n");
+    const events = lines.map((line) => JSON.parse(line));
+    const observedMarkers = events
+      .filter((event) => event.type === "user.concurrent")
+      .map((event) => event.data.marker)
+      .sort();
+    expect(observedMarkers).toEqual([...markers].sort());
+    const metadataEvents = events.filter((event) => event.type === "metadata_change");
+    expect(metadataEvents).toHaveLength(1);
+    const metadataEvent = metadataEvents[0];
+    expect(metadataEvent.previous.tags.description).toBe(previousDescription);
+    expect(metadataEvent.value.tags.description).toBe(nextDescription);
+    expect(JSON.stringify(metadataEvent).length).toBeGreaterThan(4096);
+  }, 30_000);
+
   it("reader never sees a half-written file during truncation", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();

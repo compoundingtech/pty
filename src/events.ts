@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import {
   getEventsPath, getSessionDir, ensureSessionDir,
   atomicWriteFileSync, atomicWriteFile,
+  acquireFileLock, releaseFileLock,
 } from "./sessions.ts";
 
 export const EventType = {
@@ -158,6 +160,19 @@ export interface TagsChangeEvent extends EventBase {
   value: Record<string, string>;
 }
 
+export interface MetadataChangeEvent extends EventBase {
+  type: "metadata_change";
+  /** Only fields and tag keys that effectively changed are present. */
+  previous: {
+    displayName?: string | null;
+    tags?: Record<string, string | null>;
+  };
+  value: {
+    displayName?: string | null;
+    tags?: Record<string, string | null>;
+  };
+}
+
 export type EventRecord =
   | BellEvent
   | TitleChangeEvent
@@ -172,7 +187,8 @@ export type EventRecord =
   | SessionFlappingEvent
   | UserEvent
   | DisplayNameChangeEvent
-  | TagsChangeEvent;
+  | TagsChangeEvent
+  | MetadataChangeEvent;
 
 /** Type guard: narrows an EventRecord to a UserEvent. */
 export function isUserEvent(e: EventRecord): e is UserEvent {
@@ -203,6 +219,43 @@ export function validateUserEventType(type: string): string | null {
 const MAX_LINES = 1000;
 const KEEP_LINES = 500;
 const TRUNCATE_CHECK_INTERVAL = 100;
+const EVENT_LOCK_WAIT_MS = 5_000;
+
+function getEventLockPath(name: string): string {
+  return path.join(getSessionDir(), `${name}.events.lock`);
+}
+
+export function acquireEventLock(name: string): boolean {
+  return acquireFileLock(getEventLockPath(name));
+}
+
+export function releaseEventLock(name: string): void {
+  releaseFileLock(getEventLockPath(name));
+}
+
+/** @internal Acquire with bounded polling for async writers. */
+export async function waitForEventLock(
+  name: string,
+  waitMs = EVENT_LOCK_WAIT_MS,
+): Promise<void> {
+  const deadline = Date.now() + waitMs;
+  while (!acquireEventLock(name)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+    }
+    const delayMs = Math.min(10, deadline - Date.now());
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
+async function withEventLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
+  await waitForEventLock(name);
+  try {
+    return await operation();
+  } finally {
+    releaseEventLock(name);
+  }
+}
 
 /** One-shot helper to append a single event to a session's events log
  *  without keeping an EventWriter around. Used by CLI subcommands like
@@ -212,29 +265,33 @@ const TRUNCATE_CHECK_INTERVAL = 100;
  *  truncate path is skipped via a cheap stat when the file is small. */
 export async function appendEvent(name: string, event: EventRecord): Promise<void> {
   ensureSessionDir();
-  const filePath = getEventsPath(name);
-  const line = JSON.stringify(event) + "\n";
-  await fsp.appendFile(filePath, line);
-  await maybeTruncate(filePath);
+  await withEventLock(name, async () => {
+    const filePath = getEventsPath(name);
+    const line = JSON.stringify(event) + "\n";
+    await fsp.appendFile(filePath, line);
+    await maybeTruncate(filePath);
+  });
 }
 
-/** Synchronous twin of `appendEvent` — lets synchronous metadata-mutation
- *  helpers (setDisplayName, updateTags) emit their change events inline
- *  without forcing their signatures to go async. Uses the same retention
- *  path with a sync stat fast-path.
- *
- *  Concurrency note: `fs.appendFileSync` issues a single `write()` with
- *  `O_APPEND`, which POSIX guarantees is atomic for payloads up to
- *  `PIPE_BUF` bytes (typically 4096 on Linux/macOS). All built-in events
- *  are well under that. If a caller passes a large `user.*` event
- *  payload, concurrent appends could interleave — keep large payloads
- *  out of the event stream. */
-export function appendEventSync(name: string, event: EventRecord): void {
+/** Append while the caller owns this session's event lock. This supports
+ *  transactions that must acquire the event lock before another lock. */
+export function appendEventSyncLocked(name: string, event: EventRecord): void {
   ensureSessionDir();
   const filePath = getEventsPath(name);
   const line = JSON.stringify(event) + "\n";
   fs.appendFileSync(filePath, line);
   maybeTruncateSync(filePath);
+}
+
+export function appendEventSync(name: string, event: EventRecord): void {
+  if (!acquireEventLock(name)) {
+    throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+  }
+  try {
+    appendEventSyncLocked(name, event);
+  } finally {
+    releaseEventLock(name);
+  }
 }
 
 function maybeTruncateSync(filePath: string): void {
@@ -244,11 +301,8 @@ function maybeTruncateSync(filePath: string): void {
     const content = fs.readFileSync(filePath, "utf-8");
     const lines = content.trimEnd().split("\n");
     if (lines.length >= MAX_LINES) {
-      // Tmp+rename so readers never see a half-written rewrite. Concurrent
-      // appenders after our read but before our rename will have their
-      // lines lost (their append goes to the old inode that we unlink
-      // via rename); that's a "concurrent writes overwrite each other"
-      // case, not corruption — readers always see a valid JSONL file.
+      // The event lock spans the read and atomic replacement, so appends
+      // cannot target the old inode between those operations.
       atomicWriteFileSync(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
     }
   } catch {
@@ -307,17 +361,15 @@ export class EventWriter {
   /** Queue an event for writing. Returns immediately; I/O happens async. */
   append(event: EventRecord): void {
     this.chain = this.chain
-      .then(() => {
+      .then(() => withEventLock(this.name, async () => {
         const line = JSON.stringify(event) + "\n";
-        return fsp.appendFile(getEventsPath(this.name), line);
-      })
-      .then(() => {
+        await fsp.appendFile(getEventsPath(this.name), line);
         this.appendCount++;
         if (this.appendCount >= TRUNCATE_CHECK_INTERVAL) {
           this.appendCount = 0;
-          return truncate(getEventsPath(this.name));
+          await truncate(getEventsPath(this.name));
         }
-      })
+      }))
       .catch(() => {});
   }
 
@@ -331,23 +383,33 @@ async function truncate(filePath: string): Promise<void> {
   const content = await fsp.readFile(filePath, "utf-8");
   const lines = content.trimEnd().split("\n");
   if (lines.length >= MAX_LINES) {
-    // Tmp+rename so readers never see a half-written rewrite — same
-    // reasoning as `maybeTruncateSync`.
+    // Tmp+rename so readers never see a half-written rewrite. The caller
+    // holds the event lock across the read and replacement.
     await atomicWriteFile(filePath, lines.slice(-KEEP_LINES).join("\n") + "\n");
   }
 }
 
 export function clearEvents(name: string): void {
   ensureSessionDir();
+  if (!acquireEventLock(name)) {
+    throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+  }
   try {
     fs.writeFileSync(getEventsPath(name), "");
-  } catch {}
+  } catch {} finally {
+    releaseEventLock(name);
+  }
 }
 
 export function removeEvents(name: string): void {
+  if (!acquireEventLock(name)) {
+    throw new Error(`Session id "${name}" event log is busy. Retry the operation.`);
+  }
   try {
     fs.unlinkSync(getEventsPath(name));
-  } catch {}
+  } catch {} finally {
+    releaseEventLock(name);
+  }
 }
 
 export function readRecentEvents(name: string, count = 50): EventRecord[] {
@@ -527,6 +589,8 @@ export function formatEvent(event: EventRecord): string {
         Object.keys(t).length === 0 ? "{}" : Object.entries(t).map(([k, v]) => `${k}=${v}`).join(" ");
       return `${prefix} tags -> ${fmt(event.value)} (was ${fmt(event.previous)})`;
     }
+    case "metadata_change":
+      return `${prefix} metadata -> ${JSON.stringify(event.value)} (was ${JSON.stringify(event.previous)})`;
     default: {
       // user.* events + anything else unknown-at-compile-time.
       const e = event as EventBase & { data?: unknown; text?: string };

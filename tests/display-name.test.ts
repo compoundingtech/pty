@@ -165,20 +165,49 @@ describe("--name: explicit display label (any length / chars)", () => {
     collectPid(dir, sessions[0].name);
   });
 
-  it("rejects an --id equal to the explicit --name", () => {
+  it("allows an --id equal to the explicit --name", () => {
     const dir = makeSessionDir();
     const r = runCli(dir, {}, "run", "-d", "--id", "same", "--name", "same", "--", "cat");
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toMatch(/cannot equal/i);
+    expect(r.status).toBe(0);
+    expect(listJson(dir).find((s: any) => s.name === "same")!.displayName).toBe("same");
+    collectPid(dir, "same");
   });
 
-  it("rejects an --name that collides with another session", () => {
+  it("allows duplicate display names", () => {
     const dir = makeSessionDir();
     runCli(dir, {}, "run", "-d", "--id", "a1", "--name", "shared", "--", "cat");
     const r = runCli(dir, {}, "run", "-d", "--id", "a2", "--name", "shared", "--", "cat");
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("already in use");
+    expect(r.status).toBe(0);
+    expect(listJson(dir).filter((s: any) => s.displayName === "shared").map((s: any) => s.name)).toEqual(["a1", "a2"]);
     collectPid(dir, "a1");
+    collectPid(dir, "a2");
+  });
+
+  it.each([
+    ["leading whitespace", " Worker"],
+    ["trailing whitespace", "Worker "],
+    ["ASCII control", "Worker\u0007"],
+    ["Unicode line separator", "Worker\u2028Next"],
+    ["Unicode paragraph separator", "Worker\u2029Next"],
+    ["more than 160 Unicode scalars", "😀".repeat(161)],
+  ])("rejects %s before spawning", (_case, displayName) => {
+    const dir = makeSessionDir();
+    const id = `invalid-${Math.random().toString(36).slice(2, 8)}`;
+    const result = runCli(dir, {}, "run", "-d", "--id", id, "--name", displayName, "--", "cat");
+    if (result.status === 0) collectPid(dir, id);
+
+    expect(result.status).not.toBe(0);
+    expect(listJson(dir)).toEqual([]);
+  });
+
+  it("accepts 160 Unicode scalars plus slash and backslash as pure metadata", () => {
+    const dir = makeSessionDir();
+    const displayName = `${"😀".repeat(156)}/a\\b`;
+    const result = runCli(dir, {}, "run", "-d", "--id", "unicode-boundary", "--name", displayName, "--", "cat");
+
+    expect(result.status).toBe(0);
+    expect(listJson(dir).find((session: any) => session.name === "unicode-boundary")?.displayName).toBe(displayName);
+    collectPid(dir, "unicode-boundary");
   });
 });
 
@@ -236,24 +265,24 @@ describe("pty rename (outside a session)", () => {
     expect(r.stderr).toContain("only allowed inside a pty session");
   });
 
-  it("rejects displayName that collides with another session's name", () => {
+  it("allows displayName to collide with a stable session id", () => {
     const dir = makeSessionDir();
     runCli(dir, {}, "run", "-d", "--id", "aaa", "--no-display-name", "--", "cat");
     runCli(dir, {}, "run", "-d", "--id", "bbb", "--no-display-name", "--", "cat");
 
     const r = runCli(dir, {}, "rename", "aaa", "bbb");
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("already in use");
+    expect(r.status).toBe(0);
+    expect(listJson(dir).find((s: any) => s.name === "aaa")!.displayName).toBe("bbb");
     collectPid(dir, "aaa");
     collectPid(dir, "bbb");
   });
 
-  it("rejects displayName equal to the session's own name", () => {
+  it("allows displayName equal to the session's own id", () => {
     const dir = makeSessionDir();
     runCli(dir, {}, "run", "-d", "--id", "same", "--no-display-name", "--", "cat");
     const r = runCli(dir, {}, "rename", "same", "same");
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("cannot equal");
+    expect(r.status).toBe(0);
+    expect(listJson(dir).find((s: any) => s.name === "same")!.displayName).toBe("same");
     collectPid(dir, "same");
   });
 });
@@ -294,6 +323,47 @@ describe("lookup by displayName", () => {
     const stats = JSON.parse(r.stdout);
     expect(stats.name).toBe("raw1");
     collectPid(dir, "raw1");
+  });
+
+  it("prefers an exact stable id over matching display names", () => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--id", "other", "--name", "shared", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "shared", "--no-display-name", "--", "cat");
+
+    const r = runCli(dir, {}, "stats", "shared", "--json");
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).name).toBe("shared");
+    collectPid(dir, "other");
+    collectPid(dir, "shared");
+  });
+
+  it.each([
+    ["attach", ["attach", "shared"]],
+    ["peek", ["peek", "--plain", "shared"]],
+    ["send", ["send", "shared", "hello"]],
+    ["stats", ["stats", "shared", "--json"]],
+    ["events", ["events", "--recent", "shared"]],
+    ["restart", ["restart", "-y", "shared"]],
+    ["kill", ["kill", "shared"]],
+    ["tag", ["tag", "shared", "role=test"]],
+    ["tag-multi", ["tag-multi", "shared", "role=test"]],
+    ["emit", ["emit", "shared", "user.test"]],
+    ["rename --show", ["rename", "--show", "shared"]],
+    ["rename --clear", ["rename", "--clear", "shared"]],
+    ["rename", ["rename", "shared", "renamed"]],
+    ["rm", ["rm", "shared"]],
+  ])("fails %s closed when a display name is ambiguous", (_command, argv) => {
+    const dir = makeSessionDir();
+    runCli(dir, {}, "run", "-d", "--id", "alpha", "--name", "shared", "--", "cat");
+    runCli(dir, {}, "run", "-d", "--id", "beta", "--name", "shared", "--", "cat");
+
+    const r = runCli(dir, {}, ...argv);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('Session reference "shared" is ambiguous.');
+    expect(r.stderr).toContain("alpha");
+    expect(r.stderr).toContain("beta");
+    collectPid(dir, "alpha");
+    collectPid(dir, "beta");
   });
 });
 
