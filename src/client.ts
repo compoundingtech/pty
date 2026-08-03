@@ -295,6 +295,8 @@ export interface ProcessResources {
 
 export interface StatsResult {
   name: string;
+  generation: string;
+  ioRevision: number;
   terminal: {
     cols: number;
     rows: number;

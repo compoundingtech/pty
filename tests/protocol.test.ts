@@ -14,6 +14,7 @@ import {
   encodeStatus,
   encodeStatusResponse,
   encodeActivity,
+  encodeGuardedData,
   encodeGeometry,
   decodeSize,
   decodeGeometry,
@@ -316,6 +317,8 @@ describe("protocol", () => {
     it("accepts an old-daemon STATUS response without connection details", () => {
       const response = {
         name: "legacy",
+        generation: "generation-legacy",
+        ioRevision: 0,
         terminal: {
           cols: 80,
           rows: 24,
@@ -366,6 +369,25 @@ describe("protocol", () => {
       expect(JSON.parse(packets[0].payload.toString())).toEqual({
         op: "claim",
         producerEpoch: "epoch-a",
+      });
+    });
+  });
+
+  describe("GUARDED_DATA", () => {
+    it("round-trips compare-and-send commands and responses", () => {
+      const reader = new PacketReader();
+      const encoded = encodeGuardedData({
+        generation: "generation-a",
+        ioRevision: 7,
+        data: "x",
+      });
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.GUARDED_DATA);
+      expect(JSON.parse(packets[0].payload.toString())).toEqual({
+        generation: "generation-a",
+        ioRevision: 7,
+        data: "x",
       });
     });
   });

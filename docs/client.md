@@ -306,6 +306,8 @@ each writable client's requested size and which min-wins axes it constrains.
 ```typescript
 interface StatsResult {
   name: string;
+  generation: string;
+  ioRevision: number;
   terminal: {
     cols: number; rows: number;
     cursorX: number; cursorY: number;
@@ -362,6 +364,40 @@ interface ProcessResources {
 as `unknown` and returns to `unknown` when the publisher disconnects or the
 daemon generation changes. Terminal modes such as `alternateScreen` are
 diagnostics only and do not imply activity or idleness.
+
+### `compareAndSend(name, options): Promise<GuardedSendResponse>`
+
+Conditionally write one non-empty string only while the daemon generation and
+delivery-relevant I/O revision remain exact.
+
+```typescript
+import {
+  compareAndSend,
+  queryStats,
+} from "@compoundingtech/pty/client";
+
+const observed = await queryStats("myserver");
+const result = await compareAndSend("myserver", {
+  generation: observed.generation,
+  ioRevision: observed.ioRevision,
+  data: "continue\r",
+});
+
+if (!result.ok) {
+  // Re-check external authority and session state; no guarded bytes were sent.
+}
+```
+
+`ioRevision` advances on accepted input, child output, actual PTY size changes,
+and accepted or released activity-lease state. Guard comparison and the single
+PTY write run in one daemon event-loop turn. A mismatch, replay, malformed or
+oversized command, exited session, or read-only connection rejects with zero
+guarded bytes. Attach, peek, and status operations that cause no input or
+resize leave the revision unchanged.
+
+The guard does not interpret the data. Provider-specific idle authority,
+composer checks, key meanings, and delivery ownership remain the caller's
+responsibility.
 
 ### `connectActivityPublisher(name, options?): Promise<ActivityPublisher>`
 
@@ -537,6 +573,7 @@ const MessageType = {
   PEEK: 6,     // Read-only peek request
   STATUS: 7,   // Stats query/response
   ACTIVITY: 8, // Generic activity lease commands/responses
+  GUARDED_DATA: 9, // Generation/revision-conditional input
   GEOMETRY: 10, // Effective shared rows/cols (server → client)
 };
 ```

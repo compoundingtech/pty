@@ -2531,6 +2531,8 @@ function printStats(stats: StatsResult, meta: SessionInfo["metadata"]): void {
   console.log(`Session: ${stats.name}`);
   console.log(`  Command:    ${cmd}`);
   console.log(`  CWD:        ${cwd}`);
+  console.log(`  Generation: ${stats.generation}`);
+  console.log(`  I/O rev:    ${stats.ioRevision}`);
   console.log(`  Uptime:     ${formatUptime(stats.uptimeSeconds)}`);
   const pidSuffix = stats.process?.pid ? ` (pid ${stats.process.pid})` : "";
   console.log(`  Process:    ${stats.process.alive ? "running" : `exited (code ${stats.process.exitCode})`}${pidSuffix}`);

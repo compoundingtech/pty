@@ -10,7 +10,7 @@ export const MessageType = {
   PEEK: 6, // Client → Server: read-only attach (no input, no resize)
   STATUS: 7, // Client → Server: request stats; Server → Client: JSON stats response
   ACTIVITY: 8, // Bidirectional: generic activity lease commands/responses
-  // Value 9 is reserved for an independent protocol extension.
+  GUARDED_DATA: 9, // Bidirectional: generation/revision-conditional input
   GEOMETRY: 10, // Server → Client: effective shared rows/cols
 } as const;
 
@@ -106,6 +106,13 @@ export function encodeStatusResponse(json: string): Buffer {
 
 export function encodeActivity(value: unknown): Buffer {
   return encodePacket(MessageType.ACTIVITY, Buffer.from(JSON.stringify(value)));
+}
+
+export function encodeGuardedData(value: unknown): Buffer {
+  return encodePacket(
+    MessageType.GUARDED_DATA,
+    Buffer.from(JSON.stringify(value)),
+  );
 }
 
 export function decodeSize(payload: Buffer): { rows: number; cols: number } {

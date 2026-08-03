@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Atomic generation/revision-guarded input
+
+- Expose the live daemon `generation` and monotonic `ioRevision` through
+  STATUS, `queryStats()`, and `pty stats`. Accepted input, child output,
+  activity-state changes, and actual PTY resizes advance the revision; passive
+  attach, peek, and status requests do not.
+- Add `compareAndSend()` for one bounded, harness-neutral conditional write.
+  Exact generation/revision validation and the PTY write occur in one daemon
+  event-loop turn. Mismatch, replay, malformed or oversized input, exited
+  sessions, and read-only clients reject with zero guarded bytes.
+
 ### Harness-neutral live activity status
 
 - Add a single generation-bound activity lease with ordered `unknown`,

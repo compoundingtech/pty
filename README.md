@@ -420,7 +420,7 @@ Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-f
 import {
   spawnDaemon, listSessions, getSession,
   SessionConnection, sendData, peekScreen, queryStats,
-  connectActivityPublisher,
+  connectActivityPublisher, compareAndSend,
   EventFollower, readRecentEvents,
   extractFilterTags, matchesAllTags,
 } from "@compoundingtech/pty/client";
@@ -454,6 +454,12 @@ as `modes.alternateScreen`. Activity is explicit publisher state; terminal
 modes never imply idleness. Harness adapters can hold the single live lease
 with `connectActivityPublisher()` and publish ordered transitions. The state
 resets to `unknown` when that connection or daemon generation ends.
+
+For race-free delivery, pass a fresh `queryStats()` generation and
+`ioRevision` to `compareAndSend()`. The daemon writes once only if both still
+match; input, child output, activity changes, resize, restart, malformed
+commands, and replay reject without writing guarded bytes. PTY does not assign
+meaning to the supplied bytes or inspect provider composer state.
 
 ### Connecting to a session
 
