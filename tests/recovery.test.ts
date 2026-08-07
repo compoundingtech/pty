@@ -65,6 +65,12 @@ function unlinkRegistry(root: string, name: string): void {
   }
 }
 
+function unlinkSocketAndPid(root: string, name: string): void {
+  for (const suffix of ["sock", "pid"]) {
+    fs.unlinkSync(path.join(root, `${name}.${suffix}`));
+  }
+}
+
 async function waitFor(check: () => boolean | Promise<boolean>, timeout = 5000): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -120,6 +126,49 @@ afterEach(async () => {
 });
 
 describe("live daemon registry recovery", () => {
+  it("keeps an identity-proven daemon actionable when its socket and pidfile are missing", async () => {
+    const root = makeRoot();
+    const name = "partial-registry";
+    const { pid } = startProvider(root, name);
+
+    unlinkSocketAndPid(root, name);
+    const listed = run(root, ["list", "--json"]);
+    expect(listed.status, listed.stderr || listed.stdout).toBe(0);
+    expect(JSON.parse(listed.stdout)).toContainEqual(expect.objectContaining({
+      name,
+      pid,
+      status: "running",
+    }));
+
+    const collected = run(root, ["gc"]);
+    expect(collected.status, collected.stderr || collected.stdout).toBe(0);
+    expect(fs.existsSync(path.join(root, `${name}.json`))).toBe(true);
+    expect(readProcessStartToken(pid)).not.toBeNull();
+
+    const killed = run(root, ["kill", name]);
+    expect(killed.status, killed.stderr || killed.stdout).toBe(0);
+    await waitFor(() => readProcessStartToken(pid) === null);
+  });
+
+  it("does not trust a retained daemon pid with a mismatched process identity", () => {
+    const root = makeRoot();
+    const name = "stale-daemon-pid";
+    const { pid } = startProvider(root, name);
+    const stale = metadata(root, name);
+    stale.recovery!.processStartToken = "mismatched-process-start";
+    fs.writeFileSync(path.join(root, `${name}.json`), JSON.stringify(stale));
+
+    unlinkSocketAndPid(root, name);
+    const listed = run(root, ["list", "--json"]);
+    expect(listed.status, listed.stderr || listed.stdout).toBe(0);
+    expect(JSON.parse(listed.stdout)).toContainEqual(expect.objectContaining({
+      name,
+      pid: null,
+      status: "vanished",
+    }));
+    expect(readProcessStartToken(pid)).not.toBeNull();
+  });
+
   it("refuses an existing creation lock without any liveness signal", () => {
     const root = makeRoot();
     fs.writeFileSync(path.join(root, "locked.lock"), "2147483647");
