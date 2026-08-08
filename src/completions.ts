@@ -35,7 +35,13 @@ interface FlagSpec {
     | { _tag: "choices"; name: string; values: readonly string[] };
 }
 
-/** A leaf command: a top-level subcommand. */
+interface SubcommandSpec {
+  name: string;
+  desc: string;
+  flags?: readonly FlagSpec[];
+}
+
+/** A top-level command, optionally with one nested subcommand level. */
 interface CommandSpec {
   name: string;
   desc: string;
@@ -49,6 +55,8 @@ interface CommandSpec {
   takesPath?: boolean;
   /** A closed set of values for a positional argument. */
   positionalValues?: readonly string[];
+  /** One machine-visible command level below the top-level command. */
+  subcommands?: readonly SubcommandSpec[];
 }
 
 /** Status enum shared by `list` / `ls --status`. */
@@ -244,6 +252,39 @@ const COMMANDS: readonly CommandSpec[] = [
     positionalValues: ["patch"],
   },
   {
+    name: "evidence",
+    desc: "Read or remove exact-generation retained exit evidence",
+    subcommands: [
+      {
+        name: "snapshot",
+        desc: "Read retained evidence for one exact generation",
+        flags: [
+          {
+            name: "id",
+            desc: "Exact stable session id",
+            argument: { _tag: "free", name: "id" },
+          },
+        ],
+      },
+      {
+        name: "remove",
+        desc: "Remove only the matching terminal generation",
+        flags: [
+          {
+            name: "id",
+            desc: "Exact stable session id",
+            argument: { _tag: "free", name: "id" },
+          },
+          {
+            name: "expected-generation",
+            desc: "Opaque generation returned by evidence snapshot",
+            argument: { _tag: "free", name: "generation" },
+          },
+        ],
+      },
+    ],
+  },
+  {
     name: "up",
     desc: "Start sessions from pty.toml",
     takesPath: true,
@@ -330,6 +371,16 @@ function fishScript(): string {
   out.push("    test (count $cmd) -ge 2; and test \"$cmd[2]\" = \"$argv[1]\"");
   out.push("end");
   out.push("");
+  out.push("function __pty_needs_subcommand");
+  out.push("    set -l cmd (commandline -opc)");
+  out.push("    test (count $cmd) -eq 2; and test \"$cmd[2]\" = \"$argv[1]\"");
+  out.push("end");
+  out.push("");
+  out.push("function __pty_using_subcommand");
+  out.push("    set -l cmd (commandline -opc)");
+  out.push("    test (count $cmd) -ge 3; and test \"$cmd[2]\" = \"$argv[1]\"; and test \"$cmd[3]\" = \"$argv[2]\"");
+  out.push("end");
+  out.push("");
   out.push("complete -c pty -f");
   out.push("");
   out.push("# ── Global flags ───────────────────────────────────────────────────────");
@@ -366,6 +417,28 @@ function fishScript(): string {
         out.push(
           `complete -c pty -n ${q(guard)} -l ${f.name}${short} -d ${q(f.desc)}`,
         );
+      }
+    }
+    for (const subcommand of c.subcommands ?? []) {
+      out.push(
+        `complete -c pty -n ${q(`__pty_needs_subcommand ${c.name}`)} -a ${subcommand.name} -d ${q(subcommand.desc)}`,
+      );
+      const leafGuard = `__pty_using_subcommand ${c.name} ${subcommand.name}`;
+      for (const f of subcommand.flags ?? []) {
+        const short = f.short ? ` -s ${f.short}` : "";
+        if (f.argument?._tag === "choices") {
+          out.push(
+            `complete -c pty -n ${q(leafGuard)} -l ${f.name}${short} -x -a ${q(f.argument.values.join(" "))} -d ${q(f.desc)}`,
+          );
+        } else if (f.argument?._tag === "free") {
+          out.push(
+            `complete -c pty -n ${q(leafGuard)} -l ${f.name}${short} -x -d ${q(f.desc)}`,
+          );
+        } else {
+          out.push(
+            `complete -c pty -n ${q(leafGuard)} -l ${f.name}${short} -d ${q(f.desc)}`,
+          );
+        }
       }
     }
     // Dynamic session positional.
@@ -434,7 +507,44 @@ function bashScript(): string {
     const takesSessions = c.dynamic === "sessions";
     const takesPath = c.takesPath;
     const guard = `    ${names})`;
-    if (takesSessions) {
+    if (c.subcommands) {
+      lines.push(guard);
+      lines.push("      if [[ ${COMP_CWORD} -eq 2 ]]; then");
+      lines.push(
+        `        COMPREPLY=($(compgen -W "${c.subcommands.map((subcommand) => subcommand.name).join(" ")}" -- "\${cur}"))`,
+      );
+      lines.push("        return");
+      lines.push("      fi");
+      lines.push('      case "${COMP_WORDS[2]}" in');
+      for (const subcommand of c.subcommands) {
+        const leafFlags = subcommand.flags ?? [];
+        const leafFlagWords = leafFlags
+          .map((f) => (f.short ? `-${f.short} --${f.name}` : `--${f.name}`))
+          .join(" ");
+        lines.push(`        ${subcommand.name})`);
+        for (const f of leafFlags) {
+          if (!f.argument) continue;
+          const spellings = [f.short ? `-${f.short}` : null, `--${f.name}`].filter(Boolean);
+          const condition = spellings.map((spelling) => `"\${prev}" == "${spelling}"`).join(" || ");
+          lines.push(`          if [[ ${condition} ]]; then`);
+          if (f.argument._tag === "choices") {
+            lines.push(
+              `            COMPREPLY=($(compgen -W "${f.argument.values.join(" ")}" -- "\${cur}"))`,
+            );
+          }
+          lines.push("            return");
+          lines.push("          fi");
+        }
+        lines.push("          if [[ \"${cur}\" == -* ]]; then");
+        lines.push(
+          `            COMPREPLY=($(compgen -W "${leafFlagWords}" -- "\${cur}"))`,
+        );
+        lines.push("          fi");
+        lines.push("          ;;");
+      }
+      lines.push("      esac");
+      lines.push("      ;;");
+    } else if (takesSessions) {
       lines.push(guard);
       for (const f of c.flags ?? []) {
         if (!f.argument) continue;
@@ -525,6 +635,37 @@ function zshScript(): string {
   for (const c of COMMANDS) {
     const names = [c.name, ...(c.aliases ?? [])].join("|");
     lines.push(`        ${names})`);
+    if (c.subcommands) {
+      lines.push("          if (( CURRENT == 3 )); then");
+      lines.push(
+        `            _values 'operation' ${c.subcommands.map((subcommand) => subcommand.name).join(" ")}`,
+      );
+      lines.push("          else");
+      lines.push("            case ${words[2]} in");
+      for (const subcommand of c.subcommands) {
+        lines.push(`              ${subcommand.name})`);
+        const specs = (subcommand.flags ?? []).map((f) => {
+          const opt = f.short
+            ? `(${f.short} --${f.name}){${f.short},--${f.name}}`
+            : `--${f.name}`;
+          const argument = f.argument?._tag === "choices"
+            ? `:${f.argument.name}:(${f.argument.values.join(" ")})`
+            : f.argument?._tag === "free"
+              ? `:${f.argument.name}:`
+              : "";
+          return `'${opt}[${f.desc}]${argument}'`;
+        });
+        lines.push("                _arguments \\");
+        specs.forEach((spec, index) => {
+          lines.push(`                  ${spec}${index === specs.length - 1 ? "" : " \\"}`);
+        });
+        lines.push("                ;;");
+      }
+      lines.push("            esac");
+      lines.push("          fi");
+      lines.push("          ;;");
+      continue;
+    }
     const specs: string[] = [];
     for (const f of c.flags ?? []) {
       const opt = f.short

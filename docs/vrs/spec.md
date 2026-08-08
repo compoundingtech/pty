@@ -174,6 +174,119 @@ Explicit lifecycle commands and `gc` own mutation. Cleanup is authorized by the
 observed generation; removal wins over late daemon finalization, and permanent
 respawn cannot overwrite a replacement (R03, R10).
 
+### Retained exit evidence
+
+An evidence consumer separates observation from cleanup (R12):
+
+```text
+exact stable id
+      |
+      v
+bounded snapshot -- opaque generation --> durable consumer action
+                                             |
+                                             v
+                                conditional same-generation remove
+                                             |
+                         +-------------------+--------------------+
+                         |                   |                    |
+                      removed        semantic refusal     cleanup I/O failure
+                         |                   |                    |
+                  artifacts absent   artifacts untouched   metadata retained;
+                                                           cleanup may be partial
+```
+
+The exported client API and machine CLI share these tagged result schemas:
+
+```typescript
+type ExitEvidenceTail =
+  | { _tag: "present"; lastLines: string[] }
+  | { _tag: "unavailable" }
+
+type ExitEvidenceResult =
+  | {
+      _tag: "snapshot"
+      snapshot: {
+        name: string
+        generation: string
+        status: "exited" | "vanished"
+        exitCode: number | null
+        stream: "combined"
+        tail: ExitEvidenceTail
+      }
+    }
+  | {
+      _tag: "unavailable"
+      reason:
+        | "missing"
+        | "running"
+        | "busy"
+        | "generation-unavailable"
+        | "invalid-metadata"
+    }
+
+type RemoveGenerationResult =
+  | { _tag: "removed" }
+  | { _tag: "missing" }
+  | { _tag: "generation-mismatch" }
+  | { _tag: "not-terminal" }
+  | { _tag: "invalid-metadata" }
+  | { _tag: "busy" }
+```
+
+Snapshot and remove accept an exact filename-safe stable id, never a mutable
+display-name reference. The generation is an opaque, nonempty token returned by
+the snapshot; callers compare or return it without interpreting its format.
+`exited` carries the recorded integer exit code, while `vanished` has a null
+exit code because no terminal exit record exists. `tail.present` is the exact
+persisted combined-stream line array, including an empty array;
+`tail.unavailable` means no retained tail was persisted.
+
+The evidence metadata reader opens the metadata path read-only, nonblocking,
+and without following symlinks. It requires a regular file no larger than 1
+MiB and a JSON object with these structural constraints:
+
+| Field | Constraint |
+| --- | --- |
+| `generation` | required nonempty string |
+| `daemonPid` | optional positive integer |
+| `exitedAt`, `exitCode` | both absent, or nonempty string plus integer |
+| `lastLines` | optional array of at most 200 strings |
+
+Unknown compatible fields are ignored. Malformed JSON, oversized or nonregular
+artifacts, symlinks, invalid field types, mixed terminal fields, and over-bound
+tails produce `invalid-metadata`; they are neither truncated nor treated as
+missing. A legacy record without `generation` is explicitly
+`generation-unavailable` for snapshot and `generation-mismatch` for removal.
+
+Snapshot holds the stable-id creation lock across metadata validation and the
+daemon-generation liveness check. Conditional removal serializes event and
+creation mutation, then applies this order:
+
+1. read and structurally validate metadata;
+2. compare the retained opaque generation with the expected generation;
+3. refuse a live matching generation;
+4. re-read, revalidate, and compare the generation;
+5. remove socket, pid, event, and recovery-revision artifacts;
+6. remove metadata last, preserving evidence if an earlier cleanup step fails;
+7. release both locks.
+
+Steps 5 and 6 are not transactional. If step 5 fails, auxiliary artifacts
+removed earlier in the sequence remain absent, while metadata remains as
+retryable exact-generation evidence. No rollback is attempted. Missing
+artifacts are idempotent. Contention and semantic refusal happen before cleanup
+mutation and return tagged results. Argument, metadata-cleanup I/O, and
+output-transport failures remain operational errors rather than success-shaped
+results. The CLI output law is:
+
+| CLI outcome | stdout | stderr | exit status |
+| --- | --- | --- | --- |
+| semantic snapshot/remove result | exactly one tagged JSON document | empty | 0 |
+| argument or operational failure | no success JSON | diagnostic | nonzero |
+
+`evidence snapshot --id` and `evidence remove --id --expected-generation`
+provide leaf-specific help and completion schemas; snapshot never advertises
+the remove-only generation option (R11, R12).
+
 ### Live registry recovery
 
 A supporting daemon may publish an opaque recovery capability only when it can
@@ -220,6 +333,7 @@ input, resize, and multi-client geometry without mocks.
 | R09 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [recovery](../../src/recovery.ts), [CLI](../../src/cli.ts) | [root](../../tests/pty-root.test.ts), [display name](../../tests/display-name.test.ts), [status](../../tests/stats-cli.test.ts), [list purity](../../tests/list-purity.test.ts), [recovery](../../tests/recovery.test.ts) |
 | R10 | [sessions](../../src/sessions.ts), [events](../../src/events.ts), [recovery](../../src/recovery.ts), [protocol](../../src/protocol.ts) | [atomic writes](../../tests/atomic-writes.test.ts), [metadata events](../../tests/metadata-events.test.ts), [events](../../tests/events.test.ts), [recovery](../../tests/recovery.test.ts), [disk layout](../../tests/disk-layout-docs.test.ts) |
 | R11 | [CLI](../../src/cli.ts), [client API](../../src/client-api.ts), [remote](../../src/remote.ts), [testing API](../../src/testing/index.ts) | [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [remote](../../tests/remote-fabric.test.ts), [screenshots](../../tests/screenshot.test.ts), [keys](../../tests/keys.test.ts) |
+| R12 | [sessions](../../src/sessions.ts), [server](../../src/server.ts), [client API](../../src/client-api.ts), [CLI](../../src/cli.ts), [completions](../../src/completions.ts) | [exit evidence](../../tests/exit-reap.test.ts), [generation guard](../../tests/gc-generation-guard.test.ts), [immediate reuse](../../tests/rm-immediate-reuse.test.ts), [help](../../tests/help.test.ts), [completions](../../tests/completions.test.ts), [security](../../tests/security-fixes.test.ts) |
 
 `node scripts/verify-docs.ts --vrs-only` validates this two-document shape,
 sequential requirement IDs, links, and complete requirement references.

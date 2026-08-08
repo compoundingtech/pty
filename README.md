@@ -419,6 +419,7 @@ Like `git`, `pty` supports extensions: if you run `pty foo` and there's a `pty-f
 ```typescript
 import {
   spawnDaemon, listSessions, getSession,
+  getSessionExitEvidence, removeSessionGeneration,
   SessionConnection, sendData, peekScreen, queryStats,
   EventFollower, readRecentEvents,
   extractFilterTags, matchesAllTags,

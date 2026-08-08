@@ -29,6 +29,8 @@ import {
   updateTags,
   setDisplayName,
   patchMetadataById,
+  getSessionExitEvidence,
+  removeSessionGeneration,
   mutateMetadataUnderLock,
   allSessionNames,
   readMetadata,
@@ -408,6 +410,18 @@ Examples:
   printf '%s' '{"displayName":"Worker","tags":{"role":"worker"}}' | pty metadata patch --id a1b2c3d4
   printf '%s' '{"displayName":null,"tags":{"temporary":null}}' | pty metadata patch --id a1b2c3d4`,
 
+  evidence: `Usage: pty evidence snapshot --id <stable-id>
+       pty evidence remove --id <stable-id> --expected-generation <opaque>
+
+Read retained terminal evidence for one exact stable session generation, or
+remove that generation after the caller has durably consumed the evidence.
+Both operations emit exactly one tagged JSON document on stdout. Semantic
+outcomes exit 0; invalid arguments and operational failures exit nonzero.
+
+Examples:
+  pty evidence snapshot --id a1b2c3d4
+  pty evidence remove --id a1b2c3d4 --expected-generation 7f44b35e`,
+
   up: `Usage: pty up [<dir>] [<name>...]
 
 Start sessions declared in a pty.toml. With no args, reads ./pty.toml and starts all.
@@ -433,6 +447,23 @@ Examples:
   pty test
   pty test -t "peek"`,
 };
+
+const EVIDENCE_LEAF_HELP = {
+  snapshot: `Usage: pty evidence snapshot --id <stable-id>
+
+Emit one tagged JSON snapshot of retained terminal evidence for the exact
+stable session id.
+
+Example:
+  pty evidence snapshot --id a1b2c3d4`,
+  remove: `Usage: pty evidence remove --id <stable-id> --expected-generation <opaque>
+
+Remove one terminal session only when it still carries the opaque generation
+returned by an earlier snapshot. Emits one tagged JSON result.
+
+Example:
+  pty evidence remove --id a1b2c3d4 --expected-generation 7f44b35e`,
+} as const;
 
 /** Print a subcommand's focused help. Resolves aliases; returns false for an
  *  unknown command so the caller can fall through. */
@@ -506,6 +537,7 @@ Observe:
 
 Modify:
   pty metadata patch --id <id>            Atomically merge displayName/tags from JSON stdin
+  pty evidence snapshot --id <id>         Read exact-generation retained exit evidence as JSON
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName
@@ -526,6 +558,8 @@ Lifecycle:
   pty kill <ref>                          SIGTERM a running session's daemon
   pty recover <name> --snapshot <file>    Rebind a supporting live daemon after registry unlink
   pty rm <ref>                            Remove an exited session's metadata (alias: pty remove)
+  pty evidence remove --id <id> --expected-generation <opaque>
+                                          Remove only the matching terminal generation
   pty gc                                  Reconciliation pass: orphan-kill, abandoned-reap,
                                           permanent-respawn, exited-sweep
   pty gc --dry-run                        Preview without changing anything (alias: -n)
@@ -1557,6 +1591,11 @@ async function main(): Promise<void> {
 
     case "metadata": {
       await cmdMetadata(args.slice(1));
+      break;
+    }
+
+    case "evidence": {
+      await cmdEvidence(args.slice(1));
       break;
     }
 
@@ -2820,6 +2859,57 @@ async function cmdMetadata(rawArgs: string[]): Promise<void> {
     console.error(`pty metadata patch: ${(e as Error).message}`);
     process.exit(1);
   }
+}
+
+async function cmdEvidence(rawArgs: string[]): Promise<void> {
+  const operation = rawArgs[0];
+  if (operation !== "snapshot" && operation !== "remove") {
+    console.error('pty evidence: expected subcommand "snapshot" or "remove".');
+    console.error("  Usage: pty evidence snapshot --id <stable-id>");
+    console.error("         pty evidence remove --id <stable-id> --expected-generation <opaque>");
+    process.exit(1);
+  }
+  if (
+    rawArgs.length === 2 &&
+    (rawArgs[1] === "-h" || rawArgs[1] === "--help")
+  ) {
+    console.log(EVIDENCE_LEAF_HELP[operation]);
+    return;
+  }
+
+  let id: string | null = null;
+  let expectedGeneration: string | null = null;
+  for (let i = 1; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === "--id") {
+      const value = rawArgs[++i];
+      if (!value) throw new Error("pty evidence: --id requires a stable session id.");
+      if (id !== null) throw new Error("pty evidence: --id may only be provided once.");
+      id = value;
+    } else if (arg === "--expected-generation") {
+      const value = rawArgs[++i];
+      if (!value) throw new Error("pty evidence: --expected-generation requires an opaque generation.");
+      if (expectedGeneration !== null) {
+        throw new Error("pty evidence: --expected-generation may only be provided once.");
+      }
+      expectedGeneration = value;
+    } else {
+      throw new Error(`pty evidence: unexpected argument "${arg}".`);
+    }
+  }
+
+  if (id === null) throw new Error("pty evidence: missing required --id <stable-id>.");
+  if (operation === "snapshot") {
+    if (expectedGeneration !== null) {
+      throw new Error("pty evidence snapshot: --expected-generation is only valid for remove.");
+    }
+    fs.writeFileSync(1, `${JSON.stringify(await getSessionExitEvidence(id))}\n`);
+    return;
+  }
+  if (expectedGeneration === null) {
+    throw new Error("pty evidence remove: missing required --expected-generation <opaque>.");
+  }
+  fs.writeFileSync(1, `${JSON.stringify(await removeSessionGeneration(id, expectedGeneration))}\n`);
 }
 
 async function cmdRename(rawArgs: string[]): Promise<void> {

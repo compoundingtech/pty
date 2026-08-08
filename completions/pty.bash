@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata up down test remote-serve"
+  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata evidence up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -127,6 +127,33 @@ _pty() {
       ;;
     metadata)
       COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+      ;;
+    evidence)
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "snapshot remove" -- "${cur}"))
+        return
+      fi
+      case "${COMP_WORDS[2]}" in
+        snapshot)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+          fi
+          ;;
+        remove)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${prev}" == "--expected-generation" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id --expected-generation" -- "${cur}"))
+          fi
+          ;;
+      esac
       ;;
     up)
       COMPREPLY=($(compgen -o dirnames -- "${cur}"))

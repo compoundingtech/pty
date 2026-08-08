@@ -23,9 +23,45 @@ display name resolves only when it has exactly one match; multiple matches throw
 an error that lists the candidate stable ids. Returns `null` when no session
 matches. Resolve once, then pass `session.name` to socket-oriented APIs.
 
+### `getSessionExitEvidence(name: string): Promise<SessionExitEvidenceResult>`
+
+Read the retained terminal evidence for one dead daemon generation. A snapshot
+contains the stable session id, opaque generation, `exited` or `vanished`
+status, nullable exit code, `stream: "combined"`, and the exact persisted
+bounded `lastLines`. An absent persisted tail is tagged `unavailable`; it is
+not reported as an empty tail.
+
+The operation fails closed with a tagged `unavailable` result when the session
+is missing, running, locked, lacks a generation, or has invalid metadata. The
+evidence reader rejects malformed, oversized, symlink, non-regular, type-invalid,
+and over-200-line metadata as `invalid-metadata`.
+
+### `removeSessionGeneration(name: string, expectedGeneration: string): Promise<RemoveSessionGenerationResult>`
+
+Remove all PTY artifacts only when the retained metadata still belongs to the
+given opaque generation and its daemon is gone. Results distinguish `removed`,
+`missing`, `generation-mismatch`, `not-terminal`, `invalid-metadata`, and
+`busy`. A replacement generation is never removed. Cleanup errors other than
+absence are thrown, and metadata is removed last so failed cleanup retains the
+evidence for retry.
+
+Rust and other non-TypeScript consumers can use the equivalent machine-only
+CLI boundary. Both operations address only an immutable stable id, emit exactly
+one tagged JSON document on stdout, and exit 0 for semantic outcomes:
+
+```sh
+pty evidence snapshot --id a1b2c3d4
+pty evidence remove --id a1b2c3d4 --expected-generation 7f44b35e
+```
+
+Invalid arguments and operational failures exit nonzero with a diagnostic on
+stderr. A reconciler should durably consume the snapshot before passing its
+opaque generation to `remove`; a mismatch must leave the replacement intact.
+
 ### `validateName(name: string): void`
 
-Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]` and be at most 255 characters.
+Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]`, cannot be
+`.` or `..`, and are at most 255 characters.
 
 ### `patchMetadataById(id: string, patch: MetadataPatch): Promise<MetadataPatchResult>`
 

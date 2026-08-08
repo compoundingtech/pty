@@ -19,7 +19,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
+import {
+  getSessionExitEvidence,
+  removeSessionGeneration,
+} from "../src/client-api.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -98,6 +102,24 @@ function runCli(sessionDir: string, ...args: string[]): { stdout: string; status
   }
 }
 
+function runEvidenceCli(sessionDir: string, ...args: string[]) {
+  return spawnSync(nodeBin, [cliPath, "evidence", ...args], {
+    env: {
+      ...process.env,
+      PTY_ROOT: sessionDir,
+      PTY_ROOT_LEGACY_SILENT: "1",
+    },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+}
+
+function parseSemanticEvidenceResult(result: ReturnType<typeof runEvidenceCli>): unknown {
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  return JSON.parse(result.stdout);
+}
+
 function sessionFiles(dir: string, name: string): string[] {
   try {
     return fs.readdirSync(dir).filter((f) => f.startsWith(name));
@@ -132,6 +154,38 @@ async function waitForDaemonExit(pid: number, budgetMs = 6000): Promise<void> {
   }
 }
 
+async function waitForRuntimeTeardown(
+  dir: string,
+  name: string,
+  budgetMs = 6000,
+): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (
+    Date.now() < deadline &&
+    (fs.existsSync(path.join(dir, `${name}.sock`)) ||
+      fs.existsSync(path.join(dir, `${name}.pid`)))
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(false);
+  expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(false);
+}
+
+async function withApiRoot<T>(dir: string, run: () => Promise<T>): Promise<T> {
+  const previousRoot = process.env.PTY_ROOT;
+  const previousLegacyRoot = process.env.PTY_SESSION_DIR;
+  process.env.PTY_ROOT = dir;
+  delete process.env.PTY_SESSION_DIR;
+  try {
+    return await run();
+  } finally {
+    if (previousRoot === undefined) delete process.env.PTY_ROOT;
+    else process.env.PTY_ROOT = previousRoot;
+    if (previousLegacyRoot === undefined) delete process.env.PTY_SESSION_DIR;
+    else process.env.PTY_SESSION_DIR = previousLegacyRoot;
+  }
+}
+
 afterEach(async () => {
   // Only pids this file spawned are ever signalled.
   await terminateAndWait(bgPids);
@@ -144,6 +198,472 @@ afterEach(async () => {
     } catch {}
   }
   sessionDirs = [];
+});
+
+describe("exact-generation exit evidence", () => {
+  it("exposes the exact-generation lifecycle through one tagged JSON document per CLI operation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const stdoutSentinel = `cli-stdout-${name}`;
+    const stderrSentinel = `cli-stderr-${name}`;
+    const oldPid = await startDaemon(
+      dir,
+      name,
+      "sh",
+      ["-c", `printf '${stdoutSentinel}\\n'; printf '${stderrSentinel}\\n' >&2; exit 23`],
+      { tags: { keep: "true" } },
+    );
+
+    await waitForDaemonExit(oldPid);
+    await waitForRuntimeTeardown(dir, name);
+
+    const captured = parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    ) as Awaited<ReturnType<typeof getSessionExitEvidence>>;
+    expect(captured._tag).toBe("snapshot");
+    if (captured._tag !== "snapshot") return;
+    expect(captured.snapshot).toMatchObject({
+      name,
+      status: "exited",
+      exitCode: 23,
+      stream: "combined",
+      tail: { _tag: "present" },
+    });
+    if (captured.snapshot.tail._tag !== "present") return;
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+    );
+    expect(captured.snapshot.tail.lastLines).toEqual(persisted.lastLines);
+    expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stdoutSentinel);
+    expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stderrSentinel);
+
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      captured.snapshot.generation,
+    ))).toEqual({ _tag: "removed" });
+    expect(parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    )).toEqual({ _tag: "unavailable", reason: "missing" });
+
+    const replacementPid = await startDaemon(
+      dir,
+      name,
+      "cat",
+      [],
+      { tags: { keep: "true" } },
+    );
+    const replacement = JSON.parse(
+      fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+    );
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      captured.snapshot.generation,
+    ))).toEqual({ _tag: "generation-mismatch" });
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      replacement.generation,
+    ))).toEqual({ _tag: "not-terminal" });
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.sock`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.pid`))).toBe(true);
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+  }, 20_000);
+
+  it.each([
+    { args: [] },
+    { args: ["snapshot"] },
+    { args: ["snapshot", "--id"] },
+    { args: ["snapshot", "--id", "one", "--id", "two"] },
+    { args: ["snapshot", "--id", "one", "unexpected"] },
+    { args: ["snapshot", "--id", "one", "--expected-generation", "gen"] },
+    { args: ["remove", "--id", "one"] },
+    { args: ["remove", "--id", "one", "--expected-generation"] },
+    { args: ["remove", "--id", "one", "--expected-generation", "gen", "--expected-generation", "gen2"] },
+    { args: ["unknown", "--id", "one"] },
+  ])("rejects invalid evidence CLI arguments without success JSON: $args", ({ args }) => {
+    const result = runEvidenceCli(makeSessionDir(), ...args);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toBe("");
+    expect(result.stdout).toBe("");
+  });
+
+  it("captures the retained combined tail before conditionally removing only that generation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const stdoutSentinel = `stdout-${name}`;
+    const stderrSentinel = `stderr-${name}`;
+    const oldPid = await startDaemon(
+      dir,
+      name,
+      "sh",
+      ["-c", `printf '${stdoutSentinel}\\n'; printf '${stderrSentinel}\\n' >&2; exit 23`],
+      { tags: { keep: "true" } },
+    );
+
+    await waitForDaemonExit(oldPid);
+    await waitForRuntimeTeardown(dir, name);
+
+    await withApiRoot(dir, async () => {
+      const captured = await getSessionExitEvidence(name);
+      expect(captured._tag).toBe("snapshot");
+      if (captured._tag !== "snapshot") return;
+
+      expect(captured.snapshot).toMatchObject({
+        name,
+        status: "exited",
+        exitCode: 23,
+        stream: "combined",
+        tail: { _tag: "present" },
+      });
+      expect(captured.snapshot.generation).toEqual(expect.any(String));
+      if (captured.snapshot.tail._tag !== "present") return;
+      const persisted = JSON.parse(
+        fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+      );
+      expect(captured.snapshot.tail.lastLines).toEqual(persisted.lastLines);
+      expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stdoutSentinel);
+      expect(captured.snapshot.tail.lastLines.join("\n")).toContain(stderrSentinel);
+
+      expect(await removeSessionGeneration(name, captured.snapshot.generation))
+        .toEqual({ _tag: "removed" });
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "missing",
+      });
+
+      const replacementPid = await startDaemon(
+        dir,
+        name,
+        "cat",
+        [],
+        { tags: { keep: "true" } },
+      );
+      const replacement = JSON.parse(
+        fs.readFileSync(path.join(dir, `${name}.json`), "utf8"),
+      );
+      expect(await removeSessionGeneration(name, replacement.generation))
+        .toEqual({ _tag: "not-terminal" });
+      expect(await removeSessionGeneration(name, captured.snapshot.generation))
+        .toEqual({ _tag: "generation-mismatch" });
+      expect(isAlive(replacementPid)).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+  }, 20_000);
+
+  it("keeps an absent persisted tail explicit for a vanished generation", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "vanished-generation",
+      daemonPid: 2147483647,
+      command: "cat",
+      args: [],
+      displayCommand: "cat",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "snapshot",
+        snapshot: {
+          name,
+          generation: "vanished-generation",
+          status: "vanished",
+          exitCode: null,
+          stream: "combined",
+          tail: { _tag: "unavailable" },
+        },
+      });
+    });
+  });
+
+  it("preserves a persisted empty tail instead of calling it unavailable", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "empty-tail-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: [],
+    }));
+
+    await withApiRoot(dir, async () => {
+      const captured = await getSessionExitEvidence(name);
+      expect(captured).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          status: "exited",
+          exitCode: 0,
+          tail: { _tag: "present", lastLines: [] },
+        },
+      });
+    });
+  });
+
+  it("refuses cleanup when exact generation ownership is unavailable", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: ["legacy evidence"],
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "generation-unavailable",
+      });
+      expect(await removeSessionGeneration(name, "expected-generation"))
+        .toEqual({ _tag: "generation-mismatch" });
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+  });
+
+  it("retains terminal evidence after partial conditional cleanup", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const metadataPath = path.join(dir, `${name}.json`);
+    const socketPath = path.join(dir, `${name}.sock`);
+    const pidPath = path.join(dir, `${name}.pid`);
+    const eventsPath = path.join(dir, `${name}.events.jsonl`);
+    fs.writeFileSync(metadataPath, JSON.stringify({
+      generation: "cleanup-failure-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 17,
+      lastLines: ["still available"],
+    }));
+    fs.writeFileSync(socketPath, "stale socket");
+    fs.writeFileSync(pidPath, "2147483647\n");
+    fs.mkdirSync(eventsPath);
+
+    await withApiRoot(dir, async () => {
+      await expect(removeSessionGeneration(name, "cleanup-failure-generation"))
+        .rejects.toThrow();
+      expect(fs.existsSync(socketPath)).toBe(false);
+      expect(fs.existsSync(pidPath)).toBe(false);
+      expect(fs.existsSync(eventsPath)).toBe(true);
+      expect(fs.existsSync(metadataPath)).toBe(true);
+      expect(await getSessionExitEvidence(name)).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          generation: "cleanup-failure-generation",
+          exitCode: 17,
+          tail: { _tag: "present", lastLines: ["still available"] },
+        },
+      });
+    });
+
+    const result = runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      "cleanup-failure-generation",
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toBe("");
+    expect(result.stdout).toBe("");
+    expect(fs.existsSync(metadataPath)).toBe(true);
+  });
+
+  it.each([
+    ["numeric generation", { generation: 42 }],
+    ["empty generation", { generation: "" }],
+    ["string exit code", { exitCode: "17" }],
+    ["missing exit timestamp", { exitedAt: undefined }],
+    ["non-string tail entries", { lastLines: [7, { injected: true }] }],
+    ["tail above the persisted bound", {
+      lastLines: Array.from({ length: 201 }, (_, i) => `line-${i}`),
+    }],
+  ])("rejects %s in persisted evidence metadata", async (_case, override) => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const value = {
+      generation: "valid-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 17,
+      lastLines: ["valid evidence"],
+      tags: { keep: "true" },
+      futureCompatibleField: { preserved: true },
+      ...override,
+    };
+    fs.writeFileSync(
+      path.join(dir, `${name}.json`),
+      JSON.stringify(value),
+    );
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toEqual({
+        _tag: "unavailable",
+        reason: "invalid-metadata",
+      });
+      expect(await removeSessionGeneration(name, "valid-generation"))
+        .toEqual({ _tag: "invalid-metadata" });
+      expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+    });
+    expect(parseSemanticEvidenceResult(
+      runEvidenceCli(dir, "snapshot", "--id", name),
+    )).toEqual({ _tag: "unavailable", reason: "invalid-metadata" });
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      dir,
+      "remove",
+      "--id",
+      name,
+      "--expected-generation",
+      "valid-generation",
+    ))).toEqual({ _tag: "invalid-metadata" });
+    expect(fs.existsSync(path.join(dir, `${name}.json`))).toBe(true);
+  });
+
+  it.each(["malformed", "oversized", "directory", "symlink"])(
+    "fails closed on a %s metadata artifact",
+    async (artifact) => {
+      const dir = makeSessionDir();
+      const name = uniqueName();
+      const metadataPath = path.join(dir, `${name}.json`);
+      if (artifact === "malformed") {
+        fs.writeFileSync(metadataPath, "{not-json");
+      } else if (artifact === "oversized") {
+        fs.writeFileSync(metadataPath, JSON.stringify({
+          generation: "oversized-generation",
+          exitedAt: "2026-08-02T00:00:01.000Z",
+          exitCode: 17,
+          lastLines: ["valid evidence"],
+          padding: "x".repeat(2 * 1024 * 1024),
+        }));
+      } else if (artifact === "directory") {
+        fs.mkdirSync(metadataPath);
+      } else {
+        const target = path.join(dir, "symlink-target.json");
+        fs.writeFileSync(target, JSON.stringify({
+          generation: "symlink-generation",
+          exitedAt: "2026-08-02T00:00:01.000Z",
+          exitCode: 17,
+          lastLines: ["must not escape"],
+        }));
+        fs.symlinkSync(target, metadataPath);
+      }
+
+      await withApiRoot(dir, async () => {
+        expect(await getSessionExitEvidence(name)).toEqual({
+          _tag: "unavailable",
+          reason: "invalid-metadata",
+        });
+        expect(await removeSessionGeneration(name, "any-generation"))
+          .toEqual({ _tag: "invalid-metadata" });
+      });
+      expect(parseSemanticEvidenceResult(
+        runEvidenceCli(dir, "snapshot", "--id", name),
+      )).toEqual({ _tag: "unavailable", reason: "invalid-metadata" });
+      expect(parseSemanticEvidenceResult(runEvidenceCli(
+        dir,
+        "remove",
+        "--id",
+        name,
+        "--expected-generation",
+        "any-generation",
+      ))).toEqual({ _tag: "invalid-metadata" });
+      expect(fs.existsSync(metadataPath)).toBe(true);
+    },
+  );
+
+  it("accepts compatible unknown fields and nominal tags", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+      generation: "compatible-generation",
+      daemonPid: 2147483647,
+      command: "true",
+      args: [],
+      displayCommand: "true",
+      cwd: dir,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      exitedAt: "2026-08-02T00:00:01.000Z",
+      exitCode: 0,
+      lastLines: ["compatible evidence"],
+      tags: { keep: "true", owner: "supervisor" },
+      futureCompatibleField: { preserved: true },
+    }));
+
+    await withApiRoot(dir, async () => {
+      expect(await getSessionExitEvidence(name)).toMatchObject({
+        _tag: "snapshot",
+        snapshot: {
+          generation: "compatible-generation",
+          exitCode: 0,
+          tail: { _tag: "present", lastLines: ["compatible evidence"] },
+        },
+      });
+    });
+  });
+
+  it("rejects unsafe identities before deriving evidence paths", async () => {
+    for (const name of ["/absolute", "../traversal", "nested/path", ".", ".."] as const) {
+      await expect(getSessionExitEvidence(name)).rejects.toThrow();
+      await expect(removeSessionGeneration(name, "generation")).rejects.toThrow();
+      for (const args of [
+        ["snapshot", "--id", name],
+        ["remove", "--id", name, "--expected-generation", "generation"],
+      ]) {
+        const result = runEvidenceCli(makeSessionDir(), ...args);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).not.toBe("");
+        expect(result.stdout).toBe("");
+      }
+    }
+    await expect(getSessionExitEvidence("normal.dotted-task-id")).resolves.toEqual({
+      _tag: "unavailable",
+      reason: "missing",
+    });
+    expect(parseSemanticEvidenceResult(runEvidenceCli(
+      makeSessionDir(),
+      "snapshot",
+      "--id",
+      "normal.dotted-task-id",
+    ))).toEqual({ _tag: "unavailable", reason: "missing" });
+  });
 });
 
 describe("exit-time reap: sessions that clean themselves up", () => {

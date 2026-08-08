@@ -20,6 +20,7 @@ function verifyVrs(): void {
   const requirementsPath = path.join(vrsRoot, "requirements.md");
   const specPath = path.join(vrsRoot, "spec.md");
   const errors: string[] = [];
+  let requirementCount = 0;
 
   if (actual.join("\n") !== expected.join("\n")) {
     errors.push(`docs/vrs must contain only ${expected.join(" and ")}`);
@@ -32,6 +33,7 @@ function verifyVrs(): void {
     const ids = [...requirements.matchAll(/^- \*\*(R\d{2}) [^*]+:\*\*/gm)].map(
       (match) => match[1],
     );
+    requirementCount = ids.length;
 
     if (ids.length === 0) errors.push("requirements.md defines no requirement IDs");
     if (!ids.every((id, index) => id === `R${String(index + 1).padStart(2, "0")}`)) {
@@ -67,7 +69,7 @@ function verifyVrs(): void {
     console.error(`VRS verification failed:\n${errors.map((error) => `- ${error}`).join("\n")}`);
     process.exit(1);
   }
-  console.log("Verified 2 VRS documents and 11 requirement IDs");
+  console.log(`Verified 2 VRS documents and ${requirementCount} requirement IDs`);
 }
 
 verifyVrs();

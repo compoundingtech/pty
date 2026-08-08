@@ -1294,6 +1294,8 @@ describe("integration", () => {
     expect(() => validateName("")).toThrow(/empty/);
     expect(() => validateName("bad/name")).toThrow(/Invalid session name/);
     expect(() => validateName("../traversal")).toThrow(/Invalid session name/);
+    expect(() => validateName(".")).toThrow(/Invalid session name/);
+    expect(() => validateName("..")).toThrow(/Invalid session name/);
     expect(() => validateName("has spaces")).toThrow(/Invalid session name/);
     expect(() => validateName("a".repeat(256))).toThrow(/too long/);
   });

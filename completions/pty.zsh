@@ -35,6 +35,7 @@ _pty() {
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
     'metadata:Atomically patch presentation metadata by stable id'
+    'evidence:Read or remove exact-generation retained exit evidence'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
@@ -183,6 +184,23 @@ _pty() {
           _arguments \
             '--id[Exact stable session id]' \
             '1:mode:(patch)'
+          ;;
+        evidence)
+          if (( CURRENT == 3 )); then
+            _values 'operation' snapshot remove
+          else
+            case ${words[2]} in
+              snapshot)
+                _arguments \
+                  '--id[Exact stable session id]:id:'
+                ;;
+              remove)
+                _arguments \
+                  '--id[Exact stable session id]:id:' \
+                  '--expected-generation[Opaque generation returned by evidence snapshot]:generation:'
+                ;;
+            esac
+          fi
           ;;
         up)
           _arguments \
