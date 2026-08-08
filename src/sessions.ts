@@ -9,6 +9,7 @@ import {
   assertPrivateRecoveryPaths,
   atomicWritePrivate,
   recoveryRevisionPath,
+  readProcessStartToken,
   signRecoveryRevision,
   stampRecoveryMetadata,
 } from "./recovery.ts";
@@ -135,8 +136,8 @@ export interface SessionMetadata {
    *  delete files whose metadata carries a different generation. */
   generation?: string;
   /** PID of the daemon that owns this metadata generation. Unlike the
-   *  sidecar pidfile, this survives socket cleanup long enough for `pty rm`
-   *  to wait until deferred daemon shutdown is complete. */
+   *  sidecar pidfile, this survives socket cleanup. Inventory accepts it only
+   *  when the recovery process-start token still proves the same OS process. */
   daemonPid?: number;
   /** Capability advertised only by daemons that support authenticated,
    *  signal-free recovery of an unlinked registry. Treat `secret` as opaque. */
@@ -944,7 +945,7 @@ export async function listSessions(options: ListSessionsOptions = {}): Promise<S
 
     // A live pid remains authoritative even if its socket inode is temporarily
     // absent. Listing observes that mismatch; it never "repairs" it.
-    const pid = readPid(name);
+    const pid = readPid(name, metadata);
     if (pid !== null && isProcessAlive(pid)) {
       sessions.push({
         name,
@@ -1273,7 +1274,7 @@ export async function gc(
   for (const s of withParent) {
     const parentRef = s.metadata!.tags!.parent;
     const parentMeta = readMetadata(parentRef);
-    const parentPid = parentMeta ? readPid(parentRef) : null;
+    const parentPid = parentMeta ? readPid(parentRef, parentMeta) : null;
     const parentAlive = parentMeta != null && parentPid !== null && isProcessAlive(parentPid);
     if (parentAlive) continue;
     const reason: "missing" | "dead" = parentMeta ? "dead" : "missing";
@@ -1801,7 +1802,16 @@ export function readSessionPid(name: string): number | null {
   }
 }
 
-const readPid = readSessionPid;
+function readPid(name: string, metadata?: SessionMetadata | null): number | null {
+  const sidecarPid = readSessionPid(name);
+  if (sidecarPid !== null) return sidecarPid;
+
+  const retained = metadata ?? readMetadata(name);
+  const daemonPid = retained?.daemonPid;
+  const processStartToken = retained?.recovery?.processStartToken;
+  if (daemonPid === undefined || processStartToken === undefined) return null;
+  return readProcessStartToken(daemonPid) === processStartToken ? daemonPid : null;
+}
 
 export function isProcessAlive(pid: number): boolean {
   try {
