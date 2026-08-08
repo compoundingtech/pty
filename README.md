@@ -421,6 +421,7 @@ import {
   spawnDaemon, listSessions, getSession,
   getSessionExitEvidence, removeSessionGeneration,
   SessionConnection, sendData, peekScreen, queryStats,
+  connectActivityPublisher,
   EventFollower, readRecentEvents,
   extractFilterTags, matchesAllTags,
 } from "@compoundingtech/pty/client";
@@ -447,6 +448,13 @@ await spawnDaemon({
 const sessions = await listSessions();
 const stats = await queryStats("myserver");
 ```
+
+`queryStats()` includes generation-bound live activity
+(`unknown`, `active`, `child_command`, or `idle`) and terminal diagnostics such
+as `modes.alternateScreen`. Activity is explicit publisher state; terminal
+modes never imply idleness. Harness adapters can hold the single live lease
+with `connectActivityPublisher()` and publish ordered transitions. The state
+resets to `unknown` when that connection or daemon generation ends.
 
 ### Connecting to a session
 

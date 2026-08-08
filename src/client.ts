@@ -13,6 +13,7 @@ import {
   encodeStatus,
   decodeExit,
 } from "./protocol.ts";
+import type { ActivityStatus } from "./activity.ts";
 import { getSocketPath } from "./sessions.ts";
 import { stripAnsi } from "./tui/colors.ts";
 import { BRACKETED_PASTE_START, BRACKETED_PASTE_END } from "./paste.ts";
@@ -331,11 +332,13 @@ export interface StatsResult {
     >;
   };
   modes: {
+    alternateScreen: boolean;
     sgrMouse: boolean;
     cursorHidden: boolean;
     kittyKeyboard: boolean;
     kittyKeyboardFlags: number[];
   };
+  activity: ActivityStatus;
   uptimeSeconds: number | null;
   createdAt: string | null;
 }

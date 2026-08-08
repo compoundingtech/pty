@@ -9,7 +9,8 @@ export const MessageType = {
   SCREEN: 5, // Server → Client: screen buffer replay on attach
   PEEK: 6, // Client → Server: read-only attach (no input, no resize)
   STATUS: 7, // Client → Server: request stats; Server → Client: JSON stats response
-  // Values 8 and 9 are reserved for independent protocol extensions.
+  ACTIVITY: 8, // Bidirectional: generic activity lease commands/responses
+  // Value 9 is reserved for an independent protocol extension.
   GEOMETRY: 10, // Server → Client: effective shared rows/cols
 } as const;
 
@@ -101,6 +102,10 @@ export function encodeStatus(): Buffer {
 
 export function encodeStatusResponse(json: string): Buffer {
   return encodePacket(MessageType.STATUS, Buffer.from(json));
+}
+
+export function encodeActivity(value: unknown): Buffer {
+  return encodePacket(MessageType.ACTIVITY, Buffer.from(JSON.stringify(value)));
 }
 
 export function decodeSize(payload: Buffer): { rows: number; cols: number } {

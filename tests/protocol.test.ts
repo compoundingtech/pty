@@ -13,6 +13,7 @@ import {
   encodeScreen,
   encodeStatus,
   encodeStatusResponse,
+  encodeActivity,
   encodeGeometry,
   decodeSize,
   decodeGeometry,
@@ -327,10 +328,17 @@ describe("protocol", () => {
         daemon: { pid: 456, resources: null },
         clients: { total: 2, attached: 2, readOnly: 0 },
         modes: {
+          alternateScreen: false,
           sgrMouse: false,
           cursorHidden: false,
           kittyKeyboard: false,
           kittyKeyboardFlags: [],
+        },
+        activity: {
+          state: "unknown" as const,
+          generation: "generation-legacy",
+          producerEpoch: null,
+          sequence: 0,
         },
         uptimeSeconds: 10,
         createdAt: "2026-07-31T00:00:00.000Z",
@@ -342,6 +350,23 @@ describe("protocol", () => {
 
       expect(decoded.clients).toEqual({ total: 2, attached: 2, readOnly: 0 });
       expect(decoded.clients.connections).toBeUndefined();
+    });
+  });
+
+  describe("ACTIVITY", () => {
+    it("round-trips bounded JSON commands and responses", () => {
+      const reader = new PacketReader();
+      const encoded = encodeActivity({
+        op: "claim",
+        producerEpoch: "epoch-a",
+      });
+      const packets = reader.feed(encoded);
+      expect(packets).toHaveLength(1);
+      expect(packets[0].type).toBe(MessageType.ACTIVITY);
+      expect(JSON.parse(packets[0].payload.toString())).toEqual({
+        op: "claim",
+        producerEpoch: "epoch-a",
+      });
     });
   });
 });
