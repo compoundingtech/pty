@@ -74,7 +74,11 @@ Removals are applied first and explicit assignments second, so an assignment
 wins when both mention the same key. Older metadata without `unsetEnv` keeps
 the historical ambient-inheritance behavior.
 
-- Status (`running` / `exited` / `vanished`) is *derived* from socket + pid, not stored.
+- Status (`running` / `exited` / `vanished`) is *derived*, not stored. A
+  reachable socket or live pidfile process proves the daemon is running. If
+  both paths are absent,
+  `daemonPid` is accepted only when the retained recovery process-start token
+  still matches that OS process.
 - `generation` and `daemonPid` are internal lifecycle guards. A daemon only
   removes files still owned by its generation, and `pty rm` waits for that
   daemon to finish deferred shutdown before it reports success. Readers should
