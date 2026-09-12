@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### `pty metadata patch` waits out the attach window
+
+- An attached child starts while `pty run` still holds the per-session
+  creation lock, so a `metadata patch` executed at child start used to fail
+  deterministically with `metadata is busy`. The patch path now waits
+  boundedly (8 s total) for the creation/attach window instead of failing at
+  once. Stuck locks still fail closed with the same `busy` error — the wait
+  is bounded, never indefinite — and unknown ids still fail fast with
+  `not found`.
+- The daemon publishes the owner sidecar (`<id>.pid`) before spawning the
+  child, so ancestry checks running at child start already observe it.
+
 ### One reader for the process table
 
 - Process facts now come from one module. On Linux it reads `/proc` and spawns
