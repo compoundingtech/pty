@@ -265,6 +265,19 @@ export async function waitForEventLock(
   }
 }
 
+/** @internal Sync twin of `waitForEventLock` for CLI paths that are already
+ *  sync (e.g. `pty metadata patch` during the attach window, issue #180).
+ *  Returns `false` on timeout — fail-closed, never indefinite. */
+export function waitForEventLockSync(name: string, waitMs: number): boolean {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (true) {
+    if (acquireEventLock(name)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, remaining));
+  }
+}
+
 async function withEventLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
   await waitForEventLock(name);
   try {
