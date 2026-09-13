@@ -19,6 +19,7 @@ import {
 // from inside functions, never at module-init time.
 import {
   acquireEventLock, appendEventSync, appendEventSyncLocked, releaseEventLock,
+  waitForEventLock,
   type EventRecord,
 } from "./events.ts";
 
@@ -332,6 +333,18 @@ export interface MetadataPatch {
   tags?: Record<string, string | null>;
 }
 
+/** Total budget a `metadata patch` waits for the creation/attach window
+ *  (issue #180) before failing closed with `busy`. The attached child can
+ *  start while `pty run` still holds the per-session creation lock, so an
+ *  immediate patch from the child would deterministically fail; waiting here
+ *  (bounded, never indefinite) makes child-start patching reliable without
+ *  pushing poll loops onto every caller. */
+export const METADATA_PATCH_WAIT_MS = 8000;
+
+/** Poll interval for creation-lock waits. Short enough that a patch unblocks
+ *  promptly after the lock releases; long enough to avoid a hot spin. */
+const METADATA_PATCH_POLL_MS = 25;
+
 export interface MetadataPatchResult {
   changed: boolean;
   metadata: SessionMetadata;
@@ -360,9 +373,18 @@ export function mutateMetadataUnderLock(
     expectedGeneration?: string;
     expectedMetadata?: SessionMetadata;
     onPublished?: (metadata: SessionMetadata) => void;
+    /** Bounded wait for the creation lock before reporting `busy`. Defaults
+     *  to 0 (immediate, historical behavior) — only the `metadata patch`
+     *  path opts into waiting, so gc/respawn/exec contention semantics are
+     *  unchanged. */
+    waitMs?: number;
   } = {},
 ): MetadataMutationResult {
-  if (!acquireLock(name)) return { status: "busy" };
+  const waitMs = options.waitMs ?? 0;
+  const acquired = waitMs > 0
+    ? waitForLockSync(name, waitMs)
+    : acquireLock(name);
+  if (!acquired) return { status: "busy" };
 
   try {
     const metadata = readMetadata(name);
@@ -455,9 +477,15 @@ function applyMetadataPatchById(
   id: string,
   patch: MetadataPatch,
   eventType: MetadataPatchEvent,
+  /** Remaining bounded wait for the creation lock. The async patch path
+   *  pre-acquires the event lock without blocking the event loop; synchronous
+   *  callers keep their historical fail-fast event-lock behavior. */
+  waitMs: number = 0,
+  eventLockHeld: boolean = false,
 ): MetadataPatchResult {
   validateMetadataPatch(patch);
-  if (!acquireEventLock(id)) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  if (!eventLockHeld && !acquireEventLock(id)) {
     throw new Error(`Session id "${id}" event log is busy. Retry the operation.`);
   }
   try {
@@ -549,6 +577,9 @@ function applyMetadataPatchById(
           });
         }
       },
+      // Share the remaining attach-window budget with the creation lock
+      // wait; genuinely stuck locks still report `busy` below.
+      waitMs: Math.max(0, deadline - Date.now()),
     });
 
     if (result.status === "busy") {
@@ -560,19 +591,45 @@ function applyMetadataPatchById(
     }
     return { changed: result.status === "changed", metadata: result.metadata };
   } finally {
-    releaseEventLock(id);
+    if (!eventLockHeld) releaseEventLock(id);
   }
 }
 
-/** Atomically merge presentation metadata for one exact stable session id. */
+/** Atomically merge presentation metadata for one exact stable session id.
+ *
+ *  Waits boundedly (`waitMs`, default `METADATA_PATCH_WAIT_MS`) for the
+ *  creation/attach window (issue #180) instead of failing `busy` at once:
+ *  an attached child can run before the daemon publishes the record, and
+ *  while `pty run` still holds the creation lock. The wait only stretches
+ *  while a live creation lock says a creation is in flight — unknown ids
+ *  still fail fast, and stuck locks still fail `busy` once the budget is
+ *  spent. Never waits indefinitely. */
 export async function patchMetadataById(
   id: string,
   patch: MetadataPatch,
+  waitMs: number = METADATA_PATCH_WAIT_MS,
 ): Promise<MetadataPatchResult> {
   validateMetadataPatch(patch);
-  const session = await getSessionByName(id);
-  if (!session) throw new Error(`Session id "${id}" not found.`);
-  return applyMetadataPatchById(id, patch, "metadata_change");
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (isCreationLockHeld(id)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, METADATA_PATCH_POLL_MS));
+  }
+  if (!await getSessionByName(id)) throw new Error(`Session id "${id}" not found.`);
+  await waitForEventLock(id, Math.max(0, deadline - Date.now()));
+  try {
+    return applyMetadataPatchById(
+      id,
+      patch,
+      "metadata_change",
+      Math.max(0, deadline - Date.now()),
+      true,
+    );
+  } finally {
+    releaseEventLock(id);
+  }
 }
 
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.
@@ -2471,6 +2528,39 @@ export function acquireLock(name: string): boolean {
 
 export function releaseLock(name: string): void {
   releaseFileLock(getLockPath(name));
+}
+
+/** Blocking sleep for the sync lock waits. `Atomics.wait` parks the thread
+ *  without a hot spin and works on the main thread in Node. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+}
+
+/** Non-destructive check: is the per-name creation lock currently held by a
+ *  live process? Never creates, steals, or otherwise touches the lock —
+ *  purely observational, for deciding whether a missing record is worth
+ *  waiting for (issue #180). */
+export function isCreationLockHeld(name: string): boolean {
+  try {
+    const pid = parseInt(fs.readFileSync(getLockPath(name), "utf-8").trim(), 10);
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    return isProcessAlive(pid);
+  } catch {
+    return false;
+  }
+}
+
+/** @internal Acquire the per-name creation lock with bounded polling. Returns
+ *  `false` on timeout — fail-closed, never indefinite. A dead holder's stale
+ *  lock is still reclaimed by `acquireFileLock` while waiting. */
+export function waitForLockSync(name: string, waitMs: number): boolean {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (true) {
+    if (acquireLock(name)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    sleepSync(Math.min(METADATA_PATCH_POLL_MS, remaining));
+  }
 }
 
 // Keep backward compat for server.ts close()

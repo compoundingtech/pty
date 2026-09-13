@@ -143,7 +143,7 @@ function readEvents(dir: string, name: string): any[] {
 }
 
 describe("patchMetadataById", () => {
-  it("fails before changing metadata or events when event publication is locked", async () => {
+  it("fails before changing metadata or events when event publication stays locked", async () => {
     const dir = makeSessionDir();
     const name = uniqueName();
     await startDaemon(dir, name);
@@ -155,10 +155,16 @@ describe("patchMetadataById", () => {
     expect(acquireEventLock(name)).toBe(true);
 
     try {
+      // Issue #180: patch waits boundedly for transient contention (e.g. the
+      // attach window) instead of failing at once. A lock that never clears
+      // must still fail closed — pin that with an explicit small budget so
+      // this test doesn't sit out the full attach-window budget.
+      const startedAt = Date.now();
       await expect(patchMetadataById(name, {
         displayName: "Blocked",
         tags: { description: "x".repeat(1000) },
-      })).rejects.toThrow(/event log is busy/i);
+      }, 200)).rejects.toThrow(/event log is busy/i);
+      expect(Date.now() - startedAt).toBeLessThan(5000);
       expect(fs.readFileSync(metadataPath)).toEqual(metadataBefore);
       expect(fs.readFileSync(eventsPath)).toEqual(eventsBefore);
     } finally {

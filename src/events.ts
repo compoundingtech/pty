@@ -265,6 +265,7 @@ export async function waitForEventLock(
   }
 }
 
+
 async function withEventLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
   await waitForEventLock(name);
   try {

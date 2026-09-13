@@ -540,6 +540,14 @@ export class PtyServer {
       );
     }
 
+    // Publish the owner sidecar BEFORE spawning the child (issue #180). The
+    // child can otherwise run ancestry checks before the pidfile exists —
+    // the listen callback used to be its first publication point, after the
+    // spawn. Written while `pty run` still holds the creation lock, so no
+    // competing writer can interleave.
+    ensureSessionDir();
+    fs.writeFileSync(getPidPath(options.name), process.pid.toString());
+
     try {
       // NOTE: intentionally no `name:` option here — node-pty's `name`
       // unconditionally clobbers env.TERM, which would hide any TERM the
@@ -665,7 +673,6 @@ export class PtyServer {
       });
       this.socketServer.listen(socketPath, () => {
         try { fs.chmodSync(socketPath, 0o600); } catch {}
-        fs.writeFileSync(getPidPath(this.name), process.pid.toString());
         writeMetadata(this.name, {
           generation: this.generation,
           daemonPid: process.pid,
