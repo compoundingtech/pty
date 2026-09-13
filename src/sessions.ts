@@ -19,7 +19,7 @@ import {
 // from inside functions, never at module-init time.
 import {
   acquireEventLock, appendEventSync, appendEventSyncLocked, releaseEventLock,
-  waitForEventLockSync,
+  waitForEventLock,
   type EventRecord,
 } from "./events.ts";
 
@@ -341,9 +341,8 @@ export interface MetadataPatch {
  *  pushing poll loops onto every caller. */
 export const METADATA_PATCH_WAIT_MS = 8000;
 
-/** Poll interval for the sync lock waits above. Short enough that a patch
- *  unblocks promptly after the lock releases; long enough to avoid a hot
- *  spin on the lock file. */
+/** Poll interval for creation-lock waits. Short enough that a patch unblocks
+ *  promptly after the lock releases; long enough to avoid a hot spin. */
 const METADATA_PATCH_POLL_MS = 25;
 
 export interface MetadataPatchResult {
@@ -478,16 +477,15 @@ function applyMetadataPatchById(
   id: string,
   patch: MetadataPatch,
   eventType: MetadataPatchEvent,
-  /** Bounded wait for the event + creation locks (issue #180). Defaults to
-   *  0 (immediate, historical behavior); `patchMetadataById` passes the
-   *  attach-window budget while `setDisplayName`/`updateTags` keep the
-   *  fail-fast semantics their callers rely on. */
+  /** Remaining bounded wait for the creation lock. The async patch path
+   *  pre-acquires the event lock without blocking the event loop; synchronous
+   *  callers keep their historical fail-fast event-lock behavior. */
   waitMs: number = 0,
+  eventLockHeld: boolean = false,
 ): MetadataPatchResult {
   validateMetadataPatch(patch);
   const deadline = Date.now() + Math.max(0, waitMs);
-  const remaining = (): number => Math.max(0, deadline - Date.now());
-  if (!waitForEventLockSync(id, remaining())) {
+  if (!eventLockHeld && !acquireEventLock(id)) {
     throw new Error(`Session id "${id}" event log is busy. Retry the operation.`);
   }
   try {
@@ -581,7 +579,7 @@ function applyMetadataPatchById(
       },
       // Share the remaining attach-window budget with the creation lock
       // wait; genuinely stuck locks still report `busy` below.
-      waitMs: remaining(),
+      waitMs: Math.max(0, deadline - Date.now()),
     });
 
     if (result.status === "busy") {
@@ -593,7 +591,7 @@ function applyMetadataPatchById(
     }
     return { changed: result.status === "changed", metadata: result.metadata };
   } finally {
-    releaseEventLock(id);
+    if (!eventLockHeld) releaseEventLock(id);
   }
 }
 
@@ -620,7 +618,18 @@ export async function patchMetadataById(
     await new Promise((resolve) => setTimeout(resolve, METADATA_PATCH_POLL_MS));
   }
   if (!await getSessionByName(id)) throw new Error(`Session id "${id}" not found.`);
-  return applyMetadataPatchById(id, patch, "metadata_change", Math.max(0, deadline - Date.now()));
+  await waitForEventLock(id, Math.max(0, deadline - Date.now()));
+  try {
+    return applyMetadataPatchById(
+      id,
+      patch,
+      "metadata_change",
+      Math.max(0, deadline - Date.now()),
+      true,
+    );
+  } finally {
+    releaseEventLock(id);
+  }
 }
 
 /** Set or clear the displayName on an existing session. Atomic read-modify-write.

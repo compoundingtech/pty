@@ -185,6 +185,30 @@ describe("issue #180: metadata patch during the attach window", () => {
     }
   }, 15_000);
 
+  it("keeps the event loop live while waiting for the event lock", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    publishRecord(dir, name);
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireEventLock(name)).toBe(true);
+    let released = false;
+    // A real timer is the behavior under test: fake time cannot expose a
+    // synchronous lock wait blocking Node's actual event loop.
+    const releaseTimer = setTimeout(() => {
+      releaseEventLock(name);
+      released = true;
+    }, 100);
+    try {
+      const result = await patchMetadataById(name, { tags: { async: "settled" } }, 1000);
+      expect(released).toBe(true);
+      expect(result.changed).toBe(true);
+      expect(readMetadata(name)?.tags?.async).toBe("settled");
+    } finally {
+      clearTimeout(releaseTimer);
+      releaseEventLock(name);
+    }
+  });
+
   it("unknown ids still fail fast with not found (no live creation lock)", async () => {
     const dir = makeSessionDir();
     process.env.PTY_SESSION_DIR = dir;
@@ -196,14 +220,17 @@ describe("issue #180: metadata patch during the attach window", () => {
 });
 
 describe("issue #180: owner sidecar present at child start", () => {
-  async function verdictAtChildStart(dir: string, name: string): Promise<string> {
+  async function verdictAtChildStart(
+    dir: string,
+    name: string,
+  ): Promise<{ daemonPid: number; sidecarPid: number }> {
     const verdictPath = path.join(dir, `${name}.verdict`);
     const pidPath = path.join(dir, `${name}.pid`);
-    // The child records, as its very first action, whether the owner
-    // sidecar was already published — then parks so the daemon stays up.
+    // The child records the sidecar contents as its very first action, proving
+    // that publication is complete rather than merely that the path exists.
     const probe =
-      `if test -f "${pidPath}"; then echo present > "${verdictPath}"; ` +
-      `else echo absent > "${verdictPath}"; fi; exec sleep 30`;
+      `if test -s "${pidPath}"; then cat "${pidPath}" > "${verdictPath}"; ` +
+      `else echo invalid > "${verdictPath}"; fi; exec sleep 30`;
     const config = JSON.stringify({
       name, command: "sh", args: ["-c", probe], displayCommand: "sh",
       cwd: os.tmpdir(), rows: 24, cols: 80,
@@ -227,19 +254,22 @@ describe("issue #180: owner sidecar present at child start", () => {
     while (Date.now() < deadline) {
       try {
         const verdict = fs.readFileSync(verdictPath, "utf-8").trim();
-        if (verdict === "present" || verdict === "absent") return verdict;
+        if (verdict.length > 0) {
+          return { daemonPid: child.pid!, sidecarPid: Number(verdict) };
+        }
       } catch {}
       await new Promise((r) => setTimeout(r, 25));
     }
     throw new Error(`Timed out waiting for child verdict (daemon stderr: ${stderr})`);
   }
 
-  it("publishes the sidecar before the child runs (3 consecutive starts)", async () => {
+  it("publishes the complete sidecar before the child runs (3 consecutive starts)", async () => {
     for (let i = 0; i < 3; i++) {
       const dir = makeSessionDir();
       const name = uniqueName();
       // Must read the verdict before afterEach wipes the dir.
-      expect(await verdictAtChildStart(dir, name)).toBe("present");
+      const verdict = await verdictAtChildStart(dir, name);
+      expect(verdict.sidecarPid).toBe(verdict.daemonPid);
       await terminateAndWait(bgPids);
       bgPids = [];
     }
