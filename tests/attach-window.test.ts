@@ -22,6 +22,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { terminateAndWait } from "./setup/processes.ts";
+import { acquireEventLock, releaseEventLock } from "../src/events.ts";
 import {
   acquireLock, isCreationLockHeld, patchMetadataById, readMetadata, releaseLock,
 } from "../src/sessions.ts";
@@ -109,14 +110,17 @@ describe("issue #180: metadata patch during the attach window", () => {
     const startedAt = Date.now();
     try {
       const patchPromise = runPatchCli(dir, name, { tags: { "issue.180": "1" } });
-      // Let the patch arrive while the lock is held (pre-fix it failed here
-      // immediately with `metadata is busy`), then release like a spawner
-      // whose daemon finished publishing.
+      // Let the patch arrive while the creation lock is held. The daemon must
+      // still be able to take the event lock and publish session_start before
+      // the spawner can release the creation lock.
       await new Promise((r) => setTimeout(r, 700));
       expect(isCreationLockHeld(name)).toBe(true);
+      const eventLockAcquired = acquireEventLock(name);
+      if (eventLockAcquired) releaseEventLock(name);
       releaseLock(name);
       const run = await patchPromise;
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(600);
+      expect(eventLockAcquired).toBe(true);
       expect(run.stderr).not.toMatch(/busy/i);
       expect(run.code).toBe(0);
       expect(JSON.parse(run.stdout)).toMatchObject({ changed: true });
@@ -163,6 +167,19 @@ describe("issue #180: metadata patch during the attach window", () => {
       expect(elapsed).toBeGreaterThanOrEqual(200); // it waited, not fail-fast
       expect(elapsed).toBeLessThan(5000); // bounded, never indefinite
       expect(readMetadata(name)?.tags?.stuck).toBeUndefined();
+    } finally {
+      releaseLock(name);
+    }
+  }, 15_000);
+
+  it("reports busy when a live creator never publishes metadata", async () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    process.env.PTY_SESSION_DIR = dir;
+    expect(acquireLock(name)).toBe(true);
+    try {
+      await expect(patchMetadataById(name, { tags: { stuck: "1" } }, 300))
+        .rejects.toThrow(/metadata is busy/i);
     } finally {
       releaseLock(name);
     }

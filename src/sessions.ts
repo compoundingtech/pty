@@ -613,13 +613,13 @@ export async function patchMetadataById(
 ): Promise<MetadataPatchResult> {
   validateMetadataPatch(patch);
   const deadline = Date.now() + Math.max(0, waitMs);
-  let session = await getSessionByName(id);
-  while (!session && isCreationLockHeld(id)) {
-    if (Date.now() >= deadline) break;
+  while (isCreationLockHeld(id)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Session id "${id}" metadata is busy. Retry the operation.`);
+    }
     await new Promise((resolve) => setTimeout(resolve, METADATA_PATCH_POLL_MS));
-    session = await getSessionByName(id);
   }
-  if (!session) throw new Error(`Session id "${id}" not found.`);
+  if (!await getSessionByName(id)) throw new Error(`Session id "${id}" not found.`);
   return applyMetadataPatchById(id, patch, "metadata_change", Math.max(0, deadline - Date.now()));
 }
 
