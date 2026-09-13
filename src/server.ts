@@ -546,9 +546,7 @@ export class PtyServer {
     // spawn. Written while `pty run` still holds the creation lock, so no
     // competing writer can interleave.
     ensureSessionDir();
-    try {
-      fs.writeFileSync(getPidPath(options.name), process.pid.toString());
-    } catch {}
+    fs.writeFileSync(getPidPath(options.name), process.pid.toString());
 
     try {
       // NOTE: intentionally no `name:` option here — node-pty's `name`

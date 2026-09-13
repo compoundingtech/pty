@@ -20,7 +20,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { terminateAndWait } from "./setup/processes.ts";
 import { acquireEventLock, releaseEventLock } from "../src/events.ts";
 import {
@@ -262,6 +262,32 @@ describe("issue #180: owner sidecar present at child start", () => {
     }
     throw new Error(`Timed out waiting for child verdict (daemon stderr: ${stderr})`);
   }
+
+  it("aborts before spawning when the owner sidecar cannot be published", () => {
+    const dir = makeSessionDir();
+    const name = uniqueName();
+    const markerPath = path.join(dir, `${name}.started`);
+    fs.mkdirSync(path.join(dir, `${name}.pid`));
+    const config = JSON.stringify({
+      name,
+      command: "sh",
+      args: ["-c", `echo started > "${markerPath}"`],
+      displayCommand: "sh",
+      cwd: os.tmpdir(),
+      rows: 24,
+      cols: 80,
+    });
+
+    const daemon = spawnSync(nodeBin, [serverModule], {
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 5000,
+      env: { ...process.env, PTY_SERVER_CONFIG: config, PTY_SESSION_DIR: dir },
+    });
+
+    expect(fs.existsSync(markerPath)).toBe(false);
+    expect(daemon.status).not.toBeNull();
+    expect(daemon.status).not.toBe(0);
+  });
 
   it("publishes the complete sidecar before the child runs (3 consecutive starts)", async () => {
     for (let i = 0; i < 3; i++) {
