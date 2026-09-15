@@ -11,9 +11,21 @@ The durable system contract lives in
 
 ## Install
 
+This package is not published to the npm registry. Install it from a checkout:
+
 ```sh
-npm install -g @compoundingtech/pty
+git clone https://github.com/compoundingtech/pty.git
+cd pty
+npm ci
+npm run build
+npm install --global --prefix "$HOME/.local" .
+export PATH="$HOME/.local/bin:$PATH"
+pty --version
 ```
+
+The install links to the checkout, so keep the checkout at that path. Put
+`$HOME/.local/bin` before other bin directories that can contain a different
+command named `pty`.
 
 Or install with Nix — see [nix.md](nix.md).
 
