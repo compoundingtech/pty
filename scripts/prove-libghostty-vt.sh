@@ -59,6 +59,9 @@ esac
 CARGO_TARGET_DIR="$work/target"
 export CARGO_TARGET_DIR
 cargo test -p pty-terminal
-cargo test -p pty-testkit --test terminal_spawn
+# Real processes in real PTYs, read back through the linked library. Not
+# terminal_spawn: three of its tests wait for bash's `$` prompt, and the
+# Linux release job runs as root, where the prompt is `#`.
+cargo test -p pty-testkit --test terminal_fidelity --test terminal_queries
 rm -rf "$work"
 echo "pty-terminal and pty-testkit built and passed against $archive with no Zig"
