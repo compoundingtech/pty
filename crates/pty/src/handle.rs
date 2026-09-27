@@ -25,15 +25,10 @@ use pty_core::protocol::{
     encode_attach_with_cell, encode_data, encode_detach, encode_peek, encode_resize,
     encode_resize_with_cell,
 };
-
-use crate::actor::{Modes, Notification, Range, TerminalActor, TerminalEvent};
-use crate::graphics::{CellSize, GraphicsOptions, GraphicsState, ImageBytes};
-use crate::input::{KeyEvent, MouseEvent};
-use crate::serialize::SerializeOpts;
-use crate::snapshot::CellGrid;
-
-/// GEOMETRY (server → client, 4 bytes `rows u16BE, cols u16BE`), not yet a
-/// named `MessageType` in `pty-core`.
+use pty_terminal::{
+    CellGrid, CellSize, GraphicsOptions, GraphicsState, ImageBytes, KeyEvent, Modes,
+    MouseEvent, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
+};
 
 /// Identifies one connection attempt (or the spawned child). Bumped by
 /// [`TerminalHandle::reconnect`]; frames tagged with an older id are ignored.
@@ -963,7 +958,7 @@ impl TerminalHandle {
     }
 
     /// The pixels of one image. `None` when it is not stored (any more).
-    /// Cache the result on [`crate::graphics::ImageDesc::generation`]: it
+    /// Cache the result on [`pty_terminal::ImageDesc::generation`]: it
     /// changes whenever the pixels behind an id do.
     pub fn image_bytes(&self, id: u32) -> Option<ImageBytes> {
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -1002,8 +997,8 @@ impl TerminalHandle {
     /// actually draw.
     ///
     /// Until someone declares it, geometry uses
-    /// [`crate::graphics::CellSize::FALLBACK`] and
-    /// [`crate::graphics::GraphicsState::cell_declared`] is false.
+    /// [`pty_terminal::CellSize::FALLBACK`] and
+    /// [`pty_terminal::GraphicsState::cell_declared`] is false.
     pub fn set_cell_size(&self, width: u32, height: u32) {
         let _ = self.tx.send(Msg::CellSize(CellSize { width, height }));
     }
@@ -1031,7 +1026,7 @@ impl TerminalHandle {
     }
 
     /// Paste text, bracketed when the child asked for it. Check
-    /// [`crate::input::paste_is_safe`] first if the surface wants to confirm
+    /// [`pty_terminal::input::paste_is_safe`] first if the surface wants to confirm
     /// a multi-line paste.
     pub fn send_paste(&self, text: &str) {
         let _ = self.tx.send(Msg::Paste(text.to_string()));
@@ -1193,6 +1188,30 @@ impl Drop for TerminalHandle {
         if !self.state(|st| st.closed) {
             self.kill();
         }
+    }
+}
+
+/// What a `pty_tui::PtyPane` reads to draw this handle, so the TUI library
+/// needs nothing that spawns a child or opens a socket.
+impl pty_tui::LiveTerminal for TerminalHandle {
+    fn rev(&self) -> u64 {
+        TerminalHandle::rev(self)
+    }
+
+    fn cols(&self) -> u16 {
+        TerminalHandle::cols(self)
+    }
+
+    fn rows(&self) -> u16 {
+        TerminalHandle::rows(self)
+    }
+
+    fn snapshot(&self, scroll_offset: usize) -> CellGrid {
+        TerminalHandle::snapshot(self, scroll_offset)
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        TerminalHandle::resize(self, cols, rows)
     }
 }
 

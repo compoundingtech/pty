@@ -1,18 +1,20 @@
 //! The live pty pane, ported from `src/tui/widgets/pty-pane.ts` and the
 //! `ptyView` node (`screen.ts:705-739`): renders a [`CellGrid`] read from a
-//! [`TerminalHandle`] into a ratatui buffer with palette indices preserved,
+//! [`LiveTerminal`] into a ratatui buffer with palette indices preserved,
 //! draws focus-coloured chrome with a title, highlights a content-anchored
 //! selection, and reports the cursor only when the pane is focused and the
 //! cursor is on screen.
 //!
 //! Widgets are pure over a grid; [`PtyPane::render_handle`] is the
 //! convenience that resizes the handle to the inner rect, reads the grid
-//! (through a per-handle cache keyed by revision) and renders it.
+//! (through a per-handle cache keyed by revision) and renders it. A handle is
+//! anything that implements [`LiveTerminal`], such as the `pty` crate's
+//! `TerminalHandle`; this crate never spawns or connects to what feeds it.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use pty_terminal::{CellGrid, CellSnap, ColorSnap, TerminalHandle, Wide};
+use pty_terminal::{CellGrid, CellSnap, ColorSnap, Wide};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color as RColor, Modifier, Style};
@@ -20,6 +22,26 @@ use ratatui::widgets::Widget;
 
 use crate::text::text_width;
 use crate::theme::{BoxStyle, Rgb, Theme, to_ratatui};
+
+/// A live terminal a pane can draw: a revision that bumps on every change,
+/// a size, and the grid at a scroll offset.
+///
+/// The `pty` crate's `TerminalHandle` is one. Keeping the pane on this trait
+/// is what lets this crate render a live session without depending on the
+/// child process or daemon socket behind it.
+pub trait LiveTerminal {
+    /// The current revision; bumps on every change.
+    fn rev(&self) -> u64;
+    /// Current width.
+    fn cols(&self) -> u16;
+    /// Current height.
+    fn rows(&self) -> u16;
+    /// The cell grid `scroll_offset` rows back into history (0 = live).
+    fn snapshot(&self, scroll_offset: usize) -> CellGrid;
+    /// Resize to `cols` x `rows`. A no-op when the size is unchanged or the
+    /// terminal cannot be resized from here.
+    fn resize(&self, cols: u16, rows: u16);
+}
 
 /// A selection in pane-inner cell coordinates captured at `scroll_offset`
 /// (`PtyPaneSelection`, `pty-pane.ts:33-41`). The highlight follows the
@@ -294,10 +316,10 @@ impl<'a> PtyPane<'a> {
     /// Resize `handle` to the inner rect, read its grid through the cache
     /// and render it. The cache is keyed by the handle's revision, size and
     /// scroll offset, so a clean pane costs no snapshot.
-    pub fn render_handle(
+    pub fn render_handle<H: LiveTerminal + ?Sized>(
         area: Rect,
         buf: &mut Buffer,
-        handle: &TerminalHandle,
+        handle: &H,
         theme: Theme,
         configure: impl FnOnce(PtyPane<'_>) -> PtyPane<'_>,
     ) -> PtyPaneResult {
@@ -400,13 +422,13 @@ fn cache() -> &'static Mutex<HashMap<usize, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn handle_key(handle: &TerminalHandle) -> usize {
-    handle as *const TerminalHandle as usize
+fn handle_key<H: ?Sized>(handle: &H) -> usize {
+    (handle as *const H).cast::<()>() as usize
 }
 
 /// The grid for `handle` at `offset`, reused while the handle's revision,
 /// size and offset are unchanged (the `WeakMap` cache, `pty-pane.ts:82-94`).
-pub fn cached_grid(handle: &TerminalHandle, offset: usize) -> CellGrid {
+pub fn cached_grid<H: LiveTerminal + ?Sized>(handle: &H, offset: usize) -> CellGrid {
     let key = handle_key(handle);
     let rev = handle.rev();
     let (cols, rows) = (handle.cols(), handle.rows());
@@ -437,7 +459,7 @@ pub fn cached_grid(handle: &TerminalHandle, offset: usize) -> CellGrid {
 
 /// Drop a handle's cached grid (`clearPtyPaneCache`). Call when the handle
 /// is closed so a later handle at the same address starts clean.
-pub fn clear_pane_cache(handle: &TerminalHandle) {
+pub fn clear_pane_cache<H: ?Sized>(handle: &H) {
     if let Ok(mut c) = cache().lock() {
         c.remove(&handle_key(handle));
     }

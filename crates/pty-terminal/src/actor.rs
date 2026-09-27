@@ -1,9 +1,11 @@
 //! The terminal actor: the one owner of a libghostty `Terminal`.
 //!
 //! [`TerminalActor`] is synchronous and lives on the thread that created it
-//! (the `Terminal` is `!Send`). The daemon and the testkit already run their
-//! loop on that thread; [`crate::handle::TerminalHandle`] wraps an actor in a
-//! thread + channel for everyone else.
+//! (the `Terminal` is `!Send`). It has no thread, channel or process of its
+//! own: bytes go in through [`TerminalActor::write`] and state comes out. The
+//! daemon and the testkit run their loop on the thread that owns it; the `pty`
+//! crate's `TerminalHandle` wraps one in an actor thread fed by a child it
+//! spawned or by a daemon socket.
 //!
 //! Every call is ordered: when [`TerminalActor::write`] returns, every byte it
 //! was given has been parsed, every query in it has been answered into

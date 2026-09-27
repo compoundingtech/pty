@@ -310,22 +310,32 @@ boundary in full.
 
 ## The crates
 
-A Cargo workspace of six crates under `crates/`:
+A Cargo workspace of eight crates under `crates/`:
 
 - **`pty-core`** — the wire protocol, session registry and locks, events,
   metadata, names and tags, key/paste/duration/input parsing, `pty.toml`
   manifests, and the client operations (attach loop, peek, send, status). No
   terminal emulator, no Zig.
-- **`pty-terminal`** — the libghostty actor: owns the terminal, produces typed
-  snapshots and the VT/plain serializations, answers terminal queries.
+- **`pty-spawn`** — open a PTY and start a child in it, and the typed owner
+  that is the sole reader and reaper of that child. No terminal emulator, no
+  Zig.
+- **`pty-lifecycle`** — daemon launch, startup leases and garbage collection,
+  importable by other programs. No terminal emulator, no Zig.
+- **`pty-terminal`** — terminal state and nothing else: bytes in; libghostty's
+  screen, cells, cursor, modes, kitty graphics, input encoding, query answers
+  and the VT/plain serializations out. It spawns no process and opens no PTY
+  or socket, so its only dependencies are libghostty and a PNG decoder.
 - **`pty-testkit`** — Playwright-style test sessions: spawn a process in a real
   PTY, feed it to libghostty, take screenshots, wait for text, send named keys.
 - **`pty-tui`** — the TUI library (ratatui + crossterm): pane, theme, focus,
-  widgets, and the app runner behind the interactive session manager.
+  widgets, and the app runner behind the interactive session manager. The
+  pane draws any `LiveTerminal`, such as a `TerminalHandle`.
 - **`pty-conformance`** — the black-box suite that runs against any `pty`
   binary, Node or Rust, chosen with `PTY_TEST_BIN`.
 - **`pty`** — the `pty` binary: the command-line interface, the per-session
-  daemon, and the remote bridge.
+  daemon, and the remote bridge. Its library is `TerminalHandle`, the
+  embedding handle that spawns a child in a PTY or attaches to a session
+  daemon and keeps a `pty-terminal` terminal on its own thread.
 
 ## Building from source
 

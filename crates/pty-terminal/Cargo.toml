@@ -1,6 +1,6 @@
 [package]
 name = "pty-terminal"
-description = "libghostty-backed terminal state for pty: the terminal actor, query answers, replay serialization, typed snapshots, and the embedding handle."
+description = "libghostty-backed terminal state for pty: bytes in; screen, cells, cursor, modes, graphics, input encoding, query answers and replay serialization out. Spawns no process."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pty-spawn = { path = "../pty-spawn" }
 libghostty-vt.workspace = true
-portable-pty.workspace = true
-pty-core.workspace = true
-libc.workspace = true
 png.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

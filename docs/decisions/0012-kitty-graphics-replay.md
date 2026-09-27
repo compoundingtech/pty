@@ -181,7 +181,7 @@ pinned in `crates/pty-core/tests/protocol.rs`
 `resize_can_declare_a_cell_size`, `a_plain_size_payload_declares_no_cell`).
 
 End to end, against a real session daemon:
-`crates/pty-terminal/tests/handle.rs::a_late_attach_gets_the_image_the_child_drew_before_it_connected`
+`crates/pty/tests/handle.rs::a_late_attach_gets_the_image_the_child_drew_before_it_connected`
 — a child transmits a PNG, places it virtually, and writes a placeholder cell;
 a `TerminalHandle` attaches only afterwards, so it never sees that `DATA`, and
 still reads the decoded pixels (`[255, 0, 0, 255]`), the placement identity

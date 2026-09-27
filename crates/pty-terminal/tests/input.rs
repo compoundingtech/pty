@@ -2,10 +2,8 @@
 //! or a paste turns into depend on modes the *child* set, so every case here
 //! sets that mode the way a child would and then encodes.
 
-use std::time::Duration;
-
 use pty_terminal::input::{self, Key, KeyAction, KeyEvent, Mods, MouseAction, MouseButton, MouseEvent};
-use pty_terminal::{SpawnOptions, TerminalActor, TerminalHandle};
+use pty_terminal::TerminalActor;
 
 fn actor() -> TerminalActor {
     TerminalActor::new(10, 20, 0)
@@ -211,32 +209,4 @@ fn a_multi_line_paste_is_flagged_unsafe() {
         !input::paste_is_safe("a\x1b[201~b"),
         "a forged bracketed-paste end escapes the brackets"
     );
-}
-
-// ── through the handle ──
-
-/// The handle path: the events are `Send`, the encoding happens on the actor
-/// thread against the live terminal, and `send_*` is ordered with `write`.
-#[test]
-fn send_key_reaches_the_child_and_encode_key_agrees() {
-    let h = TerminalHandle::spawn("cat", &[], SpawnOptions::default()).expect("spawn");
-    assert!(h.wait_ready(Duration::from_secs(2)));
-
-    assert_eq!(h.encode_key(&KeyEvent::press(Key::ArrowUp)), b"\x1b[A");
-    assert_eq!(h.encode_mouse(&press()), None, "no tracking, no report");
-
-    // `cat` echoes: what the child received comes back on the screen.
-    h.send_key(&KeyEvent::typed(Key::A, "a", Some('a')));
-    h.send_key(&KeyEvent::press(Key::Enter));
-    let grid = h
-        .wait_for(Duration::from_secs(5), |g| g.text().starts_with('a'))
-        .expect("the child got the key");
-    assert!(grid.text().starts_with('a'));
-
-    h.send_paste("pasted");
-    let grid = h
-        .wait_for(Duration::from_secs(5), |g| g.text().contains("pasted"))
-        .expect("the child got the paste");
-    assert!(grid.text().contains("pasted"));
-    h.kill();
 }
