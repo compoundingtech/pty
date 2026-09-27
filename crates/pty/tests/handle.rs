@@ -47,14 +47,20 @@ fn spawn_cat_write_and_snapshot() {
 
 #[test]
 fn spawn_reports_exit_code() {
-    let h = TerminalHandle::spawn("sh", &["-c", "printf done; exit 3"], SpawnOptions::default()).expect("spawn");
+    // The child waits for a line before it exits, so the subscription is in
+    // place before the exit it has to hear. A child that exits at once can do
+    // so before `subscribe` returns, and then the event goes to nobody.
+    let h = TerminalHandle::spawn("sh", &["-c", "read _; printf done; exit 3"], SpawnOptions::default())
+        .expect("spawn");
     let events = h.subscribe();
+    h.write(b"\n");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !h.exited() && Instant::now() < deadline {
         h.wait_rev(h.rev(), Duration::from_millis(100));
     }
     assert_eq!(h.exit_code(), Some(3));
-    assert_eq!(h.plain(Range::Viewport), "done");
+    // The PTY echoed the line the child read; its output follows it.
+    assert_eq!(h.plain(Range::Viewport), "\ndone");
     let mut saw_exit = false;
     while let Ok(ev) = events.try_recv() {
         if ev == HandleEvent::Exited(3) {
