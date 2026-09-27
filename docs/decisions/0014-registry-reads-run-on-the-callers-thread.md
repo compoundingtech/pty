@@ -78,7 +78,7 @@ threads removes the cause without deciding that for it.
   that a Linux full accept queue is a `StatsTimeout` at the deadline, not an
   unbounded wait in connect.
 
-**Test.** `crates/pty-core/tests/observation_roots.rs`:
+**Test.** `crates/pty-client/tests/observation_roots.rs`:
 `socket_probe_matches_a_blocking_connect` (probe answers equal a blocking
 connect, a full queue is absent on Linux and `false` on macOS, and the
 listing classifies each) and `batch_stats_bound_every_session_by_one_deadline`

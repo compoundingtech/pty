@@ -98,7 +98,7 @@ Write: one `mutate_metadata_under_lock` with `expectedGeneration` = the daemon's
 | --- | --- |
 | `PTY.REGW-R01` | `crates/pty-conformance/tests/output_activity.rs::output_leaves_the_record_alone_rust`, `a_recorded_exit_is_not_rewritten_during_shutdown` |
 | `PTY.REGW-R02` | `output_activity.rs`: `the_stamp_appears_after_output_and_reads_as_now`, `a_later_burst_moves_the_stamp_forward`, `a_busy_session_writes_the_stamp_about_once_a_second`, `a_child_that_prints_and_exits_at_once_keeps_its_stamp` |
-| `PTY.REGW-R03` | `crates/pty-core/src/registry/activity.rs` unit tests; `crates/pty-core/tests/observation_roots.rs::output_activity_reads_only_the_selected_roots_generation` |
+| `PTY.REGW-R03` | `crates/pty-core/src/registry/activity.rs` unit tests; `crates/pty-client/tests/observation_roots.rs::output_activity_reads_only_the_selected_roots_generation` |
 | `PTY.REGW-R04` | `output_activity.rs::the_exit_record_takes_over_from_the_sidecar`; cleanup by construction (module map) |
 | `PTY.REGW-R05` | `crates/pty-conformance/tests/client_generation.rs::attach_resize_and_detach_each_bump_the_generation_rust` |
 | `PTY.REGW-R06` | `client_generation.rs`: `peek_and_stats_leave_the_record_alone`, `a_resize_to_the_same_size_leaves_the_record_alone` |

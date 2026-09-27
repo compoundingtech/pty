@@ -10,7 +10,7 @@ Active. Implemented in pty-rust and in the Node pty; the bytes below are the con
 
 Defined here: the banner, the trailer for each end event, the summary line, the hint rules, where the session info comes from, and machine-mode behavior.
 
-Not defined here: the terminal reset bytes (`TERMINAL_SANITIZE`, `CURSOR_TO_BOTTOM` in `crates/pty-core/src/client/sanitize.rs`), the detach key and its double-tap window, the reconnect backoff, and the texts excluded by `PTY.TRL-A02`.
+Not defined here: the terminal reset bytes (`TERMINAL_SANITIZE`, `CURSOR_TO_BOTTOM` in `crates/pty-client/src/sanitize.rs`), the detach key and its double-tap window, the reconnect backoff, and the texts excluded by `PTY.TRL-A02`.
 
 ## Shape
 
@@ -93,10 +93,10 @@ remote  dial ──► list over the control path ──► row (or none) ──
 
 | Concern | Source |
 | --- | --- |
-| Summary, line, trailer, banner | `crates/pty-core/src/client/summary.rs` — `SessionSummary`, `LineStyle`, `SessionEnd`, `TrailerTarget`, `render_trailer`, `trailer_header`, `attach_banner`, `local_summary_provider`, `fixed_summary_provider` |
-| Attach events | `crates/pty-core/src/client/attach.rs` — `Attach::trailer`, `finish_detach`, `handle_packets`, `on_disconnect`, `try_reconnect` |
-| peek -f events | `crates/pty-core/src/client/peek.rs` — `follow`, `trailer` |
-| Remote row | `crates/pty-core/src/client/remote.rs` — `dial_route_and_describe` |
+| Summary, line, trailer, banner | `crates/pty-client/src/summary.rs` — `SessionSummary`, `LineStyle`, `SessionEnd`, `TrailerTarget`, `render_trailer`, `trailer_header`, `attach_banner`, `local_summary_provider`, `fixed_summary_provider` |
+| Attach events | `crates/pty-client/src/attach.rs` — `Attach::trailer`, `finish_detach`, `handle_packets`, `on_disconnect`, `try_reconnect` |
+| peek -f events | `crates/pty-client/src/peek.rs` — `follow`, `trailer` |
+| Remote row | `crates/pty-client/src/remote.rs` — `dial_route_and_describe` |
 | CLI wiring | `crates/pty/src/cli/attach.rs` (`do_attach`, `attach_remote`), `crates/pty/src/cli/peek.rs` |
 | `pty list` | `crates/pty/src/cli/list.rs` — `cmd_list`, `line_style` |
 | Node | `src/client.ts` (`trailer`, `exitHeader`), `src/session-presentation.ts` |

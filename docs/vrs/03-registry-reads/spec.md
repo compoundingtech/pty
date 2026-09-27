@@ -136,9 +136,9 @@ The one intended difference (`PTY.REG-T02`): the single read issues a blocking c
 | --- | --- |
 | Non-blocking connect, poll step, retry tick | `crates/pty-core/src/unix_connect.rs` (crate-private) — `Connect`, `connect`, `poll_until`, `RETRY_TICK`; `busy_connects_on_this_thread` (hidden, test-only count of `Busy` outcomes) |
 | Probe | `crates/pty-core/src/registry/list.rs` — `probe_sockets_within_budget`, `socket_reachable`, `DEFAULT_SOCKET_PROBE_BUDGET`, `SOCKET_PROBE_TIMEOUT` |
-| Batch STATUS | `crates/pty-core/src/client/stats.rs` — `query_stats_batch_in`, `Step`, `begin`, `write_request`, `read_response` |
-| Single STATUS read | `crates/pty-core/src/client/stats.rs` — `query_stats_in_with_timeout`, `query_status_json_at` |
-| Error mapping | `crates/pty-core/src/client/mod.rs` — `map_io_error`, `is_gone`, `GoneSet`, `node_error_message` |
+| Batch STATUS | `crates/pty-client/src/stats.rs` — `query_stats_batch_in`, `Step`, `begin`, `write_request`, `read_response` |
+| Single STATUS read | `crates/pty-client/src/stats.rs` — `query_stats_in_with_timeout`, `query_status_json_at` |
+| Error mapping | `crates/pty-client/src/lib.rs` — `map_io_error`, `is_gone`, `GoneSet`, `node_error_message` |
 
 ## Traceability
 
@@ -146,6 +146,6 @@ The one intended difference (`PTY.REG-T02`): the single read issues a blocking c
 | --- | --- |
 | `PTY.REG-R01`, `PTY.REG-R02` | By construction: the module map above contains no thread spawn, and every socket is a local of the call. |
 | `PTY.REG-R03` | Measured, not tested: [decision 0014](../../decisions/0014-registry-reads-run-on-the-callers-thread.md). |
-| `PTY.REG-R04`, `PTY.REG-R05`, `PTY.REG-R07` | `crates/pty-core/tests/observation_roots.rs::socket_probe_matches_a_blocking_connect` |
-| `PTY.REG-R06`, `PTY.REG-R08` | `crates/pty-core/tests/observation_roots.rs::batch_stats_bound_every_session_by_one_deadline`, `batch_stats_bound_a_peer_that_floods_data` |
-| `PTY.REG-T01` | `crates/pty-core/tests/observation_roots.rs::batch_stats_throttle_busy_retries_beside_a_flooding_peer`, `batch_stats_never_retry_a_busy_connect_at_the_deadline`, `socket_probe_never_retries_a_busy_connect_at_the_deadline` |
+| `PTY.REG-R04`, `PTY.REG-R05`, `PTY.REG-R07` | `crates/pty-client/tests/observation_roots.rs::socket_probe_matches_a_blocking_connect` |
+| `PTY.REG-R06`, `PTY.REG-R08` | `crates/pty-client/tests/observation_roots.rs::batch_stats_bound_every_session_by_one_deadline`, `batch_stats_bound_a_peer_that_floods_data` |
+| `PTY.REG-T01` | `crates/pty-client/tests/observation_roots.rs::batch_stats_throttle_busy_retries_beside_a_flooding_peer`, `batch_stats_never_retry_a_busy_connect_at_the_deadline`, `socket_probe_never_retries_a_busy_connect_at_the_deadline` |

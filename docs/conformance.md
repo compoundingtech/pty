@@ -61,7 +61,7 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 | integration.test.ts | protocol | integration_geometry.rs, integration_sync.rs | 63 | 257, 275, 295, 318, 356, 373, 395, 423, 473, 531, 701, 764, 802, 854, 901, 961, 1021, 1045, 1067, 1086, 1103, 1134, 1161, 1186, 1216, 1228, 1252, 1271, 1291, 1303, 1315, 1330, 1356, 1379, 1408, 1437, 1466, 1486, 1506, 1545, 1642, 1676, 1697, 1725, 1748, 1796, 1812, 1843, 1866, 1908, 1941, 1980, 2010, 2037, 2068, 2120, 2175, 2222, 2240 — sync ordering, roles, malformed packets, geometry via stty, kitty replay, send, peek, stats; :618 injects an EXIT ahead of DATA through server internals and has no socket-level counterpart |
 | keys.test.ts | unit | — | 0 | pty-core key resolver unit tests |
 | kill-releases-socket-command.test.ts | cli | kill_releases_socket.rs | 1 | 11 — bin/pty-kill-releases-socket-test rewritten as a Rust test; the second binary is dropped in docs/parity.md §12 |
-| kill-report.test.ts | unit | — | 0 | the report is pure logic over a process table; ported as cli/kill.rs unit tests, which is where the survivor and escalation cases live |
+| kill-report.test.ts | unit | — | 0 | the report is pure logic over a process table; ported as pty-client's stop.rs unit tests, which is where the survivor and escalation cases live |
 | kill-wait.test.ts | cli | kill_wait.rs | 3 | 39, 54, 68 |
 | list-filters.test.ts | cli | list_filters.rs | 18 | 124, 138, 149, 172, 200, 220, 245, 254, 267, 281, 288, 305, 325, 343, 361, 391, 411, 428 |
 | list-live-session-race.test.ts | cli | list_live_session_race.rs | 2 | 92, 111 |
@@ -79,7 +79,7 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 | parity-shapes.test.ts | cli | parity_shapes.rs | 2 | 1, 90 — shared shapes.json loader |
 | peek-wait.test.ts | cli | peek_wait.rs | 10 | 81, 101, 112, 123, 138, 149, 162, 175, 189, 199 |
 | proc-table.test.ts | unit | — | 0 | reading the process table is pure logic; ported as pty-core/src/proctable.rs unit tests, including the truncation guard and the layout self-check |
-| process-groups.test.ts | unit | — | 0 | group membership over an injected table; ported as daemon/tree.rs unit tests, which also cover the zombie the sweep must not count |
+| process-groups.test.ts | unit | — | 0 | group membership over an injected table; ported as pty-core's process_tree.rs unit tests, which also cover the zombie the sweep must not count |
 | process-title.test.ts | cli | process_title.rs | 1 | 38 — Linux /proc comm |
 | process-tree.test.ts | cli | process_tree.rs | 1 | 55 — only the TERM-then-KILL contract (:55) is observable; :10 and :33 are unit tests with injected process lists |
 | progress-bars.test.ts | not-portable | — | 0 | TUI widget / framework test against the Node in-process renderer |

@@ -20,7 +20,7 @@ neither should be "fixed" later by restoring the Node timing.
 1. `query_stats` treats the close as the answer. It reports
    `Session "<name>" not found or not running.` at once, using the same text
    Node uses for a socket that was never reachable
-   (`crates/pty-core/src/client/mod.rs`).
+   (`crates/pty-client/src/lib.rs`).
 2. `peek -f` treats a plain close as the end of the stream and exits 0.
 
 **Why.** In both cases the daemon has already told the client everything it
