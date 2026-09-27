@@ -28,8 +28,9 @@ pub mod tags;
 pub mod time;
 
 pub use activity::{
-    OutputActivity, last_output_at_ms, last_output_at_ms_in, newest_output_at_ms,
-    read_output_activity, read_output_activity_in, remove_output_activity, write_output_activity,
+    OutputActivity, before_output_activity_retire_on_this_thread, last_output_at_ms,
+    last_output_at_ms_in, newest_output_at_ms, publish_output_activity, read_output_activity,
+    read_output_activity_in, record_exit_retiring_output_activity,
 };
 pub use atomic::{atomic_write, is_tmp_name, random_hex16};
 pub use cleanup::{

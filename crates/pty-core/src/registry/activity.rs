@@ -7,7 +7,10 @@
 //! other registry file, and it folds the final stamp into the exit record,
 //! after which the sidecar is removed. The sidecar names the generation that
 //! wrote it, so a reader never credits one daemon's output to the next
-//! daemon that reuses the id.
+//! daemon that reuses the id. Every write and the exit-time removal run under
+//! `<name>.lock` while the record still names the writer's generation, so a
+//! daemon whose id was reused never clobbers or deletes its replacement's
+//! sidecar.
 
 use std::path::Path;
 
@@ -15,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::atomic::atomic_write;
 use super::metadata::SessionMetadata;
+use super::mutate::{MutateOptions, MutateStatus, mutate_metadata_under_lock_settled};
 use super::root::{output_activity_path, session_dir};
 
 /// The sidecar's content.
@@ -27,9 +31,27 @@ pub struct OutputActivity {
     pub last_output_at_ms: i64,
 }
 
-/// Publish `activity` for `name`, creating `.activity/` (mode 0700) on first
-/// use.
-pub fn write_output_activity(name: &str, activity: &OutputActivity) -> std::io::Result<()> {
+/// Publish `activity` for `name` while its generation still owns the name:
+/// under `<name>.lock`, and only when the record names
+/// `activity.generation`. A daemon whose id was reused must not overwrite
+/// the replacement's sidecar. `Unchanged` means written (or a best-effort
+/// write failed); `Busy` means the lock was held and the caller may retry;
+/// anything else means this generation no longer owns the name.
+pub fn publish_output_activity(name: &str, activity: &OutputActivity) -> MutateStatus {
+    mutate_metadata_under_lock_settled(
+        name,
+        |_| false,
+        &MutateOptions {
+            expected_generation: Some(activity.generation.clone()),
+            expected_metadata: None,
+        },
+        |_| {
+            let _ = write_output_activity(name, activity);
+        },
+    )
+}
+
+fn write_output_activity(name: &str, activity: &OutputActivity) -> std::io::Result<()> {
     let path = output_activity_path(name);
     if let Some(dir) = path.parent()
         && !dir.is_dir()
@@ -42,6 +64,48 @@ pub fn write_output_activity(name: &str, activity: &OutputActivity) -> std::io::
     atomic_write(&path, &bytes)
 }
 
+/// Record a daemon's exit through `mutate` (fenced on `generation`) and
+/// retire the sidecar in the same critical section: the exit record now
+/// carries the final stamp, and the unlink runs only while `generation`
+/// still owns the name, so it can never remove a replacement's sidecar.
+pub fn record_exit_retiring_output_activity(
+    name: &str,
+    generation: &str,
+    mutate: impl FnOnce(&mut SessionMetadata) -> bool,
+) -> MutateStatus {
+    mutate_metadata_under_lock_settled(
+        name,
+        mutate,
+        &MutateOptions {
+            expected_generation: Some(generation.to_string()),
+            expected_metadata: None,
+        },
+        |_| retire_output_activity(name),
+    )
+}
+
+fn retire_output_activity(name: &str) {
+    RETIRE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let _ = std::fs::remove_file(output_activity_path(name));
+}
+
+thread_local! {
+    static RETIRE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once, on the calling thread, immediately before the next
+/// sidecar unlink by [`record_exit_retiring_output_activity`]. Test-only
+/// seam for interleaving a replacement's publication; not a stable API.
+#[doc(hidden)]
+pub fn before_output_activity_retire_on_this_thread(hook: Box<dyn FnOnce()>) {
+    RETIRE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
 /// Read the sidecar in the current session directory, `None` when it is
 /// missing or unreadable.
 pub fn read_output_activity(name: &str) -> Option<OutputActivity> {
@@ -52,11 +116,6 @@ pub fn read_output_activity(name: &str) -> Option<OutputActivity> {
 pub fn read_output_activity_in(root: &Path, name: &str) -> Option<OutputActivity> {
     let raw = std::fs::read(root.join(".activity").join(format!("{name}.json"))).ok()?;
     serde_json::from_slice(&raw).ok()
-}
-
-/// Remove the sidecar; a missing one is not an error.
-pub fn remove_output_activity(name: &str) {
-    let _ = std::fs::remove_file(output_activity_path(name));
 }
 
 /// The newest output stamp a reader should believe for `name`, given the

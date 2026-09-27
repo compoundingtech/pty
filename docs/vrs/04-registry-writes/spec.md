@@ -41,8 +41,8 @@ Path: `<root>/.activity/<id>.json`. The directory is created on first use with m
 Write sequence (`PTY.REGW-R02`):
 
 1. Each output chunk sets the in-memory stamp to now. If no persist is pending, one is scheduled 1 s out.
-2. When it falls due and the child has not exited, the daemon publishes the sidecar by temp file and rename inside `.activity/`. Failure is ignored.
-3. At exit the stamp goes into the exit record. When that write lands (`Changed` or `Unchanged`), the daemon removes the sidecar (`PTY.REGW-R04`). Shutdown's later retry does not rewrite a record whose exit facts have not changed. A `GenerationMismatch` leaves the sidecar, because it may be a replacement's.
+2. When it falls due and the child has not exited, the daemon publishes the sidecar by temp file and rename inside `.activity/`, under `<id>.lock` and only while the record names its generation (`publish_output_activity`). A held lock (`Busy`) retries 50 ms later; any other refusal drops the stamp, because the name belongs to a replacement. A write failure is ignored.
+3. At exit the stamp goes into the exit record. When that write lands (`Changed` or `Unchanged`), the daemon removes the sidecar in the same critical section, before releasing `<id>.lock` (`record_exit_retiring_output_activity`, `PTY.REGW-R04`), so a replacement that reuses the id cannot publish its sidecar between the generation check and the unlink. Shutdown's later retry does not rewrite a record whose exit facts have not changed. A `GenerationMismatch` leaves the sidecar, because it may be a replacement's.
 
 Removal with the session: `cleanup_all_while_locked` (and so `cleanup_all`, `cleanup_owned_all`, `cleanup`), `remove_session_generation`, and gc's raw-candidate cleanup unlink the sidecar with the other session files (`PTY.REGW-R04`).
 
@@ -86,7 +86,7 @@ Write: one `mutate_metadata_under_lock` with `expectedGeneration` = the daemon's
 | Concern | Source |
 | --- | --- |
 | Sidecar path | `crates/pty-core/src/registry/root.rs` — `output_activity_path` |
-| Sidecar schema, write, read, removal, reader precedence | `crates/pty-core/src/registry/activity.rs` — `OutputActivity`, `write_output_activity`, `read_output_activity[_in]`, `remove_output_activity`, `last_output_at_ms[_in]`, `newest_output_at_ms` |
+| Sidecar schema, write, read, removal, reader precedence | `crates/pty-core/src/registry/activity.rs` — `OutputActivity`, `publish_output_activity`, `record_exit_retiring_output_activity`, `read_output_activity[_in]`, `last_output_at_ms[_in]`, `newest_output_at_ms` |
 | `clientGeneration` field | `crates/pty-core/src/registry/metadata.rs` — `SessionMetadata::client_generation` |
 | Output debounce and exit fold | `crates/pty/src/daemon/lifecycle.rs` — `stamp_output_activity`, `persist_output_activity`, `save_exit_metadata` |
 | Client facts and bumps | `crates/pty/src/daemon/clients.rs` — `ClientFacts`, `note_client_change`, `write_client_generation` |

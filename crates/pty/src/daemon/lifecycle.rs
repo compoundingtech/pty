@@ -150,6 +150,9 @@ pub(crate) struct Daemon {
 /// repository's `docs/vrs` R14 (not this repository's `docs/vrs`).
 const ACTIVITY_PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// How soon an activity write retries when the creation lock was held.
+const ACTIVITY_PERSIST_BUSY_RETRY: Duration = Duration::from_millis(50);
+
 /// 32 hex characters, Node's `randomBytes(16).toString("hex")`.
 fn new_generation() -> String {
     registry::atomic::random_bytes(16)
@@ -805,13 +808,20 @@ impl Daemon {
         let Some(stamped) = self.last_output_at_ms else {
             return;
         };
-        let _ = registry::write_output_activity(
+        let status = registry::publish_output_activity(
             &self.name,
             &registry::OutputActivity {
                 generation: self.generation.clone(),
                 last_output_at_ms: stamped,
             },
         );
+        // A held creation lock is transient (an attach or a patch): try
+        // again shortly rather than drop the stamp. Any other refusal means
+        // this generation no longer owns the name, and its sidecar is not
+        // this daemon's to write.
+        if status == MutateStatus::Busy {
+            self.activity_persist_at = Some(Instant::now() + ACTIVITY_PERSIST_BUSY_RETRY);
+        }
     }
 
     pub(crate) fn on_accepted_socket_ownership(&mut self, id: u64, payload: &[u8]) {
@@ -1191,8 +1201,13 @@ impl Daemon {
         // waiting out the debounce, so the last thing the child printed is
         // never lost to the exit.
         let last_output = self.last_output_at_ms;
-        let status = registry::mutate_metadata_under_lock(
+        // The exit record now carries the final stamp, so the sidecar is
+        // retired in the same critical section, while this generation still
+        // owns the name: a replacement's sidecar is never this daemon's to
+        // remove.
+        registry::record_exit_retiring_output_activity(
             &self.name,
+            &self.generation,
             move |m| {
                 let mut changed = false;
                 if m.exit_code != Some(code) {
@@ -1215,18 +1230,7 @@ impl Daemon {
                 }
                 changed
             },
-            &MutateOptions {
-                expected_generation: Some(self.generation.clone()),
-                expected_metadata: None,
-            },
-        );
-        // The exit record now carries the final stamp; the sidecar has
-        // nothing left to say. Only this generation's own write may remove
-        // it, never a replacement's.
-        if matches!(status, MutateStatus::Changed(_) | MutateStatus::Unchanged(_)) {
-            registry::remove_output_activity(&self.name);
-        }
-        status
+        )
     }
 
     /// node: src/server.ts:1321-1337

@@ -120,6 +120,39 @@ pub fn mutate_metadata_under_lock_with_wait(
     on_published: impl FnOnce(&SessionMetadata),
     wait: std::time::Duration,
 ) -> MutateStatus {
+    mutate_metadata_under_lock_core(name, mutate, options, on_published, |_| {}, wait)
+}
+
+/// [`mutate_metadata_under_lock`] whose `on_settled` hook runs once the
+/// record is final for this call — after a `Changed` publish or an
+/// `Unchanged` decline — still under `<name>.lock` and only when the guards
+/// held. A writer whose side effect must never outlive its generation's
+/// ownership of the name (the output-activity sidecar) does it here, so a
+/// replacement generation cannot publish between the check and the effect.
+pub(crate) fn mutate_metadata_under_lock_settled(
+    name: &str,
+    mutate: impl FnOnce(&mut SessionMetadata) -> bool,
+    options: &MutateOptions,
+    on_settled: impl Fn(&SessionMetadata),
+) -> MutateStatus {
+    mutate_metadata_under_lock_core(
+        name,
+        mutate,
+        options,
+        &on_settled,
+        &on_settled,
+        std::time::Duration::ZERO,
+    )
+}
+
+fn mutate_metadata_under_lock_core(
+    name: &str,
+    mutate: impl FnOnce(&mut SessionMetadata) -> bool,
+    options: &MutateOptions,
+    on_published: impl FnOnce(&SessionMetadata),
+    on_unchanged: impl FnOnce(&SessionMetadata),
+    wait: std::time::Duration,
+) -> MutateStatus {
     let _lock = match wait_for_metadata_lock(name, wait) {
         Ok(guard) => guard,
         // `Unavailable` folds into `Busy` here, as `acquire_lock` folds
@@ -154,6 +187,7 @@ pub fn mutate_metadata_under_lock_with_wait(
 
     let mut after = before.clone();
     if !mutate(&mut after) {
+        on_unchanged(&before);
         return MutateStatus::Unchanged(before);
     }
 
