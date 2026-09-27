@@ -6,7 +6,7 @@ owns; you can detach, come back with `pty attach`, read the screen from a script
 with `pty peek --plain`, type into it with `pty send`, and list, tag, restart,
 or kill sessions from any shell. Programs and agents drive sessions through the
 same commands and JSON output. This repository is a Rust port of the Node
-[`pty`](https://github.com/compoundingtech/pty), with
+[`pty`](https://github.com/compoundingtech/pty-original-experiment), with
 [libghostty](https://libghostty.tip.ghostty.org/) (the terminal core extracted
 from [Ghostty](https://ghostty.org)) in place of `@xterm/headless`. The port is
 meant as a drop-in: same commands, flags, texts, JSON shapes, exit codes, files
@@ -110,7 +110,7 @@ caches give the same result. The Nix route builds and runs on the same machine.
 runs on macOS and builds from a checkout in seconds:
 
 ```sh
-git clone https://github.com/compoundingtech/pty && cd pty
+git clone https://github.com/compoundingtech/pty-original-experiment node-pty && cd node-pty
 npm install && npm run build
 ./bin/pty --version                         # 0.12.0+<short-sha>
 ```

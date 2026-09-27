@@ -1,9 +1,9 @@
 //! # pty-terminal
 //!
 //! The libghostty-backed terminal side of the Rust
-//! [pty](https://github.com/compoundingtech/pty) port: one owner of the
-//! `!Send` `libghostty_vt::terminal::Terminal`, typed reads, Node-equivalent
-//! serialization, terminal query answers, and terminal events.
+//! [pty](https://github.com/compoundingtech/pty-original-experiment) port: one
+//! owner of the `!Send` `libghostty_vt::terminal::Terminal`, typed reads,
+//! Node-equivalent serialization, terminal query answers, and terminal events.
 //!
 //! **Bytes in, terminal state out, and nothing else.** This crate spawns no
 //! process, opens no PTY or socket, and starts no thread. Whatever feeds a
