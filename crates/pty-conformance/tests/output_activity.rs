@@ -9,9 +9,17 @@
 //! - a unix-millisecond number, not an ISO string, so a reader doing
 //!   freshness arithmetic needs no date parser;
 //! - persisted at most once a second while output flows, so a chatty session
-//!   costs one metadata write per second rather than one per chunk;
+//!   costs one write per second rather than one per chunk;
 //! - carried into the exit record even when that once-a-second write was
 //!   still pending, so the last thing a child printed is never lost.
+//!
+//! Where the running stamp is persisted differs (docs/decisions/0015): the
+//! Node daemon rewrites `<id>.json`, the Rust daemon writes the
+//! `.activity/<id>.json` sidecar and leaves the record alone until exit.
+//! [`stamp`] reads the way a consumer does — the record once it has an exit,
+//! otherwise the sidecar of the record's own generation, otherwise the
+//! record — so the contract tests run unchanged against both binaries, and
+//! the `_node`/`_rust` pair at the bottom pins the difference itself.
 //!
 //! The pinned Node reference includes this field even though its package
 //! version remains 0.12.0, so these are cross-binary contract tests.
@@ -26,8 +34,30 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The stamp a consumer should believe, by the precedence of
+/// `pty_core::registry::newest_output_at_ms`.
 fn stamp(rig: &Rig, id: &str) -> Option<i64> {
-    rig.meta(id)?.get("lastOutputAtMs")?.as_i64()
+    let meta = rig.meta(id)?;
+    let record = meta.get("lastOutputAtMs").and_then(|v| v.as_i64());
+    if meta.get("exitedAt").is_some() {
+        return record;
+    }
+    match sidecar(rig, id) {
+        Some(side) if side.get("generation") == meta.get("generation") => {
+            side.get("lastOutputAtMs").and_then(|v| v.as_i64())
+        }
+        _ => record,
+    }
+}
+
+fn sidecar_path(rig: &Rig, id: &str) -> std::path::PathBuf {
+    let meta_path = rig.meta_path(id);
+    let root = meta_path.parent().expect("metadata lives in the root");
+    root.join(".activity").join(format!("{id}.json"))
+}
+
+fn sidecar(rig: &Rig, id: &str) -> Option<serde_json::Value> {
+    read_json(&sidecar_path(rig, id))
 }
 
 /// node: tests/output-activity.test.ts:132
@@ -135,4 +165,130 @@ fn a_busy_session_writes_the_stamp_about_once_a_second() {
         seen.len()
     );
     assert!(!seen.is_empty(), "no stamp was written at all");
+}
+
+const TICKER: &[&str] = &["sh", "-c", "while :; do printf 'tick\\n'; sleep 0.05; done"];
+
+/// Rust half of `output_rewrites_the_record_node` (docs/decisions/0015):
+/// while output flows and no client comes or goes, `<id>.json` stays byte
+/// for byte what it was, and the stamp keeps moving in the sidecar.
+#[test]
+fn output_leaves_the_record_alone_rust() {
+    if !is_rust() {
+        return;
+    }
+    let rig = Rig::new();
+    rig.daemon("act-still", TICKER, DaemonOpts::no_display_name());
+    wait_until("the first sidecar stamp", || {
+        sidecar(&rig, "act-still").is_some()
+    });
+    let record = std::fs::read(rig.meta_path("act-still")).expect("record");
+    let first = stamp(&rig, "act-still").expect("first stamp");
+
+    std::thread::sleep(Duration::from_millis(2500));
+
+    assert_eq!(
+        std::fs::read(rig.meta_path("act-still")).expect("record"),
+        record,
+        "output alone rewrote the record"
+    );
+    assert!(
+        stamp(&rig, "act-still").expect("stamp") > first,
+        "the sidecar stamp stopped moving while the child kept printing"
+    );
+    assert_eq!(
+        rig.meta("act-still")
+            .and_then(|m| m.get("lastOutputAtMs").cloned()),
+        None,
+        "a running Rust record must not carry a stamp that is already stale"
+    );
+}
+
+/// Node half (docs/decisions/0015): the Node daemon persists the running
+/// stamp into `<id>.json` itself, so output rewrites the record about once a
+/// second, and there is no sidecar.
+#[test]
+fn output_rewrites_the_record_node() {
+    if !is_node() {
+        return;
+    }
+    let rig = Rig::new();
+    rig.daemon("act-still", TICKER, DaemonOpts::no_display_name());
+    wait_until("the first record stamp", || {
+        rig.meta("act-still")
+            .is_some_and(|m| m.get("lastOutputAtMs").is_some())
+    });
+    let record = std::fs::read(rig.meta_path("act-still")).expect("record");
+
+    std::thread::sleep(Duration::from_millis(2500));
+
+    assert_ne!(
+        std::fs::read(rig.meta_path("act-still")).expect("record"),
+        record,
+        "the Node daemon no longer rewrites the record on output"
+    );
+    assert!(sidecar(&rig, "act-still").is_none());
+}
+
+/// The exit record takes the stamp over and the sidecar goes, so an exited
+/// session answers from its record alone and leaves nothing behind.
+/// No Node counterpart: Node has no sidecar (docs/decisions/0015).
+#[test]
+fn the_exit_record_takes_over_from_the_sidecar() {
+    if !is_rust() {
+        return;
+    }
+    let rig = Rig::new();
+    rig.daemon(
+        "act-fold",
+        &["sh", "-c", "printf 'ready\\n'; read line"],
+        DaemonOpts::keep(),
+    );
+    wait_until("the sidecar stamp", || sidecar(&rig, "act-fold").is_some());
+    let running = stamp(&rig, "act-fold").expect("running stamp");
+    rig.pty(&["send", "act-fold", "--seq", "key:return"]);
+    wait_until("the exit record", || {
+        rig.meta("act-fold")
+            .is_some_and(|m| m.get("exitCode").is_some())
+    });
+    let folded = rig
+        .meta("act-fold")
+        .and_then(|m| m.get("lastOutputAtMs")?.as_i64())
+        .expect("the exit record must carry the stamp");
+    assert!(
+        folded >= running,
+        "exit stamp {folded} is older than {running}"
+    );
+    // The unlink follows the exit write inside the daemon, so give it the
+    // moment between the two.
+    wait_until("the sidecar to go with the exit", || {
+        !sidecar_path(&rig, "act-fold").exists()
+    });
+}
+
+/// The shutdown's retry pass must not create a second exit fact when the
+/// first exit write already landed. The file identity is the observer's
+/// signal, not merely its JSON content.
+#[test]
+fn a_recorded_exit_is_not_rewritten_during_shutdown() {
+    if !is_rust() {
+        return;
+    }
+    let rig = Rig::new();
+    rig.daemon(
+        "act-once",
+        &["sh", "-c", "printf 'done\\n'"],
+        DaemonOpts::keep(),
+    );
+    wait_until("the exit record", || {
+        rig.meta("act-once")
+            .is_some_and(|m| m.get("exitCode").is_some())
+    });
+    let path = rig.meta_path("act-once");
+    let before = std::fs::metadata(&path).expect("exit record");
+    let bytes = std::fs::read(&path).expect("exit record");
+    std::thread::sleep(Duration::from_millis(800));
+    let after = std::fs::metadata(&path).expect("retained exit record");
+    assert_eq!(std::fs::read(&path).expect("retained exit record"), bytes);
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
 }

@@ -14,7 +14,9 @@ use serde_json::Value;
 use super::list::{pid_alive, read_session_pid, socket_reachable};
 use super::lock::{acquire_event_lock, acquire_lock};
 use super::metadata::SESSION_EXIT_LAST_LINES_LIMIT;
-use super::root::{events_path, metadata_path, pid_path, recovery_revision_path, socket_path};
+use super::root::{
+    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, socket_path,
+};
 use super::names::validate_name;
 
 const METADATA_MAX_BYTES: u64 = 1024 * 1024;
@@ -319,6 +321,7 @@ pub fn remove_session_generation(
     unlink_if_present(&pid_path(name))?;
     unlink_if_present(&events_path(name))?;
     unlink_if_present(&recovery_revision_path(name))?;
+    unlink_if_present(&output_activity_path(name))?;
     unlink_if_present(&metadata_path(name))?;
     Ok(RemoveSessionGenerationResult::Removed)
 }

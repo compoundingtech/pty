@@ -172,6 +172,7 @@ gap is in what the daemon does with the frames.
 | `<name>.events.jsonl` (1000 → 500 retention, truncated at daemon start) | missing | |
 | `<name>.lock` creation/metadata lock; `<name>.events.lock`; lock order events → creation; stale-lock steal by pid | missing | Every mutation in Node takes these. A Rust writer without them can tear a Node writer's update. |
 | `.recovery/` | deferred | |
+| `.activity/<name>.json` output-activity sidecar | Rust-only | The running `lastOutputAtMs`, so output never rewrites `<name>.json`; folded into the exit record and removed. Decision 0015. |
 | `theme`, `gc.log` | missing | Small. |
 | `<name>.screen` | Rust-only | Remove once `lastLines` matches. |
 | Root created `0700` on demand | have | |
@@ -186,6 +187,8 @@ gap is in what the daemon does with the frames.
 | `recovery{...}` | deferred (preserved on rewrite, never written) |
 | `rows`, `cols`, `ephemeral`, `isolateEnv`, `extraEnv`, `unsetEnv`, `env` | missing |
 | `tags`, `displayName`, `lastAttachAt` | have |
+| `lastOutputAtMs` | have, placed differently: in `.activity/<name>.json` while running, in the record from exit on (decision 0015) |
+| `clientGeneration` | Rust-only: bumped on writable attach, resize and leave (decision 0015) |
 | `exitCode`, `exitedAt`, `lastLines` | partial (50 vs 200 lines) |
 | Unknown fields survive a rewrite | missing — Rust drops them. This breaks a mixed registry. |
 
@@ -445,7 +448,7 @@ Checked again on 2026-09-02.
 
 | Where | What | Where it stands |
 |---|---|---|
-| Node PR #168 | Persist `lastOutputAtMs`, the time the child last printed | **Merged 2026-08-29, the day this plan was approved, and nobody noticed.** Now ported: the daemon stamps it, persists it at most once a second, and carries it into the exit record. See `crates/pty-conformance/tests/output_activity.rs`. |
+| Node PR #168 | Persist `lastOutputAtMs`, the time the child last printed | **Merged 2026-08-29, the day this plan was approved, and nobody noticed.** Now ported: the daemon stamps it, persists it at most once a second, and carries it into the exit record. The running stamp lives in the `.activity/<name>.json` sidecar rather than the record (decision 0015). See `crates/pty-conformance/tests/output_activity.rs`. |
 | Node PR #173 | Bounded `keep` retention in gc: `--keep-max-age <dur>` (default `7d`, `0` sweeps now), keep-expired reported apart from the plain sweep | **Merged 2026-09-04**, and ported the same day: `pty gc --keep-max-age`, `registry::is_keep_expired` / `DEFAULT_KEEP_MAX_AGE_MS`, `crates/pty-conformance/tests/gc_keep_expiry.rs`. Node's own suite cannot be cross-run here yet — the installed Node binary is 0.12.0, which predates the flag. |
 | Node PRs #131, #133 | Generation-bound activity status; revision-guarded send | Both still drafts. Watch. |
 | Node PR #60 | Lean core: delete `up`/`down`, gc respawn, flapping | Still held. Superseded by `st2`. Informs section 12. |

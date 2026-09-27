@@ -110,6 +110,16 @@ pub fn recovery_revision_path(name: &str) -> PathBuf {
         .join(format!("{name}.revision.json"))
 }
 
+/// Path to a session's output-activity sidecar,
+/// `<root>/.activity/<name>.json`. It lives in a subdirectory, as the
+/// recovery revisions do, so that a watcher of the registry root does not see
+/// the daemon's once-a-second activity writes, and so that neither the Node
+/// nor the Rust listing mistakes it for a session (both take `<name>.json`
+/// from the root's own entries only). See docs/decisions/0015.
+pub fn output_activity_path(name: &str) -> PathBuf {
+    session_dir().join(".activity").join(format!("{name}.json"))
+}
+
 /// The CLI's startup backstop for an over-long root: when the raw
 /// `PTY_ROOT` (or `PTY_SESSION_DIR`) plus the 14 bytes of `/xxxxxxxx.sock`
 /// cannot fit `sun_path`, return Node's three-line message (no trailing

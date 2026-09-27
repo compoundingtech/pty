@@ -3,8 +3,9 @@
 //! CLIs can share one root.
 //!
 //! Per session: `<name>.json` (metadata), `<name>.sock`, `<name>.pid`,
-//! `<name>.events.jsonl`, `<name>.lock`, `<name>.events.lock`, and
-//! `.recovery/<name>.revision.json`. Atomic writes go through
+//! `<name>.events.jsonl`, `<name>.lock`, `<name>.events.lock`,
+//! `.recovery/<name>.revision.json`, and the Rust daemon's output-activity
+//! sidecar `.activity/<name>.json` ([`activity`]). Atomic writes go through
 //! `<path>.tmp.<pid>.<16 hex>` + rename; readers skip names containing
 //! `.tmp.`.
 //!
@@ -13,6 +14,7 @@
 //! and an unbound stale read-then-unlink that can defeat a newer Rust claim;
 //! see [`lock`] for the mixed-registry boundary.
 
+pub mod activity;
 pub mod atomic;
 pub mod cleanup;
 pub mod evidence;
@@ -25,6 +27,11 @@ pub mod root;
 pub mod tags;
 pub mod time;
 
+pub use activity::{
+    OutputActivity, before_output_activity_retire_on_this_thread, last_output_at_ms,
+    last_output_at_ms_in, newest_output_at_ms, publish_output_activity, read_output_activity,
+    read_output_activity_in, record_exit_retiring_output_activity,
+};
 pub use atomic::{atomic_write, is_tmp_name, random_hex16};
 pub use cleanup::{
     SessionGenerationOwner, cleanup, cleanup_all, cleanup_all_while_locked, cleanup_owned_all,
@@ -68,7 +75,8 @@ pub use names::{
 };
 pub use root::{
     SUN_PATH_MAX, default_session_dir, ensure_session_dir, event_lock_path, events_path, lock_path,
-    metadata_path, pid_path, recovery_revision_path, root_length_check, session_dir, socket_path,
+    metadata_path, output_activity_path, pid_path, recovery_revision_path, root_length_check,
+    session_dir, socket_path,
 };
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,

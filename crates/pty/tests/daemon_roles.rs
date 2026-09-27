@@ -437,9 +437,6 @@ fn attach_stamps_last_attach_at() {
     c.attach(24, 80);
     assert!(c.wait_type(Screen, T));
     assert!(wait_until(T, || d.meta().unwrap()["lastAttachAt"].is_string()));
-    let m = d.meta().unwrap();
-    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
-    assert_eq!(keys.last(), Some(&"lastAttachAt"));
 }
 
 /// `peek --full` returns scrollback; the viewport peek does not.

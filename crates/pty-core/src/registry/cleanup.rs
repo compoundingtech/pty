@@ -7,7 +7,9 @@
 use super::list::read_session_pid;
 use super::lock::{LockBusy, acquire_lock, with_both_locks};
 use super::metadata::read_metadata;
-use super::root::{events_path, metadata_path, pid_path, recovery_revision_path, socket_path};
+use super::root::{
+    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, socket_path,
+};
 
 fn unlink(path: std::path::PathBuf) {
     let _ = std::fs::remove_file(path);
@@ -22,14 +24,15 @@ pub fn cleanup_socket(name: &str) {
 }
 
 /// Remove every artifact while the caller already owns both locks:
-/// socket, pid, metadata, events, recovery revision.
+/// socket, pid, metadata, events, recovery revision, output-activity sidecar.
 ///
-/// node: src/sessions.ts:755-767
+/// node: src/sessions.ts:755-767 (Node has no activity sidecar; decision 0015)
 pub fn cleanup_all_while_locked(name: &str) {
     cleanup_socket(name);
     unlink(metadata_path(name));
     unlink(events_path(name));
     unlink(recovery_revision_path(name));
+    unlink(output_activity_path(name));
 }
 
 /// Remove everything including metadata, under the event lock then the

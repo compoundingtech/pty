@@ -20,7 +20,8 @@ use pty_core::protocol::{
     encode_status_response,
 };
 use pty_core::registry::{
-    ListOptions, SessionStatus, list_sessions_in, probe_sockets_within_budget,
+    ListOptions, SessionMetadata, SessionStatus, last_output_at_ms_in, list_sessions_in,
+    probe_sockets_within_budget,
 };
 use pty_core::{busy_connects_on_this_thread, query_stats_batch_in};
 use serde_json::json;
@@ -713,5 +714,34 @@ fn socket_probe_matches_a_blocking_connect() {
             ("live".to_string(), SessionStatus::Running),
             ("stale".to_string(), SessionStatus::Vanished),
         ]
+    );
+}
+
+#[test]
+fn output_activity_reads_only_the_selected_roots_generation() {
+    let root = TestRoot::new();
+    let dir = root.path().join(".activity");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("one.json"),
+        serde_json::to_vec(&json!({"generation": "g1", "lastOutputAtMs": 42})).unwrap(),
+    )
+    .unwrap();
+    let metadata = |generation: &str| SessionMetadata {
+        generation: Some(generation.into()),
+        ..SessionMetadata::default()
+    };
+
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "one", &metadata("g1")),
+        Some(42)
+    );
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "one", &metadata("g2")),
+        None
+    );
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "two", &metadata("g1")),
+        None
     );
 }

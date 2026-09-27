@@ -37,7 +37,7 @@ use pty_lifecycle::{
     remaining_lease_delay, startup_lease_deadline_cause, terminal_startup_lease_value,
 };
 use super::DaemonConfig;
-use super::clients::{Client, Out, REDRAW_SETTLE};
+use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
 use super::tree::{
@@ -117,8 +117,17 @@ pub(crate) struct Daemon {
     /// When the pending activity write is due. A trailing-edge debounce: the
     /// first chunk after a quiet period schedules one write a second out, and
     /// every chunk inside that window folds into it, so a chatty session
-    /// costs one metadata write per second rather than one per chunk.
+    /// costs one sidecar write per second rather than one per chunk.
     activity_persist_at: Option<Instant>,
+    /// The `clientGeneration` this daemon last bumped to (docs/decisions/0015).
+    pub(crate) client_generation: u64,
+    /// The client facts `client_generation` was bumped for.
+    pub(crate) published_client_facts: ClientFacts,
+    /// An ATTACH stamp whose write has not landed yet.
+    pub(crate) pending_attach_at: Option<String>,
+    /// `(next attempt, give up at)` for a `clientGeneration` write that met
+    /// a held lock.
+    pub(crate) client_meta_retry: Option<(Instant, Instant)>,
     listener_fd: i32,
     startup_lease: Option<ArmedStartupLease>,
     startup_lease_timer: Option<Instant>,
@@ -140,6 +149,9 @@ pub(crate) struct Daemon {
 /// node: src/server.ts `scheduleActivityPersist` (1 s), the Node pty
 /// repository's `docs/vrs` R14 (not this repository's `docs/vrs`).
 const ACTIVITY_PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// How soon an activity write retries when the creation lock was held.
+const ACTIVITY_PERSIST_BUSY_RETRY: Duration = Duration::from_millis(50);
 
 /// 32 hex characters, Node's `randomBytes(16).toString("hex")`.
 fn new_generation() -> String {
@@ -424,6 +436,10 @@ pub(crate) fn run(
         exit_meta_retry: None,
         last_output_at_ms: None,
         activity_persist_at: None,
+        client_generation: 0,
+        published_client_facts: ClientFacts::unattached(rows, cols),
+        pending_attach_at: None,
+        client_meta_retry: None,
         listener_fd,
         startup_lease_timer: startup_lease
             .as_ref()
@@ -687,6 +703,7 @@ impl Daemon {
                 self.exit_shutdown_at,
                 self.exit_meta_retry.map(|(next, _)| next),
                 self.activity_persist_at,
+                self.client_meta_retry.map(|(next, _)| next),
                 self.startup_lease_timer,
             ]
             .into_iter()
@@ -776,7 +793,10 @@ impl Daemon {
         }
     }
 
-    /// Write the newest output stamp, if it is not the one already on disk.
+    /// Publish the newest output stamp to the `.activity/<name>.json`
+    /// sidecar. The record itself is left alone: output is not a fact its
+    /// observers wait on, and rewriting it once a second made every busy
+    /// session look changed (docs/decisions/0015).
     ///
     /// Best effort on purpose: a lost stamp reads as slightly older activity,
     /// and it must never take the daemon down or block the output path.
@@ -788,17 +808,20 @@ impl Daemon {
         let Some(stamped) = self.last_output_at_ms else {
             return;
         };
-        registry::mutate_metadata_under_lock(
+        let status = registry::publish_output_activity(
             &self.name,
-            move |m| {
-                if m.last_output_at_ms == Some(stamped) {
-                    return false;
-                }
-                m.last_output_at_ms = Some(stamped);
-                true
+            &registry::OutputActivity {
+                generation: self.generation.clone(),
+                last_output_at_ms: stamped,
             },
-            &MutateOptions::default(),
         );
+        // A held creation lock is transient (an attach or a patch): try
+        // again shortly rather than drop the stamp. Any other refusal means
+        // this generation no longer owns the name, and its sidecar is not
+        // this daemon's to write.
+        if status == MutateStatus::Busy {
+            self.activity_persist_at = Some(Instant::now() + ACTIVITY_PERSIST_BUSY_RETRY);
+        }
     }
 
     pub(crate) fn on_accepted_socket_ownership(&mut self, id: u64, payload: &[u8]) {
@@ -1067,6 +1090,11 @@ impl Daemon {
         {
             self.persist_output_activity();
         }
+        if let Some((next, _)) = self.client_meta_retry
+            && next <= now
+        {
+            self.write_client_generation();
+        }
         if let Some(d) = self.exit_drain_deadline
             && d <= now
         {
@@ -1173,20 +1201,34 @@ impl Daemon {
         // waiting out the debounce, so the last thing the child printed is
         // never lost to the exit.
         let last_output = self.last_output_at_ms;
-        registry::mutate_metadata_under_lock(
+        // The exit record now carries the final stamp, so the sidecar is
+        // retired in the same critical section, while this generation still
+        // owns the name: a replacement's sidecar is never this daemon's to
+        // remove.
+        registry::record_exit_retiring_output_activity(
             &self.name,
+            &self.generation,
             move |m| {
-                m.exit_code = Some(code);
-                m.exited_at = Some(registry::now_iso8601());
-                m.last_lines = Some(last_lines);
-                if last_output.is_some() {
-                    m.last_output_at_ms = last_output;
+                let mut changed = false;
+                if m.exit_code != Some(code) {
+                    m.exit_code = Some(code);
+                    changed = true;
                 }
-                true
-            },
-            &MutateOptions {
-                expected_generation: Some(self.generation.clone()),
-                expected_metadata: None,
+                if m.exited_at.is_none() {
+                    m.exited_at = Some(registry::now_iso8601());
+                    changed = true;
+                }
+                if m.last_lines.as_ref() != Some(&last_lines) {
+                    m.last_lines = Some(last_lines);
+                    changed = true;
+                }
+                if let Some(stamp) = last_output
+                    && m.last_output_at_ms != Some(stamp)
+                {
+                    m.last_output_at_ms = Some(stamp);
+                    changed = true;
+                }
+                changed
             },
         )
     }

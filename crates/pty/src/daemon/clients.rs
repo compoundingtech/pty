@@ -19,7 +19,7 @@ use pty_core::protocol::{
     AttachedClient, MessageType, Packet, decode_attach_identity, decode_cell, decode_peek,
     decode_size, encode_exit, encode_geometry, encode_screen, encode_status_response,
 };
-use pty_core::registry::{self, MutateOptions};
+use pty_core::registry::{self, MutateOptions, MutateStatus};
 use pty_terminal::{Range, SerializeOpts};
 
 use super::lifecycle::Daemon;
@@ -27,6 +27,35 @@ use super::lifecycle::Daemon;
 /// Node's `REDRAW_SETTLE_MS`: how long after a resize the child gets to
 /// redraw before an attacher's SCREEN is cut.
 pub const REDRAW_SETTLE: Duration = Duration::from_millis(80);
+
+/// How long a `clientGeneration` write keeps retrying a held metadata lock.
+/// Lock holders are short CLI writes; a holder that outlives this loses the
+/// write, and the next client change carries the newer counter.
+const CLIENT_METADATA_RETRY: Duration = Duration::from_secs(2);
+
+/// The facts `clientGeneration` follows: what `pty stats` reports about the
+/// writable clients and the session's negotiated size. Readonly and command
+/// connections are left out on purpose, so that observing a session never
+/// rewrites its record (docs/decisions/0015).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientFacts {
+    rows: u16,
+    cols: u16,
+    /// `(connection id, rows, cols)` of every size-constraining client, in
+    /// connection order.
+    writable: Vec<(u64, u16, u16)>,
+}
+
+impl ClientFacts {
+    /// The facts of a session no client has attached to yet.
+    pub fn unattached(rows: u16, cols: u16) -> ClientFacts {
+        ClientFacts {
+            rows,
+            cols,
+            writable: Vec::new(),
+        }
+    }
+}
 
 /// Bytes to a client's socket, or an instruction to end/destroy it.
 pub enum Out {
@@ -164,19 +193,11 @@ impl Daemon {
             let g = encode_geometry(self.actor.rows(), self.actor.cols());
             self.clients[&id].send(g);
         }
-        // Best-effort: a concurrent metadata command wins this stamp, but
-        // neither writer can overwrite the other's snapshot.
-        let _ = registry::mutate_metadata_under_lock(
-            &self.name,
-            |m| {
-                m.last_attach_at = Some(registry::now_iso8601());
-                true
-            },
-            &MutateOptions {
-                expected_generation: Some(self.generation.clone()),
-                expected_metadata: None,
-            },
-        );
+        // One write carries both the attach stamp and the client-generation
+        // bump. Best-effort under the lock: a concurrent metadata command
+        // wins, the write retries briefly, and neither writer can overwrite
+        // the other's snapshot.
+        self.note_client_change(Some(registry::now_iso8601()));
         let delay = if !self.exited {
             let since_last = self
                 .last_resize
@@ -200,16 +221,20 @@ impl Daemon {
         if !self.clients.contains_key(&id) {
             return;
         }
-        let generation = {
+        let (generation, was_writable) = {
             let c = self.clients.get_mut(&id).expect("checked");
+            let was_writable = c.constrains_size();
             c.role = Role::Readonly;
             c.generation += 1;
-            c.generation
+            (c.generation, was_writable)
         };
         let resized = self.negotiate_size();
         if !resized {
             let g = encode_geometry(self.actor.rows(), self.actor.cols());
             self.clients[&id].send(g);
+        }
+        if was_writable {
+            self.note_client_change(None);
         }
         let (plain, full) = decode_peek(payload);
         self.schedule_cut(id, generation, CutKind::Peek { plain, full }, None);
@@ -240,6 +265,7 @@ impl Daemon {
         c.attach_seq = self.attach_counter;
         self.adopt_cell_size(payload);
         self.negotiate_size();
+        self.note_client_change(None);
     }
 
     /// Take the cell pixel metrics a client declared on ATTACH or RESIZE.
@@ -310,10 +336,93 @@ impl Daemon {
 
     /// `close` / `error`: forget the socket and renegotiate.
     ///
+    /// Only a departing writable client can change the client facts, so a
+    /// command connection (`pty stats`, `pty send`) or a peek closing costs
+    /// no metadata work at all.
+    ///
     /// node: src/server.ts:1054-1062
     pub(crate) fn on_closed(&mut self, id: u64) {
-        if self.clients.remove(&id).is_some() {
+        if let Some(c) = self.clients.remove(&id) {
             self.negotiate_size();
+            if c.constrains_size() {
+                self.note_client_change(None);
+            }
+        }
+    }
+
+    /// The client facts as they stand now.
+    fn client_facts(&self) -> ClientFacts {
+        ClientFacts {
+            rows: self.actor.rows(),
+            cols: self.actor.cols(),
+            writable: self
+                .clients
+                .iter()
+                .filter(|(_, c)| c.constrains_size())
+                .map(|(id, c)| (*id, c.rows, c.cols))
+                .collect(),
+        }
+    }
+
+    /// Bump `clientGeneration` and publish it when the client facts moved.
+    /// An ATTACH (`attached_at` present) always bumps: it stamps
+    /// `lastAttachAt` in the same write, and a client that re-attaches on
+    /// its connection is a new attach even at an unchanged size.
+    fn note_client_change(&mut self, attached_at: Option<String>) {
+        let facts = self.client_facts();
+        if attached_at.is_none() && facts == self.published_client_facts {
+            return;
+        }
+        self.published_client_facts = facts;
+        self.client_generation += 1;
+        if attached_at.is_some() {
+            self.pending_attach_at = attached_at;
+        }
+        self.client_meta_retry = None;
+        self.write_client_generation();
+    }
+
+    /// Write the current `clientGeneration` (and a pending `lastAttachAt`)
+    /// into the record, generation-fenced. A held lock or a concurrent
+    /// rewrite schedules a retry for up to [`CLIENT_METADATA_RETRY`].
+    pub(crate) fn write_client_generation(&mut self) {
+        let client_generation = self.client_generation;
+        let attached_at = self.pending_attach_at.clone();
+        let status = registry::mutate_metadata_under_lock(
+            &self.name,
+            move |m| {
+                let mut changed = false;
+                if let Some(at) = attached_at {
+                    m.last_attach_at = Some(at);
+                    changed = true;
+                }
+                if m.client_generation != Some(client_generation) {
+                    m.client_generation = Some(client_generation);
+                    changed = true;
+                }
+                changed
+            },
+            &MutateOptions {
+                expected_generation: Some(self.generation.clone()),
+                expected_metadata: None,
+            },
+        );
+        match status {
+            MutateStatus::Busy | MutateStatus::Stale => {
+                let now = Instant::now();
+                let deadline = self
+                    .client_meta_retry
+                    .map_or(now + CLIENT_METADATA_RETRY, |(_, deadline)| deadline);
+                self.client_meta_retry =
+                    (now < deadline).then_some((now + Duration::from_millis(10), deadline));
+            }
+            MutateStatus::Changed(_)
+            | MutateStatus::Unchanged(_)
+            | MutateStatus::Missing
+            | MutateStatus::GenerationMismatch => {
+                self.pending_attach_at = None;
+                self.client_meta_retry = None;
+            }
         }
     }
 

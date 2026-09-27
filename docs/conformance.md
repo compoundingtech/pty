@@ -9,8 +9,8 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 ## Summary
 
 - Node suites: 128
-- Rust conformance tests: 666 (640 port a Node test, 26 cover the Rust-owned fixtures)
-- Gated (`_node`/`_rust` pairs pointing at a decision record): 6 — the parity debt
+- Rust conformance tests: 674 (640 port a Node test, 34 cover the Rust-owned fixtures)
+- Gated (`_node`/`_rust` pairs pointing at a decision record): 10 — the parity debt
 - cli: 58 suites, 58 with Rust tests, 0 to do
 - not-portable: 49
 - protocol: 9 suites, 9 with Rust tests, 0 to do
@@ -153,10 +153,14 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 
 | Rust test | Node suite | decision |
 |---|---|---|
+| client_generation.rs::attach_resize_and_detach_each_bump_the_generation_rust | — | see the test's doc comment |
+| client_generation.rs::client_changes_write_no_generation_node | — | see the test's doc comment |
 | fixtures_protocol.rs::bytes_split_input_reassembles_every_scalar_rust | — | see the test's doc comment |
 | fixtures_protocol.rs::bytes_split_input_is_mangled_node | — | see the test's doc comment |
 | fixtures_protocol.rs::raw_data_bytes_node | — | see the test's doc comment |
 | fixtures_protocol.rs::raw_data_bytes_rust | — | see the test's doc comment |
+| output_activity.rs::output_leaves_the_record_alone_rust | — | see the test's doc comment |
+| output_activity.rs::output_rewrites_the_record_node | — | see the test's doc comment |
 | version.rs::version_shape_node | version.test.ts | see the test's doc comment |
 | version.rs::version_shape_rust | version.test.ts | see the test's doc comment |
 

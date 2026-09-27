@@ -10,10 +10,10 @@ use pty_core::registry::{
     self, DEFAULT_KEEP_MAX_AGE_MS, DEFAULT_SOCKET_PROBE_BUDGET, SessionInfo, SessionMetadata,
     TagMap, apply_metadata_diff, cleanup_all_while_locked, cleanup_socket, event_lock_path,
     events_path, has_process_exited_for_reap, is_keep_expired, is_keep_requested, lock_or_refusal,
-    metadata_matches_observation, metadata_path, now_epoch_ms, parse_iso8601_ms, pid_alive,
-    probe_sockets_within_budget, read_metadata, read_metadata_map, read_pid, read_pid_with,
-    recovery_revision_path, session_dir, socket_path, socket_reachable, update_tags,
-    with_both_locks, write_metadata, write_metadata_map,
+    metadata_matches_observation, metadata_path, now_epoch_ms, output_activity_path,
+    parse_iso8601_ms, pid_alive, probe_sockets_within_budget, read_metadata, read_metadata_map,
+    read_pid, read_pid_with, recovery_revision_path, session_dir, socket_path, socket_reachable,
+    update_tags, with_both_locks, write_metadata, write_metadata_map,
 };
 use sha2::{Digest, Sha256};
 
@@ -851,6 +851,7 @@ fn cleanup_raw_candidate_guarded(name: &str) -> bool {
         let _ = std::fs::remove_file(metadata_path(name));
         let _ = std::fs::remove_file(events_path(name));
         let _ = std::fs::remove_file(recovery_revision_path(name));
+        let _ = std::fs::remove_file(output_activity_path(name));
         true
     })
     .unwrap_or(false)

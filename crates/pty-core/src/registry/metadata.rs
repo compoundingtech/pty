@@ -90,14 +90,29 @@ pub struct SessionMetadata {
     /// Unix milliseconds for the newest child output the daemon has seen.
     /// Absent until a session produces output, and absent on a record an
     /// older daemon wrote — never zero, and never a claim that the session
-    /// is idle. The daemon already parses every byte, so the stamp costs
-    /// nothing to take; it is persisted at most once a second while output
-    /// flows.
+    /// is idle.
+    ///
+    /// A Rust daemon writes this field into the record only at exit. While
+    /// the child runs, the stamp lives in the `.activity/<name>.json`
+    /// sidecar ([`super::activity`]), so that output alone never rewrites
+    /// this file; read it through [`super::activity::last_output_at_ms`].
+    /// A Node daemon still writes it here at most once a second
+    /// (docs/decisions/0015).
     ///
     /// node: src/sessions.ts (`lastOutputAtMs`), the Node pty repository's
     /// `docs/vrs/requirements.md` R14 (not this repository's `docs/vrs`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at_ms: Option<i64>,
+    /// A counter the Rust daemon bumps, in the same write, whenever the
+    /// client facts `pty stats` reports change: a writable client attaches
+    /// or leaves, a writable client's size changes, or the session's
+    /// negotiated size changes. It starts again with every daemon generation,
+    /// so compare it only together with `generation`. Absent until the first
+    /// such change, and never written by a Node daemon. Readonly (PEEK) and
+    /// command connections do not bump it: observing a session must not
+    /// change its record (docs/decisions/0015).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_generation: Option<u64>,
     /// Every field this version does not model, round-tripped verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -210,6 +225,7 @@ impl SessionMetadata {
             "lastLines",
             "lastAttachAt",
             "lastOutputAtMs",
+            "clientGeneration",
         ] {
             if let Some(v) = self.to_map().get(key) {
                 m.insert(key.into(), v.clone());
