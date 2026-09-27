@@ -13,6 +13,10 @@ repository = "https://github.com/compoundingtech/pty-rust"
 # External crates, pinned to the versions in Cargo.lock.
 libc = "0.2.186"
 libghostty-vt = "0.2.1"
+# Only for its `pkg-config` feature: with it, the build links a prebuilt
+# libghostty-vt found through pkg-config (the release archives) and falls
+# back to building Ghostty with Zig when there is none.
+libghostty-vt-sys = { version = "0.2.1", features = ["pkg-config"] }
 portable-pty = "0.9.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
