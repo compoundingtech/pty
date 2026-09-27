@@ -50,8 +50,12 @@ fn spawn_reports_exit_code() {
     // The child waits for a line before it exits, so the subscription is in
     // place before the exit it has to hear. A child that exits at once can do
     // so before `subscribe` returns, and then the event goes to nobody.
-    let h = TerminalHandle::spawn("sh", &["-c", "read _; printf done; exit 3"], SpawnOptions::default())
-        .expect("spawn");
+    let h = TerminalHandle::spawn(
+        "sh",
+        &["-c", "read _; printf done; exit 3"],
+        SpawnOptions::default(),
+    )
+    .expect("spawn");
     let events = h.subscribe();
     h.write(b"\n");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -601,11 +605,23 @@ const DIACRITICS: [char; 4] = ['\u{305}', '\u{30d}', '\u{30e}', '\u{310}'];
 /// their underline colour, rows separated by CR/LF.
 fn omp_image(id: u32, pid: u32, cols: usize, rows: usize) -> String {
     let mut out = format!("\x1b_Ga=t,f=100,q=2,i={id};{PNG_16X8_BASE64}\x1b\\");
-    let fg = format!("\x1b[38;2;{};{};{}m", (id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
-    let ul = format!("\x1b[58:2::{}:{}:{}m", (pid >> 16) & 0xff, (pid >> 8) & 0xff, pid & 0xff);
+    let fg = format!(
+        "\x1b[38;2;{};{};{}m",
+        (id >> 16) & 0xff,
+        (id >> 8) & 0xff,
+        id & 0xff
+    );
+    let ul = format!(
+        "\x1b[58:2::{}:{}:{}m",
+        (pid >> 16) & 0xff,
+        (pid >> 8) & 0xff,
+        pid & 0xff
+    );
     for r in 0..rows {
         if r == 0 {
-            out.push_str(&format!("\x1b_Ga=p,U=1,q=2,i={id},p={pid},c={cols},r={rows}\x1b\\"));
+            out.push_str(&format!(
+                "\x1b_Ga=p,U=1,q=2,i={id},p={pid},c={cols},r={rows}\x1b\\"
+            ));
         } else {
             out.push_str("\r\n");
         }
