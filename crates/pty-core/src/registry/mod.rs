@@ -58,8 +58,8 @@ pub use lock::{
 };
 pub use metadata::{
     EnvMap, SESSION_EXIT_LAST_LINES_LIMIT, SessionMetadata, TagMap, apply_metadata_diff,
-    pretty_json, read_metadata, read_metadata_map, write_metadata, write_metadata_map,
-    write_metadata_publication,
+    pretty_json, read_metadata, read_metadata_in, read_metadata_map, write_metadata,
+    write_metadata_map, write_metadata_publication,
 };
 pub use mutate::{
     MetadataChangeSnapshot, MetadataPatch, MetadataPatchEvent, MetadataPatchResult, MutateOptions,
@@ -76,7 +76,7 @@ pub use names::{
 pub use root::{
     SUN_PATH_MAX, default_session_dir, ensure_session_dir, event_lock_path, events_path, lock_path,
     metadata_path, output_activity_path, pid_path, recovery_revision_path, root_length_check,
-    session_dir, socket_path,
+    session_dir, socket_path, with_root,
 };
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,

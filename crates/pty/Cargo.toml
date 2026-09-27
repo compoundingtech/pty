@@ -17,6 +17,7 @@ pty-spawn = { path = "../pty-spawn" }
 libc.workspace = true
 libghostty-vt.workspace = true
 portable-pty.workspace = true
+pty-client.workspace = true
 pty-core.workspace = true
 pty-lifecycle.workspace = true
 pty-terminal.workspace = true

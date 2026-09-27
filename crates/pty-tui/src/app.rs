@@ -8,7 +8,7 @@
 //! Every frame is drawn with ratatui inside DEC synchronized output.
 //!
 //! [`AppCtl::pause`] leaves the terminal completely and stops reading
-//! stdin so an in-process `pty_core::client::attach` can own the tty;
+//! stdin so an in-process `pty_client::attach` can own the tty;
 //! [`AppCtl::resume`] re-enters and forces a full redraw. The default
 //! `ctrl+c` ends the run with exit code 130 (`app.ts:208-211`) unless the
 //! screen's [`Screen::global_key`] consumes it first.

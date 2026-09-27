@@ -40,7 +40,7 @@ use super::DaemonConfig;
 use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
-use super::tree::{
+use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
     terminate_process_identities,

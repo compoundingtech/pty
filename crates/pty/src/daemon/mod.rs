@@ -18,7 +18,6 @@ pub mod geometry;
 pub mod lifecycle;
 mod ownership;
 pub mod status;
-pub mod tree;
 
 use std::path::PathBuf;
 

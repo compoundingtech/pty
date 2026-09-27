@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use pty_core::client::{
+use pty_client::{
     ClientError, PeekScreenOptions, peek_screen_bytes_in, peek_screen_in, query_stats_in,
     query_stats_in_with_timeout,
 };
@@ -23,7 +23,8 @@ use pty_core::registry::{
     ListOptions, SessionMetadata, SessionStatus, last_output_at_ms_in, list_sessions_in,
     probe_sockets_within_budget,
 };
-use pty_core::{busy_connects_on_this_thread, query_stats_batch_in};
+use pty_client::query_stats_batch_in;
+use pty_core::busy_connects_on_this_thread;
 use serde_json::json;
 
 const T: Duration = Duration::from_secs(5);

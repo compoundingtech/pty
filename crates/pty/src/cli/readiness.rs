@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 
-use pty_core::client::{compare_and_set_lifecycle, query_accepted_socket_ownership};
+use pty_client::{compare_and_set_lifecycle, query_accepted_socket_ownership};
 use pty_core::protocol::{AcceptedSocketOwnershipRequest, LifecycleCompareAndSetRequest};
 use pty_core::registry::validate_name;
 use super::{CliError, CliResult};

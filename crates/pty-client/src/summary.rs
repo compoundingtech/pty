@@ -2,8 +2,8 @@
 //! client prints when an attach or `peek -f` ends: a header naming the event,
 //! the session's `pty list` line, and the command that gets you back.
 
-use crate::duration::format_duration;
-use crate::registry::{
+use pty_core::duration::format_duration;
+use pty_core::registry::{
     self, SessionInfo, SessionMetadata, TagMap, is_reserved_tag_key, now_epoch_ms,
     parse_iso8601_ms, short_path,
 };

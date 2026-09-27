@@ -1,10 +1,10 @@
 //! Programmatic session access, ported from `src/connection.ts`:
 //! [`SessionConnection`] (ATTACH on connect, resolves on the first SCREEN,
 //! effective geometry from GEOMETRY, `write`/`press`/`resize`/`disconnect`),
-//! [`send_data`], and [`peek_screen`]. Unlike [`super::attach`] nothing here
+//! [`send_data`], and [`peek_screen`]. Unlike [`super::attach()`] nothing here
 //! touches stdin/stdout or prints.
 //!
-//! With the `tokio` feature, [`AsyncConnection`] offers the same surface on
+//! With the `tokio` feature, `AsyncConnection` offers the same surface on
 //! `tokio::net::UnixStream`.
 
 use std::collections::VecDeque;
@@ -13,13 +13,13 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::keys::{KeyError, resolve_key};
-use crate::paste::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
-use crate::protocol::{
+use pty_core::keys::{KeyError, resolve_key};
+use pty_core::paste::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
+use pty_core::protocol::{
     MessageType, Packet, PacketReader, decode_exit, decode_geometry, encode_attach, encode_data,
     encode_detach, encode_peek, encode_resize,
 };
-use crate::registry;
+use pty_core::registry;
 
 use super::{ClientError, GoneSet, connect_session_at, connect_session_with, map_io_error};
 
@@ -272,7 +272,7 @@ impl SessionConnection {
         }
     }
 
-    /// Send a named key (`ctrl+c`, `return`, …; see [`crate::keys`]).
+    /// Send a named key (`ctrl+c`, `return`, …; see [`pty_core::keys`]).
     pub fn press(&mut self, key: &str) -> Result<(), KeyError> {
         let bytes = resolve_key(key)?;
         self.write(bytes.as_bytes());
@@ -423,8 +423,7 @@ pub fn peek_screen_bytes_in(
 }
 
 fn retained_screen_bytes_in(root: &Path, name: &str) -> Option<Vec<u8>> {
-    let lines =
-        registry::metadata::read_metadata_at(&root.join(format!("{name}.json")))?.last_lines?;
+    let lines = registry::read_metadata_in(root, name)?.last_lines?;
     if lines.is_empty() {
         return Some(Vec::new());
     }

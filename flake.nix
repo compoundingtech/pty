@@ -172,15 +172,16 @@
           # broken pipe, and a terminal snapshot test raced its own shell loop.
           # None of those was a defect in the software.
           #
-          # So the check phase runs `pty-core`, which is the registry, the
-          # protocol, the events log, the key and input parsers and the client
-          # operations — everything the port gets wrong quietly. The behaviour
+          # So the check phase runs `pty-core` and `pty-client`: the registry,
+          # the protocol, the events log, the key and input parsers and the
+          # client operations — everything the port gets wrong quietly. The
+          # client tests talk to scripted fake daemons, not real ones. The behaviour
           # of the INSTALLED binary is proved by the checks below instead,
           # which is a better test of a package anyway.
           #
           # Everything runs on a machine with `cargo test --workspace`, and
           # `scripts/conformance-both.sh` runs the side-by-side against Node.
-          cargoTestFlags = [ "-p" "pty-core" ];
+          cargoTestFlags = [ "-p" "pty-core" "-p" "pty-client" ];
 
           # The testkit's line-editing tests drive readline through `bash`;
           # stdenv's bash is built without it, so the interactive one goes first

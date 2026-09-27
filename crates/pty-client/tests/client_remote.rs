@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::{RemoteDialer, RemoteError, RemoteSessionRow};
+use pty_client::{RemoteDialer, RemoteError, RemoteSessionRow};
 use pty_core::protocol::{MessageType, encode_screen};
 
 const T: Duration = Duration::from_secs(5);

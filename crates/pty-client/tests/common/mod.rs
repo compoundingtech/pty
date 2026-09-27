@@ -187,7 +187,7 @@ pub fn wait_unread(s: &UnixStream, timeout: Duration) {
         events: libc::POLLIN,
         revents: 0,
     }];
-    let n = pty_core::client::tty::poll(&mut fds, timeout.as_millis() as i32).unwrap();
+    let n = pty_client::tty::poll(&mut fds, timeout.as_millis() as i32).unwrap();
     assert!(n > 0, "no unread bytes arrived");
 }
 
@@ -219,7 +219,7 @@ pub struct Pipe {
 pub fn pipe() -> Pipe {
     // Not `libc::pipe2` directly: Apple has no such call, and this helper
     // is the one place that difference is handled.
-    let fds = pty_core::client::tty::cloexec_pipe(false).expect("pipe");
+    let fds = pty_client::tty::cloexec_pipe(false).expect("pipe");
     unsafe {
         Pipe {
             r: OwnedFd::from_raw_fd(fds[0]),

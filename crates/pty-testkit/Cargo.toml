@@ -16,3 +16,4 @@ pty-terminal.workspace = true
 
 [dev-dependencies]
 libghostty-vt.workspace = true
+pty-client.workspace = true

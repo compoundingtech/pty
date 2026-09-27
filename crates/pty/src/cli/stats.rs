@@ -4,7 +4,7 @@
 //! node: src/cli.ts:1345-1356 (dispatch), 2448-2564 (`cmdStats`),
 //! 2566-2595 (`printStats`), 2596-2615 (`formatMemory`, `formatUptime`)
 
-use pty_core::client;
+use pty_client as client;
 use pty_core::registry::{self, SessionInfo, SessionMetadata, short_path, time_ago};
 use pty_core::stats::{GoneStats, StatsResult};
 

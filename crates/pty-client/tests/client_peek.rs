@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::{
+use pty_client::{
     CURSOR_TO_BOTTOM, ClientIo, PeekOutcome, PeekParams, PeekWaitError, TERMINAL_SANITIZE, follow,
     peek, peek_wait, strip_ansi,
 };
@@ -39,7 +39,7 @@ fn with_io<R: Send + 'static>(
     let err = collect(stderr.r);
     if let Some(bytes) = stdin_script {
         std::thread::sleep(Duration::from_millis(100));
-        pty_core::client::tty::write_all_fd(stdin.w.as_raw_fd(), &bytes).unwrap();
+        pty_client::tty::write_all_fd(stdin.w.as_raw_fd(), &bytes).unwrap();
     }
     let r = join_within(handle, T, "peek");
     drop(stdin.w);

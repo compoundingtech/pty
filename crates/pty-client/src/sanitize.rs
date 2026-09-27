@@ -26,7 +26,7 @@ pub const TERMINAL_SANITIZE: &str = concat!(
 );
 
 /// Move the cursor to the bottom of the visible screen so status messages
-/// ("[detached]") land below the session content, not mid-screen.
+/// ("\[detached\]") land below the session content, not mid-screen.
 pub const CURSOR_TO_BOTTOM: &str = "\x1b[999;1H";
 
 /// Clear the screen and home the cursor — written before every SCREEN replay

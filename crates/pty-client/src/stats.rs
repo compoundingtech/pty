@@ -6,10 +6,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{AttachedClient, MessageType, PacketReader, encode_status, encode_status_clients};
-use crate::registry;
-use crate::stats::StatsResult;
-use crate::unix_connect::{self, Connect};
+use pty_core::protocol::{AttachedClient, MessageType, PacketReader, encode_status, encode_status_clients};
+use pty_core::registry;
+use pty_core::stats::StatsResult;
+use pty_core::unix_connect::{self, Connect};
 
 use super::{ClientError, GoneSet, connect_session_at, dropping_connection_line, map_io_error};
 

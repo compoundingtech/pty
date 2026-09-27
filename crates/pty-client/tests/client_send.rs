@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::{
+use pty_client::{
     DEFAULT_SEQ_DELAY_MS, SendDataOptions, SendOptions, resolve_seq_delay_ms, send, send_data,
 };
 use pty_core::protocol::MessageType;

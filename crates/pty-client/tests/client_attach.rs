@@ -10,9 +10,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::attach::{AttachOutcome, AttachParams, Reconnect, attach};
-use pty_core::client::summary::SessionSummary;
-use pty_core::client::{
+use pty_client::attach::{AttachOutcome, AttachParams, Reconnect, attach};
+use pty_client::summary::SessionSummary;
+use pty_client::{
     CURSOR_TO_BOTTOM, ClientError, ClientIo, RouteRefusedError, TERMINAL_SANITIZE, connect_session,
 };
 use pty_core::protocol::{
@@ -62,7 +62,7 @@ fn start_with(
 
 impl Run {
     fn type_stdin(&self, bytes: &[u8]) {
-        pty_core::client::tty::write_all_fd(self.stdin.as_ref().unwrap().as_raw_fd(), bytes)
+        pty_client::tty::write_all_fd(self.stdin.as_ref().unwrap().as_raw_fd(), bytes)
             .unwrap();
     }
     fn finish(mut self) -> (AttachOutcome, String, String) {

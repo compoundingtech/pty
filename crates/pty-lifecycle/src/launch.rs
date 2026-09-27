@@ -67,7 +67,7 @@ pub struct SpawnParams {
 impl SpawnParams {
     /// Parameters for `command` with the caller's terminal size (or 24×80).
     pub fn new(name: &str, command: &str, args: &[String]) -> Self {
-        let (rows, cols) = pty_core::client::tty::size_or_default(libc::STDOUT_FILENO);
+        let (rows, cols) = pty_client::tty::size_or_default(libc::STDOUT_FILENO);
         Self {
             name: name.to_string(),
             command: command.to_string(),
