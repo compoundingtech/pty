@@ -179,7 +179,9 @@ fn output_leaves_the_record_alone_rust() {
     }
     let rig = Rig::new();
     rig.daemon("act-still", TICKER, DaemonOpts::no_display_name());
-    wait_until("the first sidecar stamp", || sidecar(&rig, "act-still").is_some());
+    wait_until("the first sidecar stamp", || {
+        sidecar(&rig, "act-still").is_some()
+    });
     let record = std::fs::read(rig.meta_path("act-still")).expect("record");
     let first = stamp(&rig, "act-still").expect("first stamp");
 
@@ -195,7 +197,8 @@ fn output_leaves_the_record_alone_rust() {
         "the sidecar stamp stopped moving while the child kept printing"
     );
     assert_eq!(
-        rig.meta("act-still").and_then(|m| m.get("lastOutputAtMs").cloned()),
+        rig.meta("act-still")
+            .and_then(|m| m.get("lastOutputAtMs").cloned()),
         None,
         "a running Rust record must not carry a stamp that is already stale"
     );
@@ -252,7 +255,10 @@ fn the_exit_record_takes_over_from_the_sidecar() {
         .meta("act-fold")
         .and_then(|m| m.get("lastOutputAtMs")?.as_i64())
         .expect("the exit record must carry the stamp");
-    assert!(folded >= running, "exit stamp {folded} is older than {running}");
+    assert!(
+        folded >= running,
+        "exit stamp {folded} is older than {running}"
+    );
     // The unlink follows the exit write inside the daemon, so give it the
     // moment between the two.
     wait_until("the sidecar to go with the exit", || {

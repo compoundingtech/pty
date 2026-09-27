@@ -732,7 +732,16 @@ fn output_activity_reads_only_the_selected_roots_generation() {
         ..SessionMetadata::default()
     };
 
-    assert_eq!(last_output_at_ms_in(root.path(), "one", &metadata("g1")), Some(42));
-    assert_eq!(last_output_at_ms_in(root.path(), "one", &metadata("g2")), None);
-    assert_eq!(last_output_at_ms_in(root.path(), "two", &metadata("g1")), None);
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "one", &metadata("g1")),
+        Some(42)
+    );
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "one", &metadata("g2")),
+        None
+    );
+    assert_eq!(
+        last_output_at_ms_in(root.path(), "two", &metadata("g1")),
+        None
+    );
 }
