@@ -31,6 +31,13 @@ const ESCALATE_KILL_WAIT: Duration = Duration::from_millis(1_000);
 pub enum StopError {
     /// No session by that name.
     NotFound { name: String },
+    /// The caller's generation is not the session's any more: the name now
+    /// belongs to a replacement, which was left alone.
+    GenerationChanged {
+        name: String,
+        expected: String,
+        actual: Option<String>,
+    },
     /// The session has no running daemon; remove it instead.
     NotRunning { name: String },
     /// SIGTERM could not be sent to the daemon.
@@ -48,6 +55,20 @@ impl fmt::Display for StopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StopError::NotFound { name } => write!(f, "Session \"{name}\" not found."),
+            StopError::GenerationChanged {
+                name,
+                expected,
+                actual,
+            } => match actual {
+                Some(actual) => write!(
+                    f,
+                    "Session \"{name}\" is generation {actual}, not {expected}: it was replaced."
+                ),
+                None => write!(
+                    f,
+                    "Session \"{name}\" has no generation, not {expected}: it was replaced."
+                ),
+            },
             StopError::NotRunning { name } => write!(
                 f,
                 "Session \"{name}\" is not running. Use \"pty rm {name}\" to remove it."
@@ -125,14 +146,31 @@ impl Aftermath {
 /// before the signal and escalate over the tree's process groups when any
 /// of them is still there.
 ///
+/// With `expected_generation`, the session's record must still carry that
+/// generation, or nothing is touched: a replacement under the same name is
+/// not the session the caller meant. `pty kill` passes `None`.
+///
 /// The daemon keeps the session's exit record, so the session reads as
 /// exited afterwards; [`crate::remove()`] deletes it.
-pub fn stop(name: &str) -> Result<Stopped, StopError> {
+pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, StopError> {
     let Some(session) = registry::get_session_by_name(name) else {
         return Err(StopError::NotFound {
             name: name.to_string(),
         });
     };
+    let generation = session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.generation.as_deref());
+    if let Some(expected) = expected_generation
+        && generation != Some(expected)
+    {
+        return Err(StopError::GenerationChanged {
+            name: name.to_string(),
+            expected: expected.to_string(),
+            actual: generation.map(str::to_string),
+        });
+    }
     let (SessionStatus::Running, Some(pid)) = (session.status, session.pid) else {
         return Err(StopError::NotRunning {
             name: name.to_string(),
@@ -196,8 +234,12 @@ pub fn stop(name: &str) -> Result<Stopped, StopError> {
 }
 
 /// [`stop`] in the registry at `root` instead of `$PTY_ROOT`.
-pub fn stop_in(root: &Path, name: &str) -> Result<Stopped, StopError> {
-    registry::with_root(root, || stop(name))
+pub fn stop_in(
+    root: &Path,
+    name: &str,
+    expected_generation: Option<&str>,
+) -> Result<Stopped, StopError> {
+    registry::with_root(root, || stop(name, expected_generation))
 }
 
 /// Re-check a snapshot against the live process table.

@@ -10,7 +10,7 @@ use super::{CliResult, require_ref};
 /// `cmdKill`.
 pub fn run(args: &[String]) -> CliResult {
     let name = require_ref(args, "Usage: pty kill <name>")?;
-    let stopped = match pty_client::stop(&name) {
+    let stopped = match pty_client::stop(&name, None) {
         Ok(stopped) => stopped,
         Err(error) => {
             eprintln!("{error}");

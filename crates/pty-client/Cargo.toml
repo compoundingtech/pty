@@ -1,6 +1,6 @@
 [package]
 name = "pty-client"
-description = "Typed client operations over a pty session's socket: attach, peek and screen reads, send, stats, readiness, attached clients, and the remote dial. No terminal emulator, no Zig."
+description = "Typed client operations over a pty session's socket: list, attach, peek and screen reads, send, stats, signal, stop and remove, readiness, and the remote dial, each also against a registry root the caller names. No terminal emulator, no Zig."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

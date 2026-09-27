@@ -64,7 +64,7 @@ fn a_private_root_is_listed_written_read_stopped_and_removed_through_the_library
     let stats = pty_client::query_stats_in(root, &id).expect("stats");
     assert!(stats.process.alive, "{stats:?}");
 
-    let stopped = pty_client::stop_in(root, &id).expect("stop");
+    let stopped = pty_client::stop_in(root, &id, None).expect("stop");
     assert!(stopped.verified_empty(), "{stopped:?}");
     assert_ne!(status(&rig, &id), Some(SessionStatus::Running));
     assert!(
@@ -82,7 +82,9 @@ fn stopping_or_removing_what_is_not_there_says_so() {
     let rig = Rig::new();
     let id = unique("absent");
     assert_eq!(
-        pty_client::stop_in(&rig.root, &id).unwrap_err().to_string(),
+        pty_client::stop_in(&rig.root, &id, None)
+            .unwrap_err()
+            .to_string(),
         format!("Session \"{id}\" not found.")
     );
     assert_eq!(
@@ -105,6 +107,27 @@ fn a_running_session_is_not_removed() {
         format!("Session \"{id}\" is still running. Use \"pty kill {id}\" first.")
     );
     assert_eq!(status(&rig, &id), Some(SessionStatus::Running));
+}
+
+/// A stop fenced to a generation the session no longer has touches nothing:
+/// that name belongs to a replacement now.
+#[test]
+fn a_stop_fenced_to_another_generation_leaves_the_session_running() {
+    let rig = Rig::new();
+    let id = unique("fenced-stop");
+    rig.spawn_cat(&id, &[]);
+    let refused = pty_client::stop_in(&rig.root, &id, Some("not-this-generation")).unwrap_err();
+    assert!(
+        matches!(refused, pty_client::StopError::GenerationChanged { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(status(&rig, &id), Some(SessionStatus::Running));
+
+    let generation = pty_core::registry::read_metadata_in(&rig.root, &id)
+        .and_then(|m| m.generation)
+        .expect("a generation");
+    let stopped = pty_client::stop_in(&rig.root, &id, Some(&generation)).expect("stop");
+    assert!(stopped.verified_empty(), "{stopped:?}");
 }
 
 /// The signal reaches the program, not the daemon: `cat` dies of SIGTERM
@@ -145,7 +168,7 @@ fn a_session_that_is_not_running_is_not_signalled() {
     let rig = Rig::new();
     let id = unique("exited");
     spawn_kept_cat(&rig, &id);
-    pty_client::stop_in(&rig.root, &id).expect("stop");
+    pty_client::stop_in(&rig.root, &id, None).expect("stop");
     let refused = pty_client::signal_in(&rig.root, &id, libc::SIGTERM, None).unwrap_err();
     assert!(
         matches!(refused, SignalError::NotRunning { .. }),
