@@ -1,6 +1,6 @@
 [package]
 name = "pty"
-description = "The pty binary: persistent terminal sessions hosted by a per-session daemon, driven from the command line."
+description = "The pty binary: persistent terminal sessions hosted by a per-session daemon, driven from the command line. Its library is the TerminalHandle that spawns a child or attaches to a daemon."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -13,7 +13,8 @@
 //! - [`line_edit`]: readline-style single-line editing;
 //! - [`scroll`]: the [`ScrollRegion`] model and grouped list layout;
 //! - [`app`]: the [`App`] runner with `pause`/`resume` for in-process attach;
-//! - [`pane`]: the [`PtyPane`] widget over a `pty-terminal` [`CellGrid`];
+//! - [`pane`]: the [`PtyPane`] widget over a `pty-terminal` [`CellGrid`],
+//!   drawn live from any [`LiveTerminal`];
 //! - [`widgets`]: the 28 Node widgets, state-first (you own the state; render
 //!   and key dispatch are pure).
 
@@ -39,8 +40,8 @@ pub use line_edit::{
     TextFieldState, apply_text_key, next_word_boundary, prev_word_boundary, render_field_spans,
     render_field_text,
 };
-pub use pane::{PtyPane, PtyPaneResult, PtyPaneSelection, PtyView};
-pub use pty_terminal::{CellGrid, CellSnap, ColorSnap, TerminalHandle, Wide};
+pub use pane::{LiveTerminal, PtyPane, PtyPaneResult, PtyPaneSelection, PtyView};
+pub use pty_terminal::{CellGrid, CellSnap, ColorSnap, Wide};
 pub use scroll::{Group, GroupedLayout, GroupedRow, ScrollRegion};
 pub use theme::{BoxStyle, Color, Rgb, THEMES, Theme, theme_by_name, theme_names};
 

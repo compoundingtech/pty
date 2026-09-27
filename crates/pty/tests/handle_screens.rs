@@ -1,5 +1,5 @@
 //! The shared parity fixtures `tests/fixtures/parity/screens.json`, run
-//! against the terminal actor through a spawned child: plain-screen bytes
+//! against a `TerminalHandle` that spawned the fixture's child: plain-screen bytes
 //! asserted exactly, with viewport semantics (Node's `getPlainScreen`).
 //!
 //! node: tests/parity-node-reference.test.ts:132-215
@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pty_terminal::{Range, SpawnOptions, TerminalHandle};
+use pty::{SpawnOptions, TerminalHandle};
+use pty_terminal::Range;
 
 fn fixtures() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/parity/screens.json");

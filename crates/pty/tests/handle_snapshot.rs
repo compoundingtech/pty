@@ -3,7 +3,8 @@
 
 use std::time::Duration;
 
-use pty_terminal::{CellGrid, ColorSnap, SpawnOptions, TerminalHandle, Wide};
+use pty::{SpawnOptions, TerminalHandle};
+use pty_terminal::{CellGrid, ColorSnap, Wide};
 
 fn spawn(cmd: &str, args: &[&str], rows: u16, cols: u16, scrollback: usize) -> TerminalHandle {
     TerminalHandle::spawn(

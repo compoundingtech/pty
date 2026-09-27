@@ -8,12 +8,9 @@
 //! virtual placement, and placeholder cells carrying the image id in their
 //! foreground colour and the placement id in their underline colour.
 
-use std::time::{Duration, Instant};
-
 use pty_terminal::graphics::PLACEHOLDER;
 use pty_terminal::{
-    CellSize, GraphicsOptions, HandleEvent, PixelFormat, PlacementPosition, Range, SerializeOpts,
-    SpawnOptions, TerminalActor, TerminalHandle,
+    CellSize, GraphicsOptions, PixelFormat, PlacementPosition, Range, SerializeOpts, TerminalActor,
 };
 
 /// A 16x8 RGBA PNG. Generated once, checked in as bytes: the point is that
@@ -425,75 +422,6 @@ fn a_replay_without_graphics_is_unchanged() {
         without,
         "a session that never sent an image serializes exactly as before"
     );
-}
-
-/// The handle path: a real child in a real PTY, the state read from another
-/// thread. Kitty graphics need a per-thread PNG decoder and an `!Send`
-/// terminal, so this is the case that proves the actor thread set both up.
-#[test]
-fn a_spawned_child_that_draws_an_image_is_queryable_through_the_handle() {
-    let sequence = omp_image(IMAGE_ID, PLACEMENT_ID, 2, 2);
-    let h = TerminalHandle::spawn(
-        "cat",
-        &[],
-        SpawnOptions {
-            rows: 10,
-            cols: 20,
-            graphics: Some(GraphicsOptions::DEFAULT),
-            ..SpawnOptions::default()
-        },
-    )
-    .expect("spawn");
-    assert!(h.wait_ready(Duration::from_secs(2)));
-    let events = h.subscribe();
-
-    // `cat` echoes what we write, so the child is the one emitting the
-    // sequence into the terminal.
-    h.write(sequence.as_bytes());
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let state = loop {
-        let state = h.graphics(0);
-        if !state.placements.is_empty() {
-            break state;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the image; screen:\n{}",
-            h.plain(Range::Full)
-        );
-        h.wait_rev(h.rev(), Duration::from_millis(100));
-    };
-
-    assert!(state.enabled);
-    let image = state.image(IMAGE_ID).expect("the image is stored");
-    assert_eq!((image.width, image.height), (16, 8));
-    assert_eq!(
-        h.image_bytes(IMAGE_ID).map(|b| b.data.len()),
-        Some(16 * 8 * 4)
-    );
-    assert_eq!(h.graphics_generation(), state.generation);
-
-    let p = &state.placements[0];
-    assert_eq!((p.image_id, p.placement_id), (IMAGE_ID, PLACEMENT_ID));
-    assert!(matches!(p.position, PlacementPosition::Placeholder(_)));
-
-    let mut saw_graphics = false;
-    while let Ok(ev) = events.try_recv() {
-        if matches!(ev, HandleEvent::Graphics(g) if g == state.generation) {
-            saw_graphics = true;
-        }
-    }
-    assert!(saw_graphics, "the storage change is announced");
-
-    h.clear_graphics();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !h.graphics(0).placements.is_empty() {
-        assert!(Instant::now() < deadline, "clear_graphics did not take");
-        h.wait_rev(h.rev(), Duration::from_millis(100));
-    }
-    assert!(h.image_bytes(IMAGE_ID).is_none());
-    h.kill();
 }
 
 // ── bounds ──

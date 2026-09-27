@@ -45,8 +45,9 @@ binary as engine; the lead agent drives with subagents in worktrees.
     libghostty, no zig. This is what `deskset`'s `pty-wire` + `pty-cli` become.
   - `crates/pty-terminal` — the libghostty actor: owns the `!Send` `Terminal`,
     typed snapshots (cells, wrapped flags, cursor, modes, kitty stack,
-    scrollback), VT/plain serialization, query answers, terminal events, and
-    the `TerminalHandle` (attach/spawn) for embedding.
+    scrollback), VT/plain serialization, query answers, terminal events. The
+    `TerminalHandle` (attach/spawn) for embedding was built here and has
+    since moved to `crates/pty`, so this crate owns no process.
   - `crates/pty-testkit` — `Session` (spawn + daemon-backed), `Screenshot`, waits.
   - `crates/pty-tui` — ratatui-based library: pty pane, theme tokens, focus
     stack, fuzzy, line edit, app runner, and the 28 widgets.
@@ -147,7 +148,8 @@ the daemon prepending Node's mode prefix (`server.ts:1065-1082`);
 `snapshot.rs`: `CellGrid { rows, wrapped, cursor, base_y, len }` from
 `GridRef::cell()/style()` + `Row::is_wrapped()` — the `readCells` /
 `readWrappedFlags` contract. `strip.rs`: Node's exact query-strip set.
-`handle.rs`: `TerminalHandle::attach(SessionRef, AttachOptions)` and
+`handle.rs` (since moved to `crates/pty/src/handle.rs`):
+`TerminalHandle::attach(SessionRef, AttachOptions)` and
 `TerminalHandle::spawn(cmd, args, SpawnOptions)` (issues #1, #3): one actor
 thread, `AttemptId` per attach so late frames from an older attempt are
 dropped, events `Dirty{rev}|Title|Bell|Exited|Geometry`, `snapshot(offset)`,

@@ -506,10 +506,12 @@ impl App {
         }
     }
 
-    /// Forward a handle's events to the app as [`AppEvent::Dirty`] until the
-    /// handle closes.
-    pub fn watch_handle<M: Send + 'static>(handle: &crate::TerminalHandle, tx: Sender<AppEvent<M>>) {
-        let rx = handle.subscribe();
+    /// Forward a handle's events — the receiver its `subscribe` returns — to
+    /// the app as [`AppEvent::Dirty`] until the handle closes.
+    pub fn watch_handle<E: Send + 'static, M: Send + 'static>(
+        rx: Receiver<E>,
+        tx: Sender<AppEvent<M>>,
+    ) {
         thread::spawn(move || {
             while rx.recv().is_ok() {
                 if tx.send(AppEvent::Dirty).is_err() {

@@ -1,5 +1,6 @@
 //! Kitty graphics state: the durable, typed image state behind
-//! [`crate::actor::TerminalActor`] and [`crate::handle::TerminalHandle`].
+//! [`crate::actor::TerminalActor`] (and the `pty` crate's `TerminalHandle`,
+//! which reads it from an actor thread).
 //!
 //! libghostty owns the image storage; this module is the boundary that turns
 //! its borrowed handles into owned, `Send` values a compositor can hold across
@@ -40,9 +41,9 @@ pub const PLACEHOLDER: char = '\u{10eeee}';
 /// size divided by this.
 ///
 /// The metrics belong to whoever draws the cells — a font, on a host the
-/// session daemon may never see — so they travel from the client
-/// ([`crate::handle::AttachOptions::graphics`], carried on ATTACH and
-/// RESIZE) rather than being assumed. Zero means undeclared, and derived
+/// session daemon may never see — so they travel from the client (the `pty`
+/// crate's `AttachOptions::graphics`, carried on ATTACH and RESIZE) rather
+/// than being assumed. Zero means undeclared, and derived
 /// geometry uses [`CellSize::FALLBACK`] until someone says otherwise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellSize {
@@ -307,8 +308,9 @@ pub struct GraphicsState {
     /// Whether `cell` is what a client declared, or
     /// [`CellSize::FALLBACK`] because nobody has. A consumer that draws
     /// pixels should declare its own
-    /// ([`crate::handle::TerminalHandle::set_cell_size`]) rather than
-    /// trust a fallback: `c=`/`r=` placements are exact either way, but a
+    /// ([`crate::actor::TerminalActor::set_cell_size`], or the `pty`
+    /// crate's `TerminalHandle::set_cell_size`) rather than trust a
+    /// fallback: `c=`/`r=` placements are exact either way, but a
     /// placement that left its size implicit is only as right as this.
     pub cell_declared: bool,
     /// Every image that has at least one placement, by id.

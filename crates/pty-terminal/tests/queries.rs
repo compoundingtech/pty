@@ -1,11 +1,9 @@
-//! Terminal query answers: the exact bytes (actor level) and the round trip
-//! through a real child that echoes them (handle level).
+//! Terminal query answers: the exact bytes the actor gives. The round trip
+//! through a real child that echoes them is the `pty` crate's handle test.
 //!
 //! Port of the pty project's `tests/terminal-queries.test.ts:93-149`.
 
-use std::time::Duration;
-
-use pty_terminal::{Range, SpawnOptions, TerminalActor, TerminalHandle};
+use pty_terminal::{Range, TerminalActor};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
@@ -111,78 +109,4 @@ fn split_query_is_answered_once() {
         a.take_pty_replies(),
         b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c"
     );
-}
-
-// ── through a real child that echoes the answer ──
-
-fn spawn_echo(script: &str) -> TerminalHandle {
-    TerminalHandle::spawn("sh", &["-c", script], SpawnOptions::default()).expect("spawn")
-}
-
-fn wait_text(h: &TerminalHandle, needle: &str) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let text = h.plain(Range::Full);
-        if text.contains(needle) {
-            return text;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {needle:?}; screen:\n{text}"
-        );
-        h.wait_rev(h.rev(), Duration::from_millis(200));
-    }
-}
-
-/// node: tests/terminal-queries.test.ts:94-105
-#[test]
-fn child_sees_da1_answer() {
-    let h = spawn_echo("printf '\\033[c'; exec cat");
-    wait_text(&h, "62;22");
-    h.kill();
-}
-
-/// node: tests/terminal-queries.test.ts:107-116
-#[test]
-fn child_sees_osc11_answer() {
-    let h = spawn_echo("printf '\\033]11;?\\033\\\\'; exec cat");
-    wait_text(&h, "0000/0000/0000");
-    h.kill();
-}
-
-/// node: tests/terminal-queries.test.ts:118-126
-#[test]
-fn child_sees_osc10_answer() {
-    let h = spawn_echo("printf '\\033]10;?\\033\\\\'; exec cat");
-    wait_text(&h, "c0c0/c0c0/c0c0");
-    h.kill();
-}
-
-/// node: tests/terminal-queries.test.ts:128-138
-#[test]
-fn child_sees_dsr_answer() {
-    let h = spawn_echo("printf '\\033[6n'; exec cat");
-    let text = wait_text(&h, "R");
-    let has_cpr = text.lines().any(|l| {
-        let Some(r) = l.find('R') else { return false };
-        let before = &l[..r];
-        let Some(semi) = before.rfind(';') else { return false };
-        let col = &before[semi + 1..];
-        let row: String = before[..semi]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        !row.is_empty() && !col.is_empty() && col.chars().all(|c| c.is_ascii_digit())
-    });
-    assert!(has_cpr, "expected a \\d+;\\d+R report:\n{text}");
-    h.kill();
-}
-
-/// node: tests/terminal-queries.test.ts:140-149
-#[test]
-fn child_sees_da2_answer() {
-    let h = spawn_echo("printf '\\033[>c'; exec cat");
-    wait_text(&h, "382");
-    h.kill();
 }

@@ -11,9 +11,9 @@
 //!
 //! So the events here are deliberately dumb and owned ([`KeyEvent`],
 //! [`MouseEvent`]), and the encoding happens inside the terminal:
-//! [`crate::actor::TerminalActor::encode_key`] and friends, or
-//! [`crate::handle::TerminalHandle::send_key`] to encode and write in one
-//! ordered step.
+//! [`crate::actor::TerminalActor::encode_key`] and friends, or the `pty`
+//! crate's `TerminalHandle::send_key` to encode and write in one ordered
+//! step.
 //!
 //! The encoders themselves are libghostty's ([`libghostty_vt::key`],
 //! [`libghostty_vt::mouse`], [`libghostty_vt::focus`],

@@ -39,7 +39,7 @@ Requirements `PTY.IMG-R01` through `PTY.IMG-R10` are in
 | PNG normalization | `crates/pty-terminal/src/graphics.rs` — `PngDecoder`, `expand`, `install_png_decoder`, `MAX_DECODED_PNG_BYTES` (64 MiB) |
 | Cell metric wire | `crates/pty-core/src/protocol.rs` — `encode_attach_with_cell`, `encode_resize_with_cell`, `decode_cell` |
 | Client and daemon adoption | `crates/pty/src/daemon/clients.rs` — `adopt_cell_size`; `crates/pty/src/daemon/lifecycle.rs` — `terminal_actor` |
-| Embedding surface | `crates/pty-terminal/src/handle.rs` — `TerminalHandle::graphics`, `image_bytes`, `set_cell_size`, `graphics_generation`, `HandleEvent::Graphics` |
+| Embedding surface | `crates/pty/src/handle.rs` — `TerminalHandle::graphics`, `image_bytes`, `set_cell_size`, `graphics_generation`, `HandleEvent::Graphics` |
 
 ## Admission and bound
 
@@ -184,9 +184,9 @@ child-sent delete both bump it.
 
 ## Validation
 
-Test names are function names in the files given. `graphics.rs` and
-`handle.rs` are under `crates/pty-terminal/tests/`, `protocol.rs` under
-`crates/pty-core/tests/`.
+Test names are function names in the files given. `graphics.rs` is under
+`crates/pty-terminal/tests/`, `handle.rs` under `crates/pty/tests/`,
+`protocol.rs` under `crates/pty-core/tests/`.
 
 | Requirement | Owning source | Executable evidence |
 | --- | --- | --- |
@@ -199,9 +199,10 @@ Test names are function names in the files given. `graphics.rs` and
 | `PTY.IMG-R07` | `actor.rs` (`reset`), `lifecycle.rs` | `graphics.rs::the_alternate_screen_has_its_own_storage`, `a_replay_from_the_alt_screen_puts_the_normal_screens_images_on_the_normal_screen`, `handle.rs::a_late_attach_gets_the_image_the_child_drew_before_it_connected` (reconnect half) |
 | `PTY.IMG-R08` | `actor.rs` (`enable_graphics`), `graphics.rs` (`GraphicsOptions`) | None. Enforced by leaving the file, temporary-file, and shared-memory media disabled; backed by [decision 0012](../../decisions/0012-kitty-graphics-replay.md) only. A regression here would not fail the suite. |
 | `PTY.IMG-R09` | `graphics.rs` (`PngDecoder`, `expand`, `MAX_DECODED_PNG_BYTES`) | `graphics.rs::a_grayscale_png_is_stored_as_rgba`, `raising_the_storage_limit_keeps_the_cell_size_and_decodes_png`, `handle.rs::a_late_attach_gets_the_image_the_child_drew_before_it_connected` |
-| `PTY.IMG-R10` | `graphics.rs` (`generation`), `handle.rs` (`HandleEvent::Graphics`) | `graphics.rs::a_spawned_child_that_draws_an_image_is_queryable_through_the_handle`, `a_delete_from_the_child_drops_the_placement_and_the_bytes`, `scrolling_moves_the_placement_and_scrollback_still_finds_it`, `a_resize_keeps_the_image_and_reprojects_it` |
+| `PTY.IMG-R10` | `graphics.rs` (`generation`), `handle.rs` (`HandleEvent::Graphics`) | `handle.rs::a_spawned_child_that_draws_an_image_is_queryable_through_the_handle`, `graphics.rs::a_delete_from_the_child_drops_the_placement_and_the_bytes`, `scrolling_moves_the_placement_and_scrollback_still_finds_it`, `a_resize_keeps_the_image_and_reprojects_it` |
 
-Run the whole map with `cargo test -p pty-terminal -p pty-core`; the image
+Run the whole map with `cargo test -p pty-terminal -p pty-core` and
+`cargo test -p pty --test handle`; the image
 cases alone with `cargo test -p pty-terminal --test graphics`. No gated
 `_node` / `_rust` conformance pair exists or can: the Node side has no image
 state to compare against (`PTY.IMG-C05`).
