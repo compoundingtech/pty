@@ -617,7 +617,7 @@ fn omp_image(id: u32, pid: u32, cols: usize, rows: usize) -> String {
         (pid >> 8) & 0xff,
         pid & 0xff
     );
-    for r in 0..rows {
+    for (r, &row_mark) in DIACRITICS[..rows].iter().enumerate() {
         if r == 0 {
             out.push_str(&format!(
                 "\x1b_Ga=p,U=1,q=2,i={id},p={pid},c={cols},r={rows}\x1b\\"
@@ -626,10 +626,10 @@ fn omp_image(id: u32, pid: u32, cols: usize, rows: usize) -> String {
             out.push_str("\r\n");
         }
         out.push_str(&format!("{fg}{ul}"));
-        for c in 0..cols {
+        for &col_mark in &DIACRITICS[..cols] {
             out.push(PLACEHOLDER);
-            out.push(DIACRITICS[r]);
-            out.push(DIACRITICS[c]);
+            out.push(row_mark);
+            out.push(col_mark);
         }
         out.push_str("\x1b[39;59m");
     }
