@@ -98,6 +98,12 @@ fn build_darwin_socket_owner(manifest_dir: &Path) {
         status.success(),
         "Darwin socket ownership boundary did not archive"
     );
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=pty_darwin_socket_owner");
+    // Not `rustc-link-lib`: Cargo gives that only to a package's library
+    // target when there is one, and this package has one (the embedding
+    // handle). The shim's caller is the daemon, which is in the binary, so
+    // the binary stopped linking it and failed with an undefined
+    // `_pty_inspect_socket_owner_darwin`. A link argument reaches every target
+    // that is linked: the binary and its unit tests. The linker takes from
+    // the archive only what a target references.
+    println!("cargo:rustc-link-arg={}", archive.display());
 }
