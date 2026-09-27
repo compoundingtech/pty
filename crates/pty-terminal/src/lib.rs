@@ -1,9 +1,9 @@
 //! # pty-terminal
 //!
 //! The libghostty-backed terminal side of the Rust
-//! [pty](https://github.com/compoundingtech/pty) port: one owner of the
-//! `!Send` `libghostty_vt::terminal::Terminal`, typed reads, Node-equivalent
-//! serialization, terminal query answers, and terminal events.
+//! [pty](https://github.com/compoundingtech/pty-original-experiment) port: one
+//! owner of the `!Send` `libghostty_vt::terminal::Terminal`, typed reads,
+//! Node-equivalent serialization, terminal query answers, and terminal events.
 //!
 //! - [`actor`]: [`TerminalActor`], the synchronous owner of the terminal. Feed
 //!   it the child's output with [`TerminalActor::write`]; read the screen with

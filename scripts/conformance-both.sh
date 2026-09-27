@@ -56,7 +56,7 @@ case "$NODE_VERSION" in
     echo "Comparing the port against itself reports perfect parity and measures nothing."
     echo "Build the Node tool at the pinned commit and point --node at it:"
     echo "  ref=\$(cat crates/pty-conformance/node-ref)"
-    echo "  git clone --filter=blob:none https://github.com/compoundingtech/pty /some/disk/path/node-pty"
+    echo "  git clone --filter=blob:none https://github.com/compoundingtech/pty-original-experiment /some/disk/path/node-pty"
     echo "  git -C /some/disk/path/node-pty checkout --detach \$ref"
     echo "  (cd /some/disk/path/node-pty && npm ci && npm run build)"
     echo "  scripts/conformance-both.sh --node /some/disk/path/node-pty/bin/pty"

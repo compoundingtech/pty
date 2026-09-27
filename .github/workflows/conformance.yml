@@ -76,7 +76,7 @@ jobs:
         run: |
           ref=$(cat crates/pty-conformance/node-ref)
           echo "Node reference: $ref"
-          git clone --filter=blob:none https://github.com/compoundingtech/pty /tmp/node-pty
+          git clone --filter=blob:none https://github.com/compoundingtech/pty-original-experiment /tmp/node-pty
           git -C /tmp/node-pty checkout --detach "$ref"
           (cd /tmp/node-pty && npm ci --silent && npm run build --silent)
           echo "node pty: $(/tmp/node-pty/bin/pty --version)"
