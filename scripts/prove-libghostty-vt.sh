@@ -44,8 +44,17 @@ echo "no zig on PATH"
 
 PKG_CONFIG_PATH="$lib/share/pkgconfig"
 export PKG_CONFIG_PATH
-echo "== pkg-config --static --libs libghostty-vt-static =="
-pkg-config --static --libs libghostty-vt-static
+# pkg-config also searches the system's own directories. Only a resolution
+# into this archive proves anything about this archive.
+libs=$(pkg-config --static --libs libghostty-vt-static)
+echo "pkg-config --static --libs libghostty-vt-static: $libs"
+case "$libs" in
+  *"$lib/"*) ;;
+  *)
+    echo "FAIL: pkg-config resolved libghostty-vt-static outside the archive" >&2
+    exit 1
+    ;;
+esac
 
 CARGO_TARGET_DIR="$work/target"
 export CARGO_TARGET_DIR

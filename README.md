@@ -350,7 +350,8 @@ A Cargo workspace of nine crates under `crates/`:
 
 ## Building from source
 
-- Rust 1.88 or newer (edition 2024; `rust-version` is pinned in `Cargo.toml`).
+- Rust 1.90 or newer (edition 2024; `rust-version` is pinned in `Cargo.toml`,
+  and `libghostty-vt-sys` 0.2.1 needs 1.90).
 - Zig 0.15.2 on `PATH`, and `git`: the `libghostty-vt-sys` crate builds
   Ghostty's terminal core from source with Zig. (A project that only depends
   on `pty-terminal` or `pty-testkit` can use a release's prebuilt library
@@ -385,7 +386,7 @@ archive is attached to a release, the workflow builds and tests `pty-terminal`
 and `pty-testkit` against it with Zig off `PATH`, and the macOS archive
 outside Nix, with the runner's own toolchain.
 
-You need `pkg-config` (or `pkgconf`) and a C linker, and nothing beyond Rust:
+You need Rust 1.90 or newer, `pkg-config` (or `pkgconf`) and a C linker:
 
 ```sh
 tag=v0.13.0-rust.2
@@ -405,7 +406,10 @@ pty-testkit = { git = "https://github.com/compoundingtech/pty", tag = "v0.13.0-r
 
 Take the archive from the same release as the tag you depend on. The library
 and the Rust bindings come from one pinned Ghostty commit, which the archive's
-`SOURCE` file names, and libghostty's C API is not stable between commits. The
+`SOURCE` file names, and libghostty's C API is not stable between commits.
+The workspace pins `libghostty-vt` and `libghostty-vt-sys` exactly for that
+reason, so a git dependency cannot resolve to bindings the archive was not
+built for. The
 pkg-config file's prefix is relative to the file, so the directory can live
 anywhere.
 

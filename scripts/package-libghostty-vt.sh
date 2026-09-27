@@ -58,8 +58,14 @@ cp -R "$install/include" "$stage/"
 cp "$ghostty_src/LICENSE" "$stage/LICENSE-ghostty"
 # shellcheck disable=SC2016 # ${pcfiledir} is for pkg-config, not the shell.
 sed 's|^prefix=.*|prefix=${pcfiledir}/../..|' "$pc" > "$stage/share/pkgconfig/libghostty-vt-static.pc"
+# A Mac links this later with its own Xcode linker; say what it was built for.
+built_for=
+if command -v otool >/dev/null 2>&1; then
+  built_for=$(otool -l "$stage/lib/libghostty-vt.a" \
+    | awk '/LC_BUILD_VERSION/ { v = 1 } v && $1 == "minos" { m = $2 } v && $1 == "sdk" { print "macOS " m " and later (SDK " $2 ")"; exit }')
+fi
 cat > "$stage/SOURCE" <<EOF
-libghostty-vt, the static library, for $triple.
+libghostty-vt, the static library, for $triple${built_for:+, built for $built_for}.
 Built by libghostty-vt-sys $sys_version from Ghostty commit $commit,
 for pty ${GITHUB_SHA:-$(git rev-parse HEAD)}.
 
@@ -70,7 +76,9 @@ the same pty release as the pty-terminal or pty-testkit you depend on.
 EOF
 
 mkdir -p "$dist"
-tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
+# macOS tar would otherwise add AppleDouble `._*` entries for extended
+# attributes; everywhere else this is ignored.
+COPYFILE_DISABLE=1 tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$dist" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 else
