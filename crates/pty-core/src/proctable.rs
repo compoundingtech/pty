@@ -1046,9 +1046,27 @@ mod tests {
 
     // ---- a ps that is slow, silent or truncated -------------------------
 
+    /// A script for `run_ps_program` to run in place of `ps`.
+    ///
+    /// **The script is written by a child `sh`, never by this process.** The
+    /// tests run on parallel threads and several of them spawn processes. If
+    /// this process held the script open for writing when another thread
+    /// forked, the forked child kept that descriptor until its own exec, and
+    /// Linux refuses to exec a file that any process has open for writing
+    /// (`ETXTBSY`, "Text file busy"). `run_ps_program` turns that refusal
+    /// into `None`, so the fake looked as if it never ran. It only happened
+    /// under load and only now and then, which is how it reached a nix build
+    /// on Small Talk's CI. Once the child has exited, no process can hold
+    /// the script open for writing, however the other threads interleave.
     fn fake_ps(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s\n' "$2" > "$1""#, "sh"])
+            .arg(&path)
+            .arg(format!("#!/bin/sh\n{body}"))
+            .status()
+            .expect("run sh to write the fake ps");
+        assert!(status.success(), "sh could not write {}", path.display());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
