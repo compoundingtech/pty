@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::{ClientError, query_stats, query_stats_with_timeout, query_status_json};
+use pty_client::{ClientError, query_stats, query_stats_with_timeout, query_status_json};
 use pty_core::protocol::{MessageType, encode_status_response};
 use pty_core::stats::ConnectionStats;
 

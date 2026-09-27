@@ -1,7 +1,7 @@
 //! The terminal reset string must be byte-for-byte the Node client's
 //! (`src/client.ts:37-59`); `tests/sanitize.test.ts` pins its effect on xterm.
 
-use pty_core::client::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};
+use pty_client::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};
 
 /// node: tests/sanitize.test.ts:35-188
 #[test]

@@ -1,15 +1,11 @@
 [package]
 name = "pty-core"
-description = "Wire protocol, session registry, key/paste/duration/input parsing, pty.toml manifests, and client operations for the pty session tool. No terminal emulator, no zig."
+description = "Wire protocol, session registry, events log, key/paste/duration/input parsing, and pty.toml manifests for the pty session tool. The client operations are pty-client. No terminal emulator, no zig."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[features]
-# `client::connection::AsyncConnection` — the tokio flavour of `SessionConnection`.
-tokio = ["dep:tokio"]
 
 [dependencies]
 indexmap.workspace = true
@@ -19,7 +15,3 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-tokio = { version = "1.53", features = ["net", "io-util", "time"], optional = true }
-
-[dev-dependencies]
-tokio = { version = "1.53", features = ["net", "io-util", "time", "rt", "macros"] }

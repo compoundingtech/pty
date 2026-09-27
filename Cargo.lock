@@ -1156,6 +1156,7 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "portable-pty",
+ "pty-client",
  "pty-core",
  "pty-lifecycle",
  "pty-spawn",
@@ -1169,11 +1170,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-client"
+version = "0.13.0-rust"
+dependencies = [
+ "libc",
+ "pty-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pty-conformance"
 version = "0.13.0-rust"
 dependencies = [
  "libc",
  "portable-pty",
+ "pty-client",
  "pty-core",
  "pty-spawn",
  "pty-testkit",
@@ -1191,7 +1204,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "tokio",
  "toml",
 ]
 
@@ -1200,6 +1212,7 @@ name = "pty-lifecycle"
 version = "0.13.0-rust"
 dependencies = [
  "libc",
+ "pty-client",
  "pty-core",
  "serde",
  "serde_json",
@@ -1228,6 +1241,7 @@ version = "0.13.0-rust"
 dependencies = [
  "libghostty-vt",
  "portable-pty",
+ "pty-client",
  "pty-core",
  "pty-spawn",
  "pty-terminal",

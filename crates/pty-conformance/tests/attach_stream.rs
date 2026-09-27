@@ -42,7 +42,7 @@ impl StreamCli {
     /// [`StreamCli::stream`]; otherwise the read end stays in `stream_fd`.
     fn spawn(rig: &Rig, args: &[&str], read_stream: bool) -> StreamCli {
         // Not `libc::pipe2` directly: Apple has no such call.
-        let fds = pty_core::client::tty::cloexec_pipe(false).expect("pipe");
+        let fds = pty_client::tty::cloexec_pipe(false).expect("pipe");
         let (r, w) = (fds[0], fds[1]);
         let mut all: Vec<&str> = vec!["attach", "--attach-stream-fd-v1", "3"];
         all.extend_from_slice(args);

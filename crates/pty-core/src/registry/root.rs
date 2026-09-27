@@ -5,7 +5,7 @@
 //! everything else lands in `~/.local/state/pty`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Largest pathname, excluding its trailing NUL, that the supported platform
@@ -25,12 +25,45 @@ pub fn default_session_dir() -> PathBuf {
     PathBuf::from(home).join(".local").join("state").join("pty")
 }
 
-/// Resolve the session registry directory: `$PTY_ROOT`, else the deprecated
+std::thread_local! {
+    static SCOPED_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's registry rooted at `root` instead of
+/// `$PTY_ROOT`: every registry path `f` resolves on this thread — sockets,
+/// pid files, metadata, locks, the events log — lies under `root`.
+///
+/// This is for a program that keeps a registry of its own, apart from its
+/// process's `$PTY_ROOT`, and cannot set that variable because it runs other
+/// threads. Scopes nest, and the previous root comes back when `f` returns
+/// or unwinds.
+///
+/// Only the calling thread is scoped. A thread that `f` starts resolves the
+/// root for itself, so a long-lived
+/// [`EventWriter`](crate::events::EventWriter) or
+/// [`EventFollower`](crate::events::follow::EventFollower) does not inherit
+/// the scope.
+pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED_ROOT.with(|scoped| *scoped.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SCOPED_ROOT.with(|scoped| scoped.replace(Some(root.to_path_buf()))));
+    f()
+}
+
+/// Resolve the session registry directory: the root of an enclosing
+/// [`with_root`] on this thread, else `$PTY_ROOT`, else the deprecated
 /// `$PTY_SESSION_DIR` (with a one-time notice on stderr unless
 /// `PTY_ROOT_LEGACY_SILENT` is set), else `~/.local/state/pty`.
 ///
 /// node: src/sessions.ts:82-110
 pub fn session_dir() -> PathBuf {
+    if let Some(root) = SCOPED_ROOT.with(|scoped| scoped.borrow().clone()) {
+        return root;
+    }
     let root = env_non_empty("PTY_ROOT");
     let legacy = env_non_empty("PTY_SESSION_DIR");
     let silent = std::env::var_os("PTY_ROOT_LEGACY_SILENT").is_some();
@@ -137,4 +170,40 @@ pub fn root_length_check() -> Option<String> {
         ));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scoped_root_wins_nests_and_is_restored() {
+        let before = session_dir();
+        let outer = Path::new("/tmp/pty-scoped-root-outer");
+        let inner = Path::new("/tmp/pty-scoped-root-inner");
+        with_root(outer, || {
+            assert_eq!(session_dir(), outer);
+            assert_eq!(socket_path("a"), outer.join("a.sock"));
+            with_root(inner, || assert_eq!(session_dir(), inner));
+            assert_eq!(session_dir(), outer, "the inner scope gives the outer root back");
+        });
+        assert_eq!(session_dir(), before);
+    }
+
+    #[test]
+    fn a_panic_inside_the_scope_still_restores_the_root() {
+        let before = session_dir();
+        let unwound = std::panic::catch_unwind(|| {
+            with_root(Path::new("/tmp/pty-scoped-root-panic"), || panic!("inside the scope"))
+        });
+        assert!(unwound.is_err());
+        assert_eq!(session_dir(), before);
+    }
+
+    #[test]
+    fn another_thread_is_not_scoped() {
+        let scoped = Path::new("/tmp/pty-scoped-root-thread");
+        let elsewhere = with_root(scoped, || std::thread::spawn(session_dir).join().unwrap());
+        assert_ne!(elsewhere, scoped);
+    }
 }

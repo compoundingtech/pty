@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::{
+use pty_client::{
     ClientError, PeekScreenOptions, SessionConnection, SessionEvent, peek_screen,
 };
 use pty_core::protocol::{
@@ -198,7 +198,7 @@ fn peek_screen_returns_the_first_screen() {
 #[cfg(feature = "tokio")]
 mod tokio_flavour {
     use super::*;
-    use pty_core::client::AsyncConnection;
+    use pty_client::AsyncConnection;
 
     /// The async connection speaks the same protocol as the sync one.
     #[tokio::test]

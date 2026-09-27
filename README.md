@@ -230,14 +230,14 @@ a `rust` pre-release tag, and the commit it was built from.
 
 ### Library API
 
-`pty-core` exposes the same listing to Rust consumers through
-`pty_core::client::list`. `pty list --json --clients` uses this
+`pty-client` exposes the same listing to Rust consumers through
+`pty_client::list`. `pty list --json --clients` uses this
 implementation too. The module is unstable: it will move to
 `SessionRef`/`PtyRoot` (#1, #3), and `SessionInfo` currently exposes the
 on-disk session metadata as-is.
 
 ```rust
-use pty_core::client::list::{ClientQuery, ClientSet, ListOptions, list};
+use pty_client::list::{ClientQuery, ClientSet, ListOptions, list};
 use pty_core::registry::session_dir;
 
 let sessions = list(
@@ -259,6 +259,13 @@ for s in &sessions {
     }
 }
 ```
+
+The rest of what the CLI does to a session is there too, for a registry the
+caller names rather than `$PTY_ROOT`: `send_in`, `peek_screen_in`,
+`query_stats_in`, `stop_in` (`pty kill`), `remove_in` (`pty rm`), and
+`signal_in`, which signals the program a session runs rather than its daemon
+and can be fenced to one session generation. The crate docs list where each
+operation lives.
 
 `attached_clients(&sessions, &ClientQuery)` queries an already-filtered
 `&[SessionInfo]` and returns one `ClientSet` per session, in the same order.
@@ -310,12 +317,16 @@ boundary in full.
 
 ## The crates
 
-A Cargo workspace of eight crates under `crates/`:
+A Cargo workspace of nine crates under `crates/`:
 
 - **`pty-core`** — the wire protocol, session registry and locks, events,
   metadata, names and tags, key/paste/duration/input parsing, `pty.toml`
-  manifests, and the client operations (attach loop, peek, send, status). No
-  terminal emulator, no Zig.
+  manifests, and the process table and process-tree termination. No terminal
+  emulator, no Zig.
+- **`pty-client`** — the typed operations over a session's socket: list,
+  attach, peek and screen reads, send, stats, signal, stop and remove, each
+  also against a registry root the caller names. The `pty` binary's client
+  commands print what these return. No terminal emulator, no Zig.
 - **`pty-spawn`** — open a PTY and start a child in it, and the typed owner
   that is the sole reader and reaper of that child. No terminal emulator, no
   Zig.
@@ -412,20 +423,21 @@ one laptop and nothing to compare it against.
 
 ### Checking the macOS build without a Mac
 
-`pty-core` deliberately has no Zig dependency, so it can be type-checked for
-Apple silicon from any machine:
+`pty-core` and `pty-client` deliberately have no Zig dependency, so they can
+be type-checked for Apple silicon from any machine:
 
 ```sh
 rustup target add aarch64-apple-darwin
-cargo check -p pty-core --target aarch64-apple-darwin
-cargo check -p pty      --target aarch64-apple-darwin
+cargo check -p pty-core -p pty-client --all-targets --target aarch64-apple-darwin
 ```
 
 **This is worth running before you touch anything platform-specific.** It
 caught a call to `pipe2`, which Linux has and macOS does not, and it produced
 the same error a Mac did.
 
-Both crates that hold platform-specific code are covered, and the check really
-does compile the macOS branches — a deliberate error inside one is reported,
-and the host build is unaffected by it. Running the whole workspace's TESTS
-still needs a Mac.
+The check really does compile the macOS branches — a deliberate error inside
+one is reported, and the host build is unaffected by it. It no longer reaches
+`pty` itself: since 2026-09-22 its build script compiles a small C shim
+(`crates/pty/native/darwin_socket_owner.c`) against the macOS SDK's
+`libproc.h`, so the daemon's macOS code needs a Mac, as does running the whole
+workspace's TESTS.

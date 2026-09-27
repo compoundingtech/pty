@@ -1,13 +1,43 @@
-//! Client-side operations against a session daemon, ported from the pty
-//! project's `src/client.ts`, `src/connection.ts` and `src/remote.ts`.
+//! # pty-client
 //!
-//! - [`attach`] — the interactive attach loop (with the `--attach-stream-fd-v1`
-//!   machine stream and the `--remote` reconnect loop),
-//! - [`peek`] — one-shot peek, follow, and `peek --wait`,
-//! - [`send`] — `pty send` framing and pacing,
-//! - [`connection`] — [`SessionConnection`] / [`AsyncConnection`] for programs
-//!   (deskset, the testkit) that drive a session without owning a terminal,
+//! The typed operations over a `pty` session's socket, ported from the pty
+//! project's `src/client.ts`, `src/connection.ts` and `src/remote.ts`, and the
+//! `pty kill` / `pty rm` operations. The `pty` binary's client commands are
+//! thin printers over these. `pty-core` keeps the wire protocol and the
+//! registry; this crate is what a program uses to drive sessions without
+//! running the `pty` binary.
+//!
+//! | Operation | Here |
+//! |---|---|
+//! | list, with attached clients | [`list::list`] |
+//! | screen | [`peek_screen_in`] (text), [`peek_screen_bytes_in`] (bytes) |
+//! | send | [`send_in`], [`send_data`], or [`SessionConnection`] |
+//! | stats and the child's pid | [`query_stats_in`], [`query_stats_batch_in`] |
+//! | signal the program | [`signal_in`] |
+//! | stop (`pty kill`) | [`stop_in`] |
+//! | remove (`pty rm`) | [`remove_in`] |
+//! | attach, peek, follow | [`attach()`], [`peek()`], [`follow`], [`peek_wait`] |
+//!
+//! The events log is `pty_core::events` (it is part of the on-disk
+//! registry), and starting a session's daemon is `pty_lifecycle::spawn_daemon`.
+//!
+//! **Every operation that takes a root works on that registry, not on
+//! `$PTY_ROOT`**, so a program can keep sessions of its own without setting the
+//! variable. The forms without a root, like [`stop()`], are the `pty` binary's:
+//! they use `$PTY_ROOT`. The rooted forms that go through the registry use
+//! `pty_core::registry::with_root` on the calling thread.
+//!
+//! - [`attach`](mod@attach) — the interactive attach loop (with the
+//!   `--attach-stream-fd-v1` machine stream and the `--remote` reconnect
+//!   loop),
+//! - [`peek`](mod@peek) — one-shot peek, follow, and `peek --wait`,
+//! - [`send`](mod@send) — `pty send` framing and pacing,
+//! - [`connection`] — [`SessionConnection`] (and `AsyncConnection`, with the
+//!   `tokio` feature) for programs (deskset, the testkit) that drive a
+//!   session without owning a terminal,
 //! - [`stats`] — `pty stats` STATUS queries,
+//! - [`signal`](mod@signal), [`stop`](mod@stop), [`remove`](mod@remove) —
+//!   signalling, stopping and removing a session,
 //! - [`remote`] — `fabric dial` + route handshake for `--remote`,
 //! - [`sanitize`], [`tty`] — the terminal-reset byte string and tty helpers.
 //!
@@ -20,9 +50,12 @@ pub mod list;
 pub mod peek;
 pub mod readiness;
 pub mod remote;
+pub mod remove;
 pub mod sanitize;
 pub mod send;
+pub mod signal;
 pub mod stats;
+pub mod stop;
 pub mod stream;
 pub mod summary;
 pub mod tty;
@@ -48,17 +81,20 @@ pub use remote::{
     RemoteDialer, RemoteError, RemoteSessionRow, RouteRefusedError, dial_and_route,
     fetch_remote_list,
 };
+pub use remove::{RemoveError, remove, remove_in};
 pub use sanitize::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};
-pub use send::{DEFAULT_SEQ_DELAY_MS, SendOptions, resolve_seq_delay_ms, send, send_over};
+pub use send::{DEFAULT_SEQ_DELAY_MS, SendOptions, resolve_seq_delay_ms, send, send_in, send_over};
+pub use signal::{Delivery, SignalError, Signalled, signal, signal_in};
 pub use stats::{
     STATS_TIMEOUT, query_stats, query_stats_batch_in, query_stats_in, query_stats_in_with_timeout,
     query_stats_with_timeout, query_status_json,
 };
+pub use stop::{Aftermath, SHUTDOWN_WAIT, StopError, Stopped, stop, stop_in};
 pub use stream::{parse_attach_stream_fd_token, validate_attach_stream_fd};
 
-use crate::registry;
+use pty_core::registry;
 
-/// The descriptors an interactive operation ([`attach`], [`peek`], [`follow`])
+/// The descriptors an interactive operation ([`attach()`], [`peek()`], [`follow`])
 /// talks to. Defaults to the process's stdin/stdout/stderr; tests hand in pipes.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientIo {

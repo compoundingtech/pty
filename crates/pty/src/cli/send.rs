@@ -7,7 +7,7 @@
 //!
 //! node: src/cli.ts:1109-1217, src/client.ts:221-288
 
-use pty_core::client;
+use pty_client as client;
 use pty_core::keys::parse_seq_value;
 
 use super::{CliResult, resolve_ref};

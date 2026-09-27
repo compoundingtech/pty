@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 libc.workspace = true
+pty-client.workspace = true
 pty-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

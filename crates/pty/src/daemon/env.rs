@@ -122,7 +122,7 @@ pub fn build_child_env(
 }
 
 fn errno_detail(err: &std::io::Error, syscall: &str, path: &str) -> String {
-    match err.raw_os_error().and_then(pty_core::client::errno_name) {
+    match err.raw_os_error().and_then(pty_client::errno_name) {
         Some(code) => {
             let desc = err.to_string();
             let desc = desc

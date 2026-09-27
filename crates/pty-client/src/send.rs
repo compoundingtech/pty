@@ -2,11 +2,12 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
-use crate::paste::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
-use crate::protocol::encode_data;
-use crate::registry;
+use pty_core::paste::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
+use pty_core::protocol::encode_data;
+use pty_core::registry;
 
 use super::{ClientError, GoneSet, connect_session, map_io_error};
 
@@ -46,6 +47,16 @@ const FINISH_WAIT: Duration = Duration::from_secs(2);
 pub fn send<T: AsRef<[u8]>>(name: &str, items: &[T], opts: SendOptions) -> Result<(), ClientError> {
     let socket = connect_session(name)?;
     send_over(socket, name, false, items, opts)
+}
+
+/// [`send`] to a session in the registry at `root` instead of `$PTY_ROOT`.
+pub fn send_in<T: AsRef<[u8]>>(
+    root: &Path,
+    name: &str,
+    items: &[T],
+    opts: SendOptions,
+) -> Result<(), ClientError> {
+    registry::with_root(root, || send(name, items, opts))
 }
 
 /// [`send`] over an already-connected socket (a `--remote` route). `name` is

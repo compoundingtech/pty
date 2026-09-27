@@ -11,9 +11,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use common::*;
-use pty_core::client::ClientIo;
-use pty_core::client::attach::{AttachOutcome, AttachParams, Reconnect, attach};
-use pty_core::client::stream::{parse_attach_stream_fd_token, validate_attach_stream_fd};
+use pty_client::ClientIo;
+use pty_client::attach::{AttachOutcome, AttachParams, Reconnect, attach};
+use pty_client::stream::{parse_attach_stream_fd_token, validate_attach_stream_fd};
 use pty_core::protocol::{
     MessageType, decode_size, encode_data, encode_exit, encode_geometry, encode_screen,
 };
@@ -93,7 +93,7 @@ fn start(
 
 impl Run {
     fn type_stdin(&self, bytes: &[u8]) {
-        pty_core::client::tty::write_all_fd(self.stdin.as_ref().unwrap().as_raw_fd(), bytes)
+        pty_client::tty::write_all_fd(self.stdin.as_ref().unwrap().as_raw_fd(), bytes)
             .unwrap();
     }
 
@@ -511,7 +511,7 @@ fn reconnect_refusal_ends_the_machine_stream_with_exit_1() {
         .unwrap();
     });
     let dial: Reconnect = Box::new(|| {
-        Err(pty_core::client::RouteRefusedError(
+        Err(pty_client::RouteRefusedError(
             "session \"fixture\" not found".into(),
         ))
     });

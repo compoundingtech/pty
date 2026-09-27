@@ -3,7 +3,7 @@
 //! node: src/cli.ts:767-982 (dispatch and the display-name rules),
 //! 1664-1769 (`cmdRun`)
 
-use pty_core::client;
+use pty_client as client;
 use pty_core::registry::{self, EnvMap, TagMap};
 
 use super::{CliResult, SpawnParams};

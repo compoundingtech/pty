@@ -7,7 +7,7 @@
 use std::io;
 use std::os::unix::io::RawFd;
 
-use crate::protocol::{MessageType, Packet};
+use pty_core::protocol::{MessageType, Packet};
 
 use super::node_fs_error_message;
 use super::tty::write_all_fd;

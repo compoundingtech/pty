@@ -6,8 +6,8 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{MessageType, PacketReader, decode_exit, encode_peek};
-use crate::registry;
+use pty_core::protocol::{MessageType, PacketReader, decode_exit, encode_peek};
+use pty_core::registry;
 
 use super::connection::{PeekScreenOptions, peek_screen};
 use super::sanitize::{CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};

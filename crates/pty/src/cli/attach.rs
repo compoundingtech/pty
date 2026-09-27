@@ -8,8 +8,8 @@
 //! node: src/cli.ts:984-1053 (dispatch), 1773-1806 (`cmdAttach`),
 //! 1808-1853 (`handleDeadSession`)
 
-use pty_core::client;
-use pty_core::client::summary::{
+use pty_client as client;
+use pty_client::summary::{
     SessionSummary, attach_banner, fixed_summary_provider, local_summary_provider,
 };
 use pty_core::registry::{self, SessionMetadata, SessionStatus};

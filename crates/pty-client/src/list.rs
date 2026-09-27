@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Serialize, Serializer};
 
-use crate::protocol::AttachedClient;
-use crate::registry::{self, SessionInfo};
+use pty_core::protocol::AttachedClient;
+use pty_core::registry::{self, SessionInfo};
 
 use super::stats::query_attached_clients;
 
@@ -148,8 +148,8 @@ pub fn attached_clients(sessions: &[SessionInfo], query: &ClientQuery) -> Vec<Cl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{encode_status_clients, encode_status_response};
-    use crate::registry::SessionStatus;
+    use pty_core::protocol::{encode_status_clients, encode_status_response};
+    use pty_core::registry::SessionStatus;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;

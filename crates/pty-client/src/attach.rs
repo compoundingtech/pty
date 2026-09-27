@@ -16,11 +16,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{
+use pty_core::protocol::{
     MessageType, Packet, PacketReader, decode_exit, encode_attach_with_identity, encode_data,
     encode_detach, encode_resize,
 };
-use crate::registry::now_epoch_ms;
+use pty_core::registry::now_epoch_ms;
 
 use super::remote::RouteRefusedError;
 use super::sanitize::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};

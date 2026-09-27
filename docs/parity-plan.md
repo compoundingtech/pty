@@ -42,7 +42,9 @@ binary as engine; the lead agent drives with subagents in worktrees.
   - `crates/pty-core` — framing, registry, locks, events, metadata, names,
     tags, keys/paste/duration/input/queries/ptyfile, client ops (attach loop,
     peek, send, status, `SessionConnection`, reconnect, remote dial). No
-    libghostty, no zig. This is what `deskset`'s `pty-wire` + `pty-cli` become.
+    libghostty, no zig. This is what `deskset`'s `pty-wire` + `pty-cli`
+    become. The client ops have since moved to `crates/pty-client`, with
+    `pty kill`'s stop and `pty rm`'s removal.
   - `crates/pty-terminal` — the libghostty actor: owns the `!Send` `Terminal`,
     typed snapshots (cells, wrapped flags, cursor, modes, kitty stack,
     scrollback), VT/plain serialization, query answers, terminal events. The

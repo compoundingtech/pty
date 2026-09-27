@@ -7,9 +7,9 @@
 
 use std::collections::HashSet;
 
-use pty_core::client;
-use pty_core::client::list::{ClientQuery, ClientSet, attached_clients};
-use pty_core::client::summary::{LineStyle, SessionSummary};
+use pty_client as client;
+use pty_client::list::{ClientQuery, ClientSet, attached_clients};
+use pty_client::summary::{LineStyle, SessionSummary};
 use pty_core::duration::{format_duration, parse_duration};
 use pty_core::registry::{
     self, SessionInfo, SessionStatus, TagMap, extract_filter_tags, matches_all_tags, now_epoch_ms,

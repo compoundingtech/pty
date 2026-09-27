@@ -277,6 +277,11 @@ pub fn read_metadata(name: &str) -> Option<SessionMetadata> {
     read_metadata_at(&metadata_path(name))
 }
 
+/// [`read_metadata`] from an explicit registry root instead of `$PTY_ROOT`.
+pub fn read_metadata_in(root: &std::path::Path, name: &str) -> Option<SessionMetadata> {
+    read_metadata_at(&root.join(format!("{name}.json")))
+}
+
 /// Write a raw metadata object atomically as pretty JSON.
 pub fn write_metadata_map(name: &str, map: &Map<String, Value>) -> std::io::Result<()> {
     ensure_session_dir()?;

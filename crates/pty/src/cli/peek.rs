@@ -2,8 +2,8 @@
 //! rewrite (cli.ts:1068-1107, `cmdPeek` 1992-2014, `cmdPeekWait`
 //! 1941-1990) replaces this module.
 
-use pty_core::client;
-use pty_core::client::summary;
+use pty_client as client;
+use pty_client::summary;
 use pty_core::registry;
 
 use super::{CliResult, resolve_ref};

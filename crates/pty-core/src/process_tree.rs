@@ -5,9 +5,9 @@
 //! node: src/process-tree.ts
 
 use std::time::{Duration, Instant};
-use pty_core::proctable::Answer;
+use crate::proctable::Answer;
 
-pub use pty_core::proctable::{LiveIdentity, ProcTable, Row as ProcessRow};
+pub use crate::proctable::{LiveIdentity, ProcTable, Row as ProcessRow};
 
 /// One descendant, pinned to its start identity so a reused pid is skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,8 +489,8 @@ fn terminate_process_group_with(
 /// direction for a signal; a caller that needs the difference asks
 /// `proctable` and reads the three cases.
 fn is_same_process(id: &ProcessIdentity) -> bool {
-    match pty_core::proctable::process(id.pid) {
-        pty_core::proctable::Answer::Known(row) if !row.is_zombie() => {
+    match crate::proctable::process(id.pid) {
+        crate::proctable::Answer::Known(row) if !row.is_zombie() => {
             row.identity.as_ref() == Some(&id.identity)
         }
         _ => false,
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn snapshot_is_deepest_first_with_tokens() {
         // 201 has no readable identity, so it is not in the snapshot.
-        let table = pty_core::proctable::table_from_shape(
+        let table = crate::proctable::table_from_shape(
             "100 1 100 Ss linux:100\n200 100 200 S linux:200\n300 200 200 S linux:300\n201 100 200 S -\n999 1 999 S linux:999\n",
         );
         let ids = snapshot_from_table(100, &table);
@@ -604,7 +604,7 @@ mod tests {
     fn a_corpse_is_not_a_survivor() {
         let mut child = std::process::Command::new("true").spawn().expect("spawn");
         let pid = child.id() as i32;
-        let identity = pty_core::proctable::process(pid)
+        let identity = crate::proctable::process(pid)
             .known()
             .and_then(|r| r.identity);
         // On macOS it may already be gone, and then there is nothing to pin.
@@ -648,7 +648,7 @@ mod group_tests {
     // 900 is an unrelated process. This is the shape measured on Linux for
     // both tools on 2026-09-03.
     fn rows() -> ProcTable {
-        pty_core::proctable::table_from_shape(
+        crate::proctable::table_from_shape(
             "100 1 100 Ss\n200 100 200 Ss\n300 200 200 S\n400 300 400 S\n900 1 900 S\n",
         )
     }
@@ -676,7 +676,7 @@ mod group_tests {
     fn a_descendant_with_no_readable_token_is_still_inside_a_target_group() {
         let rows = rows();
         // 400 is the one whose identity cannot be read.
-        let unnamed = pty_core::proctable::table_from_shape(
+        let unnamed = crate::proctable::table_from_shape(
             "100 1 100 Ss\n200 100 200 Ss\n300 200 200 S\n400 300 400 S -\n900 1 900 S\n",
         );
         let snapshot = snapshot_from_table(100, &unnamed);
@@ -703,7 +703,7 @@ mod group_tests {
     /// Measured on Linux 2026-09-03: the row reads `<pid> <ppid> <pgid> Z`.
     #[test]
     fn a_zombie_is_not_a_group_member() {
-        let rows = pty_core::proctable::table_from_shape(
+        let rows = crate::proctable::table_from_shape(
             "100 1 100 Ss\n200 100 200 Sl\n300 200 200 Z\n",
         );
         assert_eq!(
@@ -897,7 +897,7 @@ mod unreadable_token_tests {
     /// on 2026-09-02.
     #[test]
     fn a_descendant_with_no_readable_token_is_not_in_the_snapshot() {
-        use pty_core::proctable::table_from_shape;
+        use crate::proctable::table_from_shape;
         // daemon 100 -> middle 200 -> harness 300. The middle answers; the
         // harness does not.
         let unnamed = table_from_shape("100 1 100\n200 100 200\n300 200 200 S -");
@@ -919,7 +919,7 @@ mod unreadable_token_tests {
     /// and not its subtree.
     #[test]
     fn the_subtree_below_an_unreadable_process_is_still_reached() {
-        let table = pty_core::proctable::table_from_shape(
+        let table = crate::proctable::table_from_shape(
             "100 1 100\n200 100 200\n300 200 200 S -\n400 300 200",
         );
         let ids = super::snapshot_from_table(100, &table);
@@ -934,7 +934,7 @@ mod unreadable_token_tests {
 #[cfg(test)]
 mod containment_tests {
     use super::*;
-    use pty_core::proctable::table_from_shape;
+    use crate::proctable::table_from_shape;
     use std::cell::RefCell;
 
     /// daemon child 100 -> 200 -> 300, and 400 in a group of its own.

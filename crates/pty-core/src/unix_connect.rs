@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// offers no readiness event for "the queue has room again". Callers record
 /// `now + RETRY_TICK` per busy socket and reconnect only once it has passed,
 /// so another socket that stays ready cannot turn the retry into a spin.
-pub(crate) const RETRY_TICK: Duration = Duration::from_millis(10);
+pub const RETRY_TICK: Duration = Duration::from_millis(10);
 
 std::thread_local! {
     static BUSY_CONNECTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -34,7 +34,7 @@ pub fn busy_connects_on_this_thread() -> u64 {
 }
 
 /// One non-blocking connect attempt.
-pub(crate) enum Connect {
+pub enum Connect {
     /// Connected; the stream is non-blocking.
     Connected(UnixStream),
     /// EINPROGRESS: poll for POLLOUT, then read the outcome with
@@ -51,7 +51,7 @@ pub(crate) enum Connect {
 }
 
 /// Start a non-blocking connect to `path`.
-pub(crate) fn connect(path: &Path) -> Connect {
+pub fn connect(path: &Path) -> Connect {
     let (addr, len) = match sockaddr(path) {
         Ok(addr) => addr,
         Err(e) => return Connect::Failed(e),
@@ -89,7 +89,7 @@ pub(crate) fn connect(path: &Path) -> Connect {
 /// earliest instant a busy connect is due again) arrives. Returns false when
 /// the deadline has passed or poll(2) failed with anything but EINTR: the
 /// caller stops and reports whatever is still pending as unanswered.
-pub(crate) fn poll_until(
+pub fn poll_until(
     fds: &mut [libc::pollfd],
     deadline: Instant,
     next_retry: Option<Instant>,

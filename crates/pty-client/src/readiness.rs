@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
-use crate::protocol::{
+use pty_core::protocol::{
     AcceptedSocketOwnershipRequest, AcceptedSocketOwnershipResult, LifecycleCompareAndSetRequest,
     LifecycleCompareAndSetResult, MessageType, PacketReader,
     encode_accepted_socket_ownership_request, encode_lifecycle_compare_and_set_request,
 };
-use crate::registry;
-use crate::unix_peer;
+use pty_core::registry;
+use pty_core::unix_peer;
 
 use super::{ClientError, GoneSet, map_io_error};
 
