@@ -17,8 +17,10 @@ cd "$(dirname "$0")/.."
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
-echo "== cargo test --workspace =="
-cargo test --workspace 2>&1 | tee "$log"
+# --no-fail-fast: without it cargo stops at the first failing test binary, the
+# re-run below passes it alone, and every binary after it never ran at all.
+echo "== cargo test --workspace --no-fail-fast =="
+cargo test --workspace --no-fail-fast 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 [ "$status" -eq 0 ] && { echo "workspace suite: clean on the first run"; exit 0; }
 
