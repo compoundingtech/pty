@@ -953,6 +953,19 @@ fn reap_child(
 
 /// Block until the child has exited, leaving it unreaped (`WNOWAIT`): its pid
 /// stays reserved until [`collect`] runs under the signal lock.
+///
+/// **Only an exit ends the wait.** macOS's `waitid` answers `WEXITED |
+/// WNOWAIT` for a *stopped* child too, with `si_code` `CLD_STOPPED`, and
+/// `WNOWAIT` leaves that report in place, so it answers the same way every
+/// time. Linux keeps waiting. Measured on macOS 27 on 2026-09-28. Returning on
+/// the stop sent the reaper into a blocking `waitpid` under the signal lock
+/// while the child was only stopped, and the SIGKILL or SIGCONT that would
+/// have ended the stop waited on that lock forever. A startup deadline
+/// freezes its child with SIGSTOP, so on a Mac the daemon hung right there.
+///
+/// A stop, continue or trap report is consumed instead, with `WSTOPPED |
+/// WCONTINUED` and no `WEXITED`, which can never reap. Then the wait
+/// resumes, and it blocks again on both platforms.
 fn wait_until_exited(pid: u32) {
     loop {
         // SAFETY: an all-zero siginfo_t is a valid value to be overwritten.
@@ -966,8 +979,27 @@ fn wait_until_exited(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        if result != 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             return;
+        }
+        if !matches!(
+            info.si_code,
+            libc::CLD_STOPPED | libc::CLD_CONTINUED | libc::CLD_TRAPPED
+        ) {
+            return;
+        }
+        // SAFETY: as above. No WEXITED, so this cannot collect the child.
+        let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut consumed,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            );
         }
     }
 }
