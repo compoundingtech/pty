@@ -22,7 +22,7 @@ fn screen_of(conn: &mut Conn) -> String {
 
 fn start_dumper(rig: &Rig, id: &str) -> PathBuf {
     let dump = rig.root().join("dump.bin");
-    let script = format!("stty raw -echo; cat > '{}'", dump.display());
+    let script = format!("stty raw -echo; printf '\\033[?2004h'; cat > '{}'", dump.display());
     rig.daemon(id, &["sh", "-c", &script], DaemonOpts::no_display_name());
     std::thread::sleep(Duration::from_millis(150));
     dump
