@@ -163,9 +163,10 @@ fn run_interactive(opts: InteractiveOptions) -> CliResult {
 ///
 /// node: src/cli.ts:670-760, 1626-1660
 pub fn dispatch(mut args: Vec<String>) -> i32 {
-    // Global `--root <path>`, scanned across the whole argv, first
-    // occurrence only (cli.ts:677-686).
-    if let Some(idx) = args.iter().position(|a| a == "--root") {
+    // Global `--root <path>` can follow the subcommand, but `--` hands the
+    // remaining arguments to the child of `run` unchanged.
+    let command_end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if let Some(idx) = args[..command_end].iter().position(|a| a == "--root") {
         match args.get(idx + 1) {
             Some(val) if !val.starts_with('-') => {
                 // SAFETY: single-threaded at this point; nothing else reads
