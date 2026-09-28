@@ -71,6 +71,23 @@ pub fn unique_name(prefix: &str) -> String {
     )
 }
 
+/// Has `pid` exited? A zombie counts: it has finished and only waits for
+/// whoever adopted it to reap it.
+///
+/// **Check that a process is gone with this, not `!pid_alive`.** A daemon,
+/// or a child that outlived it, is an orphan by the time it dies, and the
+/// init process or nearest subreaper that adopted it reaps it whenever it
+/// gets round to it. Until then it still answers `kill(pid, 0)`. `pty kill`
+/// and `pty rm` wait for the exit, not for somebody else's reap, so asserting
+/// `!pid_alive` right after them races that reaper. Measured on 2026-09-28:
+/// `rm_immediate_reuse` failed 230 runs in 400 with 16 at once, and every
+/// time the old daemon was in state `Z` and adopted by the user's systemd.
+/// A process that is still running answers `false`, so this proves the exit
+/// as strictly as before.
+pub fn process_exited(pid: i32) -> bool {
+    pid <= 0 || pty_core::registry::has_process_exited_for_reap(pid)
+}
+
 pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
