@@ -116,7 +116,19 @@ pub fn run(args: &[String]) -> CliResult {
     } else {
         RestartPolicy::Prompt
     };
-    attach_session(&resolved, policy, stream_fd)
+    attach_session(&resolved, policy, stream_fd, force)
+}
+
+/// The environment can be scrubbed by `env -u`, sudo or a login shell while
+/// the caller is still a descendant of the target's terminal session.
+fn inside_target_session(name: &str) -> bool {
+    // SAFETY: getsid(0) reads the calling process's session id.
+    let sid = unsafe { libc::getsid(0) };
+    if sid <= 0 {
+        return false;
+    }
+    client::stats::query_stats_with_timeout(name, std::time::Duration::from_millis(500))
+        .is_ok_and(|stats| stats.process.alive && stats.process.pid == Some(sid))
 }
 
 /// `cmdAttach`.
@@ -124,6 +136,7 @@ fn attach_session(
     name: &str,
     policy: RestartPolicy,
     stream_fd: Option<std::os::fd::RawFd>,
+    force: bool,
 ) -> CliResult {
     let Some(session) = registry::get_session_by_name(name) else {
         eprintln!("Session \"{name}\" not found.");
@@ -131,6 +144,11 @@ fn attach_session(
     };
 
     if session.status == SessionStatus::Running {
+        if !force && inside_target_session(name) {
+            eprintln!("pty attach: already inside pty session \"{name}\".");
+            eprintln!("  Detach first (Ctrl+\\) and re-run from outside.");
+            return Ok(1);
+        }
         return Ok(do_attach(name, stream_fd));
     }
 
