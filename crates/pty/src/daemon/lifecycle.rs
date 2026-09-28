@@ -43,7 +43,7 @@ use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
-    terminate_process_identities,
+    terminate_process_identities, terminate_process_identities_after_hangup,
 };
 
 /// What the helper threads tell the actor.
@@ -79,6 +79,8 @@ const EXIT_METADATA_RETRY: Duration = Duration::from_millis(400);
 const EXIT_METADATA_SETTLE: Duration = Duration::from_millis(2_000);
 /// How long `close()` waits for the child after SIGHUP.
 const CHILD_HUP_WAIT: Duration = Duration::from_millis(2_000);
+/// Grace for foreground jobs to handle the terminal's hangup before TERM.
+const DESCENDANT_HUP_WAIT: Duration = Duration::from_millis(1_000);
 /// …and after SIGKILL.
 const CHILD_KILL_WAIT: Duration = Duration::from_millis(500);
 /// `SPAWNER_POLL_INTERVAL_MS`.
@@ -1423,7 +1425,16 @@ impl Daemon {
             let term_wait = if frozen { Duration::ZERO } else { TERM_WAIT };
             let group = group_fallback.then_some(self.child_pid);
             std::thread::spawn(move || {
-                let survivors = terminate_process_identities(&ids, term_wait, KILL_WAIT);
+                let survivors = if frozen {
+                    terminate_process_identities(&ids, term_wait, KILL_WAIT)
+                } else {
+                    terminate_process_identities_after_hangup(
+                        &ids,
+                        DESCENDANT_HUP_WAIT,
+                        term_wait,
+                        KILL_WAIT,
+                    )
+                };
                 let group_gone =
                     group.is_none_or(|pgid| terminate_process_group(pgid, term_wait, KILL_WAIT));
                 (survivors, group_gone)

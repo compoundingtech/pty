@@ -7,7 +7,36 @@
 //! can end. That one case is pinned here; the rest is library-only.
 
 use pty_conformance::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[test]
+fn kill_gives_a_foreground_job_time_to_handle_hangup() {
+    let rig = Rig::new();
+    let log = rig.tmp().join("job-signal");
+    let ready = rig.tmp().join("job-ready");
+    let job = rig.tmp().join("job.sh");
+    std::fs::write(
+        &job,
+        format!(
+            "trap 'echo HUP > {}; exit 0' HUP\ntrap 'echo TERM > {}; exit 0' TERM\necho ready > {}\nwhile :; do read line; done\n",
+            log.display(), log.display(), ready.display()
+        ),
+    )
+    .unwrap();
+    let command = format!("trap 'exit 0' HUP; sh {}", job.display());
+    let _d = rig.daemon("foreground-hangup", &["sh", "-c", &command], DaemonOpts::no_display_name());
+    wait_until("foreground job", || ready.exists());
+
+    let started = Instant::now();
+    let out = rig.pty(&["kill", "foreground-hangup"]);
+    expect_status(&out, 0);
+    wait_until("job signal", || log.exists());
+    let signal = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        signal.trim() == "HUP" || started.elapsed() >= Duration::from_secs(1),
+        "foreground job received {signal:?} before the hangup grace"
+    );
+}
 
 /// node: tests/process-tree.test.ts:55
 #[test]
