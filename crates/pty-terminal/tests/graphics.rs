@@ -40,6 +40,14 @@ fn actor(rows: u16, cols: u16, scrollback: usize) -> TerminalActor {
     a
 }
 
+#[test]
+fn a_graphics_enabled_session_accepts_file_medium_images() {
+    let a = actor(24, 80, 100);
+    assert!(a.terminal().is_kitty_image_from_file_allowed().unwrap());
+    assert!(!a.terminal().is_kitty_image_from_temp_file_allowed().unwrap());
+    assert!(!a.terminal().is_kitty_image_from_shared_mem_allowed().unwrap());
+}
+
 /// OMP's `encodeKittyTransmit`: `a=t,f=100,q=2,i=<id>;<base64>`.
 fn omp_transmit(id: u32) -> String {
     format!("\x1b_Ga=t,f=100,q=2,i={id};{PNG_16X8_BASE64}\x1b\\")

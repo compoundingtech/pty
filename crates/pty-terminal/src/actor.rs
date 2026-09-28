@@ -311,9 +311,10 @@ impl TerminalActor {
             self.rollback_graphics(previous);
             return false;
         }
-        // The child must not be able to name a path or a shared-memory
-        // segment the owner never authorized: inline transmission only.
-        let _ = self.term.set_kitty_image_from_file_allowed(false);
+        // A session child may transmit an image from a file it can name, as
+        // it can to a live terminal. Keep temporary-file and shared-memory
+        // media disabled; their ownership/lifetime rules differ.
+        let _ = self.term.set_kitty_image_from_file_allowed(true);
         let _ = self.term.set_kitty_image_from_temp_file_allowed(false);
         let _ = self.term.set_kitty_image_from_shared_mem_allowed(false);
         if !graphics::install_png_decoder() {
