@@ -35,6 +35,19 @@ fn key_map(name: &str) -> Option<&'static str> {
         "end" => "\x1b[F",
         "pageup" => "\x1b[5~",
         "pagedown" => "\x1b[6~",
+        "f1" => "\x1bOP",
+        "f2" => "\x1bOQ",
+        "f3" => "\x1bOR",
+        "f4" => "\x1bOS",
+        "f5" => "\x1b[15~",
+        "f6" => "\x1b[17~",
+        "f7" => "\x1b[18~",
+        "f8" => "\x1b[19~",
+        "f9" => "\x1b[20~",
+        "f10" => "\x1b[21~",
+        "f11" => "\x1b[23~",
+        "f12" => "\x1b[24~",
+        "/" => "/",
         _ => return None,
     })
 }
@@ -59,7 +72,8 @@ fn is_modifier(m: &str) -> bool {
 fn named_keys() -> String {
     let mut names = [
         "return", "enter", "tab", "escape", "esc", "space", "backspace", "delete", "up", "down",
-        "right", "left", "home", "end", "pageup", "pagedown",
+        "right", "left", "home", "end", "pageup", "pagedown", "f1", "f2", "f3", "f4",
+        "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "/",
     ];
     names.sort_unstable();
     names.join(", ")
@@ -199,6 +213,15 @@ pub fn resolve_key(spec: &str) -> Result<String, KeyError> {
 
     let mapped = mapped.unwrap();
 
+    // The legacy control spelling for slash is the unit separator byte.
+    if base == "/" && mods.contains("ctrl") {
+        return Ok(if mods.contains("alt") {
+            "\x1b\x1f".to_string()
+        } else {
+            "\x1f".to_string()
+        });
+    }
+
     // Named keys without modifiers: return the mapped value directly.
     if !has_modifiers {
         return Ok(mapped.to_string());
@@ -221,6 +244,12 @@ pub fn resolve_key(spec: &str) -> Result<String, KeyError> {
 
     // CSI sequences of form ESC [ X  (single uppercase letter: arrows, home, end).
     if let Some(letter) = mapped.strip_prefix("\x1b[")
+        && letter.len() == 1 && letter.as_bytes()[0].is_ascii_uppercase() {
+        return Ok(format!("\x1b[1;{modp}{letter}"));
+    }
+
+    // F1–F4 use SS3 without modifiers and CSI with modifiers.
+    if let Some(letter) = mapped.strip_prefix("\x1bO")
         && letter.len() == 1 && letter.as_bytes()[0].is_ascii_uppercase() {
             return Ok(format!("\x1b[1;{modp}{letter}"));
         }

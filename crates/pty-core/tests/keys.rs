@@ -19,6 +19,28 @@ fn resolves_named_keys() {
 }
 
 #[test]
+fn resolves_function_keys_and_control_slash() {
+    for (name, sequence) in [
+        ("f1", "\x1bOP"),
+        ("f2", "\x1bOQ"),
+        ("f3", "\x1bOR"),
+        ("f4", "\x1bOS"),
+        ("f5", "\x1b[15~"),
+        ("f6", "\x1b[17~"),
+        ("f7", "\x1b[18~"),
+        ("f8", "\x1b[19~"),
+        ("f9", "\x1b[20~"),
+        ("f10", "\x1b[21~"),
+        ("f11", "\x1b[23~"),
+        ("f12", "\x1b[24~"),
+    ] {
+        assert_eq!(r(name), sequence, "{name}");
+    }
+    assert_eq!(r("ctrl+f1"), "\x1b[1;5P");
+    assert_eq!(r("ctrl+/"), "\x1f");
+}
+
+#[test]
 fn resolves_arrow_keys() {
     assert_eq!(r("up"), "\x1b[A");
     assert_eq!(r("down"), "\x1b[B");
