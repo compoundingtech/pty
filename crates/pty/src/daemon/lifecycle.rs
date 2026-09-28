@@ -9,12 +9,12 @@
 //! node: src/server.ts:323-690 (constructor), 571-598 (exit), 1295-1337
 //! (exit metadata), 1340-1456 (close, watchdog), 1458-1616 (entry, shutdown)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,37 @@ pub(crate) enum Msg {
     ExternalKill,
 }
 
+/// Pull pending client/control work ahead of terminal output without changing
+/// the order of output, EOF and child-exit notifications from the bridge.
+/// Moving packets is cheap; parsing and rendering each one is not.
+fn next_queued_message(
+    rx: &Receiver<Msg>,
+    deferred: &mut VecDeque<Msg>,
+    timeout: Option<Duration>,
+) -> Result<Msg, RecvTimeoutError> {
+    // Bound one scan even if the child can produce output faster than this
+    // thread can drain the channel. The next turn resumes the scan.
+    for _ in 0..8192 {
+        match rx.try_recv() {
+            Ok(msg @ (Msg::PtyData(_) | Msg::PtyEof | Msg::ChildExited(_))) => {
+                deferred.push_back(msg);
+            }
+            Ok(control) => return Ok(control),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                return deferred.pop_front().ok_or(RecvTimeoutError::Disconnected);
+            }
+        }
+    }
+    if let Some(msg) = deferred.pop_front() {
+        return Ok(msg);
+    }
+    match timeout {
+        Some(wait) => rx.recv_timeout(wait),
+        None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+    }
+}
+
 /// Grace after the child's exit before the daemon shuts down, so attached
 /// clients receive EXIT.
 pub const EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -106,6 +137,8 @@ pub(crate) struct Daemon {
     child_status: Option<ExitStatus>,
     pty_eof: bool,
     rx: Receiver<Msg>,
+    /// Bridge output moved aside while waiting client commands are served.
+    deferred_bridge: VecDeque<Msg>,
     external_kill: bool,
     shutdown_code: Option<i32>,
     exit_drain_deadline: Option<Instant>,
@@ -429,6 +462,7 @@ pub(crate) fn run(
         child_status: None,
         pty_eof: false,
         rx,
+        deferred_bridge: VecDeque::new(),
         external_kill: false,
         shutdown_code: None,
         exit_drain_deadline: None,
@@ -710,12 +744,16 @@ impl Daemon {
             .flatten()
             .min();
             let msg = match deadline {
-                Some(d) => match self.rx.recv_timeout(d.saturating_duration_since(now)) {
+                Some(d) => match next_queued_message(
+                    &self.rx,
+                    &mut self.deferred_bridge,
+                    Some(d.saturating_duration_since(now)),
+                ) {
                     Ok(m) => Some(m),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => break,
                 },
-                None => match self.rx.recv() {
+                None => match next_queued_message(&self.rx, &mut self.deferred_bridge, None) {
                     Ok(m) => Some(m),
                     Err(_) => break,
                 },
@@ -1346,7 +1384,11 @@ impl Daemon {
             let wake = self
                 .exit_drain_deadline
                 .map_or(deadline, |d| d.min(deadline));
-            match self.rx.recv_timeout(wake.saturating_duration_since(now)) {
+            match next_queued_message(
+                &self.rx,
+                &mut self.deferred_bridge,
+                Some(wake.saturating_duration_since(now)),
+            ) {
                 Ok(Msg::PtyData(bytes)) => self.on_pty_data(&bytes),
                 Ok(msg @ (Msg::PtyEof | Msg::ChildExited(_))) => self.handle(msg),
                 Ok(_) => {}
@@ -1490,6 +1532,23 @@ mod tests {
         let g = new_generation();
         assert_eq!(g.len(), 32);
         assert!(g.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn client_commands_pass_queued_output_without_reordering_the_bridge() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::PtyData(b"one".to_vec())).unwrap();
+        tx.send(Msg::PtyData(b"two".to_vec())).unwrap();
+        tx.send(Msg::PtyEof).unwrap();
+        tx.send(Msg::ExternalKill).unwrap();
+        let mut deferred = VecDeque::new();
+        assert!(matches!(
+            next_queued_message(&rx, &mut deferred, Some(Duration::ZERO)).unwrap(),
+            Msg::ExternalKill
+        ));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"one"));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"two"));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyEof)));
     }
 
     #[test]
