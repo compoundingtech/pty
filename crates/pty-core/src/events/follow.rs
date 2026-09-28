@@ -1,8 +1,8 @@
 //! `pty events -f`: tail one session's log, a named set, or (`--all`) every
 //! log in the registry as they appear. Existing files start at their
-//! current end; files that appear while following replay from offset 0 so
-//! their `session_start` line is not skipped; a shrink (retention rewrite
-//! or truncation) restarts at 0.
+//! current end; files that appear while following replay from the beginning so
+//! their `session_start` line is not skipped. Retention rewrites preserve the
+//! overlap with the previous snapshot so old events are not replayed.
 //!
 //! Change detection is the `notify` crate on the registry directory plus a
 //! poll every 250 ms, so delivery is deterministic even when the watcher
@@ -110,7 +110,18 @@ impl Drop for EventFollower {
 
 struct Tracked {
     path: PathBuf,
-    offset: u64,
+    snapshot: Vec<u8>,
+}
+
+impl Tracked {
+    fn new(path: PathBuf, replay_existing: bool) -> Self {
+        let snapshot = if replay_existing {
+            Vec::new()
+        } else {
+            std::fs::read(&path).unwrap_or_default()
+        };
+        Tracked { path, snapshot }
+    }
 }
 
 fn name_of(file_name: &str) -> Option<&str> {
@@ -122,13 +133,12 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
     let mut tracked: BTreeMap<String, Tracked> = BTreeMap::new();
 
     // Existing files start at EOF; a named file that does not exist yet
-    // starts at 0 when it appears.
+    // replays from the beginning when it appears.
     match &options.names {
         Some(names) => {
             for name in names {
                 let path = events_path(name);
-                let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                tracked.insert(name.clone(), Tracked { path, offset });
+                tracked.insert(name.clone(), Tracked::new(path, false));
             }
         }
         None => {
@@ -139,8 +149,7 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
                         continue;
                     };
                     let path = entry.path();
-                    let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    tracked.insert(name.to_string(), Tracked { path, offset });
+                    tracked.insert(name.to_string(), Tracked::new(path, false));
                 }
             }
         }
@@ -179,7 +188,7 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
     drop(watcher);
 }
 
-/// Newly created logs replay from offset 0.
+/// Newly created logs replay from the beginning.
 ///
 /// node: src/events.ts:532-544
 fn discover_new(dir: &Path, tracked: &mut BTreeMap<String, Tracked>) {
@@ -192,52 +201,41 @@ fn discover_new(dir: &Path, tracked: &mut BTreeMap<String, Tracked>) {
             continue;
         };
         if !tracked.contains_key(name) {
-            tracked.insert(
-                name.to_string(),
-                Tracked {
-                    path: entry.path(),
-                    offset: 0,
-                },
-            );
+            tracked.insert(name.to_string(), Tracked::new(entry.path(), true));
         }
     }
 }
 
-/// Deliver every complete line past the tracked offset; a shrink restarts
-/// at 0. A trailing partial line waits for its newline.
+/// Deliver complete lines not present in the previous atomic snapshot. The
+/// writer may remove the oldest lines at retention, so a byte offset does not
+/// identify new events even when the new file is as large as the old one.
+/// A trailing partial line waits for its newline.
 ///
 /// node: src/events.ts:489-514
 fn read_new_lines(t: &mut Tracked, on_event: &mut impl FnMut(Event)) {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(meta) = std::fs::metadata(&t.path) else {
+    let Ok(buf) = std::fs::read(&t.path) else {
         return;
     };
-    let size = meta.len();
-    if size < t.offset {
-        t.offset = 0;
-    }
-    if size == t.offset {
-        return;
-    }
-    let Ok(mut f) = std::fs::File::open(&t.path) else {
-        return;
-    };
-    if f.seek(SeekFrom::Start(t.offset)).is_err() {
-        return;
-    }
-    let mut buf = Vec::with_capacity((size - t.offset) as usize);
-    if f.take(size - t.offset).read_to_end(&mut buf).is_err() {
-        return;
-    }
     let Some(last_newline) = buf.iter().rposition(|b| *b == b'\n') else {
         return;
     };
     let complete = &buf[..=last_newline];
-    t.offset += complete.len() as u64;
-    let chunk = String::from_utf8_lossy(complete);
+    if complete == t.snapshot {
+        return;
+    }
+    let overlap = t
+        .snapshot
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == 0 || t.snapshot[i - 1] == b'\n')
+        .map(|(i, _)| &t.snapshot[i..])
+        .find(|suffix| complete.starts_with(suffix))
+        .map_or(0, |suffix| suffix.len());
+    let chunk = String::from_utf8_lossy(&complete[overlap..]);
     for line in chunk.split('\n').filter(|l| !l.is_empty()) {
         if let Ok(event) = serde_json::from_str::<Event>(line) {
             on_event(event);
         }
     }
+    t.snapshot = complete.to_vec();
 }

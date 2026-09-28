@@ -172,6 +172,33 @@ fn follows_across_an_atomic_retention_rewrite() {
     );
 }
 
+#[test]
+fn retention_does_not_replay_events_from_before_subscription() {
+    let _ = root();
+    let name = unique_name("exact-retention");
+    let path = registry::events_path(&name);
+    let old = (0..999)
+        .map(|i| Event::title_change(&name, &format!("old-{i}")).to_json() + "\n")
+        .collect::<String>();
+    std::fs::write(&path, old).unwrap();
+
+    let (mut follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.clone()]));
+    std::thread::sleep(Duration::from_millis(100));
+    events::append_event_sync(&name, &Event::title_change(&name, "new-0")).unwrap();
+    events::append_event_sync(&name, &Event::title_change(&name, "new-1")).unwrap();
+
+    let received = collect(&rx, 2, 3000);
+    std::thread::sleep(Duration::from_millis(400));
+    let rest: Vec<_> = rx.try_iter().collect();
+    follower.stop();
+    let titles: Vec<_> = received
+        .iter()
+        .chain(rest.iter())
+        .filter_map(|e| e.get_str("value"))
+        .collect();
+    assert_eq!(titles, ["new-0", "new-1"]);
+}
+
 /// node: tests/events-emit.test.ts:264-303
 #[test]
 fn delivers_user_events_in_order() {
