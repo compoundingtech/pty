@@ -12,7 +12,8 @@
 //! node: src/server.ts:75-90, 904-1063, 1213-1267
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use pty_core::protocol::{
@@ -27,6 +28,11 @@ use super::lifecycle::Daemon;
 /// Node's `REDRAW_SETTLE_MS`: how long after a resize the child gets to
 /// redraw before an attacher's SCREEN is cut.
 pub const REDRAW_SETTLE: Duration = Duration::from_millis(80);
+
+/// Maximum packets held for a client that has stopped reading its socket.
+/// DATA packets follow the PTY reader's 16 KiB chunks, so this keeps the
+/// ordinary queued output near one MiB per client.
+pub const OUTBOUND_QUEUE_PACKETS: usize = 64;
 
 /// How long a `clientGeneration` write keeps retrying a held metadata lock.
 /// Lock holders are short CLI writes; a holder that outlives this loses the
@@ -91,7 +97,8 @@ pub enum Phase {
 }
 
 pub struct Client {
-    pub tx: Sender<Out>,
+    pub tx: SyncSender<Out>,
+    disconnect: UnixStream,
     pub role: Role,
     pub rows: u16,
     pub cols: u16,
@@ -105,9 +112,10 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(tx: Sender<Out>, rows: u16, cols: u16) -> Client {
+    pub fn new(tx: SyncSender<Out>, disconnect: UnixStream, rows: u16, cols: u16) -> Client {
         Client {
             tx,
+            disconnect,
             role: Role::Command,
             rows,
             cols,
@@ -119,7 +127,15 @@ impl Client {
     }
 
     pub fn send(&self, bytes: Vec<u8>) {
-        let _ = self.tx.send(Out::Bytes(bytes));
+        self.send_out(Out::Bytes(bytes));
+    }
+
+    pub fn send_out(&self, out: Out) {
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = self.tx.try_send(out) {
+            // A client that cannot keep up must reconnect for a fresh SCREEN.
+            // Shutdown also unblocks its writer thread if it is in write_all.
+            let _ = self.disconnect.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     pub fn is_settling(&self) -> bool {
@@ -317,7 +333,7 @@ impl Daemon {
     /// was just sent still reaches it.
     fn on_detach(&mut self, id: u64) {
         if let Some(c) = self.clients.get(&id) {
-            let _ = c.tx.send(Out::End);
+            c.send_out(Out::End);
         }
         self.on_closed(id);
     }
@@ -522,5 +538,22 @@ impl Daemon {
             }
             c.send(packet.to_vec());
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_queue_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_client_keeps_only_a_bounded_number_of_packets() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(OUTBOUND_QUEUE_PACKETS);
+        let (disconnect, _peer) = UnixStream::pair().unwrap();
+        let client = Client::new(tx, disconnect, 24, 80);
+        for _ in 0..100 {
+            client.send(vec![0; 16 * 1024]);
+        }
+        let queued = rx.try_iter().count();
+        assert!(queued <= 64, "stalled client queued {queued} packets");
     }
 }

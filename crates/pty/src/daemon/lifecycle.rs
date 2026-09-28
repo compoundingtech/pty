@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use pty_lifecycle::{
     remaining_lease_delay, startup_lease_deadline_cause, terminal_startup_lease_value,
 };
 use super::DaemonConfig;
-use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE};
+use super::clients::{Client, ClientFacts, Out, OUTBOUND_QUEUE_PACKETS, REDRAW_SETTLE};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
 use pty_core::process_tree::{
@@ -54,7 +54,8 @@ pub(crate) enum Msg {
     ChildExited(ExitStatus),
     Connect {
         id: u64,
-        tx: Sender<Out>,
+        tx: SyncSender<Out>,
+        disconnect: UnixStream,
     },
     Packet {
         id: u64,
@@ -572,11 +573,14 @@ fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
 /// One writer thread (packets → socket) and one reader thread (socket →
 /// [`Msg`]) per connection.
 fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
-    let (out_tx, out_rx) = mpsc::channel::<Out>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUTBOUND_QUEUE_PACKETS);
     let Ok(mut wstream) = stream.try_clone() else {
         return;
     };
-    let _ = tx.send(Msg::Connect { id, tx: out_tx });
+    let Ok(disconnect) = stream.try_clone() else {
+        return;
+    };
+    let _ = tx.send(Msg::Connect { id, tx: out_tx, disconnect });
     std::thread::spawn(move || {
         while let Ok(out) = out_rx.recv() {
             match out {
@@ -754,9 +758,9 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx } => {
+            Msg::Connect { id, tx, disconnect } => {
                 self.clients
-                    .insert(id, Client::new(tx, self.actor.rows(), self.actor.cols()));
+                    .insert(id, Client::new(tx, disconnect, self.actor.rows(), self.actor.cols()));
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
             Msg::Closed { id } => self.on_closed(id),
@@ -1398,7 +1402,7 @@ impl Daemon {
             self.save_exit_metadata();
         }
         for (_, c) in std::mem::take(&mut self.clients) {
-            let _ = c.tx.send(Out::Destroy);
+            c.send_out(Out::Destroy);
         }
         // SAFETY: shutdown on the listening socket unblocks accept(2).
         unsafe {
