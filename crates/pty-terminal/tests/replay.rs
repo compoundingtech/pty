@@ -219,9 +219,16 @@ fn plain_keeps_written_spaces_drops_erased_and_never_written_cells() {
     );
     let mut b = TerminalActor::new(4, 10, 0);
     b.write(b"aaaaaaaaaaaaaaaaaaaaaaaaa\r\nshort");
-    assert_eq!(b.plain(Range::Viewport), "aaaaaaaaaa\naaaaaaaaaa\naaaaa\nshort");
+    assert_eq!(b.plain(Range::Viewport), "aaaaaaaaaaaaaaaaaaaaaaaaa\nshort");
     let s = b.snapshot(0);
     assert_eq!(s.wrapped, vec![false, true, true, false]);
+}
+
+#[test]
+fn plain_read_joins_soft_wraps_but_keeps_explicit_line_breaks() {
+    let mut a = TerminalActor::new(4, 10, 100);
+    a.write(b"abcdefghijklmno\r\n1234567890\r\nlast");
+    assert_eq!(a.plain(Range::Full), "abcdefghijklmno\n1234567890\nlast");
 }
 
 #[test]

@@ -260,7 +260,7 @@ fn plain_opts<'t, 's>() -> FormatterOptions<'t, 's> {
     // drops never-written cells — exactly xterm's `translateToString(true)`.
     FormatterOptions::new()
         .with_format(Format::Plain)
-        .with_unwrap(false)
+        .with_unwrap(true)
         .with_trim(false)
 }
 
