@@ -143,26 +143,40 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Spawn and wait for the socket (5 s).
+    /// Spawn and wait until the session is published (see [`Daemon::published`]).
     pub fn start(root: &Path, config: Value) -> Daemon {
-        let d = Daemon::spawn(root, config, &[]);
-        assert!(
-            wait_until(Duration::from_secs(5), || d.socket_path().exists()),
-            "daemon socket never appeared for {}",
-            d.name
-        );
-        d
+        Daemon::spawn(root, config, &[]).published()
     }
 
-    /// Spawn with extra environment and wait for the socket.
+    /// [`Daemon::start`] with extra environment.
     pub fn start_env(root: &Path, config: Value, env: &[(&str, &str)]) -> Daemon {
-        let d = Daemon::spawn(root, config, env);
+        Daemon::spawn(root, config, env).published()
+    }
+
+    /// Wait for what `pty run` waits for: the `session_start` line.
+    ///
+    /// **The socket appearing is not the session being published.** The
+    /// daemon publishes in order: socket, pid sidecar, metadata, then
+    /// `session_start` (see `daemon/lifecycle.rs`). Building the metadata
+    /// reads the daemon's own start token, which on macOS runs `ps`, so under
+    /// load a test that waited only for the socket often read the metadata
+    /// before it existed and unwrapped `None`. On a Mac on 2026-09-28 that was
+    /// `attach_stamps_last_attach_at` in 5 of 14 whole-workspace runs and
+    /// `reap_and_preserve_decisions` in 3.
+    fn published(self) -> Daemon {
         assert!(
-            wait_until(Duration::from_secs(5), || d.socket_path().exists()),
+            wait_until(Duration::from_secs(5), || self.socket_path().exists()),
             "daemon socket never appeared for {}",
-            d.name
+            self.name
         );
-        d
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !events_of_type(&self.root, &self.name, "session_start").is_empty()
+            }),
+            "daemon {} bound its socket but never published session_start",
+            self.name
+        );
+        self
     }
 
     /// Spawn without waiting for anything.
