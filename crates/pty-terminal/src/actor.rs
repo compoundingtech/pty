@@ -493,6 +493,16 @@ impl TerminalActor {
                     feed.extend_from_slice(&b);
                     broadcast.extend_from_slice(&b);
                 }
+                Token::Ris => {
+                    self.flush_feed(&mut feed);
+                    if self.modes.cursor_hidden {
+                        self.events.push(TerminalEvent::CursorVisible);
+                    }
+                    self.modes = Modes::default();
+                    self.normal_replay = None;
+                    feed.extend_from_slice(b"\x1bc");
+                    broadcast.extend_from_slice(b"\x1bc");
+                }
                 Token::Csi(c) => {
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);

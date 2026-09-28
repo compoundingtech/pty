@@ -237,6 +237,22 @@ fn reset_clears_screen_modes_and_partial_sequences() {
     assert_eq!(a.take_pty_replies(), b"");
 }
 
+#[test]
+fn child_ris_clears_the_modes_replayed_to_late_clients() {
+    let mut a = actor();
+    a.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[>1uFULL");
+    assert!(a.modes().alt_screen);
+    assert!(a.normal_replay().is_some());
+    a.write(b"\x1b");
+    a.write(b"cafter-reset");
+    assert_eq!(a.modes(), Modes::default());
+    assert!(a.normal_replay().is_none());
+    assert_eq!(a.plain(Range::Full), "after-reset");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(!replay.contains("\x1b[?1000h"), "{replay:?}");
+    assert!(!replay.contains("\x1b[>1u"), "{replay:?}");
+}
+
 // ── events (src/server.ts:409-454) ──
 
 #[test]
