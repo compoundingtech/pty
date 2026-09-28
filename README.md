@@ -350,9 +350,12 @@ A Cargo workspace of nine crates under `crates/`:
 
 ## Building from source
 
-- Rust 1.88 or newer (edition 2024; `rust-version` is pinned in `Cargo.toml`).
+- Rust 1.90 or newer (edition 2024; `rust-version` is pinned in `Cargo.toml`,
+  and `libghostty-vt-sys` 0.2.1 needs 1.90).
 - Zig 0.15.2 on `PATH`, and `git`: the `libghostty-vt-sys` crate builds
-  Ghostty's terminal core from source with Zig. The version is exact. Ghostty
+  Ghostty's terminal core from source with Zig. (A project that only depends
+  on `pty-terminal` or `pty-testkit` can use a release's prebuilt library
+  instead; see below.) The version is exact. Ghostty
   refuses 0.16.0, and 0.15.2 cannot link the macOS 26.5 SDK, so a source build
   on current macOS needs Nix.
 - The first build clones Ghostty at the commit `libghostty-vt-sys` pins and
@@ -364,6 +367,54 @@ A Cargo workspace of nine crates under `crates/`:
 ```sh
 cargo build --release                        # target/release/pty
 ```
+
+### Depending on pty-terminal or pty-testkit without Zig
+
+Each release from `v0.13.0-rust.2` on carries the libghostty-vt static library
+that `pty-terminal`, and so `pty-testkit`, links. The release workflow builds
+it for two targets:
+
+| Asset | Built on |
+|---|---|
+| `libghostty-vt-x86_64-unknown-linux-gnu.tar.gz` | Debian 12, Zig 0.15.2 |
+| `libghostty-vt-aarch64-apple-darwin.tar.gz` | macOS 14, in the Nix shell |
+
+`pty-terminal` turns on `libghostty-vt-sys`'s `pkg-config` feature. When
+pkg-config can find `libghostty-vt-static`, cargo links that archive and never
+runs Zig; when it cannot, the build falls back to Zig as before. Before an
+archive is attached to a release, the workflow builds and tests `pty-terminal`
+and `pty-testkit` against it with Zig off `PATH`, and the macOS archive
+outside Nix, with the runner's own toolchain.
+
+You need Rust 1.90 or newer, `pkg-config` (or `pkgconf`) and a C linker:
+
+```sh
+tag=v0.13.0-rust.2
+triple=x86_64-unknown-linux-gnu               # or aarch64-apple-darwin
+base=https://github.com/compoundingtech/pty/releases/download/$tag
+curl -sSfLO "$base/libghostty-vt-$triple.tar.gz"
+curl -sSfLO "$base/libghostty-vt-$triple.tar.gz.sha256"
+sha256sum -c "libghostty-vt-$triple.tar.gz.sha256"   # shasum -a 256 -c on macOS
+mkdir -p ~/.local/lib && tar -xzf "libghostty-vt-$triple.tar.gz" -C ~/.local/lib
+export PKG_CONFIG_PATH=~/.local/lib/libghostty-vt-$triple/share/pkgconfig
+```
+
+```toml
+[dev-dependencies]
+pty-testkit = { git = "https://github.com/compoundingtech/pty", tag = "v0.13.0-rust.2" }
+```
+
+Take the archive from the same release as the tag you depend on. The library
+and the Rust bindings come from one pinned Ghostty commit, which the archive's
+`SOURCE` file names, and libghostty's C API is not stable between commits.
+The workspace pins `libghostty-vt` and `libghostty-vt-sys` exactly for that
+reason, so a git dependency cannot resolve to bindings the archive was not
+built for. The
+pkg-config file's prefix is relative to the file, so the directory can live
+anywhere.
+
+On macOS this is how these crates build with plain cargo: Zig 0.15.2 cannot
+link the current SDK, but the prebuilt archive is linked by the system linker.
 
 ## Running the tests
 

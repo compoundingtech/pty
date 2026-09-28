@@ -1,7 +1,10 @@
 name: Release
 
 # Build the two binaries we can prove, verify each is portable OFF the machine
-# that built it, and attach them to a release.
+# that built it, and attach them to a release, together with the libghostty-vt
+# static library each platform built, so a project can depend on pty-terminal
+# or pty-testkit without Zig (README: "Depending on pty-terminal or pty-testkit
+# without Zig").
 #
 # `workflow_dispatch` builds and verifies WITHOUT publishing, so the artifacts
 # can be proved before anything is public. Pushing a `v*` tag does the same and
@@ -134,6 +137,22 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # The release build above built libghostty-vt with Zig (ReleaseFast) on
+      # Debian 12. Package that static library with a relocatable pkg-config
+      # file, then refuse to ship it unless pty-terminal and pty-testkit build
+      # and pass against it with Zig off PATH.
+      - name: Package libghostty-vt
+        run: |
+          sh scripts/package-libghostty-vt.sh x86_64-unknown-linux-gnu target/release \
+            target/release/build/libghostty-vt-sys-*/out/ghostty-src dist-lib
+      - name: Prove the library builds pty-terminal and pty-testkit without Zig
+        run: sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-x86_64-unknown-linux-gnu.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libghostty-vt-x86_64-unknown-linux-gnu
+          path: dist-lib/
+          if-no-files-found: error
+
   # ── macOS: nix, because cargo cannot build here ──────────────────────────
   #
   # Ghostty pins Zig 0.15.2 and that Zig cannot link the macOS 26.5 SDK, so the
@@ -148,7 +167,7 @@ jobs:
   # copies and the result is GATED, not trusted.
   macos-arm64:
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
@@ -222,6 +241,27 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # `nix build` keeps its build directory to itself, so libghostty-vt is
+      # built again with cargo in the Nix shell, which has the SDK and the
+      # pinned Ghostty source that plain cargo on current macOS lacks.
+      - name: Build libghostty-vt in the Nix shell
+        run: nix develop --command cargo build --release -p pty-terminal
+      - name: Package libghostty-vt
+        run: |
+          nix develop --command sh -c \
+            'sh scripts/package-libghostty-vt.sh aarch64-apple-darwin target/release "$GHOSTTY_SOURCE_DIR" dist-lib'
+      # OUTSIDE Nix, with the runner's own cargo and linker and no Zig: the
+      # case the archive exists for.
+      - name: Prove the library builds pty-terminal and pty-testkit without Zig or Nix
+        run: |
+          command -v pkg-config >/dev/null || brew install pkgconf
+          sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-aarch64-apple-darwin.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libghostty-vt-aarch64-apple-darwin
+          path: dist-lib/
+          if-no-files-found: error
+
   # Only on a tag. A dispatch run stops after the two jobs above, so the assets
   # can be proved before anything is published.
   publish:
@@ -240,5 +280,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes "Binaries built and verified by .github/workflows/release.yml. Each asset is checked to reference no /nix/store path before it is attached." \
+            --notes "Built and verified by .github/workflows/release.yml. Each pty binary is checked to reference no /nix/store path, and each libghostty-vt archive is checked to build and test pty-terminal and pty-testkit with no Zig, before it is attached. To use an archive, see the README: Depending on pty-terminal or pty-testkit without Zig." \
             $(find dist -type f | sort | tr '\n' ' ')

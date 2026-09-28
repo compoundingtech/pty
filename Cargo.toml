@@ -5,14 +5,26 @@ resolver = "3"
 [workspace.package]
 version = "0.13.0-rust"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "MIT"
 repository = "https://github.com/compoundingtech/pty-rust"
 
 [workspace.dependencies]
 # External crates, pinned to the versions in Cargo.lock.
 libc = "0.2.186"
-libghostty-vt = "0.2.1"
+#
+# Both libghostty crates are pinned EXACTLY. A release's libghostty-vt archive
+# is built from the Ghostty commit this libghostty-vt-sys version pins, and
+# nothing checks that when the archive is linked: the pkg-config file says
+# 0.1.0-dev for every commit, and libghostty's C API is not stable between
+# them. A caret requirement would let a downstream `cargo update` take newer
+# bindings and link them against an older archive without an error. Moving
+# these versions is a deliberate change that ships with a new archive.
+libghostty-vt = "=0.2.1"
+# Only for its `pkg-config` feature: with it, the build links a prebuilt
+# libghostty-vt found through pkg-config (the release archives) and falls
+# back to building Ghostty with Zig when there is none.
+libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
 portable-pty = "0.9.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
