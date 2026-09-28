@@ -996,6 +996,19 @@ fn a_host_paste_is_bracketed_exactly_when_the_child_enabled_bracketed_paste() {
     );
 }
 
+/// Some terminals signal an image paste with an empty bracketed-paste pair;
+/// the program then reads the image from the OS clipboard itself.
+#[test]
+fn an_empty_bracketed_paste_signal_reaches_the_child() {
+    let root = Root::new();
+    let out = root.file("image-paste.bin");
+    root.start("image-paste", &recorder(&out, "\\033[?2004h"));
+    let mut host = attach_live(&root, "image-paste");
+    let signal = b"\x1b[200~\x1b[201~";
+    host.type_str(std::str::from_utf8(signal).unwrap());
+    assert_eq!(recorded(&out, signal.len()), signal);
+}
+
 #[test]
 fn reattach_turns_bracketed_paste_back_on_for_a_child_that_enabled_it() {
     let root = Root::new();
