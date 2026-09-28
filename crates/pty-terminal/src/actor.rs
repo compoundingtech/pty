@@ -197,6 +197,9 @@ pub struct TerminalActor {
     shared: Rc<RefCell<Shared>>,
     scanner: OutputScanner,
     modes: Modes,
+    /// Kitty keyboard stacks belong to their screen. This holds the stack
+    /// for whichever screen is currently inactive.
+    inactive_kitty_stack: Vec<u8>,
     events: Vec<TerminalEvent>,
     last_title: Option<String>,
     /// Lines of history the owner asked for.
@@ -261,6 +264,7 @@ impl TerminalActor {
             shared,
             scanner: OutputScanner::new(),
             modes: Modes::default(),
+            inactive_kitty_stack: Vec::new(),
             events: Vec::new(),
             last_title: None,
             scrollback_request: scrollback,
@@ -512,9 +516,19 @@ impl TerminalActor {
                                 self.flush_feed(&mut feed);
                                 self.normal_replay =
                                     Some(crate::serialize::vt(&self.term, true, self.cell));
+                                std::mem::swap(
+                                    &mut self.modes.kitty_stack,
+                                    &mut self.inactive_kitty_stack,
+                                );
                             }
                             // Back on the normal screen: it serializes itself.
-                            (true, false) => self.normal_replay = None,
+                            (true, false) => {
+                                self.normal_replay = None;
+                                std::mem::swap(
+                                    &mut self.modes.kitty_stack,
+                                    &mut self.inactive_kitty_stack,
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -627,6 +641,7 @@ impl TerminalActor {
         self.term.reset();
         self.scanner.reset();
         self.modes = Modes::default();
+        self.inactive_kitty_stack.clear();
         self.shared.borrow_mut().titles.clear();
         self.shared.borrow_mut().bells = 0;
         // RIS restores libghostty's defaults, which include no image storage

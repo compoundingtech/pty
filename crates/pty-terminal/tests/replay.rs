@@ -190,6 +190,21 @@ fn kitty_stack_and_mouse_modes_in_the_prefix() {
     assert!(!d.serialize(SerializeOpts::ATTACH).contains("\x1b[?1003h"));
 }
 
+#[test]
+fn kitty_pushes_on_alternate_screen_do_not_survive_return_to_normal_screen() {
+    let mut child = actor();
+    child.write(b"\x1b[>1u\x1b[?1049h\x1b[>3uALT\x1b[?1049lNORMAL");
+    assert_eq!(child.kitty_flags(), 1);
+    assert_eq!(child.modes().kitty_stack, vec![1]);
+
+    let mut late = actor();
+    late.write(child.serialize(SerializeOpts::ATTACH).as_bytes());
+    child.write(b"\x1b[<u");
+    late.write(b"\x1b[<u");
+    assert!(child.modes().kitty_stack.is_empty());
+    assert_eq!(late.kitty_flags(), child.kitty_flags());
+}
+
 // ── plain-text semantics (src/server.ts:1269-1293) ──
 
 #[test]
