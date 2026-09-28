@@ -110,3 +110,24 @@ fn split_query_is_answered_once() {
         b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c"
     );
 }
+
+#[test]
+fn attached_terminal_answers_its_own_color_queries() {
+    let mut a = actor();
+    a.set_host_color_query_available(true);
+    let query = b"\x1b]11;?\x1b\\";
+    assert_eq!(a.write(query), query);
+    assert!(a.take_pty_replies().is_empty());
+
+    a.set_host_color_query_available(false);
+    assert!(a.write(query).is_empty());
+    assert_eq!(a.take_pty_replies(), b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+}
+
+#[test]
+fn headless_color_query_reports_the_childs_current_background() {
+    let mut a = actor();
+    a.write(b"\x1b]11;rgb:ff/00/00\x07");
+    assert!(a.write(b"\x1b]11;?\x1b\\").is_empty());
+    assert_eq!(a.take_pty_replies(), b"\x1b]11;rgb:ffff/0000/0000\x1b\\");
+}

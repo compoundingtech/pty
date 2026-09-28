@@ -196,6 +196,8 @@ pub struct TerminalActor {
     term: Terminal<'static, 'static>,
     shared: Rc<RefCell<Shared>>,
     scanner: OutputScanner,
+    /// Whether a writable attached terminal can answer color queries.
+    host_color_query_available: bool,
     modes: Modes,
     events: Vec<TerminalEvent>,
     last_title: Option<String>,
@@ -260,6 +262,7 @@ impl TerminalActor {
             term,
             shared,
             scanner: OutputScanner::new(),
+            host_color_query_available: false,
             modes: Modes::default(),
             events: Vec::new(),
             last_title: None,
@@ -479,6 +482,12 @@ impl TerminalActor {
         &self.term
     }
 
+    /// Route color queries to an attached terminal when one is available.
+    /// Otherwise the actor answers them from its headless defaults.
+    pub fn set_host_color_query_available(&mut self, available: bool) {
+        self.host_color_query_available = available;
+    }
+
     /// Feed the child's output. Returns the bytes to broadcast to attached
     /// clients: the input minus terminal queries (which are answered into
     /// [`TerminalActor::take_pty_replies`] instead). Mode flags, the kitty
@@ -529,7 +538,9 @@ impl TerminalActor {
                         // reaches the terminal (and may itself be answered)
                         // before this reply is queued.
                         self.flush_feed(&mut feed);
-                        if let Some(reply) = queries::color_query_reply(id, index) {
+                        if self.host_color_query_available {
+                            broadcast.extend_from_slice(&o.raw);
+                        } else if let Some(reply) = queries::current_color_query_reply(&self.term, id, index) {
                             self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
                         }
                         continue;

@@ -86,6 +86,34 @@ pub fn color_query_reply(id: u32, index: Option<u32>) -> Option<Vec<u8>> {
     }
 }
 
+/// Headless fallback using colors the child has already set in this terminal.
+/// Untouched palette entries retain the existing all-black query response.
+pub fn current_color_query_reply(term: &Terminal<'_, '_>, id: u32, index: Option<u32>) -> Option<Vec<u8>> {
+    let current = match (id, index) {
+        (10, _) => term.fg_color().ok().flatten(),
+        (11, _) => term.bg_color().ok().flatten(),
+        (4, Some(i)) if i < 256 => {
+            let current = term.color_palette().ok()?.0[i as usize];
+            let default = term.default_color_palette().ok()?.0[i as usize];
+            (current != default).then_some(current)
+        }
+        _ => None,
+    };
+    if let Some(color) = current {
+        let rgb = format!(
+            "rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
+            color.r, color.r, color.g, color.g, color.b, color.b
+        );
+        let payload = if id == 4 {
+            format!("4;{};{rgb}", index?)
+        } else {
+            format!("{id};{rgb}")
+        };
+        return Some(format!("\x1b]{payload}\x1b\\").into_bytes());
+    }
+    color_query_reply(id, index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
