@@ -153,6 +153,18 @@ impl Osc {
         (id, data)
     }
 
+    /// OSC 52 clipboard read (`selection;?`). Only a short, valid selection
+    /// is echoed in the fallback reply when no terminal can answer it.
+    pub fn clipboard_read_selection(&self) -> Option<&[u8]> {
+        let (id, data) = self.split();
+        let selection = data.strip_suffix(b";?")?;
+        (id == Some(52)
+            && !selection.is_empty()
+            && selection.len() <= 16
+            && selection.iter().all(u8::is_ascii_alphanumeric))
+        .then_some(selection)
+    }
+
     /// The colour query this OSC is, if any: `Some((10, None))` for
     /// `OSC 10 ; ?`, `Some((11, None))` for `OSC 11 ; ?`, and
     /// `Some((4, index))` for `OSC 4 ; index ; ?` (Node: `src/server.ts:459-490`

@@ -775,6 +775,7 @@ impl Daemon {
     /// node: src/server.ts:559-569
     fn on_pty_data(&mut self, bytes: &[u8]) {
         self.stamp_output_activity();
+        self.actor.set_clipboard_client_available(!self.clients.is_empty());
         let cleaned = self.actor.write(bytes);
         let replies = self.actor.take_pty_replies();
         self.write_pty(&replies);
