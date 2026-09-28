@@ -91,6 +91,30 @@ fn root_flag_pins_the_registry() {
     }
 }
 
+#[test]
+fn root_flag_after_command_separator_is_passed_to_the_child() {
+    let rig = Rig::new();
+    let result = rig.scratch.join("child-argv.txt");
+    let other_root = rig.scratch.join("other-root");
+    let script = format!(
+        "printf '<%s>' \"$@\" > '{}'; exec sleep 30",
+        result.display()
+    );
+    let other_root = other_root.to_str().unwrap();
+    let out = rig.run(&[
+        "run", "-d", "--id", "argv-root", "--", "/bin/sh", "-c", &script,
+        "sh", "--root", other_root,
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    cli_common::wait_until("child arguments", || result.exists());
+    assert_eq!(
+        std::fs::read_to_string(&result).unwrap(),
+        format!("<--root><{other_root}>")
+    );
+    assert!(rig.path("argv-root.json").exists());
+    assert!(!rig.scratch.join("other-root").exists());
+}
+
 /// node: tests/gc-flap-clear-badge-root-len.test.ts:163-230
 #[test]
 fn root_length_backstop() {
