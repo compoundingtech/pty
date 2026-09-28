@@ -288,17 +288,21 @@ fn inspect_linux(
         let Some(rows) = parse_linux_tcp_table(&table) else {
             return unavailable(format!("socket-table-invalid:{pid}"));
         };
-        let mut inodes: HashSet<String> = rows
-            .into_iter()
-            .filter(|row| {
-                row.state == "01"
-                    && row.local_address == expected_local
-                    && row.local_port == local_port
-                    && row.remote_address == expected_remote
-                    && row.remote_port == remote_port
-            })
-            .map(|row| row.inode)
-            .collect();
+        let mut inodes = HashSet::new();
+        let mut collect_matches = |rows: Vec<LinuxTcpRow>, local: &str, remote: &str| {
+            inodes.extend(
+                rows.into_iter()
+                    .filter(|row| {
+                        row.state == "01"
+                            && row.local_address == local
+                            && row.local_port == local_port
+                            && row.remote_address == remote
+                            && row.remote_port == remote_port
+                    })
+                    .map(|row| row.inode),
+            );
+        };
+        collect_matches(rows, &expected_local, &expected_remote);
         if let Some((mapped_local, mapped_remote)) = &mapped {
             // IPv4 peers of a dual-stack listener appear only in tcp6.
             // An absent tcp6 table is normal on IPv6-disabled kernels.
@@ -306,13 +310,7 @@ fn inspect_linux(
                 let Some(rows) = parse_linux_tcp_table(&table) else {
                     return unavailable(format!("socket-table-invalid:{pid}"));
                 };
-                inodes.extend(rows.into_iter().filter(|row| {
-                    row.state == "01"
-                        && row.local_address == *mapped_local
-                        && row.local_port == local_port
-                        && row.remote_address == *mapped_remote
-                        && row.remote_port == remote_port
-                }).map(|row| row.inode));
+                collect_matches(rows, mapped_local, mapped_remote);
             }
         }
         if inodes.is_empty() {
