@@ -10,6 +10,18 @@ fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
 }
 
+#[test]
+fn replay_restores_dynamic_colors_and_palette_entries() {
+    let mut child = actor();
+    child.write(b"\x1b]11;rgb:ff/00/00\x07\x1b]10;rgb:00/ff/00\x07\x1b]12;rgb:00/00/ff\x07\x1b]4;1;rgb:12/34/56\x07color");
+    let mut late = actor();
+    late.write(child.serialize(SerializeOpts::ATTACH).as_bytes());
+    assert_eq!(late.terminal().bg_color().unwrap(), child.terminal().bg_color().unwrap());
+    assert_eq!(late.terminal().fg_color().unwrap(), child.terminal().fg_color().unwrap());
+    assert_eq!(late.terminal().cursor_color().unwrap(), child.terminal().cursor_color().unwrap());
+    assert_eq!(late.terminal().color_palette().unwrap().0[1], child.terminal().color_palette().unwrap().0[1]);
+}
+
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
 
 /// node: tests/screen-replay-altscreen.test.ts:62-83
