@@ -524,13 +524,15 @@ impl TerminalActor {
                     }
                 }
                 Token::Osc(o) => {
-                    if let Some((id, index)) = o.color_query() {
+                    if let Some(queries) = o.color_query() {
                         // Answer in stream order: everything before the query
                         // reaches the terminal (and may itself be answered)
                         // before this reply is queued.
                         self.flush_feed(&mut feed);
-                        if let Some(reply) = queries::color_query_reply(id, index) {
-                            self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                        for (id, index) in queries {
+                            if let Some(reply) = queries::color_query_reply(id, index) {
+                                self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                            }
                         }
                         continue;
                     }

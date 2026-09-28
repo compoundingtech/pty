@@ -10,6 +10,16 @@ fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
 }
 
+#[test]
+fn every_palette_slot_in_one_query_gets_a_reply() {
+    let mut a = actor();
+    a.write(b"\x1b]4;1;?;2;?\x07");
+    assert_eq!(
+        a.take_pty_replies(),
+        b"\x1b]4;1;rgb:0000/0000/0000\x1b\\\x1b]4;2;rgb:0000/0000/0000\x1b\\"
+    );
+}
+
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
 
 /// node: tests/screen-replay-altscreen.test.ts:62-83
