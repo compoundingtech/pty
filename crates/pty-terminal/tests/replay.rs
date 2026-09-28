@@ -10,6 +10,20 @@ fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
 }
 
+#[test]
+fn replay_restores_the_childs_cursor_shape_and_color() {
+    let mut a = actor();
+    a.write(b"\x1b[6 q\x1b]12;#ff5f5f\x1b\\text");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(replay.contains("\x1b[6 q"), "{replay:?}");
+    assert!(replay.contains("\x1b]12;#ff5f5f\x1b\\"), "{replay:?}");
+
+    a.write(b"\x1b[0 q\x1b]112\x1b\\");
+    let reset = a.serialize(SerializeOpts::ATTACH);
+    assert!(!reset.contains("\x1b[6 q"), "{reset:?}");
+    assert!(!reset.contains("\x1b]12;#ff5f5f\x1b\\"), "{reset:?}");
+}
+
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
 
 /// node: tests/screen-replay-altscreen.test.ts:62-83

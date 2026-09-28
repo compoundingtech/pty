@@ -220,6 +220,9 @@ pub struct TerminalActor {
     /// back to when that program exits. Node gets it for free because
     /// xterm's serialize addon holds both buffers.
     normal_replay: Option<String>,
+    /// Most recent child cursor settings, which the cell formatter omits.
+    cursor_shape_replay: Option<Vec<u8>>,
+    cursor_color_replay: Option<Vec<u8>>,
 }
 
 impl TerminalActor {
@@ -268,6 +271,8 @@ impl TerminalActor {
             cell: CellSize::default(),
             graphics: None,
             normal_replay: None,
+            cursor_shape_replay: None,
+            cursor_color_replay: None,
         }
     }
 
@@ -474,6 +479,15 @@ impl TerminalActor {
         self.normal_replay.as_deref()
     }
 
+    /// Cursor settings to apply after the cell replay.
+    pub fn cursor_replay(&self) -> String {
+        self.cursor_shape_replay
+            .iter()
+            .chain(self.cursor_color_replay.iter())
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect()
+    }
+
     /// The underlying terminal, for reads this API does not cover.
     pub fn terminal(&self) -> &Terminal<'static, 'static> {
         &self.term
@@ -494,6 +508,13 @@ impl TerminalActor {
                     broadcast.extend_from_slice(&b);
                 }
                 Token::Csi(c) => {
+                    if c.final_byte == b'q'
+                        && c.prefix.is_none()
+                        && c.intermediates == [b' ']
+                        && c.params.first().copied().unwrap_or(0) <= 6
+                    {
+                        self.cursor_shape_replay = Some(c.raw.clone());
+                    }
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);
                     } else if c.is_kitty_pop() {
@@ -524,6 +545,10 @@ impl TerminalActor {
                     }
                 }
                 Token::Osc(o) => {
+                    let (osc_id, osc_data) = o.split();
+                    if osc_id == Some(112) || (osc_id == Some(12) && osc_data != b"?") {
+                        self.cursor_color_replay = Some(o.raw.clone());
+                    }
                     if let Some((id, index)) = o.color_query() {
                         // Answer in stream order: everything before the query
                         // reaches the terminal (and may itself be answered)
@@ -627,6 +652,8 @@ impl TerminalActor {
         self.term.reset();
         self.scanner.reset();
         self.modes = Modes::default();
+        self.cursor_shape_replay = None;
+        self.cursor_color_replay = None;
         self.shared.borrow_mut().titles.clear();
         self.shared.borrow_mut().bells = 0;
         // RIS restores libghostty's defaults, which include no image storage
