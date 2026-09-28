@@ -576,8 +576,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     let Ok(mut wstream) = stream.try_clone() else {
         return;
     };
-    let _ = tx.send(Msg::Connect { id, tx: out_tx });
-    std::thread::spawn(move || {
+    let writer = std::thread::Builder::new().spawn(move || {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(bytes) => {
@@ -593,7 +592,13 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         }
         let _ = wstream.shutdown(std::net::Shutdown::Both);
     });
-    std::thread::spawn(move || {
+    if let Err(e) = writer {
+        daemon_warn!("pty daemon: cannot start client writer thread: {e}");
+        return;
+    }
+    let _ = tx.send(Msg::Connect { id, tx: out_tx });
+    let reader_tx = tx.clone();
+    let reader = std::thread::Builder::new().spawn(move || {
         let mut stream = stream;
         let mut parser = PacketReader::new();
         let mut buf = [0u8; 16384];
@@ -603,7 +608,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
                 Ok(n) => match parser.feed(&buf[..n]) {
                     Ok(packets) => {
                         for packet in packets {
-                            if tx.send(Msg::Packet { id, packet }).is_err() {
+                            if reader_tx.send(Msg::Packet { id, packet }).is_err() {
                                 return;
                             }
                         }
@@ -620,8 +625,12 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
                 Err(_) => break,
             }
         }
-        let _ = tx.send(Msg::Closed { id });
+        let _ = reader_tx.send(Msg::Closed { id });
     });
+    if let Err(e) = reader {
+        daemon_warn!("pty daemon: cannot start client reader thread: {e}");
+        let _ = tx.send(Msg::Closed { id });
+    }
 }
 
 /// SIGTERM and SIGINT are external kills.
