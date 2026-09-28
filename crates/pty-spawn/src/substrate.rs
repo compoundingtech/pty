@@ -1902,6 +1902,47 @@ mod tests {
         );
     }
 
+    /// A stopped child has not exited. On macOS `waitid` reports the stop to
+    /// a `WEXITED | WNOWAIT` wait; a reaper that took it for the exit blocked
+    /// in `waitpid` under the signal lock, and the SIGKILL below could never
+    /// be sent. That is how a startup deadline, which freezes the child with
+    /// SIGSTOP, hung the daemon on a Mac.
+    #[test]
+    // The child is reaped by `collect_fenced` on the reaper thread.
+    #[allow(clippy::zombie_processes)]
+    fn a_stopped_child_does_not_hold_the_signal_lock() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let signals = Arc::new(ChildSignals::new(Some(pid)));
+        let reaper_signals = Arc::clone(&signals);
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            wait_until_exited(pid);
+            let _ = reaped_tx.send(collect_fenced(pid, &reaper_signals));
+        });
+        signals.signal(libc::SIGSTOP).unwrap();
+        // Long enough for the reaper to see the stop, as it did on macOS.
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            reaped_rx.try_recv().is_err(),
+            "the reaper reported a stopped child as reaped"
+        );
+        let killer_signals = Arc::clone(&signals);
+        let (sent_tx, sent_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent_tx.send(killer_signals.signal(libc::SIGKILL));
+        });
+        assert!(
+            sent_rx.recv_timeout(T).is_ok_and(|sent| sent.is_ok()),
+            "SIGKILL could not take the signal lock: the reaper is holding it"
+        );
+        let status = reaped_rx.recv_timeout(T).expect("the killed child was reaped");
+        assert_eq!(status.and_then(|status| status.signal), Some(libc::SIGKILL));
+    }
+
     /// Until the child is reaped, signals reach it and its process group.
     #[test]
     // The child is reaped by `collect_fenced`, which is what this tests.
