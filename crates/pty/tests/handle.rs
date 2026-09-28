@@ -252,8 +252,9 @@ fn attach_identity_reconnect_reaches_the_replacement() {
     assert!(h.attempt() > first_attempt);
     assert!(!h.exited(), "the old EXIT does not belong to the new attempt");
     assert!(h.wait_ready(Duration::from_secs(5)), "replacement SCREEN");
-    let text = h.plain(Range::Full);
-    assert!(text.contains("second"), "{text:?}");
+    // The replacement's SCREEN can arrive before its child has printed, so
+    // wait for the output rather than reading the screen once.
+    let text = wait_text(&h, "second");
     assert!(!text.contains("first"), "old screen must be gone: {text:?}");
     h.kill();
     rig.kill("a");

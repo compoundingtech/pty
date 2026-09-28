@@ -506,6 +506,22 @@ impl Rig {
         cmd
     }
 
+    /// Wait until `pty peek --plain <id>` shows `needle`.
+    ///
+    /// **A session's first output is not there the moment its daemon is.**
+    /// The child prints it after the daemon is up, so a test that attaches
+    /// and expects that output in the initial SCREEN has to wait for it
+    /// first. Sleeping a fixed time before attaching is a guess about
+    /// scheduling, and it lost on a loaded Mac on 2026-09-28. A peek is
+    /// read-only, so waiting this way leaves nothing behind for the attach
+    /// under test.
+    pub fn wait_for_screen(&self, id: &str, needle: &str) {
+        wait_until(&format!("{id}'s screen to show {needle:?}"), || {
+            let out = self.pty(&["peek", "--plain", id]);
+            out.status == 0 && out.stdout().contains(needle)
+        });
+    }
+
     /// Run the binary under test with the rig's base environment.
     pub fn pty(&self, args: &[&str]) -> Out {
         self.run(self.command(args), None)
