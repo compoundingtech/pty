@@ -191,7 +191,8 @@ fn attach_replays_screen_streams_data_and_detaches() {
     let h = TerminalHandle::attach(rig.session("a"), AttachOptions::default()).expect("attach");
     assert!(h.wait_ready(Duration::from_secs(5)), "first SCREEN");
     assert!(h.is_ready());
-    let text = h.plain(Range::Full);
+    // The first SCREEN can come before the child has printed.
+    let text = wait_text(&h, "first");
     assert!(text.contains("first"), "{text:?}");
     h.write(b"typed\r");
     wait_text(&h, "typed");
@@ -233,7 +234,7 @@ fn attach_identity_reconnect_reaches_the_replacement() {
     rig.run("a", "printf 'first\\n'; exec sleep 60");
     let h = TerminalHandle::attach(rig.session("a"), AttachOptions::default()).expect("attach");
     assert!(h.wait_ready(Duration::from_secs(5)));
-    assert!(h.plain(Range::Full).contains("first"));
+    wait_text(&h, "first");
     let first_attempt = h.attempt();
 
     // The first daemon goes away. On an external kill the daemon destroys
@@ -299,7 +300,7 @@ fn a_late_attach_gets_the_image_the_child_drew_before_it_connected() {
     )
     .expect("attach");
     assert!(h.wait_ready(Duration::from_secs(5)), "first SCREEN");
-    assert!(h.plain(Range::Full).contains("drawn"));
+    wait_text(&h, "drawn");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let state = loop {
