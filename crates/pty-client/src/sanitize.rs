@@ -19,6 +19,10 @@ pub const TERMINAL_SANITIZE: &str = concat!(
     "\x1b[4l",     // reset insert mode (IRM) to replace
     "\x1b[r",      // reset scroll region (DECSTBM)
     "\x1b[0m",     // reset SGR attributes
+    "\x1b]104\x1b\\", // restore the host's default palette
+    "\x1b]110\x1b\\", // restore default foreground
+    "\x1b]111\x1b\\", // restore default background
+    "\x1b]112\x1b\\", // restore default cursor colour
     "\x1b[0 q",    // reset cursor style
     "\x1b>",       // reset application keypad mode (DECKPNM)
     "\x1b(B",      // reset G0 charset to ASCII
