@@ -28,6 +28,20 @@ pub const ISOLATED_ENV_ALLOWLIST: &[&str] = &[
 /// The `TERM` a child gets when none was inherited.
 pub const DEFAULT_CHILD_TERM: &str = "xterm-256color";
 
+/// Values that identify the terminal which launched the daemon. A session
+/// may later be attached from another terminal, so inherited copies become
+/// stale. Explicit `env` and `extraEnv` remain under the caller's control.
+const HOST_TERMINAL_IDENTITY: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "ITERM_SESSION_ID",
+    "TERM_SESSION_ID",
+    "WT_SESSION",
+    "Q_TERM",
+    "IRIS_FD",
+];
+
 /// The text Node throws when `env` is combined with the inherited-policy
 /// options.
 ///
@@ -73,6 +87,9 @@ pub fn build_child_env_from(
             .collect()
     };
     if cfg.env.is_none() {
+        for key in HOST_TERMINAL_IDENTITY {
+            env.remove(*key);
+        }
         for key in cfg.unset_env() {
             env.remove(key);
         }
@@ -193,6 +210,33 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn inherited_terminal_identity_does_not_follow_a_detached_session() {
+        let source = src(&[
+            ("HOME", "/h"),
+            ("TERM_PROGRAM", "old-terminal"),
+            ("TERM_PROGRAM_VERSION", "1.0"),
+            ("LC_TERMINAL", "old-terminal"),
+            ("ITERM_SESSION_ID", "old-session"),
+            ("TERM_SESSION_ID", "old-session"),
+            ("WT_SESSION", "old-session"),
+            ("Q_TERM", "old-terminal"),
+            ("IRIS_FD", "13"),
+        ]);
+        for isolated in [false, true] {
+            let mut config = cfg();
+            config.isolate_env = Some(isolated);
+            let env = build_child_env_from(&config, "g", &source).unwrap();
+            assert_eq!(env.get("HOME").map(String::as_str), Some("/h"));
+            for key in [
+                "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL",
+                "ITERM_SESSION_ID", "TERM_SESSION_ID", "WT_SESSION", "Q_TERM", "IRIS_FD",
+            ] {
+                assert!(!env.contains_key(key), "{key} leaked with isolate_env={isolated}");
+            }
+        }
     }
 
     /// node: tests/restart-launch-parity.test.ts:106-189
