@@ -99,12 +99,15 @@ impl Rig {
         let mut c = self.cmd(args);
         c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = c.spawn().expect("spawn pty");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        // A command that rejects its arguments exits without reading stdin,
+        // and a write that loses that race gets EPIPE. The test checks the
+        // command's status and output, so a closed stdin is not a failure;
+        // any other write error still is.
+        match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("writing the command's stdin: {e}"),
+        }
         finish(child.wait_with_output().unwrap())
     }
 
