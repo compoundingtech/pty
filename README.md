@@ -210,9 +210,11 @@ pty kill API && pty rm API
 pty help                                     # every command; pty <cmd> --help for one
 ```
 
-Sessions live under `$PTY_ROOT` (default `~/.local/state/pty`): one unix socket,
-pid file, and metadata file per session. Set `PTY_ROOT` to isolate a registry,
-for example in tests.
+Sessions live under `$PTY_ROOT` (default `~/.local/state/pty/<hostname>`): one
+unix socket, pid file, and metadata file per session. The hostname keeps
+registries apart on machines that share a home directory. Set `PTY_ROOT` to
+isolate a registry, for example in tests. Set it to the former default path if
+you need access to sessions created there.
 
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.
