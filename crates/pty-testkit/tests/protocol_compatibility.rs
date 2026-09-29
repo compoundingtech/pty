@@ -84,3 +84,35 @@ fn a_batched_newer_daemon_response_identifies_the_outdated_client() {
     let error = replies.into_iter().next().unwrap().1.unwrap_err().to_string();
     assert!(error.contains("client is outdated"), "{error}");
 }
+
+#[test]
+fn batch_keeps_valid_status_after_unknown_frame_without_masking_other_errors() {
+    const STATUS: &[u8] = br#"{"name":"compatible","terminal":{"cols":80,"rows":24,"cursorX":0,"cursorY":0,"scrollbackUsed":0,"scrollbackCapacity":0},"process":{"alive":true,"exitCode":null,"pid":123,"resources":null},"daemon":{"pid":456,"resources":null},"clients":{"total":0,"attached":0,"readOnly":0},"modes":{"sgrMouse":false,"cursorHidden":false,"kittyKeyboard":false,"kittyKeyboardFlags":[]},"uptimeSeconds":0,"createdAt":null}"#;
+    let root = std::env::temp_dir().join(format!("pi-{}", pty_testkit::server::random_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let compatible = UnixListener::bind(root.join("compatible.sock")).unwrap();
+    let outdated = UnixListener::bind(root.join("outdated.sock")).unwrap();
+    let good = std::thread::spawn(move || {
+        let (mut socket, _) = compatible.accept().unwrap();
+        let mut request = [0; 5];
+        socket.read_exact(&mut request).unwrap();
+        socket.write_all(&encode_packet(MessageType::Unknown(255), b"optional")).unwrap();
+        socket.write_all(&encode_packet(MessageType::Status, STATUS)).unwrap();
+    });
+    let bad = std::thread::spawn(move || {
+        let (mut socket, _) = outdated.accept().unwrap();
+        let mut request = [0; 5];
+        socket.read_exact(&mut request).unwrap();
+        socket.write_all(&encode_packet(MessageType::Unknown(255), b"newer protocol")).unwrap();
+    });
+    let replies = pty_client::query_stats_batch_in(
+        &root,
+        &["compatible".to_string(), "outdated".to_string()],
+        Duration::from_millis(500),
+    );
+    good.join().unwrap();
+    bad.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(replies[0].1.as_ref().unwrap().name, "compatible");
+    assert!(replies[1].1.as_ref().unwrap_err().to_string().contains("client is outdated"));
+}
