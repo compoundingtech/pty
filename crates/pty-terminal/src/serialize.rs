@@ -114,6 +114,12 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
             // wherever its own trailing CUP put it and the alternate body
             // that follows is written from wherever the cursor is.
             out.push_str("\x1b[?1049l");
+            // The prefix restored the active alternate stack. Rebuild the
+            // saved normal stack while the normal screen is active, so a
+            // later pop after leaving the alternate screen has its history.
+            for flags in actor.inactive_kitty_stack() {
+                out.push_str(&format!("\x1b[>{flags}u"));
+            }
             out.push_str(normal);
             out.push_str("\x1b[?1049h\x1b[H");
         } else {
@@ -121,6 +127,7 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
         }
     }
     out.push_str(&vt(actor.terminal(), opts.scrollback, actor.cell_size()));
+    out.push_str(&actor.cursor_replay());
     out
 }
 
@@ -345,6 +352,13 @@ fn plain_opts<'t, 's>() -> FormatterOptions<'t, 's> {
         .with_trim(false)
 }
 
+fn plain_unwrapped_opts<'t, 's>() -> FormatterOptions<'t, 's> {
+    FormatterOptions::new()
+        .with_format(Format::Plain)
+        .with_unwrap(true)
+        .with_trim(false)
+}
+
 /// The VT serialization: cells with styles, then cursor position, modes that
 /// differ from their defaults, the kitty keyboard flags, and the kitty
 /// graphics storage. With `scrollback` the history rows come first; without
@@ -406,7 +420,7 @@ pub fn plain_lines_full(term: &Terminal) -> Vec<String> {
 /// The viewport rows as trimmed lines, trailing empty rows dropped. What
 /// [`plain_viewport`] joins.
 pub fn plain_lines_viewport(term: &Terminal) -> Vec<String> {
-    plain_lines(format_active(term, plain_opts()))
+    plain_lines(format_active(term, plain_unwrapped_opts()))
 }
 
 /// Node's `getPlainScreen()`: rows `baseY..length`.
@@ -416,7 +430,7 @@ pub fn plain_viewport(term: &Terminal) -> String {
 
 /// Node's `getFullPlainScreen()`: every row.
 pub fn plain_full(term: &Terminal) -> String {
-    plain_lines_full(term).join("\n")
+    plain_lines(format(term, plain_unwrapped_opts())).join("\n")
 }
 
 #[cfg(test)]
