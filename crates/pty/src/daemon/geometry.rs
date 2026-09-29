@@ -26,6 +26,12 @@ impl Daemon {
         if rows == 0 || cols == 0 {
             return false;
         }
+        // A corrupted or hostile client can request the full u16 range.
+        // Resizing the terminal actor to that grid blocks this daemon's
+        // serving thread, including STATUS for every other client.
+        if rows > 4096 || cols > 4096 || u32::from(rows) * u32::from(cols) > 250_000 {
+            return false;
+        }
         if rows == self.actor.rows() && cols == self.actor.cols() {
             return false;
         }

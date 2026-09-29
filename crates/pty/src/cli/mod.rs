@@ -349,6 +349,20 @@ pub fn spawn_daemon(p: &SpawnParams) -> Result<(), String> {
     params.command = pty_core::spawn::resolve_command(&p.command)?;
     let executable =
         std::env::current_exe().map_err(|e| format!("cannot find own executable: {e}"))?;
+    // A long-lived picker can outlive an atomic package upgrade. On Linux
+    // `/proc/self/exe` then names the old, unlinked inode with ` (deleted)`
+    // appended. Start new daemons from the replacement at its install path.
+    let executable = if executable.exists() {
+        executable
+    } else {
+        let path = executable.to_string_lossy();
+        let replacement = path
+            .strip_suffix(" (deleted)")
+            .map(std::path::PathBuf::from)
+            .filter(|candidate| candidate.is_file())
+            .ok_or_else(|| format!("cannot find a replacement for own executable: {path}"))?;
+        replacement
+    };
     pty_lifecycle::spawn_daemon(&executable, params)
         .map(|_| ())
         .map_err(|e| e.to_string())
