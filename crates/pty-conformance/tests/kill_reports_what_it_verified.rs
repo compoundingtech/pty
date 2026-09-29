@@ -66,8 +66,8 @@ fn killed_means_the_descendants_are_gone_too() {
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "killed");
 
-    assert!(!pid_alive(daemon_pid), "daemon {daemon_pid} outlived kill");
-    let alive: Vec<i32> = tree.into_iter().filter(|&p| pid_alive(p)).collect();
+    assert!(process_exited(daemon_pid), "daemon {daemon_pid} outlived kill");
+    let alive: Vec<i32> = tree.into_iter().filter(|&p| !process_exited(p)).collect();
     assert!(
         alive.is_empty(),
         "kill said \"killed\" while these processes were still running: {alive:?}"
@@ -86,7 +86,7 @@ fn a_verified_kill_exits_zero_and_an_unverified_one_does_not() {
     let stdout = out.stdout();
 
     // This session is ordinary, so the tree should be empty and the status 0.
-    let tree_empty = descendants(daemon_pid).into_iter().all(|p| !pid_alive(p));
+    let tree_empty = descendants(daemon_pid).into_iter().all(process_exited);
     assert!(tree_empty, "precondition: the tree should be gone");
     expect_status(&out, 0);
     assert!(

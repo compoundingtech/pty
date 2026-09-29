@@ -142,8 +142,20 @@ fn attach_at_a_different_size_nudges_a_redraw() {
     cfg["rows"] = json!(40);
     cfg["cols"] = json!(120);
     let d = Daemon::start(&root, cfg);
+    // The reporter prints READY only after its WINCH trap is installed. A
+    // resize that lands before the trap is ignored by bash's default action,
+    // so wait for READY, through read-only peeks that never resize, rather
+    // than for a fixed 100 ms: that guess lost 4 runs in 300 on a loaded Mac
+    // once `Daemon::start` began returning at publication.
+    assert!(
+        wait_until(T, || {
+            let mut peek = d.connect();
+            peek.peek();
+            peek.wait_type(Screen, T) && peek.screen().is_some_and(|s| s.contains("READY"))
+        }),
+        "the reporter never printed READY"
+    );
     let mut c = d.connect();
-    c.wait_for(Duration::from_millis(100), |_| false);
     c.attach(24, 80);
     assert!(c.wait_type(Screen, T));
     assert!(
