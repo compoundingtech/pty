@@ -3,12 +3,20 @@
 //! another, same picture).
 
 use pty_terminal::{
-    ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
+    CellSize, ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
 use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
+}
+
+#[test]
+fn pixel_queries_use_a_declared_cell_size() {
+    let mut a = actor();
+    a.set_cell_size(CellSize { width: 10, height: 21 });
+    a.write(b"\x1b[16t\x1b[14t");
+    assert_eq!(a.take_pty_replies(), b"\x1b[6;21;10t\x1b[4;504;800t");
 }
 
 #[test]
@@ -248,6 +256,22 @@ fn reset_clears_screen_modes_and_partial_sequences() {
     let data = a.write(b"c");
     assert_eq!(data, b"c", "the pending ESC [ is forgotten");
     assert_eq!(a.take_pty_replies(), b"");
+}
+
+#[test]
+fn child_ris_clears_the_modes_replayed_to_late_clients() {
+    let mut a = actor();
+    a.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[>1uFULL");
+    assert!(a.modes().alt_screen);
+    assert!(a.normal_replay().is_some());
+    a.write(b"\x1b");
+    a.write(b"cafter-reset");
+    assert_eq!(a.modes(), Modes::default());
+    assert!(a.normal_replay().is_none());
+    assert_eq!(a.plain(Range::Full), "after-reset");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(!replay.contains("\x1b[?1000h"), "{replay:?}");
+    assert!(!replay.contains("\x1b[>1u"), "{replay:?}");
 }
 
 // ── events (src/server.ts:409-454) ──

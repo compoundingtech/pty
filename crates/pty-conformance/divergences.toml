@@ -80,3 +80,16 @@ behind both 51 newer unrelated events and more than 50 newer matching events. \
 Remove this entry when Node supports the same exact all-retained-match and \
 empty-success semantics, or if Rust removes it.
 """
+
+[[divergence]]
+test = "process_tree::kill_gives_a_foreground_job_time_to_handle_hangup"
+side = "node"
+kind = "node-defect"
+reason = """
+The foreground job traps HUP and TERM and records which signal reaches it. \
+Against the pinned Node binary on Node 22 in CI, `pty kill` delivered TERM \
+before the one-second hangup grace elapsed. Rust delivered HUP first or \
+waited through the grace period before TERM. The foreground job should get \
+a chance to handle terminal hangup before the stronger termination signal. \
+Remove this entry if Node adopts the same grace period.
+"""

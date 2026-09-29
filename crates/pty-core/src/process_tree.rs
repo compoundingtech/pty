@@ -543,6 +543,18 @@ pub const TERM_WAIT: Duration = Duration::from_millis(1_500);
 /// Default KILL grace (`killWaitMs`).
 pub const KILL_WAIT: Duration = Duration::from_millis(500);
 
+/// After a terminal hangup, give descendants time to handle SIGHUP before
+/// escalating to TERM and KILL. The wait ends as soon as they all exit.
+pub fn terminate_process_identities_after_hangup(
+    ids: &[ProcessIdentity],
+    hup_wait: Duration,
+    term_wait: Duration,
+    kill_wait: Duration,
+) -> Vec<ProcessIdentity> {
+    let survivors = wait_for_identities_to_exit(ids, hup_wait);
+    terminate_process_identities(&survivors, term_wait, kill_wait)
+}
+
 /// TERM, wait ≤ `term_wait`; KILL the survivors, wait ≤ `kill_wait`; return
 /// whatever is still alive.
 ///
