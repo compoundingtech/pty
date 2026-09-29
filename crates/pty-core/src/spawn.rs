@@ -3,6 +3,7 @@
 //! node: src/spawn.ts:372-393
 
 use std::path::{Path, PathBuf};
+use std::io::Read;
 
 /// Node's `resolveCommand`: an absolute path must exist; a path with a `/`
 /// is resolved against the current directory and must exist; a bare name is
@@ -15,6 +16,7 @@ pub fn resolve_command(cmd: &str) -> Result<String, String> {
     let path = Path::new(cmd);
     if path.is_absolute() {
         return if path.exists() {
+            check_executable(path, cmd)?;
             Ok(cmd.to_string())
         } else {
             Err(not_found())
@@ -25,12 +27,46 @@ pub fn resolve_command(cmd: &str) -> Result<String, String> {
             .map(|cwd| normalize(&cwd.join(path)))
             .map_err(|_| not_found())?;
         return if resolved.exists() {
+            check_executable(&resolved, cmd)?;
             Ok(resolved.to_string_lossy().into_owned())
         } else {
             Err(not_found())
         };
     }
-    which(cmd).ok_or_else(not_found)
+    let found = which(cmd).ok_or_else(not_found)?;
+    check_executable(Path::new(&found), cmd)?;
+    Ok(found)
+}
+
+fn check_executable(path: &Path, requested: &str) -> Result<(), String> {
+    if !is_executable_file(path) {
+        return Err(format!("Command is not executable: {requested}"));
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        // An executable binary need not be readable. The spawn path will
+        // report any real execution failure after this optional shebang check.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(error) => return Err(format!("Cannot read command {requested}: {error}")),
+    };
+    let mut head = [0u8; 512];
+    let size = file
+        .read(&mut head)
+        .map_err(|error| format!("Cannot read command {requested}: {error}"))?;
+    if head[..size].starts_with(b"#!") {
+        let line = head[2..size].split(|byte| *byte == b'\n').next().unwrap_or_default();
+        let interpreter = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .find(|part| !part.is_empty())
+            .unwrap_or_default();
+        let interpreter = std::str::from_utf8(interpreter).unwrap_or_default();
+        if !is_executable_file(Path::new(interpreter)) {
+            return Err(format!(
+                "Command interpreter not found or not executable: {requested} ({interpreter})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `path.resolve`: collapse `.` and `..` lexically (no symlink resolution).
@@ -87,6 +123,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn execute_only_binary_can_be_resolved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target-exec-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("true");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let resolved = resolve_command(binary.to_str().unwrap());
+        std::fs::remove_file(&binary).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(resolved.unwrap(), binary.to_string_lossy());
+    }
+
+    #[test]
     fn absolute_paths_must_exist() {
         assert_eq!(resolve_command("/bin/sh").unwrap(), "/bin/sh");
         assert_eq!(
@@ -111,7 +164,9 @@ mod tests {
         let dir = cwd.join("target-rc-test-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("tool");
-        std::fs::write(&file, "").unwrap();
+        std::fs::write(&file, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         let rel = "./target-rc-test-dir/../target-rc-test-dir/tool";
         assert_eq!(
             resolve_command(rel).unwrap(),

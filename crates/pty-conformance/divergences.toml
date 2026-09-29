@@ -50,22 +50,6 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
-test = "spawn_options::pwd_is_the_directory_as_written_wherever_the_caller_stood"
-side = "node"
-kind = "node-defect"
-reason = """
-pty-rust sets `PWD` in the child environment to the working directory as the \
-caller wrote it, following node-pty's own `env.PWD = cwd` in \
-`src/unixTerminal.ts`. The Node pty does not, so its child has no `PWD` at all \
-and the shell derives one from `getcwd()`. Where the directory is reached \
-through a symlink those disagree, and `pty run --cwd X` then answers one way \
-from inside X and another from anywhere else. pty-rust is the correct side. \
-This divergence was not written down anywhere before the gate found it: it is \
-in neither docs/parity.md nor a decision record. Remove this entry if the Node \
-pty adopts the same behaviour.
-"""
-
-[[divergence]]
 test = "events::recent_type_filter_returns_every_retained_match_and_preserves_envelopes_order"
 side = "node"
 kind = "intended"

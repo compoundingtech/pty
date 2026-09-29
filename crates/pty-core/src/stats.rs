@@ -96,6 +96,12 @@ pub struct ModeStats {
     pub cursor_hidden: bool,
     pub kitty_keyboard: bool,
     pub kitty_keyboard_flags: Vec<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bracketed_paste: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The full running-session stats result.
