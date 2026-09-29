@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use pty_core::events::{AbandonReason, Event, append_event_locked};
@@ -353,6 +355,44 @@ fn is_permanent(meta: &SessionMetadata) -> bool {
         == Some("permanent")
 }
 
+const CWD_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_CWD_PROBES: usize = 8;
+static ACTIVE_CWD_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+/// A stalled filesystem must not hold gc's reconciliation pass. A timed-out
+/// probe is inconclusive, so it cannot justify abandoning the session.
+fn cwd_is_gone_with<F>(cwd: &str, metadata: F) -> bool
+where
+    F: FnOnce(&Path) -> std::io::Result<std::fs::Metadata> + Send + 'static,
+{
+    if ACTIVE_CWD_PROBES
+        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+            (n < MAX_CWD_PROBES).then_some(n + 1)
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let path = PathBuf::from(cwd);
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("pty-cwd-probe".into())
+        .spawn(move || {
+            let gone = metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            let _ = tx.send(gone);
+            ACTIVE_CWD_PROBES.fetch_sub(1, Ordering::AcqRel);
+        });
+    if spawned.is_err() {
+        ACTIVE_CWD_PROBES.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    rx.recv_timeout(CWD_PROBE_TIMEOUT).unwrap_or(false)
+}
+
+fn cwd_is_gone(cwd: &str) -> bool {
+    cwd_is_gone_with(cwd, |path| std::fs::metadata(path))
+}
+
 /// cwd-gone wins over idle; idle needs a valid positive threshold and a
 /// parseable `lastAttachAt`.
 ///
@@ -369,7 +409,7 @@ fn classify_abandoned(
         == Some("false");
     if !meta.cwd.is_empty()
         && !cwd_opted_out
-        && std::fs::metadata(&meta.cwd).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        && cwd_is_gone(&meta.cwd)
     {
         return Some(AbandonDecision {
             reason: AbandonReason::CwdGone,
@@ -1060,6 +1100,17 @@ pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stalled_cwd_probe_is_inconclusive_within_the_deadline() {
+        let started = Instant::now();
+        let gone = cwd_is_gone_with("/unresponsive", |_| {
+            std::thread::sleep(Duration::from_secs(1));
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(!gone);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 
     #[test]
     fn layout_tag_shape() {
