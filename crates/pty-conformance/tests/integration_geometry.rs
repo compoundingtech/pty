@@ -447,7 +447,7 @@ fn peek_with_plain_flag_returns_text_without_ansi_codes() {
 fn peek_plain_trims_trailing_blank_lines() {
     let rig = Rig::new();
     rig.daemon("pk2", &["sh", "-c", "echo 'only line'; sleep 30"], DaemonOpts::no_display_name());
-    std::thread::sleep(Duration::from_millis(200));
+    rig.wait_for_screen("pk2", "only line");
     let mut peeker = rig.connect("pk2");
     peeker.peek(true, false);
     let screen = peeker.wait_for(MessageType::Screen, Duration::from_secs(5)).expect("SCREEN");
@@ -469,7 +469,7 @@ fn restart_preserves_command_and_cwd_after_killing_a_running_session() {
         ..Default::default()
     };
     rig.daemon("rs1", &["sh", "-c", "echo 'original'; sleep 60"], opts);
-    std::thread::sleep(Duration::from_millis(200));
+    rig.wait_for_screen("rs1", "original");
 
     let meta1 = rig.meta("rs1").expect("metadata");
     let cmd1 = meta1["command"].as_str().unwrap().to_string();
