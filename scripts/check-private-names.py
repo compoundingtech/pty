@@ -2,7 +2,8 @@
 """Keep private machine, person, and agent names out of this public repository.
 
 Fails when a tracked file names one of the fleet's machines, a home directory
-under /home or /Users, a person/ ID, or an agent/fleet/ ID. Write invented
+under /home or /Users, a person/ ID, or an internal agent or mission ID
+(agent/fleet/, mission/fleet/, mission-run/fleet/). Write invented
 examples instead: web1.example.com, /home/example, /Users/example,
 person/alex, agent/example/worker.
 
@@ -15,6 +16,7 @@ expression per line, searched in `path:text of the line`. Blank lines and
 lines starting with # are ignored.
 
 Run it from anywhere inside the repository: python3 scripts/check-private-names.py
+With --self-test it checks its own patterns instead of the repository.
 """
 
 import hashlib
@@ -30,6 +32,7 @@ MACHINE_DIGESTS = {
     "9fe430e5274621be518924ed90d2355f39eeb1d4d98fb00ea0022f3a26ba5595",
     "5881d66b8738b483578c8479c59f09856a5447b47bbd2660cff7dc92e1607a2d",
     "294aa8d75483b8331e3ba6a7f24aea15202747f36de65197e7bc6194880b2558",
+    "151ec47d45b057450da03010df462bf604183571812f9ba66598b9fb8f8b692c",
 }
 
 ALLOW_FILE = ".private-names-allow"
@@ -37,7 +40,7 @@ ALLOW_FILE = ".private-names-allow"
 WORD = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 HOME = re.compile(r"/(?:home|Users)/([A-Za-z0-9._-]+)")
 PERSON = re.compile(r"(?<![A-Za-z0-9_-])person/([A-Za-z0-9._-]+)")
-AGENT = re.compile(r"(?<![A-Za-z0-9_-])agent/fleet/")
+FLEET_ID = re.compile(r"(?<![A-Za-z0-9_-])(?:agent|mission|mission-run)/fleet/")
 INVENTED_PEOPLE = {"alex"}
 
 
@@ -67,11 +70,32 @@ def problems(line):
         name = match.group(1)
         if not invented(name) and name.lower() not in INVENTED_PEOPLE:
             yield f"person ID {match.group(0)!r}: use person/alex"
-    if AGENT.search(line):
-        yield "agent/fleet/ ID: use agent/example/..."
+    if FLEET_ID.search(line):
+        yield "internal agent or mission ID: use agent/example/..."
+
+
+def self_test():
+    """Prove each kind of name is caught and each invented example is not."""
+    MACHINE_DIGESTS.add(digest("plantedhost"))
+    caught = [
+        "ssh plantedhost", "PlantedHost.local (cli)", "plantedhost-pty",
+        "cd /home/someone/src", "/Users/someone", "person/someone",
+        "agent/fleet/x/standing/y", "mission/fleet/x", "mission-run/fleet/x/1",
+    ]
+    allowed = [
+        "ssh example-host", "plantedhostx", "/home/example/src", "/Users/Example99/Proj",
+        "person/alex", "person/example-2", "agent/example/worker",
+    ]
+    wrong = [line for line in caught if not list(problems(line))]
+    wrong += [line for line in allowed if list(problems(line))]
+    for line in wrong:
+        print(f"self test: wrong answer for {line!r}")
+    return 1 if wrong else 0
 
 
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
     root = Path(
         subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
