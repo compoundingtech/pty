@@ -94,19 +94,27 @@ pub fn tty_name(fd: RawFd) -> Option<String> {
 /// The window size `(rows, cols)` of a tty fd, or `None` when it is not a
 /// terminal (or the ioctl fails).
 pub fn window_size(fd: RawFd) -> Option<(u16, u16)> {
+    window_size_with_cell(fd).map(|(rows, cols, _, _)| (rows, cols))
+}
+
+/// Window rows and columns plus cell pixels when the host tty reports them.
+pub fn window_size_with_cell(fd: RawFd) -> Option<(u16, u16, u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
     if rc == 0 {
-        Some((ws.ws_row, ws.ws_col))
+        let width = if ws.ws_col > 0 { ws.ws_xpixel / ws.ws_col } else { 0 };
+        let height = if ws.ws_row > 0 { ws.ws_ypixel / ws.ws_row } else { 0 };
+        Some((ws.ws_row, ws.ws_col, width, height))
     } else {
         None
     }
 }
 
-/// `stdout.rows ?? 24`, `stdout.columns ?? 80`: the size of `fd` when it is a
-/// tty, else the 24×80 default (`client.ts:581-582`).
+/// The size of `fd` when it is a tty, with 24×80 defaults for missing or
+/// zero dimensions. Some launchers provide a tty whose window size is 0×0.
 pub fn size_or_default(fd: RawFd) -> (u16, u16) {
-    window_size(fd).unwrap_or((24, 80))
+    let (rows, cols) = window_size(fd).unwrap_or((24, 80));
+    (if rows == 0 { 24 } else { rows }, if cols == 0 { 80 } else { cols })
 }
 
 /// RAII guard that puts a tty into raw mode and restores the original
@@ -322,20 +330,24 @@ impl Drop for SigwinchPipe {
     }
 }
 
-/// Replace the Kitty keyboard-protocol encoding of Ctrl+\ (`ESC[92;5u`) with
-/// the legacy byte so the detach logic works with one representation
-/// (`client.ts:20-31`).
+/// Replace Kitty keyboard encodings of Ctrl+\ with the legacy byte. Caps Lock
+/// and Num Lock add their modifier bits even though they do not change the key.
 pub fn normalize_detach_key(data: &[u8]) -> Vec<u8> {
-    const KITTY: &[u8] = b"\x1b[92;5u";
-    if !data.windows(KITTY.len()).any(|w| w == KITTY) {
+    const KITTY: [&[u8]; 4] = [
+        b"\x1b[92;5u",
+        b"\x1b[92;69u",
+        b"\x1b[92;133u",
+        b"\x1b[92;197u",
+    ];
+    if !KITTY.iter().any(|seq| data.windows(seq.len()).any(|w| w == *seq)) {
         return data.to_vec();
     }
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if data[i..].starts_with(KITTY) {
+        if let Some(seq) = KITTY.iter().find(|seq| data[i..].starts_with(**seq)) {
             out.push(DETACH_KEY);
-            i += KITTY.len();
+            i += seq.len();
         } else {
             out.push(data[i]);
             i += 1;

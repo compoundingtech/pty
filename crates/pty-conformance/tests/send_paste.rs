@@ -9,7 +9,7 @@ use std::time::Duration;
 
 fn start_dump_session(rig: &Rig, name: &str) -> PathBuf {
     let dump = rig.root().join(format!("{name}.dump.bin"));
-    let script = format!("stty raw -echo; cat > '{}'", dump.display());
+    let script = format!("stty raw -echo; printf '\\033[?2004h'; cat > '{}'", dump.display());
     rig.daemon(name, &["sh", "-c", &script], DaemonOpts::no_display_name());
     // Let `stty raw -echo` take effect before the first write.
     std::thread::sleep(Duration::from_millis(150));

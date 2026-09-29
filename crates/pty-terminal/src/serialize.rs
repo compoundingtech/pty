@@ -16,6 +16,7 @@
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::CellContentTag;
 use libghostty_vt::selection::Selection;
+use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
 use libghostty_vt::terminal::{Point, PointCoordinate, Terminal};
 
 use crate::actor::{Modes, TerminalActor};
@@ -104,6 +105,7 @@ pub fn mode_prefix(modes: &Modes, include_alt_screen: bool) -> String {
 pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> String {
     let modes = actor.modes();
     let mut out = mode_prefix(&modes, opts.include_alt_screen_prefix);
+    out.push_str(&dynamic_color_prefix(actor.terminal()));
     if let Some(normal) = actor.normal_replay() {
         if opts.include_alt_screen_prefix && modes.alt_screen {
             // Back to the normal screen for its own half, then to the
@@ -120,6 +122,35 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
     }
     out.push_str(&vt(actor.terminal(), opts.scrollback, actor.cell_size()));
     out
+}
+
+/// Restore only colors the child changed from the terminal defaults. This
+/// leaves an attached host's own theme alone for untouched entries.
+fn dynamic_color_prefix(term: &Terminal<'_, '_>) -> String {
+    let mut out = String::new();
+    for (id, current, default) in [
+        (10, term.fg_color(), term.default_fg_color()),
+        (11, term.bg_color(), term.default_bg_color()),
+        (12, term.cursor_color(), term.default_cursor_color()),
+    ] {
+        if let (Ok(Some(color)), Ok(base)) = (current, default)
+            && Some(color) != base
+        {
+            out.push_str(&osc_rgb(id, color));
+        }
+    }
+    if let (Ok(current), Ok(default)) = (term.color_palette(), term.default_color_palette()) {
+        for (i, color) in current.0.iter().enumerate() {
+            if *color != default.0[i] {
+                out.push_str(&format!("\x1b]4;{i};rgb:{:02x}/{:02x}/{:02x}\x1b\\", color.r, color.g, color.b));
+            }
+        }
+    }
+    out
+}
+
+fn osc_rgb(id: u8, color: RgbColor) -> String {
+    format!("\x1b]{id};rgb:{:02x}/{:02x}/{:02x}\x1b\\", color.r, color.g, color.b)
 }
 
 fn format(term: &Terminal, opts: FormatterOptions) -> String {
@@ -162,6 +193,56 @@ fn vt_opts<'t, 's>() -> FormatterOptions<'t, 's> {
         .with_cursor(false)
         .with_modes(true)
         .with_kitty_keyboard(true)
+}
+
+fn current_pen_sgr(style: Style) -> String {
+    let mut p = vec!["0".to_string()];
+    for (enabled, code) in [
+        (style.bold, "1"),
+        (style.faint, "2"),
+        (style.italic, "3"),
+        (style.blink, "5"),
+        (style.inverse, "7"),
+        (style.invisible, "8"),
+        (style.strikethrough, "9"),
+        (style.overline, "53"),
+    ] {
+        if enabled {
+            p.push(code.to_string());
+        }
+    }
+    let underline = match style.underline {
+        Underline::None => None,
+        Underline::Single => Some("4"),
+        Underline::Double => Some("4:2"),
+        Underline::Curly => Some("4:3"),
+        Underline::Dotted => Some("4:4"),
+        Underline::Dashed => Some("4:5"),
+        _ => None,
+    };
+    if let Some(code) = underline {
+        p.push(code.to_string());
+    }
+    for (color, base, bright, extended) in [
+        (style.fg_color, 30, 90, 38),
+        (style.bg_color, 40, 100, 48),
+    ] {
+        match color {
+            StyleColor::None => {}
+            StyleColor::Palette(index) if index.0 < 8 => p.push((base + index.0 as u32).to_string()),
+            StyleColor::Palette(index) if index.0 < 16 => {
+                p.push((bright + index.0 as u32 - 8).to_string());
+            }
+            StyleColor::Palette(index) => p.push(format!("{extended};5;{}", index.0)),
+            StyleColor::Rgb(rgb) => p.push(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+        }
+    }
+    match style.underline_color {
+        StyleColor::None => {}
+        StyleColor::Palette(index) => p.push(format!("58;5;{}", index.0)),
+        StyleColor::Rgb(rgb) => p.push(format!("58;2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+    }
+    format!("\x1b[{}m", p.join(";"))
 }
 
 fn row_has_text(term: &Terminal, y: u32, cols: u16) -> bool {
@@ -304,6 +385,7 @@ pub fn vt(term: &Terminal, scrollback: bool, cell: CellSize) -> String {
     let cy = term.cursor_y().unwrap_or(0);
     out.push_str(&format!("\x1b[{};{}H", cy + 1, cx + 1));
     out.push_str(&graphics::replay(term, cell));
+    out.push_str(&current_pen_sgr(term.cursor_style().unwrap_or_default()));
     out
 }
 

@@ -3,11 +3,44 @@
 //! another, same picture).
 
 use pty_terminal::{
-    ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
+    CellSize, ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
+use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
+}
+
+#[test]
+fn replay_restores_dynamic_colors_and_palette_entries() {
+    let mut child = actor();
+    child.write(b"\x1b]11;rgb:ff/00/00\x07\x1b]10;rgb:00/ff/00\x07\x1b]12;rgb:00/00/ff\x07\x1b]4;1;rgb:12/34/56\x07color");
+    let mut late = actor();
+    late.write(child.serialize(SerializeOpts::ATTACH).as_bytes());
+    assert_eq!(late.terminal().bg_color().unwrap(), child.terminal().bg_color().unwrap());
+    assert_eq!(late.terminal().fg_color().unwrap(), child.terminal().fg_color().unwrap());
+    assert_eq!(late.terminal().cursor_color().unwrap(), child.terminal().cursor_color().unwrap());
+    assert_eq!(late.terminal().color_palette().unwrap().0[1], child.terminal().color_palette().unwrap().0[1]);
+}
+
+#[test]
+fn pixel_queries_use_a_declared_cell_size() {
+    let mut a = actor();
+    a.set_cell_size(CellSize { width: 10, height: 21 });
+    a.write(b"\x1b[16t\x1b[14t");
+    assert_eq!(a.take_pty_replies(), b"\x1b[6;21;10t\x1b[4;504;800t");
+}
+
+#[test]
+fn replay_restores_the_pen_for_text_written_after_attach() {
+    let mut source = actor();
+    source.write(b"\x1b[4:3;58:2::255:0:0mBEFORE ");
+    let mut late = actor();
+    late.write(source.serialize(SerializeOpts::ATTACH).as_bytes());
+    late.write(b"AFTER");
+    let pen = late.terminal().cursor_style().unwrap();
+    assert_eq!(pen.underline, Underline::Curly);
+    assert_eq!(pen.underline_color, StyleColor::Rgb(RgbColor { r: 255, g: 0, b: 0 }));
 }
 
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
@@ -235,6 +268,22 @@ fn reset_clears_screen_modes_and_partial_sequences() {
     let data = a.write(b"c");
     assert_eq!(data, b"c", "the pending ESC [ is forgotten");
     assert_eq!(a.take_pty_replies(), b"");
+}
+
+#[test]
+fn child_ris_clears_the_modes_replayed_to_late_clients() {
+    let mut a = actor();
+    a.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[>1uFULL");
+    assert!(a.modes().alt_screen);
+    assert!(a.normal_replay().is_some());
+    a.write(b"\x1b");
+    a.write(b"cafter-reset");
+    assert_eq!(a.modes(), Modes::default());
+    assert!(a.normal_replay().is_none());
+    assert_eq!(a.plain(Range::Full), "after-reset");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(!replay.contains("\x1b[?1000h"), "{replay:?}");
+    assert!(!replay.contains("\x1b[>1u"), "{replay:?}");
 }
 
 // ── events (src/server.ts:409-454) ──

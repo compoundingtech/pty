@@ -538,9 +538,10 @@ fn start_owner(
         .map_err(io::Error::other)?;
     let reader_tx = tx.clone();
     let reader_flow = owner_stream.clone();
+    let reader_signals = Arc::clone(&signals);
     thread::Builder::new()
         .name("pty-substrate-reader".into())
-        .spawn(move || read_master(reader, reader_tx, reader_flow))
+        .spawn(move || read_master(reader, reader_tx, reader_flow, reader_signals))
         .map_err(io::Error::other)?;
     let reaper_tx = tx.clone();
     let reaper_signals = Arc::clone(&signals);
@@ -816,6 +817,7 @@ fn read_master(
     mut reader: Box<dyn Read + Send>,
     tx: Sender<Command>,
     owner_stream: Option<Arc<Queue>>,
+    child: Arc<ChildSignals>,
 ) {
     let mut buf = vec![0_u8; READ_CHUNK];
     let mut end_retries = 0;
@@ -831,13 +833,17 @@ fn read_master(
             // those bytes. Measured 2026-09-23 on Linux with every CPU busy: a
             // bare portable-pty reader lost the tail in 4 of 1500 rounds, and
             // none with this retry, which got the bytes about 1 ms after the
-            // first end. So only an end that repeats, with nothing read in
-            // between, is believed.
-            Ok(0) if end_retries < END_RETRIES => {
-                end_retries += 1;
-                thread::sleep(Duration::from_millis(1));
+            // first end. A live child can also close every slave descriptor
+            // temporarily and later reopen /dev/tty, so repeated ends are
+            // believed only after that child has exited.
+            Ok(0) => {
+                if end_retries >= END_RETRIES && !child.can_reopen_terminal() {
+                    break;
+                }
+                end_retries = (end_retries + 1).min(END_RETRIES);
+                let delay_ms = if end_retries < END_RETRIES { 1 } else { 50 };
+                thread::sleep(Duration::from_millis(delay_ms));
             }
-            Ok(0) => break,
             Ok(n) => {
                 end_retries = 0;
                 if let Some(stream) = &owner_stream {
@@ -854,9 +860,13 @@ fn read_master(
                 thread::sleep(Duration::from_millis(1))
             }
             // The same early end, from a reader that reports EIO itself.
-            Err(error) if error.raw_os_error() == Some(libc::EIO) && end_retries < END_RETRIES => {
-                end_retries += 1;
-                thread::sleep(Duration::from_millis(1));
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                if end_retries >= END_RETRIES && !child.can_reopen_terminal() {
+                    break;
+                }
+                end_retries = (end_retries + 1).min(END_RETRIES);
+                let delay_ms = if end_retries < END_RETRIES { 1 } else { 50 };
+                thread::sleep(Duration::from_millis(delay_ms));
             }
             Err(_) => break,
         }
@@ -893,6 +903,10 @@ impl ChildSignals {
         self.reaped
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn can_reopen_terminal(&self) -> bool {
+        self.pid.is_some() && !*self.lock()
     }
 
     fn signal(&self, signal: libc::c_int) -> io::Result<()> {
@@ -1408,7 +1422,7 @@ mod tests {
             Ok(&b"-and-more"[..]),
         ]));
         let (tx, rx) = mpsc::channel();
-        read_master(Box::new(reader), tx, None);
+        read_master(Box::new(reader), tx, None, Arc::new(ChildSignals::new(None)));
         let mut output = Vec::new();
         let mut closed = false;
         for command in rx.try_iter() {

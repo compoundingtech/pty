@@ -50,22 +50,6 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
-test = "spawn_options::pwd_is_the_directory_as_written_wherever_the_caller_stood"
-side = "node"
-kind = "node-defect"
-reason = """
-pty-rust sets `PWD` in the child environment to the working directory as the \
-caller wrote it, following node-pty's own `env.PWD = cwd` in \
-`src/unixTerminal.ts`. The Node pty does not, so its child has no `PWD` at all \
-and the shell derives one from `getcwd()`. Where the directory is reached \
-through a symlink those disagree, and `pty run --cwd X` then answers one way \
-from inside X and another from anywhere else. pty-rust is the correct side. \
-This divergence was not written down anywhere before the gate found it: it is \
-in neither docs/parity.md nor a decision record. Remove this entry if the Node \
-pty adopts the same behaviour.
-"""
-
-[[divergence]]
 test = "events::recent_type_filter_returns_every_retained_match_and_preserves_envelopes_order"
 side = "node"
 kind = "intended"
@@ -79,4 +63,17 @@ original chronological order. The fixture proves old matches remain visible \
 behind both 51 newer unrelated events and more than 50 newer matching events. \
 Remove this entry when Node supports the same exact all-retained-match and \
 empty-success semantics, or if Rust removes it.
+"""
+
+[[divergence]]
+test = "process_tree::kill_gives_a_foreground_job_time_to_handle_hangup"
+side = "node"
+kind = "node-defect"
+reason = """
+The foreground job traps HUP and TERM and records which signal reaches it. \
+Against the pinned Node binary on Node 22 in CI, `pty kill` delivered TERM \
+before the one-second hangup grace elapsed. Rust delivered HUP first or \
+waited through the grace period before TERM. The foreground job should get \
+a chance to handle terminal hangup before the stronger termination signal. \
+Remove this entry if Node adopts the same grace period.
 """

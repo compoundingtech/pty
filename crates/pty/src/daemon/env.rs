@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use pty_core::registry::{EnvMap, TagMap};
 use pty_lifecycle::{DaemonConfig, READY_FD_ENV};
 
 /// What an isolated child keeps of the daemon's environment (plus `LC_*`).
@@ -27,6 +28,50 @@ pub const ISOLATED_ENV_ALLOWLIST: &[&str] = &[
 
 /// The `TERM` a child gets when none was inherited.
 pub const DEFAULT_CHILD_TERM: &str = "xterm-256color";
+
+/// Values that identify the terminal which launched the daemon. A session
+/// may later be attached from another terminal, so inherited copies become
+/// stale. Explicit `env` and `extraEnv` remain under the caller's control.
+const HOST_TERMINAL_IDENTITY: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "ITERM_SESSION_ID",
+    "TERM_SESSION_ID",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "WT_SESSION",
+    "Q_TERM",
+    "IRIS_FD",
+];
+
+/// The login environment a permanent session needs when a service manager
+/// later respawns it with a bare environment. This is deliberately smaller
+/// than the child's full environment: metadata must not copy arbitrary
+/// secrets merely because the child inherited them.
+pub fn permanent_respawn_env(
+    cfg: &DaemonConfig,
+    tags: &TagMap,
+    child_env: &BTreeMap<String, String>,
+) -> Option<EnvMap> {
+    if tags.get("strategy").map(String::as_str) != Some("permanent") || cfg.env.is_some() {
+        return None;
+    }
+    if let Some(saved) = &cfg.session_env {
+        return Some(saved.clone());
+    }
+    let mut saved = EnvMap::new();
+    for (key, value) in child_env {
+        if matches!(
+            key.as_str(),
+            "PATH" | "LANG" | "DISPLAY" | "WAYLAND_DISPLAY" | "XDG_SESSION_TYPE" | "SSH_AUTH_SOCK"
+        ) || key.starts_with("LC_")
+        {
+            saved.insert(key.clone(), value.clone());
+        }
+    }
+    (!saved.is_empty()).then_some(saved)
+}
 
 /// The text Node throws when `env` is combined with the inherited-policy
 /// options.
@@ -73,6 +118,14 @@ pub fn build_child_env_from(
             .collect()
     };
     if cfg.env.is_none() {
+        if let Some(session_env) = &cfg.session_env {
+            for (k, v) in session_env {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        for key in HOST_TERMINAL_IDENTITY {
+            env.remove(*key);
+        }
         for key in cfg.unset_env() {
             env.remove(key);
         }
@@ -193,6 +246,85 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn inherited_terminal_identity_does_not_follow_a_detached_session() {
+        let source = src(&[
+            ("HOME", "/h"),
+            ("TERM_PROGRAM", "old-terminal"),
+            ("TERM_PROGRAM_VERSION", "1.0"),
+            ("LC_TERMINAL", "old-terminal"),
+            ("ITERM_SESSION_ID", "old-session"),
+            ("TERM_SESSION_ID", "old-session"),
+            ("KITTY_WINDOW_ID", "42"),
+            ("KITTY_PID", "1234"),
+            ("WT_SESSION", "old-session"),
+            ("Q_TERM", "old-terminal"),
+            ("IRIS_FD", "13"),
+        ]);
+        for isolated in [false, true] {
+            let mut config = cfg();
+            config.isolate_env = Some(isolated);
+            let env = build_child_env_from(&config, "g", &source).unwrap();
+            assert_eq!(env.get("HOME").map(String::as_str), Some("/h"));
+            for key in [
+                "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL",
+                "ITERM_SESSION_ID", "TERM_SESSION_ID", "KITTY_WINDOW_ID", "KITTY_PID",
+                "WT_SESSION", "Q_TERM", "IRIS_FD",
+            ] {
+                assert!(!env.contains_key(key), "{key} leaked with isolate_env={isolated}");
+            }
+        }
+    }
+
+    #[test]
+    fn permanent_respawn_keeps_login_values_without_copying_unrelated_secrets() {
+        let cfg = cfg();
+        let mut tags = TagMap::new();
+        tags.insert("strategy".into(), "permanent".into());
+        let child = build_child_env_from(
+            &cfg,
+            "g",
+            &src(&[
+                ("PATH", "/home/user/bin:/usr/bin"),
+                ("LANG", "en_US.UTF-8"),
+                ("LC_CTYPE", "en_US.UTF-8"),
+                ("DISPLAY", ":77"),
+                ("WAYLAND_DISPLAY", "wayland-7"),
+                ("XDG_SESSION_TYPE", "wayland"),
+                ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+                ("UNRELATED_SECRET", "secret"),
+            ]),
+        )
+        .unwrap();
+        let saved = permanent_respawn_env(&cfg, &tags, &child).unwrap();
+        for key in [
+            "PATH",
+            "LANG",
+            "LC_CTYPE",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert_eq!(saved.get(key), child.get(key));
+        }
+        assert!(!saved.contains_key("UNRELATED_SECRET"));
+        let mut restart_cfg = cfg.clone();
+        restart_cfg.session_env = Some(saved.clone());
+        restart_cfg.unset_env = Some(vec!["DISPLAY".into()]);
+        let mut extra = EnvMap::new();
+        extra.insert("LANG".into(), "fr_FR.UTF-8".into());
+        restart_cfg.extra_env = Some(extra);
+        let restarted = build_child_env_from(&restart_cfg, "h", &src(&[("PATH", "/usr/bin")]))
+            .unwrap();
+        assert_eq!(restarted.get("PATH"), saved.get("PATH"));
+        assert_eq!(restarted.get("LANG").map(String::as_str), Some("fr_FR.UTF-8"));
+        assert!(!restarted.contains_key("DISPLAY"));
+        assert_eq!(permanent_respawn_env(&restart_cfg, &tags, &restarted), Some(saved));
+        tags.clear();
+        assert!(permanent_respawn_env(&cfg, &tags, &child).is_none());
     }
 
     /// node: tests/restart-launch-parity.test.ts:106-189
