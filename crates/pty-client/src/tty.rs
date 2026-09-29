@@ -323,20 +323,24 @@ impl Drop for SigwinchPipe {
     }
 }
 
-/// Replace the Kitty keyboard-protocol encoding of Ctrl+\ (`ESC[92;5u`) with
-/// the legacy byte so the detach logic works with one representation
-/// (`client.ts:20-31`).
+/// Replace Kitty keyboard encodings of Ctrl+\ with the legacy byte. Caps Lock
+/// and Num Lock add their modifier bits even though they do not change the key.
 pub fn normalize_detach_key(data: &[u8]) -> Vec<u8> {
-    const KITTY: &[u8] = b"\x1b[92;5u";
-    if !data.windows(KITTY.len()).any(|w| w == KITTY) {
+    const KITTY: [&[u8]; 4] = [
+        b"\x1b[92;5u",
+        b"\x1b[92;69u",
+        b"\x1b[92;133u",
+        b"\x1b[92;197u",
+    ];
+    if !KITTY.iter().any(|seq| data.windows(seq.len()).any(|w| w == *seq)) {
         return data.to_vec();
     }
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if data[i..].starts_with(KITTY) {
+        if let Some(seq) = KITTY.iter().find(|seq| data[i..].starts_with(**seq)) {
             out.push(DETACH_KEY);
-            i += KITTY.len();
+            i += seq.len();
         } else {
             out.push(data[i]);
             i += 1;
