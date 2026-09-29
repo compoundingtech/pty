@@ -247,7 +247,19 @@ struct AttachIdentity {
 /// The legacy 8-byte size/cell prefix remains intact; older daemons ignore
 /// the JSON suffix, and newer daemons accept the older 4/8-byte packets.
 pub fn encode_attach_with_identity(rows: u16, cols: u16, pid: u32, tty: Option<&str>) -> Vec<u8> {
-    let mut payload = size_cell_payload(rows, cols, 0, 0).to_vec();
+    encode_attach_with_identity_and_cell(rows, cols, 0, 0, pid, tty)
+}
+
+/// Encode ATTACH with both client identity and measured cell pixels.
+pub fn encode_attach_with_identity_and_cell(
+    rows: u16,
+    cols: u16,
+    cell_width: u16,
+    cell_height: u16,
+    pid: u32,
+    tty: Option<&str>,
+) -> Vec<u8> {
+    let mut payload = size_cell_payload(rows, cols, cell_width, cell_height).to_vec();
     payload.extend(
         serde_json::to_vec(&AttachIdentity {
             pid,

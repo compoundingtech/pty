@@ -86,6 +86,18 @@ impl Csi {
         self.final_byte == b'q' && self.prefix == Some(b'>') && self.intermediates.is_empty()
     }
 
+    /// CSI 14t, 16t and 18t ask for window, cell and grid geometry.
+    pub fn size_query(&self) -> Option<u16> {
+        if self.final_byte == b't' && self.prefix.is_none() && self.intermediates.is_empty() {
+            match self.params.as_slice() {
+                [14] | [16] | [18] => Some(self.params[0]),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// True when the sequence is one of the queries Node keeps out of DATA:
     /// DA1, DA2, DSR (cursor position), XTVERSION.
     ///
@@ -95,7 +107,11 @@ impl Csi {
     /// a leaked spelling would be answered a second time by the client's real
     /// terminal.
     pub fn is_stripped_query(&self) -> bool {
-        self.is_da1_query() || self.is_da2_query() || self.is_dsr_query() || self.is_xtversion_query()
+        self.is_da1_query()
+            || self.is_da2_query()
+            || self.is_dsr_query()
+            || self.is_xtversion_query()
+            || self.size_query().is_some()
     }
 
     /// Kitty keyboard push `CSI > flags u` → the pushed flags
