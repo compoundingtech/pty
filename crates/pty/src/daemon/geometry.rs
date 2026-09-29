@@ -32,6 +32,10 @@ impl Daemon {
         self.actor.resize(cols, rows);
         self.broadcast_geometry(rows, cols);
         self.resize_pty(rows, cols);
+        // Mode 2048 can produce a pty reply during resize, even if the
+        // child never prints again. Send it after the kernel size changes.
+        let replies = self.actor.take_pty_replies();
+        self.write_pty(&replies);
         self.last_resize = Some(Instant::now());
         true
     }
@@ -47,11 +51,15 @@ impl Daemon {
     }
 
     pub(crate) fn resize_pty(&self, rows: u16, cols: u16) {
+        let cell = self.actor.cell_size();
+        let pixels = |cells: u16, extent: u32| {
+            ((cells as u32).saturating_mul(extent)).min(u16::MAX as u32) as u16
+        };
         let _ = self.session.resize(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: pixels(cols, cell.width),
+            pixel_height: pixels(rows, cell.height),
         });
     }
 

@@ -71,6 +71,23 @@ pub fn unique_name(prefix: &str) -> String {
     )
 }
 
+/// Has `pid` exited? A zombie counts: it has finished and only waits for
+/// whoever adopted it to reap it.
+///
+/// **Check that a process is gone with this, not `!pid_alive`.** A daemon,
+/// or a child that outlived it, is an orphan by the time it dies, and the
+/// init process or nearest subreaper that adopted it reaps it whenever it
+/// gets round to it. Until then it still answers `kill(pid, 0)`. `pty kill`
+/// and `pty rm` wait for the exit, not for somebody else's reap, so asserting
+/// `!pid_alive` right after them races that reaper. Measured on 2026-09-28:
+/// `rm_immediate_reuse` failed 230 runs in 400 with 16 at once, and every
+/// time the old daemon was in state `Z` and adopted by the user's systemd.
+/// A process that is still running answers `false`, so this proves the exit
+/// as strictly as before.
+pub fn process_exited(pid: i32) -> bool {
+    pid <= 0 || pty_core::registry::has_process_exited_for_reap(pid)
+}
+
 pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -143,26 +160,40 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Spawn and wait for the socket (5 s).
+    /// Spawn and wait until the session is published (see [`Daemon::published`]).
     pub fn start(root: &Path, config: Value) -> Daemon {
-        let d = Daemon::spawn(root, config, &[]);
-        assert!(
-            wait_until(Duration::from_secs(5), || d.socket_path().exists()),
-            "daemon socket never appeared for {}",
-            d.name
-        );
-        d
+        Daemon::spawn(root, config, &[]).published()
     }
 
-    /// Spawn with extra environment and wait for the socket.
+    /// [`Daemon::start`] with extra environment.
     pub fn start_env(root: &Path, config: Value, env: &[(&str, &str)]) -> Daemon {
-        let d = Daemon::spawn(root, config, env);
+        Daemon::spawn(root, config, env).published()
+    }
+
+    /// Wait for what `pty run` waits for: the `session_start` line.
+    ///
+    /// **The socket appearing is not the session being published.** The
+    /// daemon publishes in order: socket, pid sidecar, metadata, then
+    /// `session_start` (see `daemon/lifecycle.rs`). Building the metadata
+    /// reads the daemon's own start token, which on macOS runs `ps`, so under
+    /// load a test that waited only for the socket often read the metadata
+    /// before it existed and unwrapped `None`. On a Mac on 2026-09-28 that was
+    /// `attach_stamps_last_attach_at` in 5 of 14 whole-workspace runs and
+    /// `reap_and_preserve_decisions` in 3.
+    fn published(self) -> Daemon {
         assert!(
-            wait_until(Duration::from_secs(5), || d.socket_path().exists()),
+            wait_until(Duration::from_secs(5), || self.socket_path().exists()),
             "daemon socket never appeared for {}",
-            d.name
+            self.name
         );
-        d
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !events_of_type(&self.root, &self.name, "session_start").is_empty()
+            }),
+            "daemon {} bound its socket but never published session_start",
+            self.name
+        );
+        self
     }
 
     /// Spawn without waiting for anything.

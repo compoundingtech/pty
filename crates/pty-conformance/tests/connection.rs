@@ -20,6 +20,36 @@ fn screen_of(conn: &mut Conn) -> String {
     String::from_utf8_lossy(&p.payload).into_owned()
 }
 
+// **Wait for the output, not for a fixed time.** A session's output is
+// produced by its child after the daemon is up, and these tests used to sleep
+// 300 ms and then look. That is a guess about scheduling, and it lost under
+// load on 2026-09-28: `peek_returns_screen_content` and
+// `peek_returns_plain_text_when_plain` each failed once in 200 runs of this
+// binary, and `connects_and_receives_initial_screen` twice in 24
+// whole-workspace runs. What each test checks is that the output arrives;
+// how soon was never the point.
+
+/// `pty <args>` (a peek) once it exits 0 and its stdout shows `needle`.
+fn peek_once_it_shows(rig: &Rig, args: &[&str], needle: &str) -> Out {
+    let mut out = rig.pty(args);
+    wait_until(&format!("`pty {}` to show {needle:?}", args.join(" ")), || {
+        out = rig.pty(args);
+        out.status == 0 && out.stdout().contains(needle)
+    });
+    out
+}
+
+/// DATA from `conn` until it contains every one of `needles`.
+fn data_until(conn: &mut Conn, needles: &[&str]) -> String {
+    let mut received = Vec::new();
+    wait_until(&format!("DATA containing {needles:?}"), || {
+        received.extend(data_bytes(&conn.drain(Duration::from_millis(50))));
+        let text = String::from_utf8_lossy(&received);
+        needles.iter().all(|n| text.contains(n))
+    });
+    String::from_utf8_lossy(&received).into_owned()
+}
+
 fn start_dumper(rig: &Rig, id: &str) -> PathBuf {
     let dump = rig.root().join("dump.bin");
     let script = format!("stty raw -echo; printf '\\033[?2004h'; cat > '{}'", dump.display());
@@ -40,7 +70,9 @@ fn wait_for_dump(dump: &Path, min_len: usize) -> Vec<u8> {
 fn connects_and_receives_initial_screen() {
     let rig = Rig::new();
     rig.daemon("c1", &["sh", "-c", "echo hello-screen; exec cat"], DaemonOpts::no_display_name());
-    std::thread::sleep(Duration::from_millis(300));
+    // The attach must replay output produced before it, so first wait until
+    // that output is on the daemon's screen.
+    peek_once_it_shows(&rig, &["peek", "--plain", "c1"], "hello-screen");
     let mut conn = rig.connect("c1");
     conn.attach(24, 80);
     let screen = screen_of(&mut conn);
@@ -62,9 +94,7 @@ fn receives_data_events_after_connect() {
     conn.attach(24, 80);
     screen_of(&mut conn);
     conn.data(b"test-input");
-    std::thread::sleep(Duration::from_millis(300));
-    let received = data_bytes(&conn.drain(Duration::from_millis(100)));
-    let text = String::from_utf8_lossy(&received);
+    let text = data_until(&mut conn, &["test-input"]);
     assert!(text.contains("test-input"), "{text:?}");
     conn.detach();
 }
@@ -79,9 +109,7 @@ fn press_sends_named_keys() {
     screen_of(&mut conn);
     conn.data(b"hello");
     conn.data(b"\r");
-    std::thread::sleep(Duration::from_millis(300));
-    let received = data_bytes(&conn.drain(Duration::from_millis(100)));
-    let text = String::from_utf8_lossy(&received);
+    let text = data_until(&mut conn, &["hello", "\r"]);
     assert!(text.contains("hello"), "{text:?}");
     assert!(text.contains('\r'), "{text:?}");
     conn.detach();
@@ -137,8 +165,7 @@ fn send_data_sends_text_to_a_session() {
     rig.daemon("s1", &["sh", "-c", "stty raw -echo; cat"], DaemonOpts::no_display_name());
     std::thread::sleep(Duration::from_millis(150));
     expect_status(&rig.pty(&["send", "s1", "hello-send"]), 0);
-    std::thread::sleep(Duration::from_millis(200));
-    let out = rig.pty(&["peek", "--plain", "s1"]);
+    let out = peek_once_it_shows(&rig, &["peek", "--plain", "s1"], "hello-send");
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "hello-send");
 }
@@ -207,8 +234,7 @@ fn paste_with_nothing_to_send_does_not_emit_markers_alone() {
 fn peek_returns_screen_content() {
     let rig = Rig::new();
     rig.daemon("k1", &["sh", "-c", "echo peek-test; exec cat"], DaemonOpts::no_display_name());
-    std::thread::sleep(Duration::from_millis(300));
-    let out = rig.pty(&["peek", "k1"]);
+    let out = peek_once_it_shows(&rig, &["peek", "k1"], "peek-test");
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "peek-test");
 }
@@ -218,8 +244,7 @@ fn peek_returns_screen_content() {
 fn peek_returns_plain_text_when_plain() {
     let rig = Rig::new();
     rig.daemon("k2", &["sh", "-c", "echo plain-test; exec cat"], DaemonOpts::no_display_name());
-    std::thread::sleep(Duration::from_millis(300));
-    let out = rig.pty(&["peek", "--plain", "k2"]);
+    let out = peek_once_it_shows(&rig, &["peek", "--plain", "k2"], "plain-test");
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "plain-test");
     expect_not_regex(&out.stdout(), "\x1b\\[");
