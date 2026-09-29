@@ -340,7 +340,7 @@ pub fn send_data<T: AsRef<[u8]>>(
     let path = registry::socket_path(name);
     let map =
         |e: &std::io::Error| map_io_error(name, false, GoneSet::Strict, "write", Some(&path), e);
-    let paste = opts.paste && !items.is_empty();
+    let paste = opts.paste && !items.is_empty() && crate::query_stats(name)?.modes.bracketed_paste;
     if paste {
         socket
             .write_all(&encode_data(BRACKETED_PASTE_START.as_bytes()))
@@ -768,7 +768,16 @@ mod async_connection {
         let map = |e: &std::io::Error| {
             map_io_error(name, false, GoneSet::Strict, "write", Some(&path), e)
         };
-        let paste = opts.paste && !items.is_empty();
+        let paste = if opts.paste && !items.is_empty() {
+            let name = name.to_owned();
+            tokio::task::spawn_blocking(move || crate::query_stats(&name))
+                .await
+                .map_err(|error| ClientError::Connection(format!("stats task failed: {error}")))??
+                .modes
+                .bracketed_paste
+        } else {
+            false
+        };
         if paste {
             socket
                 .write_all(&encode_data(BRACKETED_PASTE_START.as_bytes()))

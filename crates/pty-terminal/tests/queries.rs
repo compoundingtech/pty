@@ -72,9 +72,12 @@ fn color_queries_answer_with_st_whatever_the_query_terminator() {
         assert_eq!(data, b"", "{q:?} must not reach DATA");
         assert_eq!(a.take_pty_replies(), reply, "{q:?}");
     }
-    // Node answers only the first index of a multi-query and consumes it.
+    // Answer every queried slot in a multi-query, in request order.
     assert_eq!(a.write(b"\x1b]4;1;?;2;?\x07"), b"");
-    assert_eq!(a.take_pty_replies(), b"\x1b]4;1;rgb:0000/0000/0000\x1b\\");
+    assert_eq!(
+        a.take_pty_replies(),
+        b"\x1b]4;1;rgb:0000/0000/0000\x1b\\\x1b]4;2;rgb:0000/0000/0000\x1b\\"
+    );
     // A non-query OSC 10 (a set) passes through and is not answered.
     let set = b"\x1b]10;rgb:ffff/0000/0000\x07";
     assert_eq!(a.write(set), set);
@@ -109,4 +112,21 @@ fn split_query_is_answered_once() {
         a.take_pty_replies(),
         b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c"
     );
+}
+
+#[test]
+fn clipboard_read_without_a_client_has_a_bounded_empty_reply() {
+    let mut a = actor();
+    let mut broadcast = a.write(b"text\x1b]52;c;");
+    broadcast.extend(a.write(b"?\x07more"));
+    assert_eq!(broadcast, b"textmore");
+    assert_eq!(a.take_pty_replies(), b"\x1b]52;c;\x1b\\");
+}
+
+#[test]
+fn clipboard_read_reaches_an_attached_terminal() {
+    let mut a = actor();
+    a.set_clipboard_client_available(true);
+    assert_eq!(a.write(b"\x1b]52;c;?\x07"), b"\x1b]52;c;?\x07");
+    assert!(a.take_pty_replies().is_empty());
 }

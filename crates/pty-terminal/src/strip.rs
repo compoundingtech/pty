@@ -183,22 +183,39 @@ impl Osc {
         (id, data)
     }
 
-    /// The colour query this OSC is, if any: `Some((10, None))` for
-    /// `OSC 10 ; ?`, `Some((11, None))` for `OSC 11 ; ?`, and
-    /// `Some((4, index))` for `OSC 4 ; index ; ?` (Node: `src/server.ts:459-490`
-    /// — OSC 10/11 must be exactly `?`; OSC 4 is consumed whenever the data
-    /// contains a `?`, and answered when it starts with a number).
-    pub fn color_query(&self) -> Option<(u32, Option<u32>)> {
+    /// OSC 52 clipboard read (`selection;?`). Only a short, valid selection
+    /// is echoed in the fallback reply when no terminal can answer it.
+    pub fn clipboard_read_selection(&self) -> Option<&[u8]> {
+        let (id, data) = self.split();
+        let selection = data.strip_suffix(b";?")?;
+        (id == Some(52)
+            && !selection.is_empty()
+            && selection.len() <= 16
+            && selection.iter().all(u8::is_ascii_alphanumeric))
+        .then_some(selection)
+    }
+
+    /// The colour queries in this OSC, if any. OSC 4 can request several
+    /// palette slots in one sequence; each valid `index;?` pair gets a reply.
+    /// An OSC 4 containing `?` is consumed even if no pair is valid.
+    pub fn color_query(&self) -> Option<Vec<(u32, Option<u32>)>> {
         let (id, data) = self.split();
         match id? {
-            10 | 11 if data == b"?" => Some((id?, None)),
+            id @ (10 | 11) if data == b"?" => Some(vec![(id, None)]),
             4 if data.contains(&b'?') => {
-                let digits: String = std::str::from_utf8(data)
-                    .unwrap_or("")
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                Some((4, digits.parse::<u32>().ok()))
+                let fields: Vec<_> = data.split(|b| *b == b';').collect();
+                Some(
+                    fields
+                        .chunks_exact(2)
+                        .filter_map(|pair| {
+                            if pair[1] != b"?" {
+                                return None;
+                            }
+                            let index = std::str::from_utf8(pair[0]).ok()?.parse::<u32>().ok()?;
+                            Some((4, Some(index)))
+                        })
+                        .collect(),
+                )
             }
             _ => None,
         }
@@ -612,7 +629,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(q, vec![Some((10, None)), Some((4, Some(17))), Some((4, None)), None, Some((4, Some(1)))]);
+        assert_eq!(q, vec![Some(vec![(10, None)]), Some(vec![(4, Some(17))]), Some(vec![]), None, Some(vec![(4, Some(1)), (4, Some(2))])]);
     }
 
     #[test]

@@ -98,6 +98,7 @@ impl Daemon {
                 cursor_hidden: modes.cursor_hidden,
                 kitty_keyboard: !modes.kitty_stack.is_empty(),
                 kitty_keyboard_flags: modes.kitty_stack.clone(),
+                bracketed_paste: modes.bracketed_paste,
             },
             uptime_seconds,
             created_at,
