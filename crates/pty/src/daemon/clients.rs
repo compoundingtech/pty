@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,9 @@ pub const REDRAW_SETTLE: Duration = Duration::from_millis(80);
 /// DATA packets follow the PTY reader's 16 KiB chunks, so this keeps the
 /// ordinary queued output near one MiB per client.
 pub const OUTBOUND_QUEUE_PACKETS: usize = 64;
+/// Include a full graphics SCREEN, but disconnect before repeated replays can
+/// occupy unbounded memory on a stalled connection.
+pub const OUTBOUND_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long a `clientGeneration` write keeps retrying a held metadata lock.
 /// Lock holders are short CLI writes; a holder that outlives this loses the
@@ -65,11 +70,22 @@ impl ClientFacts {
 
 /// Bytes to a client's socket, or an instruction to end/destroy it.
 pub enum Out {
-    Bytes(Vec<u8>),
+    Bytes(QueuedBytes),
     /// `socket.end()`: half-close, the peer closes when it is done.
     End,
     /// `socket.destroy()`: close both ways now.
     Destroy,
+}
+
+pub struct QueuedBytes {
+    pub bytes: Vec<u8>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedBytes {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes.len(), Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +115,7 @@ pub enum Phase {
 pub struct Client {
     pub tx: SyncSender<Out>,
     disconnect: UnixStream,
+    pending_bytes: Arc<AtomicUsize>,
     pub role: Role,
     pub rows: u16,
     pub cols: u16,
@@ -116,6 +133,7 @@ impl Client {
         Client {
             tx,
             disconnect,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
             role: Role::Command,
             rows,
             cols,
@@ -127,7 +145,21 @@ impl Client {
     }
 
     pub fn send(&self, bytes: Vec<u8>) {
-        self.send_out(Out::Bytes(bytes));
+        let len = bytes.len();
+        if self
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending.checked_add(len).filter(|total| *total <= OUTBOUND_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            let _ = self.disconnect.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        self.send_out(Out::Bytes(QueuedBytes {
+            bytes,
+            pending: Arc::clone(&self.pending_bytes),
+        }));
     }
 
     pub fn send_out(&self, out: Out) {
@@ -544,6 +576,7 @@ impl Daemon {
 #[cfg(test)]
 mod bounded_queue_tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn stalled_client_keeps_only_a_bounded_number_of_packets() {
@@ -555,5 +588,20 @@ mod bounded_queue_tests {
         }
         let queued = rx.try_iter().count();
         assert!(queued <= 64, "stalled client queued {queued} packets");
+    }
+
+    #[test]
+    fn repeated_large_screen_packets_exhaust_byte_budget_and_disconnect() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(OUTBOUND_QUEUE_PACKETS);
+        let (disconnect, mut peer) = UnixStream::pair().unwrap();
+        let client = Client::new(tx, disconnect, 24, 80);
+        for _ in 0..9 {
+            client.send(vec![0; 8 * 1024 * 1024]);
+        }
+        assert_eq!(client.pending_bytes.load(Ordering::Acquire), OUTBOUND_QUEUE_BYTES);
+        peer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+        assert_eq!(rx.try_iter().count(), 8);
+        assert_eq!(client.pending_bytes.load(Ordering::Acquire), 0);
     }
 }

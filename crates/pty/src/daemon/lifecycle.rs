@@ -584,8 +584,8 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         while let Ok(out) = out_rx.recv() {
             match out {
-                Out::Bytes(bytes) => {
-                    if wstream.write_all(&bytes).is_err() {
+                Out::Bytes(packet) => {
+                    if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
                 }
