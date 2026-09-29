@@ -232,6 +232,16 @@ fn plain_read_joins_soft_wraps_but_keeps_explicit_line_breaks() {
 }
 
 #[test]
+fn screenshot_and_exit_history_keep_physical_wrapped_rows() {
+    let mut a = TerminalActor::new(4, 10, 100);
+    a.write(b"abcdefghijklmno");
+    assert_eq!(a.plain(Range::Full), "abcdefghijklmno");
+    let rows = vec!["abcdefghij".to_string(), "klmno".to_string()];
+    assert_eq!(pty_terminal::screenshot::capture(a.terminal()).lines, rows);
+    assert_eq!(pty_terminal::serialize::plain_lines_full(a.terminal()), rows);
+}
+
+#[test]
 fn reset_clears_screen_modes_and_partial_sequences() {
     let mut a = actor();
     a.write(b"\x1b[?25l\x1b[>7u\x1b]0;t\x07hello\x1b[");

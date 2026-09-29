@@ -260,6 +260,13 @@ fn plain_opts<'t, 's>() -> FormatterOptions<'t, 's> {
     // drops never-written cells — exactly xterm's `translateToString(true)`.
     FormatterOptions::new()
         .with_format(Format::Plain)
+        .with_unwrap(false)
+        .with_trim(false)
+}
+
+fn plain_unwrapped_opts<'t, 's>() -> FormatterOptions<'t, 's> {
+    FormatterOptions::new()
+        .with_format(Format::Plain)
         .with_unwrap(true)
         .with_trim(false)
 }
@@ -324,7 +331,7 @@ pub fn plain_lines_full(term: &Terminal) -> Vec<String> {
 /// The viewport rows as trimmed lines, trailing empty rows dropped. What
 /// [`plain_viewport`] joins.
 pub fn plain_lines_viewport(term: &Terminal) -> Vec<String> {
-    plain_lines(format_active(term, plain_opts()))
+    plain_lines(format_active(term, plain_unwrapped_opts()))
 }
 
 /// Node's `getPlainScreen()`: rows `baseY..length`.
@@ -334,7 +341,7 @@ pub fn plain_viewport(term: &Terminal) -> String {
 
 /// Node's `getFullPlainScreen()`: every row.
 pub fn plain_full(term: &Terminal) -> String {
-    plain_lines_full(term).join("\n")
+    plain_lines(format(term, plain_unwrapped_opts())).join("\n")
 }
 
 #[cfg(test)]
