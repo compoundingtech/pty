@@ -1546,9 +1546,10 @@ mod tests {
 
     #[test]
     fn command_socket_does_not_suppress_clipboard_fallback() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(OUTBOUND_QUEUE_PACKETS);
+        let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, 24, 80));
+        clients.insert(1, Client::new(tx, disconnect, 24, 80));
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(clipboard_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");
