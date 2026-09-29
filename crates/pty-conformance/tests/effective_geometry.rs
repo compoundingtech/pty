@@ -117,16 +117,16 @@ fn terminal_cols(rig: &Rig, id: &str) -> u64 {
     s["terminal"]["cols"].as_u64().expect("terminal.cols")
 }
 
-/// The wrapped `X` rows as `pty peek --plain` shows them.
-fn has_two_wrapped_lines(rig: &Rig, id: &str, width: usize) -> bool {
+/// Plain reads join soft-wrapped rows, so a two-row write is one logical line.
+fn has_resize_output(rig: &Rig, id: &str, width: usize) -> bool {
     let out = rig.pty(&["peek", "--plain", id]);
     if out.status != 0 {
         return false;
     }
-    let expected = "X".repeat(width);
+    let expected = "X".repeat(width * 2);
     let text = out.stdout();
     let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-    lines.len() >= 2 && lines[0] == expected && lines[1] == expected
+    lines.len() == 1 && lines[0] == expected
 }
 
 /// node: tests/effective-geometry.test.ts:152
@@ -267,7 +267,7 @@ fn resizes_the_grid_on_peer_attach_resize_and_disconnect() {
     small.conn.attach(24, 10);
     small.wait_for("small attach", |p| has(p, MessageType::Screen));
     large.wait_for("testing attach geometry", |p| geometry_cols(p).last() == Some(&10));
-    wait_until("testing attach grid", || has_two_wrapped_lines(&rig, "geo5", 10));
+    wait_until("testing attach grid", || has_resize_output(&rig, "geo5", 10));
     large.conn.resize(24, 30);
     std::thread::sleep(Duration::from_millis(50));
     large.pump();
@@ -275,12 +275,12 @@ fn resizes_the_grid_on_peer_attach_resize_and_disconnect() {
 
     small.conn.resize(24, 8);
     large.wait_for("testing resize geometry", |p| geometry_cols(p).last() == Some(&8));
-    wait_until("testing resize grid", || has_two_wrapped_lines(&rig, "geo5", 8));
+    wait_until("testing resize grid", || has_resize_output(&rig, "geo5", 8));
 
     small.conn.detach();
     drop(small);
     large.wait_for("testing disconnect geometry", |p| geometry_cols(p).last() == Some(&30));
-    wait_until("testing disconnect grid", || has_two_wrapped_lines(&rig, "geo5", 30));
+    wait_until("testing disconnect grid", || has_resize_output(&rig, "geo5", 30));
 }
 
 /// node: tests/effective-geometry.test.ts:304
