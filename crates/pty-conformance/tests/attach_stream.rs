@@ -297,6 +297,8 @@ fn frames_events_through_fd_3_from_a_real_daemon() {
     let rig = Rig::new();
     let id = "launcher";
     rig.daemon(id, &["sh", "-c", "printf LAUNCHER_READY; read value"], DaemonOpts::no_display_name());
+    // The SCREEN below must already carry the child's output.
+    rig.wait_for_screen(id, "LAUNCHER_READY");
     let mut cli = StreamCli::spawn(&rig, &[id], true);
     assert!(cli.wait_for_type(MessageType::Screen, Duration::from_secs(10)));
     cli.write_stdin(b"done\n");
@@ -321,6 +323,8 @@ fn frames_a_local_detach_before_closing_fd_3() {
     let rig = Rig::new();
     let id = "launcher-detach";
     rig.daemon(id, &["sh", "-c", "printf DETACH_READY; sleep 300"], DaemonOpts::no_display_name());
+    // The SCREEN below must already carry the child's output.
+    rig.wait_for_screen(id, "DETACH_READY");
     let mut cli = StreamCli::spawn(&rig, &[id], true);
     assert!(cli.wait_for_type(MessageType::Screen, Duration::from_secs(10)));
     cli.write_stdin(&[0x1c]);

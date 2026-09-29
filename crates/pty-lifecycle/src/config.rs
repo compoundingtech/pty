@@ -48,6 +48,8 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_env: Option<EnvMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_env: Option<EnvMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unset_env: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvMap>,

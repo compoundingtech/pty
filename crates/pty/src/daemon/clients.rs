@@ -168,7 +168,7 @@ impl Daemon {
             return;
         }
         let (rows, cols) = decode_size(payload);
-        self.adopt_cell_size(payload);
+        let cell_changed = self.adopt_cell_size(payload);
         // Read before negotiation: a smaller client shrinks the session to
         // its own size, which would then look like it had matched.
         let size_matched = rows == self.actor.rows() && cols == self.actor.cols();
@@ -189,6 +189,9 @@ impl Daemon {
             c.generation
         };
         let resized = self.negotiate_size();
+        if cell_changed && !resized {
+            self.resize_pty(self.actor.rows(), self.actor.cols());
+        }
         if !resized {
             let g = encode_geometry(self.actor.rows(), self.actor.cols());
             self.clients[&id].send(g);
@@ -263,8 +266,11 @@ impl Daemon {
         c.cols = cols;
         self.attach_counter += 1;
         c.attach_seq = self.attach_counter;
-        self.adopt_cell_size(payload);
-        self.negotiate_size();
+        let cell_changed = self.adopt_cell_size(payload);
+        let resized = self.negotiate_size();
+        if cell_changed && !resized {
+            self.resize_pty(self.actor.rows(), self.actor.cols());
+        }
         self.note_client_change(None);
     }
 
@@ -282,13 +288,18 @@ impl Daemon {
     /// and cols there is nothing to negotiate: the metrics change no bytes and
     /// no client's screen, only what this session reports as derived
     /// geometry.
-    fn adopt_cell_size(&mut self, payload: &[u8]) {
+    fn adopt_cell_size(&mut self, payload: &[u8]) -> bool {
         if let Some((width, height)) = decode_cell(payload) {
-            self.actor.set_cell_size(pty_terminal::CellSize {
+            let cell = pty_terminal::CellSize {
                 width: width as u32,
                 height: height as u32,
-            });
+            };
+            if self.actor.cell_size() != cell {
+                self.actor.set_cell_size(cell);
+                return true;
+            }
         }
+        false
     }
 
     /// node: src/server.ts:1040-1043

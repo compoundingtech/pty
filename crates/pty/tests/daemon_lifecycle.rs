@@ -599,7 +599,7 @@ fn kill_terminates_a_deep_tree_and_releases_the_name() {
 
     let (_o, e, code) = run_pty(&root, &["kill", &name], &[]);
     assert_eq!(code, 0, "{e}");
-    assert!(!pid_alive(leaf), "leaf {leaf} survived `pty kill`");
+    assert!(process_exited(leaf), "leaf {leaf} survived `pty kill`");
     assert!(!root.join(format!("{name}.sock")).exists());
 
     let (second_pid, second_ready) = (root.join("second.pid"), root.join("second.ready"));

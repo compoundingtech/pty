@@ -137,9 +137,13 @@ fn concurrent_stealers_cannot_both_win() {
     let winners = outs.iter().filter(|o| o.status.success()).count();
     assert_eq!(winners, 1, "{:?}", outs.iter().map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).collect::<Vec<_>>());
     let loser = outs.iter().find(|o| !o.status.success()).unwrap();
+    // "already in use" is the loser that started after the winner had
+    // published: `pty run`'s pre-check refuses it before it reaches the lock.
+    // Two launches spawned together still run one after the other on a
+    // loaded machine; that failed this test once in 24 whole-workspace runs.
     expect_regex(
         &String::from_utf8_lossy(&loser.stderr),
-        "is being created by another process|is already running|event log is busy",
+        "is being created by another process|is already running|event log is busy|is already in use",
     );
     let list = rig.list_json();
     assert_eq!(list.len(), 1, "{list:?}");
