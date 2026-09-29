@@ -234,6 +234,23 @@ pub fn pid_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Has `pid` exited? A zombie counts: it has finished and only waits for
+/// whoever adopted it to reap it.
+///
+/// **Check that a process is gone with this, not `!pid_alive`.** A daemon,
+/// or a child that outlived it, is an orphan by the time it dies, and the
+/// init process or nearest subreaper that adopted it reaps it whenever it
+/// gets round to it. Until then it still answers `kill(pid, 0)`. `pty kill`
+/// and `pty rm` wait for the exit, not for somebody else's reap, so asserting
+/// `!pid_alive` right after them races that reaper. Measured on 2026-09-28:
+/// `rm_immediate_reuse` failed 230 runs in 400 with 16 at once, and every
+/// time the old daemon was in state `Z` and adopted by the user's systemd.
+/// A process that is still running answers `false`, so this proves the exit
+/// as strictly as before.
+pub fn process_exited(pid: i32) -> bool {
+    pid <= 0 || pty_core::registry::has_process_exited_for_reap(pid)
+}
+
 /// Wait until `pid` is gone: exited AND reaped, or exited and unreapable.
 ///
 /// **This is the direct signal for "the daemon has finished".** A test that
@@ -504,6 +521,22 @@ impl Rig {
         }
         cmd.current_dir(&self.tmp);
         cmd
+    }
+
+    /// Wait until `pty peek --plain <id>` shows `needle`.
+    ///
+    /// **A session's first output is not there the moment its daemon is.**
+    /// The child prints it after the daemon is up, so a test that attaches
+    /// and expects that output in the initial SCREEN has to wait for it
+    /// first. Sleeping a fixed time before attaching is a guess about
+    /// scheduling, and it lost on a loaded Mac on 2026-09-28. A peek is
+    /// read-only, so waiting this way leaves nothing behind for the attach
+    /// under test.
+    pub fn wait_for_screen(&self, id: &str, needle: &str) {
+        wait_until(&format!("{id}'s screen to show {needle:?}"), || {
+            let out = self.pty(&["peek", "--plain", id]);
+            out.status == 0 && out.stdout().contains(needle)
+        });
     }
 
     /// Run the binary under test with the rig's base environment.
