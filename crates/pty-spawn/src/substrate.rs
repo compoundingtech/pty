@@ -538,9 +538,10 @@ fn start_owner(
         .map_err(io::Error::other)?;
     let reader_tx = tx.clone();
     let reader_flow = owner_stream.clone();
+    let reader_signals = Arc::clone(&signals);
     thread::Builder::new()
         .name("pty-substrate-reader".into())
-        .spawn(move || read_master(reader, reader_tx, reader_flow))
+        .spawn(move || read_master(reader, reader_tx, reader_flow, reader_signals))
         .map_err(io::Error::other)?;
     let reaper_tx = tx.clone();
     let reaper_signals = Arc::clone(&signals);
@@ -816,6 +817,7 @@ fn read_master(
     mut reader: Box<dyn Read + Send>,
     tx: Sender<Command>,
     owner_stream: Option<Arc<Queue>>,
+    child: Arc<ChildSignals>,
 ) {
     let mut buf = vec![0_u8; READ_CHUNK];
     let mut end_retries = 0;
@@ -831,13 +833,17 @@ fn read_master(
             // those bytes. Measured 2026-09-23 on Linux with every CPU busy: a
             // bare portable-pty reader lost the tail in 4 of 1500 rounds, and
             // none with this retry, which got the bytes about 1 ms after the
-            // first end. So only an end that repeats, with nothing read in
-            // between, is believed.
-            Ok(0) if end_retries < END_RETRIES => {
-                end_retries += 1;
-                thread::sleep(Duration::from_millis(1));
+            // first end. A live child can also close every slave descriptor
+            // temporarily and later reopen /dev/tty, so repeated ends are
+            // believed only after that child has exited.
+            Ok(0) => {
+                if end_retries >= END_RETRIES && !child.can_reopen_terminal() {
+                    break;
+                }
+                end_retries = (end_retries + 1).min(END_RETRIES);
+                let delay_ms = if end_retries < END_RETRIES { 1 } else { 50 };
+                thread::sleep(Duration::from_millis(delay_ms));
             }
-            Ok(0) => break,
             Ok(n) => {
                 end_retries = 0;
                 if let Some(stream) = &owner_stream {
@@ -854,9 +860,13 @@ fn read_master(
                 thread::sleep(Duration::from_millis(1))
             }
             // The same early end, from a reader that reports EIO itself.
-            Err(error) if error.raw_os_error() == Some(libc::EIO) && end_retries < END_RETRIES => {
-                end_retries += 1;
-                thread::sleep(Duration::from_millis(1));
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                if end_retries >= END_RETRIES && !child.can_reopen_terminal() {
+                    break;
+                }
+                end_retries = (end_retries + 1).min(END_RETRIES);
+                let delay_ms = if end_retries < END_RETRIES { 1 } else { 50 };
+                thread::sleep(Duration::from_millis(delay_ms));
             }
             Err(_) => break,
         }
@@ -893,6 +903,10 @@ impl ChildSignals {
         self.reaped
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn can_reopen_terminal(&self) -> bool {
+        self.pid.is_some() && !*self.lock()
     }
 
     fn signal(&self, signal: libc::c_int) -> io::Result<()> {
@@ -953,6 +967,19 @@ fn reap_child(
 
 /// Block until the child has exited, leaving it unreaped (`WNOWAIT`): its pid
 /// stays reserved until [`collect`] runs under the signal lock.
+///
+/// **Only an exit ends the wait.** macOS's `waitid` answers `WEXITED |
+/// WNOWAIT` for a *stopped* child too, with `si_code` `CLD_STOPPED`, and
+/// `WNOWAIT` leaves that report in place, so it answers the same way every
+/// time. Linux keeps waiting. Measured on macOS 27 on 2026-09-28. Returning on
+/// the stop sent the reaper into a blocking `waitpid` under the signal lock
+/// while the child was only stopped, and the SIGKILL or SIGCONT that would
+/// have ended the stop waited on that lock forever. A startup deadline
+/// freezes its child with SIGSTOP, so on a Mac the daemon hung right there.
+///
+/// A stop, continue or trap report is consumed instead, with `WSTOPPED |
+/// WCONTINUED` and no `WEXITED`, which can never reap. Then the wait
+/// resumes, and it blocks again on both platforms.
 fn wait_until_exited(pid: u32) {
     loop {
         // SAFETY: an all-zero siginfo_t is a valid value to be overwritten.
@@ -966,8 +993,27 @@ fn wait_until_exited(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        if result != 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             return;
+        }
+        if !matches!(
+            info.si_code,
+            libc::CLD_STOPPED | libc::CLD_CONTINUED | libc::CLD_TRAPPED
+        ) {
+            return;
+        }
+        // SAFETY: as above. No WEXITED, so this cannot collect the child.
+        let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut consumed,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            );
         }
     }
 }
@@ -1376,7 +1422,7 @@ mod tests {
             Ok(&b"-and-more"[..]),
         ]));
         let (tx, rx) = mpsc::channel();
-        read_master(Box::new(reader), tx, None);
+        read_master(Box::new(reader), tx, None, Arc::new(ChildSignals::new(None)));
         let mut output = Vec::new();
         let mut closed = false;
         for command in rx.try_iter() {
@@ -1900,6 +1946,47 @@ mod tests {
             sent_to(pid as libc::pid_t).is_empty(),
             "a signal went to a released pid"
         );
+    }
+
+    /// A stopped child has not exited. On macOS `waitid` reports the stop to
+    /// a `WEXITED | WNOWAIT` wait; a reaper that took it for the exit blocked
+    /// in `waitpid` under the signal lock, and the SIGKILL below could never
+    /// be sent. That is how a startup deadline, which freezes the child with
+    /// SIGSTOP, hung the daemon on a Mac.
+    #[test]
+    // The child is reaped by `collect_fenced` on the reaper thread.
+    #[allow(clippy::zombie_processes)]
+    fn a_stopped_child_does_not_hold_the_signal_lock() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let signals = Arc::new(ChildSignals::new(Some(pid)));
+        let reaper_signals = Arc::clone(&signals);
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            wait_until_exited(pid);
+            let _ = reaped_tx.send(collect_fenced(pid, &reaper_signals));
+        });
+        signals.signal(libc::SIGSTOP).unwrap();
+        // Long enough for the reaper to see the stop, as it did on macOS.
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            reaped_rx.try_recv().is_err(),
+            "the reaper reported a stopped child as reaped"
+        );
+        let killer_signals = Arc::clone(&signals);
+        let (sent_tx, sent_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent_tx.send(killer_signals.signal(libc::SIGKILL));
+        });
+        assert!(
+            sent_rx.recv_timeout(T).is_ok_and(|sent| sent.is_ok()),
+            "SIGKILL could not take the signal lock: the reaper is holding it"
+        );
+        let status = reaped_rx.recv_timeout(T).expect("the killed child was reaped");
+        assert_eq!(status.and_then(|status| status.signal), Some(libc::SIGKILL));
     }
 
     /// Until the child is reaped, signals reach it and its process group.
