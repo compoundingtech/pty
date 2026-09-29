@@ -106,8 +106,8 @@ fn kill_releases_the_owned_socket_and_a_replacement_starts() {
 
     let killed = rig.pty(&["kill", "kill-socket"]);
     expect_status(&killed, 0);
-    assert!(!pid_alive(first_daemon), "daemon survived kill");
-    assert!(!pid_alive(first_owner), "socket owner {first_owner} survived kill (it ignores HUP/TERM)");
+    assert!(process_exited(first_daemon), "daemon survived kill");
+    assert!(process_exited(first_owner), "socket owner {first_owner} survived kill (it ignores HUP/TERM)");
 
     let second = rig.pty(&[
         "run",
@@ -132,5 +132,5 @@ fn kill_releases_the_owned_socket_and_a_replacement_starts() {
     assert!(sock.exists());
 
     expect_status(&rig.pty(&["kill", "kill-socket"]), 0);
-    assert!(!pid_alive(second_owner), "second owner {second_owner} survived kill");
+    assert!(process_exited(second_owner), "second owner {second_owner} survived kill");
 }

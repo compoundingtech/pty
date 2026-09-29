@@ -30,7 +30,7 @@ fn daemon_shuts_down_when_the_spawner_dies() {
     let _ = spawner.wait();
     assert!(!pid_alive(spawner_pid));
     // The watchdog polls every 5 s.
-    let died = poll_for(Duration::from_secs(12), || !pid_alive(daemon_pid));
+    let died = poll_for(Duration::from_secs(12), || process_exited(daemon_pid));
     if !died {
         kill_pid(daemon_pid, libc::SIGTERM);
     }
@@ -54,7 +54,7 @@ fn daemon_exits_at_once_when_the_spawner_is_already_dead() {
     // Either the launch already reports the daemon gone, or the published
     // daemon leaves within 8 s.
     let died = poll_for(Duration::from_secs(8), || match rig.pid("wd-dead") {
-        Some(pid) => !pid_alive(pid),
+        Some(pid) => process_exited(pid),
         None => d.launch.status != 0 || !rig.socket_path("wd-dead").exists(),
     });
     if let Some(pid) = rig.pid("wd-dead")
@@ -79,5 +79,5 @@ fn invalid_spawner_pid_disables_the_watchdog() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(pid_alive(daemon_pid), "daemon exited on an unparsable PTY_SPAWNER_PID");
     kill_pid(daemon_pid, libc::SIGTERM);
-    assert!(poll_for(Duration::from_secs(3), || !pid_alive(daemon_pid)));
+    assert!(poll_for(Duration::from_secs(3), || process_exited(daemon_pid)));
 }
