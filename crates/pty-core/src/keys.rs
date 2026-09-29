@@ -213,12 +213,18 @@ pub fn resolve_key(spec: &str) -> Result<String, KeyError> {
 
     let mapped = mapped.unwrap();
 
-    // The legacy control spelling for slash is the unit separator byte.
-    if base == "/" && mods.contains("ctrl") {
+    if base == "/" {
+        // The shifted glyph depends on the keyboard layout. Refuse this
+        // spelling rather than silently sending an unshifted slash.
+        if mods.contains("shift") {
+            return Err(KeyError(format!("Unsupported slash chord: \"{spec}\".")));
+        }
+        // The legacy control spelling is the unit separator byte.
+        let slash = if mods.contains("ctrl") { "\x1f" } else { "/" };
         return Ok(if mods.contains("alt") {
-            "\x1b\x1f".to_string()
+            format!("\x1b{slash}")
         } else {
-            "\x1f".to_string()
+            slash.to_string()
         });
     }
 

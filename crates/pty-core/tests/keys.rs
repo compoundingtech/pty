@@ -38,6 +38,10 @@ fn resolves_function_keys_and_control_slash() {
     }
     assert_eq!(r("ctrl+f1"), "\x1b[1;5P");
     assert_eq!(r("ctrl+/"), "\x1f");
+    assert_eq!(r("alt+/"), "\x1b/");
+    assert_eq!(r("alt+ctrl+/"), "\x1b\x1f");
+    assert!(resolve_key("shift+/").is_err());
+    assert!(resolve_key("ctrl+shift+/").is_err());
 }
 
 #[test]
