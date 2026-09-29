@@ -24,6 +24,22 @@ fn replay_restores_the_childs_cursor_shape_and_color() {
     assert!(!reset.contains("\x1b]12;#ff5f5f\x1b\\"), "{reset:?}");
 }
 
+#[test]
+fn ris_clears_saved_cursor_settings_across_writes() {
+    let mut a = actor();
+    a.write(b"\x1b[6 q\x1b]12;#ff5f5f\x1b\\");
+    assert!(!a.cursor_replay().is_empty());
+    assert!(a.write(b"\x1b").is_empty());
+    assert_eq!(a.write(b"c"), b"\x1bc");
+    assert_eq!(a.cursor_replay(), "");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(!replay.contains("\x1b[6 q"), "{replay:?}");
+    assert!(!replay.contains("\x1b]12;#ff5f5f\x1b\\"), "{replay:?}");
+
+    a.write(b"\x1b[4 q");
+    assert_eq!(a.cursor_replay(), "\x1b[4 q");
+}
+
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
 
 /// node: tests/screen-replay-altscreen.test.ts:62-83

@@ -504,6 +504,13 @@ impl TerminalActor {
         for tok in tokens {
             match tok {
                 Token::Raw(b) => {
+                    // RIS resets cursor shape and color in the live terminal.
+                    // The scanner holds a trailing ESC until the next write,
+                    // so a split ESC c also arrives here as one raw token.
+                    if b.windows(2).any(|bytes| bytes == b"\x1bc") {
+                        self.cursor_shape_replay = None;
+                        self.cursor_color_replay = None;
+                    }
                     feed.extend_from_slice(&b);
                     broadcast.extend_from_slice(&b);
                 }
