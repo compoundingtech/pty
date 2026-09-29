@@ -45,6 +45,12 @@ impl StreamCli {
         let fds = pty_client::tty::cloexec_pipe(false).expect("pipe");
         let (r, w) = (fds[0], fds[1]);
         let mut all: Vec<&str> = vec!["attach", "--attach-stream-fd-v1", "3"];
+        // The fake daemon in the stream framing cases cannot answer the
+        // session-id guard's STATS request. Those cases exercise the stream
+        // transport, so explicitly opt out of the guard for that fixture.
+        if args.contains(&FAKE) {
+            all.push("--force");
+        }
         all.extend_from_slice(args);
         let mut cmd = rig.command(&all);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -450,7 +456,7 @@ fn stdout_stays_the_controlling_tty_for_the_attach_geometry() {
     });
     let stream_path = rig.tmp().join("controlling-tty.stream");
     let script = format!(
-        "exec '{}' attach --attach-stream-fd-v1 3 {FAKE} 3>'{}'",
+        "exec '{}' attach --force --attach-stream-fd-v1 3 {FAKE} 3>'{}'",
         pty_bin().display(),
         stream_path.display()
     );
