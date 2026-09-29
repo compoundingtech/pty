@@ -14,12 +14,13 @@
 use pty_conformance::*;
 use std::time::Duration;
 
-/// The exact sanitize string (src/client.ts:37-55), no separators.
-const TERMINAL_SANITIZE: &str = concat!(
+/// The Node sanitize sequence, split around the optional Rust host-color reset.
+const TERMINAL_SANITIZE_PREFIX: &str = concat!(
     "\x1b[?1049l", "\x1b[?1l", "\x1b[?7h", "\x1b[?6l", "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l",
     "\x1b[?1004l", "\x1b[?1006l", "\x1b[?25h", "\x1b[?2004l", "\x1b[4l", "\x1b[r", "\x1b[0m",
-    "\x1b[0 q", "\x1b>", "\x1b(B", "\x1b[<99u",
 );
+const HOST_COLOR_RESETS: &str = "\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
+const TERMINAL_SANITIZE_SUFFIX: &str = "\x1b[0 q\x1b>\x1b(B\x1b[<99u";
 const CURSOR_TO_BOTTOM: &str = "\x1b[999;1H";
 
 /// Run `pty attach` in a tty on a session that prints READY and exits with
@@ -46,8 +47,10 @@ fn attach_detach_bytes(rig: &Rig, id: &str) -> (Option<i32>, String) {
 }
 
 fn after_sanitize(out: &str) -> &str {
-    let i = out.find(TERMINAL_SANITIZE).unwrap_or_else(|| panic!("no TERMINAL_SANITIZE in {out:?}"));
-    &out[i + TERMINAL_SANITIZE.len()..]
+    let i = out.find(TERMINAL_SANITIZE_PREFIX).unwrap_or_else(|| panic!("no sanitize prefix in {out:?}"));
+    let tail = &out[i + TERMINAL_SANITIZE_PREFIX.len()..];
+    let tail = tail.strip_prefix(HOST_COLOR_RESETS).unwrap_or(tail);
+    tail.strip_prefix(TERMINAL_SANITIZE_SUFFIX).unwrap_or_else(|| panic!("no sanitize suffix in {out:?}"))
 }
 
 /// The whole reset string, then cursor-to-bottom and the exit trailer, when
@@ -58,12 +61,12 @@ fn attach_emits_sanitize_then_exit_trailer() {
     let rig = Rig::new();
     let (code, out) = attach_exit_bytes(&rig, "sx");
     assert_eq!(code, Some(3), "attach exit code; output {out:?}");
-    expect_contains(&out, TERMINAL_SANITIZE);
+    expect_contains(&out, TERMINAL_SANITIZE_PREFIX);
     let tail = after_sanitize(&out);
     assert!(tail.starts_with(CURSOR_TO_BOTTOM), "cursor-to-bottom must follow sanitize: {tail:?}");
     expect_contains(tail, "[sx exited with code 3 after ");
     expect_contains(tail, "  restart: pty attach sx");
-    assert_eq!(out.matches(TERMINAL_SANITIZE).count(), 1, "sanitize emitted once: {out:?}");
+    assert_eq!(out.matches(TERMINAL_SANITIZE_PREFIX).count(), 1, "sanitize emitted once: {out:?}");
 }
 
 /// The same reset string and a `[detached from <id>]` trailer on a local detach.
@@ -73,7 +76,7 @@ fn detach_emits_sanitize_then_detached_trailer() {
     let rig = Rig::new();
     let (code, out) = attach_detach_bytes(&rig, "sd");
     assert_eq!(code, Some(0), "detach exit code; output {out:?}");
-    expect_contains(&out, TERMINAL_SANITIZE);
+    expect_contains(&out, TERMINAL_SANITIZE_PREFIX);
     let tail = after_sanitize(&out);
     assert!(tail.starts_with(CURSOR_TO_BOTTOM), "cursor-to-bottom must follow sanitize: {tail:?}");
     expect_contains(tail, "[detached from sd]");
@@ -93,9 +96,9 @@ fn peek_emits_sanitize_after_screen() {
     expect_status(&out, 0);
     let s = out.stdout();
     expect_contains(&s, "PEEK-READY");
-    let screen_end = s.find(TERMINAL_SANITIZE).unwrap_or_else(|| panic!("no sanitize in peek output {s:?}"));
+    let screen_end = s.find(TERMINAL_SANITIZE_PREFIX).unwrap_or_else(|| panic!("no sanitize in peek output {s:?}"));
     assert!(screen_end > 0);
-    assert_eq!(&s[screen_end + TERMINAL_SANITIZE.len()..], format!("{CURSOR_TO_BOTTOM}\n"));
+    assert_eq!(after_sanitize(&s), format!("{CURSOR_TO_BOTTOM}\n"));
     let plain = rig.pty(&["peek", "--plain", "sp"]);
     expect_status(&plain, 0);
     expect_not_contains(&plain.stdout(), "\x1b[");
