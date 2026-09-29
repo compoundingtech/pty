@@ -17,8 +17,8 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use pty_core::protocol::{
-    MessageType, Packet, PacketReader, decode_exit, encode_attach_with_identity, encode_data,
-    encode_detach, encode_resize,
+    MessageType, Packet, PacketReader, decode_exit, encode_attach_with_identity_and_cell,
+    encode_data, encode_detach, encode_resize_with_cell,
 };
 use pty_core::registry::now_epoch_ms;
 
@@ -28,7 +28,7 @@ use super::stream::{Accepted, MachineStream, truncated_line};
 use super::summary::{SessionEnd, SummaryProvider, TrailerTarget, render_trailer, trailer_header};
 use super::tty::{
     DETACH_KEY, DOUBLE_TAP_MS, FdWriter, RawMode, SigwinchPipe, is_tty, normalize_detach_key, poll,
-    read_fd, size_or_default, tty_name, window_size,
+    read_fd, tty_name, window_size_with_cell,
 };
 use super::{
     ClientError, ClientIo, GoneSet, dropping_connection_line, is_gone, node_error_message,
@@ -148,6 +148,7 @@ struct Attach<'a> {
     detach_armed: Option<Instant>,
     phase: Phase,
     stdin_open: bool,
+    stdin_was_tty: bool,
     sigwinch: Option<SigwinchPipe>,
 }
 
@@ -184,6 +185,7 @@ pub fn attach(params: AttachParams, io: &ClientIo) -> AttachOutcome {
         detach_armed: None,
         phase: Phase::Live,
         stdin_open: true,
+        stdin_was_tty: is_tty(io.stdin),
         sigwinch: None,
     };
     a.on_ready();
@@ -234,10 +236,13 @@ impl Attach<'_> {
         if self.raw.is_none() {
             self.raw = RawMode::enable_if_tty(self.io.stdin);
         }
-        let (rows, cols) = size_or_default(self.io.stdout);
-        self.socket_write(&encode_attach_with_identity(
+        let (rows, cols, cell_width, cell_height) =
+            window_size_with_cell(self.io.stdout).unwrap_or((24, 80, 0, 0));
+        self.socket_write(&encode_attach_with_identity_and_cell(
             rows,
             cols,
+            cell_width,
+            cell_height,
             std::process::id(),
             tty_name(self.io.stdin).as_deref(),
         ));
@@ -488,8 +493,11 @@ impl Attach<'_> {
 
     fn handle_sigwinch(&mut self) {
         let arrived = self.sigwinch.as_ref().is_some_and(|p| p.drain());
-        if arrived && let Some((rows, cols)) = window_size(self.io.stdout) {
-            self.socket_write(&encode_resize(rows, cols));
+        if arrived
+            && let Some((rows, cols, cell_width, cell_height)) =
+                window_size_with_cell(self.io.stdout)
+        {
+            self.socket_write(&encode_resize_with_cell(rows, cols, cell_width, cell_height));
         }
     }
 
@@ -572,6 +580,9 @@ impl Attach<'_> {
                 && fds[i].revents != 0
             {
                 self.handle_stdin_readable();
+                if self.stdin_was_tty && !self.stdin_open {
+                    return self.finish(0);
+                }
             }
             if let Some(i) = sigwinch_idx
                 && fds[i].revents != 0
