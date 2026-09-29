@@ -13,5 +13,5 @@ Flags:
 
 Examples:
   pty peek --plain myserver
-  pty peek --remote hetzner myserver
+  pty peek --remote example-host myserver
   pty peek --wait "Listening" -t 10 --plain myserver

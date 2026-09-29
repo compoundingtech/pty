@@ -791,7 +791,7 @@ fn update_tags_events_carry_full_maps_and_skip_no_ops() {
 /// `update_tags`, and assert the only differences are the appended `tags`
 /// map and the appended event — including byte-level formatting parity.
 ///
-/// node: tests/metadata-events.test.ts:169-202; docs/parity-plan.md WP2 "Done"
+/// node: tests/metadata-events.test.ts:169-202
 #[test]
 fn node_written_metadata_round_trips_byte_for_byte() {
     let Some(bin) = node_pty() else {
@@ -883,8 +883,6 @@ fn node_written_metadata_round_trips_byte_for_byte() {
 /// The file on disk right after `update_tags` is byte-identical to the
 /// Node original with `tags` appended — checked while the Node daemon is
 /// still running so nothing else has touched the record.
-///
-/// node: docs/parity-plan.md WP2 "Done"
 #[test]
 fn node_written_metadata_rewrite_is_original_plus_tags() {
     let Some(bin) = node_pty() else {

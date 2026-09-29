@@ -136,7 +136,7 @@ fn random_session_name_shape() {
 /// node: src/cli.ts:651-668, 971-973
 #[test]
 fn auto_display_name_examples() {
-    let cwd = Path::new("/home/u/myapp");
+    let cwd = Path::new("/home/example/myapp");
     let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(
         registry::auto_display_name(cwd, "node", &s(&["server.js"])),

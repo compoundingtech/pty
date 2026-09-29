@@ -1,0 +1,15 @@
+name: Private names
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No private machine, person, or agent names
+        run: python3 scripts/check-private-names.py

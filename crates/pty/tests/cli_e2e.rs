@@ -636,7 +636,7 @@ fn post_exit_peek_returns_final_screen() {
 
 #[test]
 fn run_force_creates_nested_session() {
-    // Parity #4 (canonical, CoS/Nathan ruling): --force CREATES a session even
+    // Parity #4 (canonical ruling): --force CREATES a session even
     // from inside a pty session (PTY_SESSION set) — bypasses the nesting guard,
     // matching node's --help + the fixed node code. Both --force alone and
     // --force -d create; and --force is parsed (not treated as the command).

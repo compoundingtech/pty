@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn long_hostname_keeps_default_socket_path_within_kernel_limit() {
-        let home = Path::new("/home/team/shared/users/alexander");
+        let home = Path::new("/home/example/shared/users/member");
         let host = b"build-node-01234567890123456789012345678";
         let root = default_session_dir_for_host(home, host);
         let socket = root.join("abcdefgh.sock");

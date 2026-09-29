@@ -18,5 +18,5 @@ Flags:
 
 Examples:
   pty list
-  pty list --remote hetzner
+  pty list --remote example-host
   pty list --filter-tag role=web --json

@@ -405,7 +405,7 @@ fn socket_probe_budget_is_shared() {
 /// Field-for-field agreement with Node's `pty list --json` on a directory
 /// of fabricated running / exited / vanished records.
 ///
-/// node: src/cli.ts:2292-2305; docs/parity-plan.md WP2 "Done"
+/// node: src/cli.ts:2292-2305
 #[test]
 fn matches_node_list_json_on_a_mixed_directory() {
     let Some(bin) = node_pty() else {

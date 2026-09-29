@@ -69,8 +69,8 @@ the required behavior. Track the compatibility matrix, crate boundaries, and
 acceptance tests in [issue #1](https://github.com/compoundingtech/pty-rust/issues/1).
 
 Where the port stands against the Node `pty`, surface by surface, is in
-[docs/parity.md](docs/parity.md); the work packages that close the gap are in
-[docs/parity-plan.md](docs/parity-plan.md).
+[docs/parity.md](docs/parity.md); how the workspace is laid out, and why, is in
+[docs/architecture.md](docs/architecture.md).
 
 What must stay true of terminal images — the Kitty graphics protocol state a
 session holds and replays — is in
