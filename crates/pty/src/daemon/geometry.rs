@@ -26,6 +26,12 @@ impl Daemon {
         if rows == 0 || cols == 0 {
             return false;
         }
+        // A corrupted or hostile client can request the full u16 range.
+        // Resizing the terminal actor to that grid blocks this daemon's
+        // serving thread, including STATUS for every other client.
+        if rows > 4096 || cols > 4096 || u32::from(rows) * u32::from(cols) > 250_000 {
+            return false;
+        }
         if rows == self.actor.rows() && cols == self.actor.cols() {
             return false;
         }
@@ -51,11 +57,15 @@ impl Daemon {
     }
 
     pub(crate) fn resize_pty(&self, rows: u16, cols: u16) {
+        let cell = self.actor.cell_size();
+        let pixels = |cells: u16, extent: u32| {
+            ((cells as u32).saturating_mul(extent)).min(u16::MAX as u32) as u16
+        };
         let _ = self.session.resize(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: pixels(cols, cell.width),
+            pixel_height: pixels(rows, cell.height),
         });
     }
 
