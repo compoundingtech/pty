@@ -98,7 +98,7 @@ pub fn query_stats_batch_in(
                     continue;
                 }
                 Step::Connecting(s) | Step::Writing(s, _) => (s.as_raw_fd(), libc::POLLOUT),
-                Step::Reading(s, _) => (s.as_raw_fd(), libc::POLLIN),
+                Step::Reading(s, _, _) => (s.as_raw_fd(), libc::POLLIN),
                 Step::Done(_) => continue,
             };
             polled.push(i);
@@ -134,7 +134,9 @@ pub fn query_stats_batch_in(
                     )))),
                 },
                 Step::Writing(s, written) => write_request(s, written, &request, name, &query.path),
-                Step::Reading(s, reader) => read_response(s, reader, &mut buf, name),
+                Step::Reading(s, reader, saw_unknown) => {
+                    read_response(s, reader, saw_unknown, &mut buf, name)
+                }
                 other => other,
             };
         }
@@ -145,6 +147,9 @@ pub fn query_stats_batch_in(
         .map(|(query, name)| {
             let result = match query.step {
                 Step::Done(result) => *result,
+                Step::Reading(_, _, saw_unknown) => {
+                    Err(missing_status_error(name, saw_unknown))
+                }
                 _ => Err(ClientError::StatsTimeout(name.clone())),
             };
             (name.clone(), result)
@@ -167,7 +172,7 @@ enum Step {
     /// Connected, `usize` request bytes written.
     Writing(UnixStream, usize),
     /// Request sent; collecting packets until STATUS.
-    Reading(UnixStream, PacketReader),
+    Reading(UnixStream, PacketReader, bool),
     Done(Box<Result<StatsResult, ClientError>>),
 }
 
@@ -224,7 +229,7 @@ fn write_request(
             }
         }
     }
-    Step::Reading(socket, PacketReader::new())
+    Step::Reading(socket, PacketReader::new(), false)
 }
 
 /// One read per readiness event, then back to the poll loop: a peer that
@@ -236,11 +241,12 @@ fn write_request(
 fn read_response(
     mut socket: UnixStream,
     mut reader: PacketReader,
+    saw_unknown: bool,
     buf: &mut [u8],
     name: &str,
 ) -> Step {
     match socket.read(buf) {
-        Ok(0) => Step::Done(Box::new(Err(ClientError::StatsTimeout(name.to_string())))),
+        Ok(0) => Step::Done(Box::new(Err(missing_status_error(name, saw_unknown)))),
         Ok(n) => match reader.feed(&buf[..n]) {
             Ok(packets) => match packets.iter().find(|p| p.type_ == MessageType::Status) {
                 Some(p) => {
@@ -250,7 +256,11 @@ fn read_response(
                             .map_err(|_| ClientError::InvalidStats(name.to_string())),
                     ))
                 }
-                None => Step::Reading(socket, reader),
+                None => Step::Reading(
+                    socket,
+                    reader,
+                    saw_unknown || packets.iter().any(|p| matches!(p.type_, MessageType::Unknown(_))),
+                ),
             },
             Err(e) => {
                 let _ = std::io::stderr().write_all(dropping_connection_line(&e).as_bytes());
@@ -260,7 +270,7 @@ fn read_response(
         Err(e)
             if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted =>
         {
-            Step::Reading(socket, reader)
+            Step::Reading(socket, reader, saw_unknown)
         }
         Err(e) => Step::Done(Box::new(Err(map_io_error(
             name,
@@ -310,22 +320,24 @@ fn query_status_at(
         .map_err(|e| map_io_error(name, false, GoneSet::Strict, "write", Some(path), &e))?;
     let mut reader = PacketReader::new();
     let mut buf = [0u8; 8192];
+    let mut saw_unknown_packet = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(ClientError::StatsTimeout(name.to_string()));
+            return Err(missing_status_error(name, saw_unknown_packet));
         }
         let _ = socket.set_read_timeout(Some(remaining));
         match socket.read(&mut buf) {
             // Closed without a STATUS: Node has no close handler here, so the
             // 2 s timer is what fires.
-            Ok(0) => return Err(ClientError::StatsTimeout(name.to_string())),
+            Ok(0) => return Err(missing_status_error(name, saw_unknown_packet)),
             Ok(n) => match reader.feed(&buf[..n]) {
                 Ok(packets) => {
                     for p in packets {
                         if p.type_ == MessageType::Status {
                             return Ok(String::from_utf8_lossy(&p.payload).into_owned());
                         }
+                        saw_unknown_packet |= matches!(p.type_, MessageType::Unknown(_));
                     }
                 }
                 Err(e) => {
@@ -337,12 +349,20 @@ fn query_status_at(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Err(ClientError::StatsTimeout(name.to_string()));
+                return Err(missing_status_error(name, saw_unknown_packet));
             }
             Err(e) => {
                 return Err(map_io_error(name, false, GoneSet::Strict, "read", None, &e));
             }
         }
+    }
+}
+
+fn missing_status_error(name: &str, saw_unknown_packet: bool) -> ClientError {
+    if saw_unknown_packet {
+        ClientError::OutdatedClient(name.to_string())
+    } else {
+        ClientError::StatsTimeout(name.to_string())
     }
 }
 
@@ -359,26 +379,28 @@ pub fn query_status_json_over(
         .map_err(|e| map_io_error(name, false, GoneSet::Strict, "write", None, &e))?;
     let mut reader = PacketReader::new();
     let mut buf = [0u8; 8192];
+    let mut saw_unknown_packet = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(ClientError::StatsTimeout(name.to_string()));
+            return Err(missing_status_error(name, saw_unknown_packet));
         }
         let _ = socket.set_read_timeout(Some(remaining));
         match socket.read(&mut buf) {
-            Ok(0) => return Err(ClientError::StatsTimeout(name.to_string())),
+            Ok(0) => return Err(missing_status_error(name, saw_unknown_packet)),
             Ok(n) => {
                 for p in reader.feed(&buf[..n]).unwrap_or_default() {
                     if p.type_ == MessageType::Status {
                         return Ok(String::from_utf8_lossy(&p.payload).into_owned());
                     }
+                    saw_unknown_packet |= matches!(p.type_, MessageType::Unknown(_));
                 }
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Err(ClientError::StatsTimeout(name.to_string()));
+                return Err(missing_status_error(name, saw_unknown_packet));
             }
             Err(e) => return Err(map_io_error(name, false, GoneSet::Strict, "read", None, &e)),
         }
