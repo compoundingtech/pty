@@ -1,5 +1,5 @@
-//! Terminal reset sequences, byte-for-byte the pty project's
-//! `src/client.ts:37-59`.
+//! Terminal reset sequences based on the pty project's `src/client.ts:37-59`,
+//! with additional host color resets.
 
 /// Reset terminal modes a program may have enabled, so the terminal isn't left
 /// "poisoned" after detach/peek (alt screen, mouse tracking, hidden cursor,
