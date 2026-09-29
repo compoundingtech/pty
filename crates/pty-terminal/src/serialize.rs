@@ -16,7 +16,7 @@
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::CellContentTag;
 use libghostty_vt::selection::Selection;
-use libghostty_vt::style::{Style, StyleColor, Underline};
+use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
 use libghostty_vt::terminal::{Point, PointCoordinate, Terminal};
 
 use crate::actor::{Modes, TerminalActor};
@@ -105,6 +105,7 @@ pub fn mode_prefix(modes: &Modes, include_alt_screen: bool) -> String {
 pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> String {
     let modes = actor.modes();
     let mut out = mode_prefix(&modes, opts.include_alt_screen_prefix);
+    out.push_str(&dynamic_color_prefix(actor.terminal()));
     if let Some(normal) = actor.normal_replay() {
         if opts.include_alt_screen_prefix && modes.alt_screen {
             // Back to the normal screen for its own half, then to the
@@ -121,6 +122,35 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
     }
     out.push_str(&vt(actor.terminal(), opts.scrollback, actor.cell_size()));
     out
+}
+
+/// Restore only colors the child changed from the terminal defaults. This
+/// leaves an attached host's own theme alone for untouched entries.
+fn dynamic_color_prefix(term: &Terminal<'_, '_>) -> String {
+    let mut out = String::new();
+    for (id, current, default) in [
+        (10, term.fg_color(), term.default_fg_color()),
+        (11, term.bg_color(), term.default_bg_color()),
+        (12, term.cursor_color(), term.default_cursor_color()),
+    ] {
+        if let (Ok(Some(color)), Ok(base)) = (current, default)
+            && Some(color) != base
+        {
+            out.push_str(&osc_rgb(id, color));
+        }
+    }
+    if let (Ok(current), Ok(default)) = (term.color_palette(), term.default_color_palette()) {
+        for (i, color) in current.0.iter().enumerate() {
+            if *color != default.0[i] {
+                out.push_str(&format!("\x1b]4;{i};rgb:{:02x}/{:02x}/{:02x}\x1b\\", color.r, color.g, color.b));
+            }
+        }
+    }
+    out
+}
+
+fn osc_rgb(id: u8, color: RgbColor) -> String {
+    format!("\x1b]{id};rgb:{:02x}/{:02x}/{:02x}\x1b\\", color.r, color.g, color.b)
 }
 
 fn format(term: &Terminal, opts: FormatterOptions) -> String {

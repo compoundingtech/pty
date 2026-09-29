@@ -19,5 +19,6 @@ serde_json.workspace = true
 tokio = { version = "1.53", features = ["net", "io-util", "time", "rt"], optional = true }
 
 [dev-dependencies]
+pty-terminal = { path = "../pty-terminal" }
 serde_json.workspace = true
 tokio = { version = "1.53", features = ["net", "io-util", "time", "rt", "macros"] }
