@@ -131,7 +131,7 @@ mod tests {
             .join(format!("target-exec-only-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("true");
-        std::fs::copy("/bin/true", &binary).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111)).unwrap();
         let resolved = resolve_command(binary.to_str().unwrap());
         std::fs::remove_file(&binary).unwrap();
