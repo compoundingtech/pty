@@ -74,6 +74,9 @@ pub struct SessionMetadata {
     pub isolate_env: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_env: Option<EnvMap>,
+    /// Selected inherited values retained across permanent-session respawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_env: Option<EnvMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unset_env: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +213,11 @@ impl SessionMetadata {
             && !extra_env.is_empty()
         {
             m.insert("extraEnv".into(), string_map_value(extra_env));
+        }
+        if let Some(session_env) = &self.session_env
+            && !session_env.is_empty()
+        {
+            m.insert("sessionEnv".into(), string_map_value(session_env));
         }
         if let Some(unset) = &self.unset_env
             && !unset.is_empty()
