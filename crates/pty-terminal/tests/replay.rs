@@ -2,19 +2,52 @@
 //! itself, and the ratatui-style round trip (serialize in one actor, parse in
 //! another, same picture).
 
+use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 use pty_terminal::{
     CellSize, ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
-use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
 }
 
 #[test]
+fn replay_restores_the_childs_cursor_shape_and_color() {
+    let mut a = actor();
+    a.write(b"\x1b[6 q\x1b]12;#ff5f5f\x1b\\text");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(replay.contains("\x1b[6 q"), "{replay:?}");
+    assert!(replay.contains("\x1b]12;#ff5f5f\x1b\\"), "{replay:?}");
+
+    a.write(b"\x1b[0 q\x1b]112\x1b\\");
+    let reset = a.serialize(SerializeOpts::ATTACH);
+    assert!(!reset.contains("\x1b[6 q"), "{reset:?}");
+    assert!(!reset.contains("\x1b]12;#ff5f5f\x1b\\"), "{reset:?}");
+}
+
+#[test]
+fn ris_clears_saved_cursor_settings_across_writes() {
+    let mut a = actor();
+    a.write(b"\x1b[6 q\x1b]12;#ff5f5f\x1b\\");
+    assert!(!a.cursor_replay().is_empty());
+    assert!(a.write(b"\x1b").is_empty());
+    assert_eq!(a.write(b"c"), b"\x1bc");
+    assert_eq!(a.cursor_replay(), "");
+    let replay = a.serialize(SerializeOpts::ATTACH);
+    assert!(!replay.contains("\x1b[6 q"), "{replay:?}");
+    assert!(!replay.contains("\x1b]12;#ff5f5f\x1b\\"), "{replay:?}");
+
+    a.write(b"\x1b[4 q");
+    assert_eq!(a.cursor_replay(), "\x1b[4 q");
+}
+
+#[test]
 fn pixel_queries_use_a_declared_cell_size() {
     let mut a = actor();
-    a.set_cell_size(CellSize { width: 10, height: 21 });
+    a.set_cell_size(CellSize {
+        width: 10,
+        height: 21,
+    });
     a.write(b"\x1b[16t\x1b[14t");
     assert_eq!(a.take_pty_replies(), b"\x1b[6;21;10t\x1b[4;504;800t");
 }
@@ -28,7 +61,10 @@ fn replay_restores_the_pen_for_text_written_after_attach() {
     late.write(b"AFTER");
     let pen = late.terminal().cursor_style().unwrap();
     assert_eq!(pen.underline, Underline::Curly);
-    assert_eq!(pen.underline_color, StyleColor::Rgb(RgbColor { r: 255, g: 0, b: 0 }));
+    assert_eq!(
+        pen.underline_color,
+        StyleColor::Rgb(RgbColor { r: 255, g: 0, b: 0 })
+    );
 }
 
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──
@@ -74,7 +110,10 @@ fn legacy_1047_is_normalized_to_1049_in_the_prefix() {
     assert!(screen.starts_with("\x1b[?1049h"), "{screen:?}");
     let mut b = actor();
     b.write(b"\x1b[?47h\x1b[Halt-47");
-    assert!(b.serialize(SerializeOpts::ATTACH).starts_with("\x1b[?1049h"));
+    assert!(
+        b.serialize(SerializeOpts::ATTACH)
+            .starts_with("\x1b[?1049h")
+    );
 }
 
 /// node: src/server.ts:1065-1072 — PEEK never carries Node's alt-screen
@@ -156,7 +195,13 @@ fn serializer_carries_the_modes_xterm_serializes() {
     let mut a = actor();
     a.write(b"\x1b[?2004h\x1b[?1000h\x1b[?1004h\x1b[?1h\x1b[?1049h\x1b[Hx");
     let screen = a.serialize(SerializeOpts::ATTACH);
-    for m in ["\x1b[?2004h", "\x1b[?1000h", "\x1b[?1004h", "\x1b[?1h", "\x1b[?1049h"] {
+    for m in [
+        "\x1b[?2004h",
+        "\x1b[?1000h",
+        "\x1b[?1004h",
+        "\x1b[?1h",
+        "\x1b[?1049h",
+    ] {
         assert!(screen.contains(m), "{m:?} missing from {screen:?}");
     }
 }
@@ -177,7 +222,8 @@ fn mode_flags_follow_the_childs_sequences() {
     assert!(m.mouse_1000 && m.mouse_1003);
     assert_eq!(a.take_events(), vec![TerminalEvent::CursorVisible]);
     assert_eq!(
-        a.serialize(SerializeOpts::PEEK).find("\x1b[?1000h\x1b[?1003h"),
+        a.serialize(SerializeOpts::PEEK)
+            .find("\x1b[?1000h\x1b[?1003h"),
         Some(0),
         "prefix leads with the tracked mouse modes"
     );
@@ -204,7 +250,10 @@ fn kitty_stack_and_mouse_modes_in_the_prefix() {
     let mut c = actor();
     c.write(b"\x1b[?1006h\x1b[?25l\x1b[>7u\x1b[?1002h");
     let screen = c.serialize(SerializeOpts::ATTACH);
-    assert!(screen.starts_with("\x1b[?1002h\x1b[?1006h\x1b[?25l\x1b[>7u"), "{screen:?}");
+    assert!(
+        screen.starts_with("\x1b[?1002h\x1b[?1006h\x1b[?25l\x1b[>7u"),
+        "{screen:?}"
+    );
 
     let mut d = actor();
     d.write(b"\x1b[?1003h\x1b[?1003l");
@@ -252,7 +301,10 @@ fn plain_viewport_is_the_active_area_and_full_is_everything() {
     assert_eq!(a.plain(Range::Viewport), "line7\nline8\nline9");
     assert_eq!(
         a.plain(Range::Full),
-        (0..10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n")
+        (0..10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert_eq!(a.base_y(), 7);
     assert_eq!(a.buffer_length(), 11);
@@ -270,7 +322,10 @@ fn plain_keeps_written_spaces_drops_erased_and_never_written_cells() {
     );
     let mut b = TerminalActor::new(4, 10, 0);
     b.write(b"aaaaaaaaaaaaaaaaaaaaaaaaa\r\nshort");
-    assert_eq!(b.plain(Range::Viewport), "aaaaaaaaaa\naaaaaaaaaa\naaaaa\nshort");
+    assert_eq!(
+        b.plain(Range::Viewport),
+        "aaaaaaaaaa\naaaaaaaaaa\naaaaa\nshort"
+    );
     let s = b.snapshot(0);
     assert_eq!(s.wrapped, vec![false, true, true, false]);
 }
@@ -356,8 +411,16 @@ fn round_trip(a: &TerminalActor) -> TerminalActor {
     // background (docs/decisions/0002-ansi-serialization.md), so the plain
     // text is compared right-trimmed; the cell comparison below is exact.
     let trimmed = |s: String| s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
-    assert_eq!(trimmed(b.plain(Range::Full)), trimmed(a.plain(Range::Full)), "plain text");
-    assert_eq!((b.base_y(), b.buffer_length()), (a.base_y(), a.buffer_length()), "buffer shape");
+    assert_eq!(
+        trimmed(b.plain(Range::Full)),
+        trimmed(a.plain(Range::Full)),
+        "plain text"
+    );
+    assert_eq!(
+        (b.base_y(), b.buffer_length()),
+        (a.base_y(), a.buffer_length()),
+        "buffer shape"
+    );
     // A pending wrap (cursor past the last column) cannot be expressed by
     // CUP; xterm's serializer has the same limit.
     let clamp = |c: (u16, u16, bool)| (c.0.min(a.cols() - 1), c.1, c.2);
@@ -377,7 +440,10 @@ fn round_trip(a: &TerminalActor) -> TerminalActor {
 #[test]
 fn full_width_rgb_background_fill_survives_replay() {
     let mut a = actor();
-    let line = format!("\x1b[48;2;71;76;86m{}\x1b[0m\r\nBG-FILL-DONE\r\n", " ".repeat(80));
+    let line = format!(
+        "\x1b[48;2;71;76;86m{}\x1b[0m\r\nBG-FILL-DONE\r\n",
+        " ".repeat(80)
+    );
     a.write(line.as_bytes());
     assert!(a.serialize(SerializeOpts::ATTACH).contains("48;2;71;76;86"));
     let b = round_trip(&a);
@@ -390,11 +456,19 @@ fn full_width_rgb_background_fill_survives_replay() {
 #[test]
 fn partial_background_fill_survives_replay() {
     let mut a = actor();
-    let line = format!("\x1b[48;2;0;100;200m{}\x1b[0m{}\r\nPARTIAL-BG-DONE\r\n", " ".repeat(40), " ".repeat(40));
+    let line = format!(
+        "\x1b[48;2;0;100;200m{}\x1b[0m{}\r\nPARTIAL-BG-DONE\r\n",
+        " ".repeat(40),
+        " ".repeat(40)
+    );
     a.write(line.as_bytes());
     let b = round_trip(&a);
     let s = b.snapshot(0);
-    assert!(s.rows[0][..40].iter().all(|c| c.bg == ColorSnap::Rgb(0, 100, 200)));
+    assert!(
+        s.rows[0][..40]
+            .iter()
+            .all(|c| c.bg == ColorSnap::Rgb(0, 100, 200))
+    );
     assert!(s.rows[0][40..].iter().all(|c| c.bg == ColorSnap::Default));
 }
 
@@ -403,7 +477,10 @@ fn partial_background_fill_survives_replay() {
 fn text_with_background_survives_replay() {
     let mut a = actor();
     let text = "Hello World";
-    let line = format!("\x1b[48;2;30;30;30m\x1b[38;2;255;255;255m{text}{}\x1b[0m\r\nTEXT-BG-DONE\r\n", " ".repeat(80 - text.len()));
+    let line = format!(
+        "\x1b[48;2;30;30;30m\x1b[38;2;255;255;255m{text}{}\x1b[0m\r\nTEXT-BG-DONE\r\n",
+        " ".repeat(80 - text.len())
+    );
     a.write(line.as_bytes());
     let b = round_trip(&a);
     let s = b.snapshot(0);
@@ -427,7 +504,10 @@ fn alt_screen_with_per_row_background_erase_survives_replay() {
     a.write(script.as_bytes());
     let b = round_trip(&a);
     let s = b.snapshot(0);
-    assert!(s.rows[1][0].text == " " && s.rows[1][79].bg == ColorSnap::Rgb(71, 76, 86), "erased-with-bg row keeps its background");
+    assert!(
+        s.rows[1][0].text == " " && s.rows[1][79].bg == ColorSnap::Rgb(71, 76, 86),
+        "erased-with-bg row keeps its background"
+    );
     assert!(s.rows[0][1].bold);
     assert!(b.plain(Range::Viewport).contains("RATATUI-SCREEN-OK"));
     assert!(b.alt_screen_active());
@@ -465,7 +545,10 @@ fn full_screen_el_background_is_kept_on_every_row() {
     let b = round_trip(&a);
     let s = b.snapshot(0);
     for (y, row) in s.rows.iter().enumerate() {
-        assert!(row.iter().all(|c| c.bg == ColorSnap::Rgb(128, 0, 128)), "row {y} lost its background");
+        assert!(
+            row.iter().all(|c| c.bg == ColorSnap::Rgb(128, 0, 128)),
+            "row {y} lost its background"
+        );
     }
 }
 

@@ -24,7 +24,7 @@ use crate::queries;
 use crate::screenshot::{self, Screenshot};
 use crate::serialize::{self, SerializeOpts};
 use crate::snapshot::{self, CellGrid};
-use crate::strip::{OutputScanner, Osc, Token};
+use crate::strip::{Osc, OutputScanner, Token};
 
 /// Node's scrollback (`src/server.ts:333-338`), in lines.
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -223,6 +223,9 @@ pub struct TerminalActor {
     /// back to when that program exits. Node gets it for free because
     /// xterm's serialize addon holds both buffers.
     normal_replay: Option<String>,
+    /// Most recent child cursor settings, which the cell formatter omits.
+    cursor_shape_replay: Option<Vec<u8>>,
+    cursor_color_replay: Option<Vec<u8>>,
 }
 
 impl TerminalActor {
@@ -272,6 +275,8 @@ impl TerminalActor {
             cell: CellSize::default(),
             graphics: None,
             normal_replay: None,
+            cursor_shape_replay: None,
+            cursor_color_replay: None,
         }
     }
 
@@ -306,7 +311,10 @@ impl TerminalActor {
             self.rollback_graphics(previous);
             return false;
         }
-        if self.term.set_apc_max_bytes_kitty(opts.apc_max_bytes).is_err()
+        if self
+            .term
+            .set_apc_max_bytes_kitty(opts.apc_max_bytes)
+            .is_err()
             || self
                 .term
                 .set_kitty_image_storage_limit(opts.storage_bytes)
@@ -348,7 +356,12 @@ impl TerminalActor {
     fn apply_cell(&mut self) -> Result<(), libghostty_vt::error::Error> {
         let cell = self.cell.or_fallback();
         self.term
-            .resize(self.cols().max(1), self.rows().max(1), cell.width, cell.height)
+            .resize(
+                self.cols().max(1),
+                self.rows().max(1),
+                cell.width,
+                cell.height,
+            )
             .map(|_| ())
     }
 
@@ -401,7 +414,8 @@ impl TerminalActor {
     /// The pixels of one image, copied out of the storage. `None` when it is
     /// not there (a delete won the race).
     pub fn image_bytes(&self, id: u32) -> Option<ImageBytes> {
-        self.graphics.and_then(|_| graphics::image_bytes(&self.term, id))
+        self.graphics
+            .and_then(|_| graphics::image_bytes(&self.term, id))
     }
 
     /// Drop every image and placement, keeping the protocol on: what a pane
@@ -482,6 +496,15 @@ impl TerminalActor {
         &self.inactive_kitty_stack
     }
 
+    /// Cursor settings to apply after the cell replay.
+    pub fn cursor_replay(&self) -> String {
+        self.cursor_shape_replay
+            .iter()
+            .chain(self.cursor_color_replay.iter())
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect()
+    }
+
     /// The underlying terminal, for reads this API does not cover.
     pub fn terminal(&self) -> &Terminal<'static, 'static> {
         &self.term
@@ -498,11 +521,21 @@ impl TerminalActor {
         for tok in tokens {
             match tok {
                 Token::Raw(b) => {
+                    // RIS resets cursor shape and color in the live terminal.
+                    // The scanner holds a trailing ESC until the next write,
+                    // so a split ESC c also arrives here as one raw token.
+                    if b.windows(2).any(|bytes| bytes == b"\x1bc") {
+                        self.cursor_shape_replay = None;
+                        self.cursor_color_replay = None;
+                    }
                     feed.extend_from_slice(&b);
                     broadcast.extend_from_slice(&b);
                 }
                 Token::Ris => {
                     self.flush_feed(&mut feed);
+                    self.inactive_kitty_stack.clear();
+                    self.cursor_shape_replay = None;
+                    self.cursor_color_replay = None;
                     if self.modes.cursor_hidden {
                         self.events.push(TerminalEvent::CursorVisible);
                     }
@@ -522,8 +555,18 @@ impl TerminalActor {
                             18 => format!("\x1b[8;{rows};{cols}t"),
                             _ => unreachable!(),
                         };
-                        self.shared.borrow_mut().pty_replies.extend_from_slice(reply.as_bytes());
+                        self.shared
+                            .borrow_mut()
+                            .pty_replies
+                            .extend_from_slice(reply.as_bytes());
                         continue;
+                    }
+                    if c.final_byte == b'q'
+                        && c.prefix.is_none()
+                        && c.intermediates == [b' ']
+                        && c.params.first().copied().unwrap_or(0) <= 6
+                    {
+                        self.cursor_shape_replay = Some(c.raw.clone());
                     }
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);
@@ -565,13 +608,20 @@ impl TerminalActor {
                     }
                 }
                 Token::Osc(o) => {
+                    let (osc_id, osc_data) = o.split();
+                    if osc_id == Some(112) || (osc_id == Some(12) && osc_data != b"?") {
+                        self.cursor_color_replay = Some(o.raw.clone());
+                    }
                     if let Some((id, index)) = o.color_query() {
                         // Answer in stream order: everything before the query
                         // reaches the terminal (and may itself be answered)
                         // before this reply is queued.
                         self.flush_feed(&mut feed);
                         if let Some(reply) = queries::color_query_reply(id, index) {
-                            self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                            self.shared
+                                .borrow_mut()
+                                .pty_replies
+                                .extend_from_slice(&reply);
                         }
                         continue;
                     }
@@ -627,7 +677,13 @@ impl TerminalActor {
                         fields.push((part[..eq].to_string(), part[eq + 1..].to_string()));
                     }
                 }
-                let get = |k: &str| fields.iter().rev().find(|(fk, _)| fk == k).map(|(_, v)| v.clone());
+                let get = |k: &str| {
+                    fields
+                        .iter()
+                        .rev()
+                        .find(|(fk, _)| fk == k)
+                        .map(|(_, v)| v.clone())
+                };
                 Notification {
                     title: get("title").or_else(|| get("t")),
                     body: get("body").or_else(|| get("b")),
@@ -669,6 +725,8 @@ impl TerminalActor {
         self.scanner.reset();
         self.modes = Modes::default();
         self.inactive_kitty_stack.clear();
+        self.cursor_shape_replay = None;
+        self.cursor_color_replay = None;
         self.shared.borrow_mut().titles.clear();
         self.shared.borrow_mut().bells = 0;
         // RIS restores libghostty's defaults, which include no image storage
@@ -815,7 +873,10 @@ impl TerminalActor {
     /// The kitty keyboard flags currently in effect (libghostty's value; the
     /// push/pop history is [`Modes::kitty_stack`]).
     pub fn kitty_flags(&self) -> u8 {
-        self.term.kitty_keyboard_flags().map(|f| f.bits()).unwrap_or(0)
+        self.term
+            .kitty_keyboard_flags()
+            .map(|f| f.bits())
+            .unwrap_or(0)
     }
 
     /// Override palette entries `0..colors.len()` (a theme). Cells keep

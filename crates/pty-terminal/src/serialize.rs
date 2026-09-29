@@ -126,6 +126,7 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
         }
     }
     out.push_str(&vt(actor.terminal(), opts.scrollback, actor.cell_size()));
+    out.push_str(&actor.cursor_replay());
     out
 }
 
