@@ -160,6 +160,59 @@ pub fn remove_session_files(name: &str) {
 /// A pid no live process can own (above Linux's `pid_max`).
 pub const DEAD_PID: i32 = 2_147_483_646;
 
+/// The socket a dead daemon leaves behind: a real socket file that refuses
+/// every connect.
+///
+/// **It is bound and never listened on.** Binding a `UnixListener` and
+/// dropping it looks the same, but for a moment it is not: the tests run on
+/// parallel threads, and some of them spawn processes (`ps` for a start
+/// token on macOS, `true` in `process_helpers`). A child forked while the
+/// listener is open holds a copy of it until its exec finishes, and on macOS
+/// exec includes checking the new binary's code signature, which is slow
+/// under load. A probe that connects in that window is accepted, and the
+/// session reads as `Running`. On a Mac on 2026-09-28 that failed 44 runs
+/// of the test binary in 1000.
+/// A socket that was never put into the listening state refuses connections
+/// whichever process holds it, so the stale socket is stale from the moment
+/// it exists.
+pub fn stale_socket(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain socket calls on a descriptor this function owns and
+    // closes; `addr` is zeroed and `bytes` fits with its terminating NUL.
+    let (rc, err) = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(bytes.len() < addr.sun_path.len(), "{} is too long", path.display());
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        let rc = libc::bind(
+            fd,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        );
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        (rc, err)
+    };
+    assert_eq!(rc, 0, "bind {}: {err}", path.display());
+
+    // The two properties the tests rely on, checked here rather than assumed.
+    let file_type = std::fs::symlink_metadata(path).unwrap().file_type();
+    assert!(file_type.is_socket(), "{} is not a socket", path.display());
+    let refused = std::os::unix::net::UnixStream::connect(path).unwrap_err();
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "a stale socket must refuse a connect"
+    );
+}
+
 /// Parsed lines of `<name>.events.jsonl` (empty when missing).
 pub fn read_events(name: &str) -> Vec<serde_json::Value> {
     let path = root().join(format!("{name}.events.jsonl"));

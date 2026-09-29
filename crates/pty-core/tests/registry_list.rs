@@ -8,7 +8,7 @@ use std::os::unix::net::UnixListener;
 use std::time::Duration;
 
 use pty_core::registry::{self, SessionMetadata, SessionStatus};
-use registry_support::{DEAD_PID, node_pty, root, run_node_pty, unique_name};
+use registry_support::{DEAD_PID, node_pty, root, run_node_pty, stale_socket, unique_name};
 use serde_json::{Value, json};
 
 fn write_json(name: &str, value: Value) {
@@ -127,8 +127,7 @@ fn reachable_socket_overrides_a_dead_pid() {
 fn stale_socket_with_dead_pid_reports_the_retained_record() {
     let _ = root();
     let name = unique_name("stalesock");
-    let listener = UnixListener::bind(registry::socket_path(&name)).unwrap();
-    drop(listener); // the inode stays, nothing listens
+    stale_socket(&registry::socket_path(&name));
     std::fs::write(registry::pid_path(&name), DEAD_PID.to_string()).unwrap();
     write_json(&name, base(&name));
     assert_eq!(find(&name).status, SessionStatus::Vanished);
@@ -149,7 +148,7 @@ fn stale_socket_with_dead_pid_reports_the_retained_record() {
 fn stale_socket_with_dead_pid_and_no_metadata_is_omitted() {
     let _ = root();
     let name = unique_name("nometa");
-    drop(UnixListener::bind(registry::socket_path(&name)).unwrap());
+    stale_socket(&registry::socket_path(&name));
     std::fs::write(registry::pid_path(&name), DEAD_PID.to_string()).unwrap();
     assert!(registry::list_sessions().iter().all(|s| s.name != name));
 }
@@ -162,7 +161,7 @@ fn stale_socket_with_dead_pid_and_no_metadata_is_omitted() {
 fn socket_with_unreadable_pid_is_running_defensively() {
     let _ = root();
     let name = unique_name("nopid");
-    drop(UnixListener::bind(registry::socket_path(&name)).unwrap());
+    stale_socket(&registry::socket_path(&name));
     let s = find(&name);
     assert_eq!(s.status, SessionStatus::Running);
     assert_eq!(s.pid, None);
