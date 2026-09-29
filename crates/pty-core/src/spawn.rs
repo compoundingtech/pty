@@ -42,8 +42,13 @@ fn check_executable(path: &Path, requested: &str) -> Result<(), String> {
     if !is_executable_file(path) {
         return Err(format!("Command is not executable: {requested}"));
     }
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("Cannot read command {requested}: {error}"))?;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        // An executable binary need not be readable. The spawn path will
+        // report any real execution failure after this optional shebang check.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(error) => return Err(format!("Cannot read command {requested}: {error}")),
+    };
     let mut head = [0u8; 512];
     let size = file
         .read(&mut head)
@@ -116,6 +121,23 @@ fn is_executable_file(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_only_binary_can_be_resolved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target-exec-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("true");
+        std::fs::copy("/bin/true", &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let resolved = resolve_command(binary.to_str().unwrap());
+        std::fs::remove_file(&binary).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(resolved.unwrap(), binary.to_string_lossy());
+    }
 
     #[test]
     fn absolute_paths_must_exist() {
