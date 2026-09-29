@@ -27,11 +27,20 @@ pub fn default_session_dir() -> PathBuf {
     let mut hostname = [0u8; 256];
     let host = if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } == 0 {
         let len = hostname.iter().position(|&b| b == 0).unwrap_or(hostname.len());
-        String::from_utf8_lossy(&hostname[..len]).into_owned()
+        &hostname[..len]
     } else {
-        "localhost".to_string()
+        b"localhost"
     };
-    PathBuf::from(home).join(".local").join("state").join("pty").join(host)
+    default_session_dir_for_host(Path::new(&home), host)
+}
+
+fn default_session_dir_for_host(home: &Path, host: &[u8]) -> PathBuf {
+    // A fixed-width FNV-1a digest keeps the socket path usable when the host
+    // name is long, while retaining a stable directory per host.
+    let hash = host.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    home.join(".local/state/pty").join(format!("h-{hash:016x}"))
 }
 
 std::thread_local! {
@@ -184,6 +193,17 @@ pub fn root_length_check() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_hostname_keeps_default_socket_path_within_kernel_limit() {
+        let home = Path::new("/home/team/shared/users/alexander");
+        let host = b"build-node-01234567890123456789012345678";
+        let root = default_session_dir_for_host(home, host);
+        let socket = root.join("abcdefgh.sock");
+        assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
+        assert_eq!(root, default_session_dir_for_host(home, host));
+        assert_ne!(root, default_session_dir_for_host(home, b"other-host"));
+    }
 
     #[test]
     fn shared_home_default_child() {
