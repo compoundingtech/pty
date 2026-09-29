@@ -98,19 +98,33 @@ impl Csi {
         }
     }
 
-    /// True when the sequence is one of the queries Node keeps out of DATA:
-    /// DA1, DA2, DSR (cursor position), XTVERSION.
+    /// True when the session terminal answers the query itself and the
+    /// attached client's terminal must not answer it again.
     ///
     /// Node's regexes (`src/server.ts:264-274`) match only the shortest spelling
     /// of each (`ESC[c`, `ESC[>c`, `ESC[6n`, `ESC[>0q`); this strips every
     /// spelling Node *answers* (`ESC[0c`, `ESC[>0c`, `ESC[>q`) as well, because
     /// a leaked spelling would be answered a second time by the client's real
-    /// terminal.
+    /// terminal. The same applies to DSR 5n, DECRQM and the kitty keyboard
+    /// state query, which libghostty also answers locally, and to the geometry
+    /// queries answered from the session's size.
     pub fn is_stripped_query(&self) -> bool {
         self.is_da1_query()
             || self.is_da2_query()
             || self.is_dsr_query()
             || self.is_xtversion_query()
+            || (self.final_byte == b'n'
+                && self.prefix.is_none()
+                && self.intermediates.is_empty()
+                && self.params.as_slice() == [5])
+            || (self.final_byte == b'p'
+                && self.prefix == Some(b'?')
+                && self.intermediates == [b'$']
+                && !self.params.is_empty())
+            || (self.final_byte == b'u'
+                && self.prefix == Some(b'?')
+                && self.intermediates.is_empty()
+                && self.params.is_empty())
             || self.size_query().is_some()
     }
 
@@ -501,6 +515,15 @@ mod tests {
         assert_eq!(strip("hello world"), "hello world");
         let ansi = "\x1b[1;31mred bold\x1b[0m";
         assert_eq!(strip(ansi), ansi);
+    }
+
+    #[test]
+    fn strips_state_queries_answered_by_the_session_terminal() {
+        assert_eq!(
+            strip("a\x1b[?2004$pb\x1b[5nc\x1b[?ud"),
+            "abcd"
+        );
+        assert_eq!(strip("\x1b[?2004h\x1b[?2004l"), "\x1b[?2004h\x1b[?2004l");
     }
 
     /// node: tests/terminal-queries.test.ts:73-80
