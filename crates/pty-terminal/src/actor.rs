@@ -504,6 +504,19 @@ impl TerminalActor {
                     broadcast.extend_from_slice(b"\x1bc");
                 }
                 Token::Csi(c) => {
+                    if let Some(query) = c.size_query() {
+                        self.flush_feed(&mut feed);
+                        let cell = self.cell_size().or_fallback();
+                        let (rows, cols) = (self.rows() as u32, self.cols() as u32);
+                        let reply = match query {
+                            14 => format!("\x1b[4;{};{}t", rows * cell.height, cols * cell.width),
+                            16 => format!("\x1b[6;{};{}t", cell.height, cell.width),
+                            18 => format!("\x1b[8;{rows};{cols}t"),
+                            _ => unreachable!(),
+                        };
+                        self.shared.borrow_mut().pty_replies.extend_from_slice(reply.as_bytes());
+                        continue;
+                    }
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);
                     } else if c.is_kitty_pop() {
