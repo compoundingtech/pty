@@ -86,6 +86,18 @@ impl Csi {
         self.final_byte == b'q' && self.prefix == Some(b'>') && self.intermediates.is_empty()
     }
 
+    /// CSI 14t, 16t and 18t ask for window, cell and grid geometry.
+    pub fn size_query(&self) -> Option<u16> {
+        if self.final_byte == b't' && self.prefix.is_none() && self.intermediates.is_empty() {
+            match self.params.as_slice() {
+                [14] | [16] | [18] => Some(self.params[0]),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// True when the session terminal answers the query itself and the
     /// attached client's terminal must not answer it again.
     ///
@@ -94,7 +106,8 @@ impl Csi {
     /// spelling Node *answers* (`ESC[0c`, `ESC[>0c`, `ESC[>q`) as well, because
     /// a leaked spelling would be answered a second time by the client's real
     /// terminal. The same applies to DSR 5n, DECRQM and the kitty keyboard
-    /// state query, which libghostty also answers locally.
+    /// state query, which libghostty also answers locally, and to the geometry
+    /// queries answered from the session's size.
     pub fn is_stripped_query(&self) -> bool {
         self.is_da1_query()
             || self.is_da2_query()
@@ -112,6 +125,7 @@ impl Csi {
                 && self.prefix == Some(b'?')
                 && self.intermediates.is_empty()
                 && self.params.is_empty())
+            || self.size_query().is_some()
     }
 
     /// Kitty keyboard push `CSI > flags u` → the pushed flags
