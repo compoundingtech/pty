@@ -4,31 +4,72 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use common::*;
 use pty_client::{
     DEFAULT_SEQ_DELAY_MS, SendDataOptions, SendOptions, resolve_seq_delay_ms, send, send_data,
 };
-use pty_core::protocol::MessageType;
+use pty_core::protocol::{MessageType, Packet, PacketReader, encode_status_response};
 
 const T: Duration = Duration::from_secs(5);
 
+fn status_body(bracketed_paste: bool) -> String {
+    serde_json::json!({
+        "name": "send", "terminal": {"cols": 80, "rows": 24, "cursorX": 0,
+            "cursorY": 0, "scrollbackUsed": 0, "scrollbackCapacity": 100},
+        "process": {"alive": true, "exitCode": null, "pid": 123, "resources": null},
+        "daemon": {"pid": 456, "resources": null},
+        "clients": {"total": 0, "attached": 0, "readOnly": 0},
+        "modes": {"sgrMouse": false, "cursorHidden": false, "kittyKeyboard": false,
+            "kittyKeyboardFlags": [], "bracketedPaste": bracketed_paste},
+        "uptimeSeconds": 0, "createdAt": null
+    })
+    .to_string()
+}
+
+fn collect_with_status(mut socket: UnixStream, bracketed_paste: bool) -> Vec<Packet> {
+    socket.set_read_timeout(Some(T)).unwrap();
+    let mut reader = PacketReader::new();
+    let mut out = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        match socket.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for packet in reader.feed(&buf[..n]).unwrap() {
+                    if packet.type_ == MessageType::Status {
+                        assert!(packet.payload.is_empty());
+                        socket
+                            .write_all(&encode_status_response(&status_body(bracketed_paste)))
+                            .unwrap();
+                    }
+                    out.push(packet);
+                }
+            }
+            Err(error) => panic!("fake daemon read: {error}"),
+        }
+    }
+    out
+}
+
 /// Run one `send` and return the DATA payloads the daemon received, in order.
-fn capture(items: &[&str], opts: SendOptions) -> Vec<Vec<u8>> {
+fn capture(items: &[&str], opts: SendOptions, bracketed_paste: bool) -> Vec<Vec<u8>> {
     let d = FakeDaemon::bind("send");
     let listener = d.listener.try_clone().unwrap();
     let h = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        read_packets_until_eof(&mut s, T)
+        let (s, _) = listener.accept().unwrap();
+        collect_with_status(s, bracketed_paste)
     });
     send(&d.name, items, opts).unwrap();
     let packets = h.join().unwrap();
-    assert!(
-        packets.iter().all(|p| p.type_ == MessageType::Data),
-        "{packets:?}"
+    assert_eq!(
+        packets.iter().filter(|p| p.type_ == MessageType::Status).count(),
+        usize::from(opts.paste && !items.is_empty())
     );
-    packets.into_iter().map(|p| p.payload).collect()
+    packets.into_iter().filter(|p| p.type_ == MessageType::Data).map(|p| p.payload).collect()
 }
 
 fn joined(parts: &[Vec<u8>]) -> String {
@@ -44,6 +85,7 @@ fn paste_wraps_a_single_positional_in_markers() {
             delay_ms: 0,
             paste: true,
         },
+        true,
     );
     assert_eq!(
         got,
@@ -65,6 +107,7 @@ fn paste_wraps_the_whole_seq_payload_in_one_pair() {
             delay_ms: 0,
             paste: true,
         },
+        true,
     );
     assert_eq!(joined(&got), "\x1b[200~first second third\x1b[201~");
     assert_eq!(got.len(), 5);
@@ -74,6 +117,7 @@ fn paste_wraps_the_whole_seq_payload_in_one_pair() {
             delay_ms: 50,
             paste: true,
         },
+        true,
     );
     assert_eq!(joined(&got), "\x1b[200~AB\x1b[201~");
 }
@@ -81,7 +125,7 @@ fn paste_wraps_the_whole_seq_payload_in_one_pair() {
 /// node: tests/send-paste.test.ts:188-219
 #[test]
 fn no_markers_without_paste_and_literal_newlines_survive() {
-    let got = capture(&["plain-text"], SendOptions::default());
+    let got = capture(&["plain-text"], SendOptions::default(), true);
     assert_eq!(got, vec![b"plain-text".to_vec()]);
     let got = capture(
         &["line-one\nline-two\n"],
@@ -89,8 +133,11 @@ fn no_markers_without_paste_and_literal_newlines_survive() {
             delay_ms: 0,
             paste: true,
         },
+        true,
     );
     assert_eq!(joined(&got), "\x1b[200~line-one\nline-two\n\x1b[201~");
+    let got = capture(&["paste-disabled"], SendOptions { delay_ms: 0, paste: true }, false);
+    assert_eq!(got, vec![b"paste-disabled".to_vec()]);
 }
 
 /// node: tests/send-paste.test.ts:267-290 — each `--seq` item is its own DATA
@@ -103,6 +150,7 @@ fn seq_items_are_separate_packets() {
             delay_ms: 0,
             paste: false,
         },
+        true,
     );
     assert_eq!(got.len(), 4);
     assert_eq!(joined(&got), "\x15\x15\x15\x15");
@@ -115,12 +163,13 @@ fn send_data_paste_pair_and_empty_payload() {
     let d = FakeDaemon::bind("sd");
     let listener = d.listener.try_clone().unwrap();
     let h = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        for _ in 0..2 {
-            let (mut s, _) = listener.accept().unwrap();
-            out.push(read_packets_until_eof(&mut s, T));
-        }
-        out
+        let handlers: Vec<_> = (0..3)
+            .map(|_| {
+                let (socket, _) = listener.accept().unwrap();
+                std::thread::spawn(move || collect_with_status(socket, true))
+            })
+            .collect();
+        handlers.into_iter().map(|handler| handler.join().unwrap()).collect::<Vec<_>>()
     });
     send_data(
         &d.name,
@@ -141,6 +190,8 @@ fn send_data_paste_pair_and_empty_payload() {
     )
     .unwrap();
     let got = h.join().unwrap();
+    assert_eq!(got[1].len(), 1);
+    assert_eq!(got[1][0].type_, MessageType::Status);
     let first: Vec<Vec<u8>> = got[0].iter().map(|p| p.payload.clone()).collect();
     assert_eq!(joined(&first), "\x1b[200~xy\x1b[201~");
     assert_eq!(
@@ -157,7 +208,7 @@ fn send_data_paste_pair_and_empty_payload() {
             .count(),
         1
     );
-    assert!(got[1].is_empty());
+    assert!(got[2].is_empty());
 }
 
 /// node: tests/seq-delay.test.ts:15-28, :83-106 — the pacing default and the
@@ -176,6 +227,7 @@ fn delay_resolution_and_pacing() {
             delay_ms: 100,
             paste: false,
         },
+        true,
     );
     let elapsed = start.elapsed();
     assert_eq!(got.len(), 3);

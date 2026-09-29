@@ -33,7 +33,7 @@ use pty_spawn::substrate::{ExitStatus, Lifecycle, SessionEvent, SessionOwner, Se
 use pty_terminal::{TerminalActor, serialize};
 
 use super::DaemonConfig;
-use super::clients::{Client, ClientFacts, OUTBOUND_QUEUE_PACKETS, Out, REDRAW_SETTLE};
+use super::clients::{Client, ClientFacts, OUTBOUND_QUEUE_PACKETS, Out, REDRAW_SETTLE, Role};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
 use pty_core::process_tree::{
@@ -726,6 +726,12 @@ fn install_spawner_watchdog(tx: Sender<Msg>) {
     });
 }
 
+fn clipboard_client_available(clients: &BTreeMap<u64, Client>) -> bool {
+    clients.values().any(|client| {
+        client.role == Role::Writable && client.attached.is_some() && !client.is_settling()
+    })
+}
+
 impl Daemon {
     fn owner(&self) -> SessionGenerationOwner {
         SessionGenerationOwner {
@@ -829,6 +835,7 @@ impl Daemon {
     /// node: src/server.ts:559-569
     fn on_pty_data(&mut self, bytes: &[u8]) {
         self.stamp_output_activity();
+        self.actor.set_clipboard_client_available(clipboard_client_available(&self.clients));
         let cleaned = self.actor.write(bytes);
         let replies = self.actor.take_pty_replies();
         self.write_pty(&replies);
@@ -1533,8 +1540,29 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pty_spawn::{external_owned_pair, open, shell_exec};
     use std::time::Duration;
+    use pty_core::protocol::AttachedClient;
+    use pty_spawn::{external_owned_pair, open, shell_exec};
+
+    #[test]
+    fn command_socket_does_not_suppress_clipboard_fallback() {
+        let (tx, _rx) = mpsc::channel();
+        let mut clients = BTreeMap::new();
+        clients.insert(1, Client::new(tx, 24, 80));
+        let mut actor = TerminalActor::new(24, 80, 0);
+        actor.set_clipboard_client_available(clipboard_client_available(&clients));
+        assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");
+        assert_eq!(actor.take_pty_replies(), b"\x1b]52;c;\x1b\\");
+
+        let client = clients.get_mut(&1).unwrap();
+        client.role = Role::Writable;
+        client.attached = Some(AttachedClient {
+            pid: None,
+            tty: None,
+            attached_at: String::new(),
+        });
+        assert!(clipboard_client_available(&clients));
+    }
 
     #[test]
     fn wait_status_maps_signals_to_128_plus() {
