@@ -2,7 +2,8 @@
 //!
 //! Mirrors `src/sessions.ts:24-131` of the Node project: `PTY_ROOT` wins,
 //! the deprecated `PTY_SESSION_DIR` is honoured with a one-time notice, and
-//! everything else lands in `~/.local/state/pty`.
+//! otherwise sessions use a host-specific directory under
+//! `~/.local/state/pty`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,27 @@ fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// The default registry root, `~/.local/state/pty`.
+/// A machine-local default registry root under the home state directory.
+/// The hostname keeps sockets and records apart when homes are shared.
 pub fn default_session_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".local").join("state").join("pty")
+    let mut hostname = [0u8; 256];
+    let host = if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } == 0 {
+        let len = hostname.iter().position(|&b| b == 0).unwrap_or(hostname.len());
+        &hostname[..len]
+    } else {
+        b"localhost"
+    };
+    default_session_dir_for_host(Path::new(&home), host)
+}
+
+fn default_session_dir_for_host(home: &Path, host: &[u8]) -> PathBuf {
+    // A fixed-width FNV-1a digest keeps the socket path usable when the host
+    // name is long, while retaining a stable directory per host.
+    let hash = host.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    home.join(".local/state/pty").join(format!("h-{hash:016x}"))
 }
 
 std::thread_local! {
@@ -57,7 +75,7 @@ pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
 /// Resolve the session registry directory: the root of an enclosing
 /// [`with_root`] on this thread, else `$PTY_ROOT`, else the deprecated
 /// `$PTY_SESSION_DIR` (with a one-time notice on stderr unless
-/// `PTY_ROOT_LEGACY_SILENT` is set), else `~/.local/state/pty`.
+/// `PTY_ROOT_LEGACY_SILENT` is set), else [`default_session_dir`].
 ///
 /// node: src/sessions.ts:82-110
 pub fn session_dir() -> PathBuf {
@@ -175,6 +193,51 @@ pub fn root_length_check() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_hostname_keeps_default_socket_path_within_kernel_limit() {
+        let home = Path::new("/home/team/shared/users/alexander");
+        let host = b"build-node-01234567890123456789012345678";
+        let root = default_session_dir_for_host(home, host);
+        let socket = root.join("abcdefgh.sock");
+        assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
+        assert_eq!(root, default_session_dir_for_host(home, host));
+        assert_ne!(root, default_session_dir_for_host(home, b"other-host"));
+    }
+
+    #[test]
+    fn shared_home_default_child() {
+        let Ok(home) = std::env::var("PTY_TEST_SHARED_HOME_DEFAULT") else {
+            return;
+        };
+        assert_eq!(
+            default_session_dir().parent(),
+            Some(Path::new(&home).join(".local/state/pty").as_path())
+        );
+    }
+
+    #[test]
+    fn default_registry_names_the_host_with_a_runtime_directory_present() {
+        let base = std::env::temp_dir().join(format!(
+            "pty-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base.join("run")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "registry::root::tests::shared_home_default_child"])
+            .env("PTY_TEST_SHARED_HOME_DEFAULT", &base)
+            .env("XDG_RUNTIME_DIR", base.join("run"))
+            .env("HOME", &base)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(base);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    }
 
     #[test]
     fn a_scoped_root_wins_nests_and_is_restored() {

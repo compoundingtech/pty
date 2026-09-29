@@ -1184,6 +1184,7 @@ version = "0.13.0-rust"
 dependencies = [
  "libc",
  "pty-core",
+ "pty-terminal",
  "serde",
  "serde_json",
  "tokio",
