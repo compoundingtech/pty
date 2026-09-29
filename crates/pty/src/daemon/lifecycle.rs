@@ -1514,20 +1514,42 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         spawn_session_bridge(daemon_stream, tx);
         peer_client.input(b"equal\n".to_vec()).unwrap();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::PtyData(bytes) if !bytes.is_empty()
-        ));
+        let mut forwarded = match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            Msg::PtyData(bytes) if !bytes.is_empty() => bytes,
+            _ => panic!("the bridge did not forward the input's output"),
+        };
         assert!(matches!(
             peer_stream.recv_timeout(Duration::from_secs(2)).unwrap(),
             SessionEvent::Data(bytes) if !bytes.is_empty()
         ));
 
+        // **Output read before the loss is delivered ahead of it.** The input
+        // produces the terminal's echo and then `cat`'s copy, and the kernel
+        // decides whether that is one read or two. When it is two, the second
+        // chunk is still in flight here, so "the next message is EOF" failed
+        // 36 runs of this test in 600 on Linux on 2026-09-28. The contract is:
+        // the input's output, then EOF, then nothing, which is what this
+        // checks.
         owner.lose_ownership();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::PtyEof
-        ));
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Msg::PtyData(bytes) => forwarded.extend_from_slice(&bytes),
+                Msg::PtyEof => break,
+                _ => panic!("the bridge sent something other than output before EOF"),
+            }
+        }
+        assert!(
+            b"equal\r\nequal\r\n".starts_with(&forwarded),
+            "only the input's echo and output may be forwarded, got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(2)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "the bridge must stop after owner loss"
+        );
         assert_eq!(
             daemon_client.input(Vec::new()),
             Err(pty_spawn::substrate::SessionError::OwnerLost)

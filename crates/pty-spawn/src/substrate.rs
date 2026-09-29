@@ -967,6 +967,19 @@ fn reap_child(
 
 /// Block until the child has exited, leaving it unreaped (`WNOWAIT`): its pid
 /// stays reserved until [`collect`] runs under the signal lock.
+///
+/// **Only an exit ends the wait.** macOS's `waitid` answers `WEXITED |
+/// WNOWAIT` for a *stopped* child too, with `si_code` `CLD_STOPPED`, and
+/// `WNOWAIT` leaves that report in place, so it answers the same way every
+/// time. Linux keeps waiting. Measured on macOS 27 on 2026-09-28. Returning on
+/// the stop sent the reaper into a blocking `waitpid` under the signal lock
+/// while the child was only stopped, and the SIGKILL or SIGCONT that would
+/// have ended the stop waited on that lock forever. A startup deadline
+/// freezes its child with SIGSTOP, so on a Mac the daemon hung right there.
+///
+/// A stop, continue or trap report is consumed instead, with `WSTOPPED |
+/// WCONTINUED` and no `WEXITED`, which can never reap. Then the wait
+/// resumes, and it blocks again on both platforms.
 fn wait_until_exited(pid: u32) {
     loop {
         // SAFETY: an all-zero siginfo_t is a valid value to be overwritten.
@@ -980,8 +993,27 @@ fn wait_until_exited(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        if result != 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             return;
+        }
+        if !matches!(
+            info.si_code,
+            libc::CLD_STOPPED | libc::CLD_CONTINUED | libc::CLD_TRAPPED
+        ) {
+            return;
+        }
+        // SAFETY: as above. No WEXITED, so this cannot collect the child.
+        let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut consumed,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            );
         }
     }
 }
@@ -1914,6 +1946,47 @@ mod tests {
             sent_to(pid as libc::pid_t).is_empty(),
             "a signal went to a released pid"
         );
+    }
+
+    /// A stopped child has not exited. On macOS `waitid` reports the stop to
+    /// a `WEXITED | WNOWAIT` wait; a reaper that took it for the exit blocked
+    /// in `waitpid` under the signal lock, and the SIGKILL below could never
+    /// be sent. That is how a startup deadline, which freezes the child with
+    /// SIGSTOP, hung the daemon on a Mac.
+    #[test]
+    // The child is reaped by `collect_fenced` on the reaper thread.
+    #[allow(clippy::zombie_processes)]
+    fn a_stopped_child_does_not_hold_the_signal_lock() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let signals = Arc::new(ChildSignals::new(Some(pid)));
+        let reaper_signals = Arc::clone(&signals);
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            wait_until_exited(pid);
+            let _ = reaped_tx.send(collect_fenced(pid, &reaper_signals));
+        });
+        signals.signal(libc::SIGSTOP).unwrap();
+        // Long enough for the reaper to see the stop, as it did on macOS.
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            reaped_rx.try_recv().is_err(),
+            "the reaper reported a stopped child as reaped"
+        );
+        let killer_signals = Arc::clone(&signals);
+        let (sent_tx, sent_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent_tx.send(killer_signals.signal(libc::SIGKILL));
+        });
+        assert!(
+            sent_rx.recv_timeout(T).is_ok_and(|sent| sent.is_ok()),
+            "SIGKILL could not take the signal lock: the reaper is holding it"
+        );
+        let status = reaped_rx.recv_timeout(T).expect("the killed child was reaped");
+        assert_eq!(status.and_then(|status| status.signal), Some(libc::SIGKILL));
     }
 
     /// Until the child is reaped, signals reach it and its process group.
