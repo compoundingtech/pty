@@ -113,6 +113,12 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
             // wherever its own trailing CUP put it and the alternate body
             // that follows is written from wherever the cursor is.
             out.push_str("\x1b[?1049l");
+            // The prefix restored the active alternate stack. Rebuild the
+            // saved normal stack while the normal screen is active, so a
+            // later pop after leaving the alternate screen has its history.
+            for flags in actor.inactive_kitty_stack() {
+                out.push_str(&format!("\x1b[>{flags}u"));
+            }
             out.push_str(normal);
             out.push_str("\x1b[?1049h\x1b[H");
         } else {
@@ -120,6 +126,7 @@ pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> Strin
         }
     }
     out.push_str(&vt(actor.terminal(), opts.scrollback, actor.cell_size()));
+    out.push_str(&actor.cursor_replay());
     out
 }
 
