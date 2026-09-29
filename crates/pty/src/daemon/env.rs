@@ -37,6 +37,8 @@ const HOST_TERMINAL_IDENTITY: &[&str] = &[
     "LC_TERMINAL",
     "ITERM_SESSION_ID",
     "TERM_SESSION_ID",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
     "WT_SESSION",
     "Q_TERM",
     "IRIS_FD",
@@ -221,6 +223,8 @@ mod tests {
             ("LC_TERMINAL", "old-terminal"),
             ("ITERM_SESSION_ID", "old-session"),
             ("TERM_SESSION_ID", "old-session"),
+            ("KITTY_WINDOW_ID", "42"),
+            ("KITTY_PID", "1234"),
             ("WT_SESSION", "old-session"),
             ("Q_TERM", "old-terminal"),
             ("IRIS_FD", "13"),
@@ -232,7 +236,8 @@ mod tests {
             assert_eq!(env.get("HOME").map(String::as_str), Some("/h"));
             for key in [
                 "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL",
-                "ITERM_SESSION_ID", "TERM_SESSION_ID", "WT_SESSION", "Q_TERM", "IRIS_FD",
+                "ITERM_SESSION_ID", "TERM_SESSION_ID", "KITTY_WINDOW_ID", "KITTY_PID",
+                "WT_SESSION", "Q_TERM", "IRIS_FD",
             ] {
                 assert!(!env.contains_key(key), "{key} leaked with isolate_env={isolated}");
             }
