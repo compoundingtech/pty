@@ -94,10 +94,17 @@ pub fn tty_name(fd: RawFd) -> Option<String> {
 /// The window size `(rows, cols)` of a tty fd, or `None` when it is not a
 /// terminal (or the ioctl fails).
 pub fn window_size(fd: RawFd) -> Option<(u16, u16)> {
+    window_size_with_cell(fd).map(|(rows, cols, _, _)| (rows, cols))
+}
+
+/// Window rows and columns plus cell pixels when the host tty reports them.
+pub fn window_size_with_cell(fd: RawFd) -> Option<(u16, u16, u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
     if rc == 0 {
-        Some((ws.ws_row, ws.ws_col))
+        let width = if ws.ws_col > 0 { ws.ws_xpixel / ws.ws_col } else { 0 };
+        let height = if ws.ws_row > 0 { ws.ws_ypixel / ws.ws_row } else { 0 };
+        Some((ws.ws_row, ws.ws_col, width, height))
     } else {
         None
     }
