@@ -38,9 +38,19 @@ impl Client {
     }
 
     /// Read until the accumulated text contains `needle`; returns the text.
+    ///
+    /// **The budget has to cover the child script, not just the daemon.** The
+    /// scripts here print a line and run an external `sleep` a hundred or two
+    /// hundred times, which takes at least 10 s for the ticks, and each
+    /// `sleep` is a fork and exec that slows down on a loaded machine. With
+    /// `deadline() * 2` (20 s), a Mac at load average ~34 on 2026-09-28 ran
+    /// out of time with the ticks script at about tick 89 of 100 (984 bytes)
+    /// and the rapid script at about line 190 of 200 (2085 bytes). Both were
+    /// still printing. What these tests check does not depend on how fast the
+    /// script runs, so the budget is generous.
     fn wait_for_text(&mut self, needle: &str) -> String {
         let start = Instant::now();
-        let timeout = deadline() * 2;
+        let timeout = deadline() * 6;
         loop {
             let text = text_of(&self.packets);
             if text.contains(needle) {

@@ -36,7 +36,7 @@ fn rm_waits_out_the_old_generation_before_permitting_replacement() {
         let removed = rig.pty(&["rm", name]);
         expect_status(&removed, 0);
         expect_contains(&removed.stdout(), "removed");
-        assert!(!pid_alive(old_pid), "[{iteration}] rm returned with the old daemon alive");
+        assert!(process_exited(old_pid), "[{iteration}] rm returned with the old daemon alive");
 
         let replacement = rig.pty(&["run", "-d", "--id", name, "--", "cat"]);
         expect_status(&replacement, 0);

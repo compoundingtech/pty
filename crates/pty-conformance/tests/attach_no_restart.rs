@@ -101,7 +101,7 @@ fn exited_session_is_refused_before_delayed_input_can_restart_it() {
     assert_eq!(invocation_count(&marker), 1);
     assert_eq!(event_count(&rig, id, "session_start"), 1);
     if let Some(pid) = rig.pid(id) {
-        assert!(!pid_alive(pid), "retained daemon {pid} came back");
+        assert!(process_exited(pid), "retained daemon {pid} came back");
     }
 }
 
