@@ -59,10 +59,10 @@ fn kill_ends_a_descendant_that_ignores_hup_and_term() {
 
     let out = rig.pty(&["kill", "tree"]);
     expect_status(&out, 0);
-    assert!(!pid_alive(daemon_pid), "daemon {daemon_pid} survived kill");
-    assert!(!pid_alive(leaf_pid), "signal-ignoring leaf {leaf_pid} survived kill");
+    assert!(process_exited(daemon_pid), "daemon {daemon_pid} survived kill");
+    assert!(process_exited(leaf_pid), "signal-ignoring leaf {leaf_pid} survived kill");
     assert!(
-        poll_for(Duration::from_secs(2), || !pid_alive(sleeper)),
+        poll_for(Duration::from_secs(2), || process_exited(sleeper)),
         "sleep {sleeper} under the leaf survived kill"
     );
 }
