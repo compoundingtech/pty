@@ -196,6 +196,8 @@ pub struct TerminalActor {
     term: Terminal<'static, 'static>,
     shared: Rc<RefCell<Shared>>,
     scanner: OutputScanner,
+    /// Whether an attached terminal can answer OSC 52 clipboard reads.
+    clipboard_client_available: bool,
     modes: Modes,
     events: Vec<TerminalEvent>,
     last_title: Option<String>,
@@ -263,6 +265,7 @@ impl TerminalActor {
             term,
             shared,
             scanner: OutputScanner::new(),
+            clipboard_client_available: false,
             modes: Modes::default(),
             events: Vec::new(),
             last_title: None,
@@ -502,6 +505,12 @@ impl TerminalActor {
         &self.term
     }
 
+    /// Let clipboard reads reach an attached terminal. Without one, the
+    /// actor supplies an empty reply so a child waiting on a read can resume.
+    pub fn set_clipboard_client_available(&mut self, available: bool) {
+        self.clipboard_client_available = available;
+    }
+
     /// Feed the child's output. Returns the bytes to broadcast to attached
     /// clients: the input minus terminal queries (which are answered into
     /// [`TerminalActor::take_pty_replies`] instead). Mode flags, the kitty
@@ -593,16 +602,25 @@ impl TerminalActor {
                     if osc_id == Some(112) || (osc_id == Some(12) && osc_data != b"?") {
                         self.cursor_color_replay = Some(o.raw.clone());
                     }
-                    if let Some((id, index)) = o.color_query() {
+                    if let Some(selection) = o.clipboard_read_selection()
+                        && !self.clipboard_client_available
+                    {
+                        self.flush_feed(&mut feed);
+                        let mut reply = b"\x1b]52;".to_vec();
+                        reply.extend_from_slice(selection);
+                        reply.extend_from_slice(b";\x1b\\");
+                        self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                        continue;
+                    }
+                    if let Some(queries) = o.color_query() {
                         // Answer in stream order: everything before the query
                         // reaches the terminal (and may itself be answered)
                         // before this reply is queued.
                         self.flush_feed(&mut feed);
-                        if let Some(reply) = queries::color_query_reply(id, index) {
-                            self.shared
-                                .borrow_mut()
-                                .pty_replies
-                                .extend_from_slice(&reply);
+                        for (id, index) in queries {
+                            if let Some(reply) = queries::color_query_reply(id, index) {
+                                self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                            }
                         }
                         continue;
                     }
