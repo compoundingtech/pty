@@ -72,7 +72,20 @@ pub fn send_over<T: AsRef<[u8]>>(
     let path = registry::socket_path(name);
     let map =
         |e: &std::io::Error| map_io_error(name, remote, GoneSet::Broad, "write", Some(&path), e);
-    let paste = opts.paste && !items.is_empty();
+    let paste = if opts.paste && !items.is_empty() {
+        let status_socket = socket.try_clone().map_err(|e| map(&e))?;
+        let status = crate::stats::query_status_json_over(
+            status_socket,
+            name,
+            crate::stats::STATS_TIMEOUT,
+        )?;
+        serde_json::from_str::<pty_core::stats::StatsResult>(&status)
+            .map_err(|_| ClientError::InvalidStats(name.to_string()))?
+            .modes
+            .bracketed_paste
+    } else {
+        false
+    };
     if paste {
         socket
             .write_all(&encode_data(BRACKETED_PASTE_START.as_bytes()))
