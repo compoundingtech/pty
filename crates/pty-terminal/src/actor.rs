@@ -24,7 +24,7 @@ use crate::queries;
 use crate::screenshot::{self, Screenshot};
 use crate::serialize::{self, SerializeOpts};
 use crate::snapshot::{self, CellGrid};
-use crate::strip::{OutputScanner, Osc, Token};
+use crate::strip::{Osc, OutputScanner, Token};
 
 /// Node's scrollback (`src/server.ts:333-338`), in lines.
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -307,7 +307,10 @@ impl TerminalActor {
             self.rollback_graphics(previous);
             return false;
         }
-        if self.term.set_apc_max_bytes_kitty(opts.apc_max_bytes).is_err()
+        if self
+            .term
+            .set_apc_max_bytes_kitty(opts.apc_max_bytes)
+            .is_err()
             || self
                 .term
                 .set_kitty_image_storage_limit(opts.storage_bytes)
@@ -349,7 +352,12 @@ impl TerminalActor {
     fn apply_cell(&mut self) -> Result<(), libghostty_vt::error::Error> {
         let cell = self.cell.or_fallback();
         self.term
-            .resize(self.cols().max(1), self.rows().max(1), cell.width, cell.height)
+            .resize(
+                self.cols().max(1),
+                self.rows().max(1),
+                cell.width,
+                cell.height,
+            )
             .map(|_| ())
     }
 
@@ -402,7 +410,8 @@ impl TerminalActor {
     /// The pixels of one image, copied out of the storage. `None` when it is
     /// not there (a delete won the race).
     pub fn image_bytes(&self, id: u32) -> Option<ImageBytes> {
-        self.graphics.and_then(|_| graphics::image_bytes(&self.term, id))
+        self.graphics
+            .and_then(|_| graphics::image_bytes(&self.term, id))
     }
 
     /// Drop every image and placement, keeping the protocol on: what a pane
@@ -514,7 +523,35 @@ impl TerminalActor {
                     feed.extend_from_slice(&b);
                     broadcast.extend_from_slice(&b);
                 }
+                Token::Ris => {
+                    self.flush_feed(&mut feed);
+                    self.cursor_shape_replay = None;
+                    self.cursor_color_replay = None;
+                    if self.modes.cursor_hidden {
+                        self.events.push(TerminalEvent::CursorVisible);
+                    }
+                    self.modes = Modes::default();
+                    self.normal_replay = None;
+                    feed.extend_from_slice(b"\x1bc");
+                    broadcast.extend_from_slice(b"\x1bc");
+                }
                 Token::Csi(c) => {
+                    if let Some(query) = c.size_query() {
+                        self.flush_feed(&mut feed);
+                        let cell = self.cell_size().or_fallback();
+                        let (rows, cols) = (self.rows() as u32, self.cols() as u32);
+                        let reply = match query {
+                            14 => format!("\x1b[4;{};{}t", rows * cell.height, cols * cell.width),
+                            16 => format!("\x1b[6;{};{}t", cell.height, cell.width),
+                            18 => format!("\x1b[8;{rows};{cols}t"),
+                            _ => unreachable!(),
+                        };
+                        self.shared
+                            .borrow_mut()
+                            .pty_replies
+                            .extend_from_slice(reply.as_bytes());
+                        continue;
+                    }
                     if c.final_byte == b'q'
                         && c.prefix.is_none()
                         && c.intermediates == [b' ']
@@ -562,7 +599,10 @@ impl TerminalActor {
                         // before this reply is queued.
                         self.flush_feed(&mut feed);
                         if let Some(reply) = queries::color_query_reply(id, index) {
-                            self.shared.borrow_mut().pty_replies.extend_from_slice(&reply);
+                            self.shared
+                                .borrow_mut()
+                                .pty_replies
+                                .extend_from_slice(&reply);
                         }
                         continue;
                     }
@@ -618,7 +658,13 @@ impl TerminalActor {
                         fields.push((part[..eq].to_string(), part[eq + 1..].to_string()));
                     }
                 }
-                let get = |k: &str| fields.iter().rev().find(|(fk, _)| fk == k).map(|(_, v)| v.clone());
+                let get = |k: &str| {
+                    fields
+                        .iter()
+                        .rev()
+                        .find(|(fk, _)| fk == k)
+                        .map(|(_, v)| v.clone())
+                };
                 Notification {
                     title: get("title").or_else(|| get("t")),
                     body: get("body").or_else(|| get("b")),
@@ -807,7 +853,10 @@ impl TerminalActor {
     /// The kitty keyboard flags currently in effect (libghostty's value; the
     /// push/pop history is [`Modes::kitty_stack`]).
     pub fn kitty_flags(&self) -> u8 {
-        self.term.kitty_keyboard_flags().map(|f| f.bits()).unwrap_or(0)
+        self.term
+            .kitty_keyboard_flags()
+            .map(|f| f.bits())
+            .unwrap_or(0)
     }
 
     /// Override palette entries `0..colors.len()` (a theme). Cells keep

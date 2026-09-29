@@ -38,16 +38,41 @@ echo "== ${#reruns[@]} test binary/binaries failed; re-running each alone =="
 printf '   %s\n' "${reruns[@]}"
 echo
 
+# The tests that failed in the workspace run, named once, so a failure that
+# then passes alone is still reported somewhere a person reads. A binary that
+# loses a race and passes alone keeps the build green, which is the policy;
+# without this it also left no trace outside the raw log, and intermittent
+# tests reached other projects' CI before anyone here saw them.
+mapfile -t failed_tests < <(awk '/^failures:$/ {f=1; next} /^test result:/ {f=0} f && /^    [A-Za-z_:0-9]+$/ {print $1}' "$log" | sort -u)
+
 failed=0
+passed_alone=()
 for args in "${reruns[@]}"; do
   echo "== cargo test $args -- --test-threads=1 =="
   # shellcheck disable=SC2086
   if cargo test $args -- --test-threads=1; then
     echo "   passed alone — treating the first failure as a lost race"
+    passed_alone+=("$args")
   else
     echo "   FAILED ALONE — this is a defect, not a flake"
     failed=1
   fi
 done
+
+if [ ${#passed_alone[@]} -gt 0 ]; then
+  names=$(printf '%s, ' "${failed_tests[@]}"); names=${names%, }
+  for args in "${passed_alone[@]}"; do
+    echo "::warning title=Intermittent test binary::\`cargo test $args\` failed in the workspace run and passed alone. Tests that failed in the workspace run: ${names:-unknown}"
+  done
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo "### Failed in the workspace run, passed alone"
+      printf -- '- `cargo test %s`\n' "${passed_alone[@]}"
+      echo
+      echo "Tests that failed in the workspace run:"
+      printf -- '- `%s`\n' "${failed_tests[@]}"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
 
 exit "$failed"

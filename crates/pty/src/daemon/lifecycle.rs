@@ -9,12 +9,12 @@
 //! node: src/server.ts:323-690 (constructor), 571-598 (exit), 1295-1337
 //! (exit metadata), 1340-1456 (close, watchdog), 1458-1616 (entry, shutdown)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,11 +39,11 @@ use pty_lifecycle::{
 use super::DaemonConfig;
 use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE};
 use super::daemon_warn;
-use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
+use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
-    terminate_process_identities,
+    terminate_process_identities, terminate_process_identities_after_hangup,
 };
 
 /// What the helper threads tell the actor.
@@ -67,6 +67,37 @@ pub(crate) enum Msg {
     ExternalKill,
 }
 
+/// Pull pending client/control work ahead of terminal output without changing
+/// the order of output, EOF and child-exit notifications from the bridge.
+/// Moving packets is cheap; parsing and rendering each one is not.
+fn next_queued_message(
+    rx: &Receiver<Msg>,
+    deferred: &mut VecDeque<Msg>,
+    timeout: Option<Duration>,
+) -> Result<Msg, RecvTimeoutError> {
+    // Bound one scan even if the child can produce output faster than this
+    // thread can drain the channel. The next turn resumes the scan.
+    for _ in 0..8192 {
+        match rx.try_recv() {
+            Ok(msg @ (Msg::PtyData(_) | Msg::PtyEof | Msg::ChildExited(_))) => {
+                deferred.push_back(msg);
+            }
+            Ok(control) => return Ok(control),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                return deferred.pop_front().ok_or(RecvTimeoutError::Disconnected);
+            }
+        }
+    }
+    if let Some(msg) = deferred.pop_front() {
+        return Ok(msg);
+    }
+    match timeout {
+        Some(wait) => rx.recv_timeout(wait),
+        None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+    }
+}
+
 /// Grace after the child's exit before the daemon shuts down, so attached
 /// clients receive EXIT.
 pub const EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -79,6 +110,8 @@ const EXIT_METADATA_RETRY: Duration = Duration::from_millis(400);
 const EXIT_METADATA_SETTLE: Duration = Duration::from_millis(2_000);
 /// How long `close()` waits for the child after SIGHUP.
 const CHILD_HUP_WAIT: Duration = Duration::from_millis(2_000);
+/// Grace for foreground jobs to handle the terminal's hangup before TERM.
+const DESCENDANT_HUP_WAIT: Duration = Duration::from_millis(1_000);
 /// …and after SIGKILL.
 const CHILD_KILL_WAIT: Duration = Duration::from_millis(500);
 /// `SPAWNER_POLL_INTERVAL_MS`.
@@ -106,6 +139,8 @@ pub(crate) struct Daemon {
     child_status: Option<ExitStatus>,
     pty_eof: bool,
     rx: Receiver<Msg>,
+    /// Bridge output moved aside while waiting client commands are served.
+    deferred_bridge: VecDeque<Msg>,
     external_kill: bool,
     shutdown_code: Option<i32>,
     exit_drain_deadline: Option<Instant>,
@@ -342,6 +377,7 @@ pub(crate) fn run(
         tags: (!published_tags.is_empty()).then(|| published_tags.clone()),
         isolate_env: cfg.isolate_env().then_some(true),
         extra_env: cfg.extra_env().cloned(),
+        session_env: permanent_respawn_env(&cfg, &published_tags, &child_env),
         unset_env: (!cfg.unset_env().is_empty()).then(|| cfg.unset_env().to_vec()),
         env: cfg.env.clone(),
         ..Default::default()
@@ -429,6 +465,7 @@ pub(crate) fn run(
         child_status: None,
         pty_eof: false,
         rx,
+        deferred_bridge: VecDeque::new(),
         external_kill: false,
         shutdown_code: None,
         exit_drain_deadline: None,
@@ -576,8 +613,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     let Ok(mut wstream) = stream.try_clone() else {
         return;
     };
-    let _ = tx.send(Msg::Connect { id, tx: out_tx });
-    std::thread::spawn(move || {
+    let writer = std::thread::Builder::new().spawn(move || {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(bytes) => {
@@ -593,7 +629,13 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         }
         let _ = wstream.shutdown(std::net::Shutdown::Both);
     });
-    std::thread::spawn(move || {
+    if let Err(e) = writer {
+        daemon_warn!("pty daemon: cannot start client writer thread: {e}");
+        return;
+    }
+    let _ = tx.send(Msg::Connect { id, tx: out_tx });
+    let reader_tx = tx.clone();
+    let reader = std::thread::Builder::new().spawn(move || {
         let mut stream = stream;
         let mut parser = PacketReader::new();
         let mut buf = [0u8; 16384];
@@ -603,7 +645,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
                 Ok(n) => match parser.feed(&buf[..n]) {
                     Ok(packets) => {
                         for packet in packets {
-                            if tx.send(Msg::Packet { id, packet }).is_err() {
+                            if reader_tx.send(Msg::Packet { id, packet }).is_err() {
                                 return;
                             }
                         }
@@ -620,8 +662,12 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
                 Err(_) => break,
             }
         }
-        let _ = tx.send(Msg::Closed { id });
+        let _ = reader_tx.send(Msg::Closed { id });
     });
+    if let Err(e) = reader {
+        daemon_warn!("pty daemon: cannot start client reader thread: {e}");
+        let _ = tx.send(Msg::Closed { id });
+    }
 }
 
 /// SIGTERM and SIGINT are external kills.
@@ -710,12 +756,16 @@ impl Daemon {
             .flatten()
             .min();
             let msg = match deadline {
-                Some(d) => match self.rx.recv_timeout(d.saturating_duration_since(now)) {
+                Some(d) => match next_queued_message(
+                    &self.rx,
+                    &mut self.deferred_bridge,
+                    Some(d.saturating_duration_since(now)),
+                ) {
                     Ok(m) => Some(m),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => break,
                 },
-                None => match self.rx.recv() {
+                None => match next_queued_message(&self.rx, &mut self.deferred_bridge, None) {
                     Ok(m) => Some(m),
                     Err(_) => break,
                 },
@@ -1346,7 +1396,11 @@ impl Daemon {
             let wake = self
                 .exit_drain_deadline
                 .map_or(deadline, |d| d.min(deadline));
-            match self.rx.recv_timeout(wake.saturating_duration_since(now)) {
+            match next_queued_message(
+                &self.rx,
+                &mut self.deferred_bridge,
+                Some(wake.saturating_duration_since(now)),
+            ) {
                 Ok(Msg::PtyData(bytes)) => self.on_pty_data(&bytes),
                 Ok(msg @ (Msg::PtyEof | Msg::ChildExited(_))) => self.handle(msg),
                 Ok(_) => {}
@@ -1423,7 +1477,16 @@ impl Daemon {
             let term_wait = if frozen { Duration::ZERO } else { TERM_WAIT };
             let group = group_fallback.then_some(self.child_pid);
             std::thread::spawn(move || {
-                let survivors = terminate_process_identities(&ids, term_wait, KILL_WAIT);
+                let survivors = if frozen {
+                    terminate_process_identities(&ids, term_wait, KILL_WAIT)
+                } else {
+                    terminate_process_identities_after_hangup(
+                        &ids,
+                        DESCENDANT_HUP_WAIT,
+                        term_wait,
+                        KILL_WAIT,
+                    )
+                };
                 let group_gone =
                     group.is_none_or(|pgid| terminate_process_group(pgid, term_wait, KILL_WAIT));
                 (survivors, group_gone)
@@ -1493,6 +1556,23 @@ mod tests {
     }
 
     #[test]
+    fn client_commands_pass_queued_output_without_reordering_the_bridge() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::PtyData(b"one".to_vec())).unwrap();
+        tx.send(Msg::PtyData(b"two".to_vec())).unwrap();
+        tx.send(Msg::PtyEof).unwrap();
+        tx.send(Msg::ExternalKill).unwrap();
+        let mut deferred = VecDeque::new();
+        assert!(matches!(
+            next_queued_message(&rx, &mut deferred, Some(Duration::ZERO)).unwrap(),
+            Msg::ExternalKill
+        ));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"one"));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"two"));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyEof)));
+    }
+
+    #[test]
     fn substrate_adapter_fences_generation_and_forwards_owner_loss() {
         let pair = open(24, 80).unwrap();
         let child = pair.slave.spawn_command(shell_exec("cat", &[])).unwrap();
@@ -1514,20 +1594,42 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         spawn_session_bridge(daemon_stream, tx);
         peer_client.input(b"equal\n".to_vec()).unwrap();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::PtyData(bytes) if !bytes.is_empty()
-        ));
+        let mut forwarded = match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            Msg::PtyData(bytes) if !bytes.is_empty() => bytes,
+            _ => panic!("the bridge did not forward the input's output"),
+        };
         assert!(matches!(
             peer_stream.recv_timeout(Duration::from_secs(2)).unwrap(),
             SessionEvent::Data(bytes) if !bytes.is_empty()
         ));
 
+        // **Output read before the loss is delivered ahead of it.** The input
+        // produces the terminal's echo and then `cat`'s copy, and the kernel
+        // decides whether that is one read or two. When it is two, the second
+        // chunk is still in flight here, so "the next message is EOF" failed
+        // 36 runs of this test in 600 on Linux on 2026-09-28. The contract is:
+        // the input's output, then EOF, then nothing, which is what this
+        // checks.
         owner.lose_ownership();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::PtyEof
-        ));
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Msg::PtyData(bytes) => forwarded.extend_from_slice(&bytes),
+                Msg::PtyEof => break,
+                _ => panic!("the bridge sent something other than output before EOF"),
+            }
+        }
+        assert!(
+            b"equal\r\nequal\r\n".starts_with(&forwarded),
+            "only the input's echo and output may be forwarded, got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(2)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "the bridge must stop after owner loss"
+        );
         assert_eq!(
             daemon_client.input(Vec::new()),
             Err(pty_spawn::substrate::SessionError::OwnerLost)
