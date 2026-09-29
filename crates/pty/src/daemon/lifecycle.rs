@@ -39,7 +39,7 @@ use pty_lifecycle::{
 use super::DaemonConfig;
 use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE};
 use super::daemon_warn;
-use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error};
+use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
@@ -375,6 +375,7 @@ pub(crate) fn run(
         tags: (!published_tags.is_empty()).then(|| published_tags.clone()),
         isolate_env: cfg.isolate_env().then_some(true),
         extra_env: cfg.extra_env().cloned(),
+        session_env: permanent_respawn_env(&cfg, &published_tags, &child_env),
         unset_env: (!cfg.unset_env().is_empty()).then(|| cfg.unset_env().to_vec()),
         env: cfg.env.clone(),
         ..Default::default()
