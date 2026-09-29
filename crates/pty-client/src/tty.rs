@@ -110,10 +110,11 @@ pub fn window_size_with_cell(fd: RawFd) -> Option<(u16, u16, u16, u16)> {
     }
 }
 
-/// `stdout.rows ?? 24`, `stdout.columns ?? 80`: the size of `fd` when it is a
-/// tty, else the 24×80 default (`client.ts:581-582`).
+/// The size of `fd` when it is a tty, with 24×80 defaults for missing or
+/// zero dimensions. Some launchers provide a tty whose window size is 0×0.
 pub fn size_or_default(fd: RawFd) -> (u16, u16) {
-    window_size(fd).unwrap_or((24, 80))
+    let (rows, cols) = window_size(fd).unwrap_or((24, 80));
+    (if rows == 0 { 24 } else { rows }, if cols == 0 { 80 } else { cols })
 }
 
 /// RAII guard that puts a tty into raw mode and restores the original
