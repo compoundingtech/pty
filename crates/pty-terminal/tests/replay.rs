@@ -5,9 +5,22 @@
 use pty_terminal::{
     ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
+use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
+}
+
+#[test]
+fn replay_restores_the_pen_for_text_written_after_attach() {
+    let mut source = actor();
+    source.write(b"\x1b[4:3;58:2::255:0:0mBEFORE ");
+    let mut late = actor();
+    late.write(source.serialize(SerializeOpts::ATTACH).as_bytes());
+    late.write(b"AFTER");
+    let pen = late.terminal().cursor_style().unwrap();
+    assert_eq!(pen.underline, Underline::Curly);
+    assert_eq!(pen.underline_color, StyleColor::Rgb(RgbColor { r: 255, g: 0, b: 0 }));
 }
 
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──

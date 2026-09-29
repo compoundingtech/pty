@@ -519,7 +519,7 @@ fn cleans_up_socket_and_pid_files_on_close() {
     assert!(d.socket_path().exists());
     let pid = d.pid();
     kill_pid(pid, libc::SIGTERM);
-    wait_until("daemon exit", || !pid_alive(pid));
+    wait_until("daemon exit", || process_exited(pid));
     wait_until("socket removed", || !d.socket_path().exists());
     assert!(!d.pid_path().exists(), "pid file left behind");
 }
@@ -668,7 +668,7 @@ fn metadata_persists_after_server_closes() {
     );
     rig.wait_for_exit("exit2");
     let pid = d.pid();
-    wait_until("daemon exit", || !pid_alive(pid));
+    wait_until("daemon exit", || process_exited(pid));
     wait_until("socket removed", || !d.socket_path().exists());
     assert!(d.meta_path().exists(), "metadata removed");
     let meta = d.meta();
