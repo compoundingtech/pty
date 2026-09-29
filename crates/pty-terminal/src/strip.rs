@@ -222,6 +222,8 @@ impl Osc {
 pub enum Token {
     /// Bytes carrying nothing the scanner cares about (text, other escapes).
     Raw(Vec<u8>),
+    /// Full terminal reset (`ESC c`).
+    Ris,
     /// A complete CSI sequence.
     Csi(Csi),
     /// A complete OSC sequence.
@@ -233,6 +235,7 @@ impl Token {
     pub fn raw(&self) -> &[u8] {
         match self {
             Token::Raw(b) => b,
+            Token::Ris => b"\x1bc",
             Token::Csi(c) => &c.raw,
             Token::Osc(o) => &o.raw,
         }
@@ -312,6 +315,12 @@ impl OutputScanner {
                     }
                 }
                 State::Esc => match b {
+                    b'c' => {
+                        self.seq.clear();
+                        self.state = State::Ground;
+                        flush_raw(&mut raw, &mut out);
+                        out.push(Token::Ris);
+                    }
                     b'[' => {
                         self.seq.push(b);
                         self.state = State::Csi;
