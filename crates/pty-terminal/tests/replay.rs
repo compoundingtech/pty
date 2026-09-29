@@ -205,6 +205,21 @@ fn kitty_pushes_on_alternate_screen_do_not_survive_return_to_normal_screen() {
     assert_eq!(late.kitty_flags(), child.kitty_flags());
 }
 
+#[test]
+fn replay_while_in_alt_restores_normal_kitty_push_stack() {
+    let mut child = actor();
+    child.write(b"\x1b[>1u\x1b[>2u\x1b[?1049h\x1b[>3uALT");
+    let mut late = actor();
+    late.write(child.serialize(SerializeOpts::ATTACH).as_bytes());
+    assert_eq!(late.modes().kitty_stack, vec![3]);
+
+    child.write(b"\x1b[<u\x1b[?1049l\x1b[<u");
+    late.write(b"\x1b[<u\x1b[?1049l\x1b[<u");
+    assert_eq!(child.modes().kitty_stack, vec![1]);
+    assert_eq!(late.modes().kitty_stack, child.modes().kitty_stack);
+    assert_eq!(late.kitty_flags(), child.kitty_flags());
+}
+
 // ── plain-text semantics (src/server.ts:1269-1293) ──
 
 #[test]

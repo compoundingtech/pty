@@ -478,6 +478,10 @@ impl TerminalActor {
         self.normal_replay.as_deref()
     }
 
+    pub(crate) fn inactive_kitty_stack(&self) -> &[u8] {
+        &self.inactive_kitty_stack
+    }
+
     /// The underlying terminal, for reads this API does not cover.
     pub fn terminal(&self) -> &Terminal<'static, 'static> {
         &self.term
