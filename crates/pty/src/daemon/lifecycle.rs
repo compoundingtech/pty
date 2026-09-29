@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,18 +32,18 @@ use pty_core::registry::{
 use pty_spawn::substrate::{ExitStatus, Lifecycle, SessionEvent, SessionOwner, SessionRef};
 use pty_terminal::{TerminalActor, serialize};
 
-use pty_lifecycle::{
-    ArmedStartupLease, StartupLeaseTerminalCause, arm_startup_lease, monotonic_now_ns,
-    remaining_lease_delay, startup_lease_deadline_cause, terminal_startup_lease_value,
-};
 use super::DaemonConfig;
-use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE, Role};
+use super::clients::{Client, ClientFacts, OUTBOUND_QUEUE_PACKETS, Out, REDRAW_SETTLE, Role};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
     terminate_process_identities, terminate_process_identities_after_hangup,
+};
+use pty_lifecycle::{
+    ArmedStartupLease, StartupLeaseTerminalCause, arm_startup_lease, monotonic_now_ns,
+    remaining_lease_delay, startup_lease_deadline_cause, terminal_startup_lease_value,
 };
 
 /// What the helper threads tell the actor.
@@ -54,7 +54,8 @@ pub(crate) enum Msg {
     ChildExited(ExitStatus),
     Connect {
         id: u64,
-        tx: Sender<Out>,
+        tx: SyncSender<Out>,
+        disconnect: UnixStream,
     },
     Packet {
         id: u64,
@@ -302,10 +303,7 @@ fn teardown_process_table() -> ProcTable {
 
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
-pub(crate) fn run(
-    cfg: DaemonConfig,
-    readiness: super::ReadyNotifier,
-) -> Result<i32, String> {
+pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
     let name = cfg.name.clone();
     let generation = cfg
         .generation
@@ -410,10 +408,7 @@ pub(crate) fn run(
                     .get_or_insert_with(TagMap::new)
                     .insert(
                         lease.lifecycle_tag.clone(),
-                        terminal_startup_lease_value(
-                            &generation,
-                            StartupLeaseTerminalCause::Exit,
-                        ),
+                        terminal_startup_lease_value(&generation, StartupLeaseTerminalCause::Exit),
                     );
                 let _ = registry::write_metadata_publication(&name, &terminal_metadata);
             }
@@ -436,8 +431,9 @@ pub(crate) fn run(
         });
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
     let (owner, session_client, session_stream) =
-        pty_spawn::external_owned_pair_attached(session, pair, child)
-            .map_err(|e| format!("Failed to hand PTY to the session substrate for \"{name}\": {e}"))?;
+        pty_spawn::external_owned_pair_attached(session, pair, child).map_err(|e| {
+            format!("Failed to hand PTY to the session substrate for \"{name}\": {e}")
+        })?;
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_session_bridge(session_stream, tx.clone());
 
@@ -551,7 +547,6 @@ fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, tx: Sender<M
     });
 }
 
-
 /// Will this `accept` failure pass on its own?
 ///
 /// A signal, a peer that hung up before we reached it, or a machine with no
@@ -609,15 +604,18 @@ fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
 /// One writer thread (packets → socket) and one reader thread (socket →
 /// [`Msg`]) per connection.
 fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
-    let (out_tx, out_rx) = mpsc::channel::<Out>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUTBOUND_QUEUE_PACKETS);
     let Ok(mut wstream) = stream.try_clone() else {
+        return;
+    };
+    let Ok(disconnect) = stream.try_clone() else {
         return;
     };
     let writer = std::thread::Builder::new().spawn(move || {
         while let Ok(out) = out_rx.recv() {
             match out {
-                Out::Bytes(bytes) => {
-                    if wstream.write_all(&bytes).is_err() {
+                Out::Bytes(packet) => {
+                    if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
                 }
@@ -633,7 +631,11 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         daemon_warn!("pty daemon: cannot start client writer thread: {e}");
         return;
     }
-    let _ = tx.send(Msg::Connect { id, tx: out_tx });
+    let _ = tx.send(Msg::Connect {
+        id,
+        tx: out_tx,
+        disconnect,
+    });
     let reader_tx = tx.clone();
     let reader = std::thread::Builder::new().spawn(move || {
         let mut stream = stream;
@@ -810,9 +812,11 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx } => {
-                self.clients
-                    .insert(id, Client::new(tx, self.actor.rows(), self.actor.cols()));
+            Msg::Connect { id, tx, disconnect } => {
+                self.clients.insert(
+                    id,
+                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols()),
+                );
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
             Msg::Closed { id } => self.on_closed(id),
@@ -942,18 +946,15 @@ impl Daemon {
             let value = self
                 .settle_startup_lifecycle(StartupLeaseTerminalCause::Exit, true)
                 .unwrap_or_else(|| {
-                    terminal_startup_lease_value(
-                        &self.generation,
-                        StartupLeaseTerminalCause::Exit,
-                    )
+                    terminal_startup_lease_value(&self.generation, StartupLeaseTerminalCause::Exit)
                 });
             return LifecycleCompareAndSetResult::Terminal { value };
         }
         let expired = self.startup_lease.as_ref().is_some_and(|lease| {
             !self.startup_lease_disarmed
-                && lease.deadline_monotonic_ns.is_some_and(|deadline| {
-                    monotonic_now_ns().is_none_or(|now| now >= deadline)
-                })
+                && lease
+                    .deadline_monotonic_ns
+                    .is_some_and(|deadline| monotonic_now_ns().is_none_or(|now| now >= deadline))
         });
         if expired {
             if self.settle_startup_deadline().is_none() {
@@ -996,8 +997,7 @@ impl Daemon {
                     && serde_json::from_str::<serde_json::Value>(&request.value)
                         .ok()
                         .is_some_and(|lifecycle| {
-                            lifecycle.get("_tag").and_then(|tag| tag.as_str())
-                                == Some("terminal")
+                            lifecycle.get("_tag").and_then(|tag| tag.as_str()) == Some("terminal")
                                 && lifecycle
                                     .get("generation")
                                     .and_then(|generation| generation.as_str())
@@ -1193,8 +1193,7 @@ impl Daemon {
                         self.external_kill = true;
                         self.shutdown_code = Some(124);
                     } else {
-                        self.startup_lease_timer =
-                            Some(now + Duration::from_millis(10));
+                        self.startup_lease_timer = Some(now + Duration::from_millis(10));
                     }
                 } else {
                     self.startup_lease_timer = Some(now + remaining);
@@ -1218,7 +1217,10 @@ impl Daemon {
     ///
     /// node: src/server.ts:571-598
     fn finalize_exit(&mut self) {
-        let status = self.child_status.unwrap_or(ExitStatus { code: None, signal: None });
+        let status = self.child_status.unwrap_or(ExitStatus {
+            code: None,
+            signal: None,
+        });
         let signal = status.signal;
         let code = signal.map_or(status.code.unwrap_or(-1), |signal| 128 + signal);
         self.settle_startup_lifecycle(StartupLeaseTerminalCause::Exit, true);
@@ -1262,32 +1264,28 @@ impl Daemon {
         // retired in the same critical section, while this generation still
         // owns the name: a replacement's sidecar is never this daemon's to
         // remove.
-        registry::record_exit_retiring_output_activity(
-            &self.name,
-            &self.generation,
-            move |m| {
-                let mut changed = false;
-                if m.exit_code != Some(code) {
-                    m.exit_code = Some(code);
-                    changed = true;
-                }
-                if m.exited_at.is_none() {
-                    m.exited_at = Some(registry::now_iso8601());
-                    changed = true;
-                }
-                if m.last_lines.as_ref() != Some(&last_lines) {
-                    m.last_lines = Some(last_lines);
-                    changed = true;
-                }
-                if let Some(stamp) = last_output
-                    && m.last_output_at_ms != Some(stamp)
-                {
-                    m.last_output_at_ms = Some(stamp);
-                    changed = true;
-                }
-                changed
-            },
-        )
+        registry::record_exit_retiring_output_activity(&self.name, &self.generation, move |m| {
+            let mut changed = false;
+            if m.exit_code != Some(code) {
+                m.exit_code = Some(code);
+                changed = true;
+            }
+            if m.exited_at.is_none() {
+                m.exited_at = Some(registry::now_iso8601());
+                changed = true;
+            }
+            if m.last_lines.as_ref() != Some(&last_lines) {
+                m.last_lines = Some(last_lines);
+                changed = true;
+            }
+            if let Some(stamp) = last_output
+                && m.last_output_at_ms != Some(stamp)
+            {
+                m.last_output_at_ms = Some(stamp);
+                changed = true;
+            }
+            changed
+        })
     }
 
     /// node: src/server.ts:1321-1337
@@ -1459,7 +1457,7 @@ impl Daemon {
             self.save_exit_metadata();
         }
         for (_, c) in std::mem::take(&mut self.clients) {
-            let _ = c.tx.send(Out::Destroy);
+            c.send_out(Out::Destroy);
         }
         // SAFETY: shutdown on the listening socket unblocks accept(2).
         unsafe {
@@ -1548,9 +1546,10 @@ mod tests {
 
     #[test]
     fn command_socket_does_not_suppress_clipboard_fallback() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(OUTBOUND_QUEUE_PACKETS);
+        let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, 24, 80));
+        clients.insert(1, Client::new(tx, disconnect, 24, 80));
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(clipboard_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");
@@ -1668,7 +1667,10 @@ mod tests {
     fn substrate_adapter_clients_share_lifecycle_state() {
         let pair = open(24, 80).unwrap();
         let session = SessionRef::new("/tmp", "daemon-adapter-lifecycle", "generation-a");
-        let child = pair.slave.spawn_command(shell_exec("sleep", &["30".to_string()])).unwrap();
+        let child = pair
+            .slave
+            .spawn_command(shell_exec("sleep", &["30".to_string()]))
+            .unwrap();
         let owner = external_owned_pair(session.clone(), pair, child).unwrap();
         let (first, first_stream) = owner.attach(&session).unwrap();
         let (second, second_stream) = owner.attach(&session).unwrap();
@@ -1682,10 +1684,15 @@ mod tests {
         first.terminate().unwrap();
         let event = second_stream.recv_timeout(Duration::from_secs(2)).unwrap();
         let exit = match event {
-            SessionEvent::OutputClosed => second_stream.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SessionEvent::OutputClosed => {
+                second_stream.recv_timeout(Duration::from_secs(2)).unwrap()
+            }
             event => event,
         };
-        assert!(matches!(exit, SessionEvent::Lifecycle(Lifecycle::Exited(_))));
+        assert!(matches!(
+            exit,
+            SessionEvent::Lifecycle(Lifecycle::Exited(_))
+        ));
         assert!(matches!(second.lifecycle(), Ok(Lifecycle::Exited(_))));
     }
 }
