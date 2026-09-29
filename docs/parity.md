@@ -287,7 +287,8 @@ Capabilities the session manager and a `pty-layout`-class program need:
   widget with border, focus color, selection highlight, and cursor report.
 - Session manager: list with running/exited markers, display name and id,
   cwd with `~`, command, `(exited 2h ago)`, `[permanent]`, inline tags; fuzzy
-  filter with `host/session` syntax; relay host groups; keys `↑↓ ⏎ q esc
+  filter with `host/session` syntax and readline-style editing (`applyTextKey`:
+  ctrl+w/u/k, word motion, cursor); relay host groups; keys `↑↓ ⏎ q esc
   ctrl+c ctrl+g`; attach and return to the list; one-key create (`$SHELL` in
   `$HOME`, random id, no display name); restart of an exited session;
   `--preselect-new`; `--filter-tag` inheritance; 1 s refresh; theme file.
