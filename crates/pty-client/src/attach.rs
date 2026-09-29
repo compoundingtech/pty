@@ -148,6 +148,7 @@ struct Attach<'a> {
     detach_armed: Option<Instant>,
     phase: Phase,
     stdin_open: bool,
+    stdin_was_tty: bool,
     sigwinch: Option<SigwinchPipe>,
 }
 
@@ -184,6 +185,7 @@ pub fn attach(params: AttachParams, io: &ClientIo) -> AttachOutcome {
         detach_armed: None,
         phase: Phase::Live,
         stdin_open: true,
+        stdin_was_tty: is_tty(io.stdin),
         sigwinch: None,
     };
     a.on_ready();
@@ -578,6 +580,9 @@ impl Attach<'_> {
                 && fds[i].revents != 0
             {
                 self.handle_stdin_readable();
+                if self.stdin_was_tty && !self.stdin_open {
+                    return self.finish(0);
+                }
             }
             if let Some(i) = sigwinch_idx
                 && fds[i].revents != 0
