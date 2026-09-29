@@ -127,7 +127,15 @@ pub fn run(args: &[String]) -> CliResult {
     if !wait.is_empty() {
         return match client::peek_wait(&name, &wait, timeout, plain) {
             Ok(screen) => {
-                println!("{screen}");
+                if plain {
+                    println!("{screen}");
+                } else {
+                    println!(
+                        "{screen}{}{}",
+                        client::TERMINAL_SANITIZE,
+                        client::CURSOR_TO_BOTTOM
+                    );
+                }
                 Ok(0)
             }
             Err(e) => {
