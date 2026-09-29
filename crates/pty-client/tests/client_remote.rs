@@ -131,8 +131,8 @@ fn handshake_timeout_and_close_before_ack() {
     // the budget was 200 ms against a server that slept 500 ms, a slow spawn
     // spent the whole budget before the handshake began and the error came
     // back as a dial timeout rather than a handshake one — the right failure
-    // reported by the wrong name. `Silber.mandat-macos` hit it on Apple
-    // silicon on 2026-09-02, one run in three at default parallelism. It
+    // reported by the wrong name. It happened on Apple silicon on
+    // 2026-09-02, one run in three at default parallelism. It
     // never failed here in twenty runs, including under load, which is what
     // a race that is tight everywhere and lucky on one machine looks like.
     //

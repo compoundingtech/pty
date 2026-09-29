@@ -27,7 +27,7 @@ ROOT=$(mktemp -d /tmp/st2surface.XXXXXX)
 WORK=$(mktemp -d /tmp/st2work.XXXXXX)
 export PTY_ROOT="$ROOT"
 PASS=0; FAIL=0
-ID="hetz.demo.agent"
+ID="example.demo.agent"
 
 say() { printf '%-58s %s\n' "$1" "$2"; }
 ok()   { PASS=$((PASS+1)); say "$1" "ok"; }
@@ -43,10 +43,10 @@ out=$("$BIN" --help 2>&1); rc=$?
 [ $rc -eq 0 ] && echo "$out" | grep -q "run" && ok "pty --help" || bad "pty --help" "rc=$rc"
 
 # 2. pty run, st2's exact agent-task flags
-out=$("$BIN" run -d --force --id "$ID" --name "hetz.demo" --cwd "$WORK" \
+out=$("$BIN" run -d --force --id "$ID" --name "example.demo" --cwd "$WORK" \
   --tag role=agent --tag keep=true \
   --unset-env NO_COLOR \
-  --env ST_AGENT=hetz.demo --env CATALOG="$WORK" --env ST_ROOT="$WORK" --env PTY_ROOT="$ROOT" \
+  --env ST_AGENT=example.demo --env CATALOG="$WORK" --env ST_ROOT="$WORK" --env PTY_ROOT="$ROOT" \
   -- sh -c 'printf "READY\n"; exec sh' 2>&1); rc=$?
 check "pty run -d --force --id --name --cwd --tag --env" $rc "rc=$rc out=$out"
 
@@ -60,14 +60,14 @@ done
 echo "$json" | grep -q '"status":"running"' && ok "list --json says running" || bad "list --json says running" "$(echo "$json" | head -c 200)"
 echo "$json" | grep -q '"role":"agent"' && ok "run persisted --tag role=agent" || bad "run persisted --tag role=agent" "tags missing"
 echo "$json" | grep -q '"keep":"true"' && ok "run persisted --tag keep=true" || bad "run persisted --tag keep=true" "tag missing"
-echo "$json" | grep -q '"displayName":"hetz.demo"' && ok "run persisted --name" || bad "run persisted --name" "name missing"
+echo "$json" | grep -q '"displayName":"example.demo"' && ok "run persisted --name" || bad "run persisted --name" "name missing"
 
 # 4. the child really inherited the --env values
 sleep 0.2
 "$BIN" send "$ID" --seq 'printf "ENVCHECK=%s\n" "$ST_AGENT"' --seq key:return >/dev/null 2>&1
 sleep 0.5
 seen=$("$BIN" peek --full --plain "$ID" 2>&1)
-echo "$seen" | grep -q "ENVCHECK=hetz.demo" && ok "--env reached the child" || bad "--env reached the child" "no ENVCHECK line"
+echo "$seen" | grep -q "ENVCHECK=example.demo" && ok "--env reached the child" || bad "--env reached the child" "no ENVCHECK line"
 echo "$seen" | grep -q "READY" && ok "peek --full --plain shows output" || bad "peek --full --plain shows output" "no READY"
 
 # 5. ding's three send shapes
@@ -112,7 +112,7 @@ echo "$out" | grep -qi "not found" \
   && ok "pty rm of an absent id says 'not found'" || bad "pty rm of an absent id says 'not found'" "said: $out"
 
 # 11. run with --no-display-name, st2's other presentation branch
-"$BIN" run -d --force --id "hetz.demo.ding" --no-display-name --cwd "$WORK" -- sh -c 'exec cat' >/dev/null 2>&1
+"$BIN" run -d --force --id "example.demo.ding" --no-display-name --cwd "$WORK" -- sh -c 'exec cat' >/dev/null 2>&1
 check "pty run --no-display-name" $? "rc=$?"
 sleep 0.3
 dn=$("$BIN" list --json 2>&1 | grep -o '"displayName":[^,}]*')
@@ -121,7 +121,7 @@ if [ -z "$dn" ] || [ "$dn" = '"displayName":null' ]; then
 else
   bad "--no-display-name leaves no display name" "$dn"
 fi
-"$BIN" kill hetz.demo.ding >/dev/null 2>&1; "$BIN" rm hetz.demo.ding >/dev/null 2>&1
+"$BIN" kill example.demo.ding >/dev/null 2>&1; "$BIN" rm example.demo.ding >/dev/null 2>&1
 
 # 12. list --json on an empty root: st2 calls this constantly
 EMPTY=$(mktemp -d /tmp/st2empty.XXXXXX)

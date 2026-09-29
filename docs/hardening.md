@@ -101,8 +101,15 @@ rule is the inversion of the natural instinct:
 > ever testing what it claims, before you assume the fix is wrong.
 
 **A test that asserts on a short common word, shares mutable state, or derives
-uniqueness from a clock is a candidate.** `docs/parity.md` §12b lists the
-substring candidates in the conformance suite that nobody has yet examined.
+uniqueness from a clock is a candidate.** About a hundred substring assertions
+in the conformance suite check that output *contains* a short common word.
+Most are safe, because the word is a marker the test itself printed into the
+session and nothing else could have produced it. The rest have the shape that
+failed before: `exited`, `removed`, `killed`, `busy`, `not found`,
+`restarted`, `vanished`, `null`. Three tests of exactly that shape once passed
+for the wrong reason, each matching its word in output that had nothing to do
+with what it checked. Treat a pass from one of them as unproven until somebody
+has read it.
 
 ## The conformance suite does not build the binary it tests
 
@@ -204,6 +211,19 @@ frames and a character mangled inside one frame produced the same message —
 and those want completely different searches. It now prints the wanted bytes,
 the received bytes, and each frame separately. **The rewritten message found
 the cause in one run.**
+
+## A bound only an optimized build meets is not a flake
+
+A test that fails at random under load and a test that states a bound the
+build profile cannot meet look the same from outside, and only one of them is
+a scheduling accident. `fixtures_protocol.rs::a_client_that_never_reads_does_not_starve_the_others`
+was called flaky for days. It is a throughput bound: one megabyte of child
+output through a session nobody is attached to took 9.4 s unoptimized, 0.22 s
+optimized, and 0.25 s with the Node tool. The budget is now widened when the
+binary under test is the workspace's own test build.
+
+Calling a test flaky ends the investigation. Before using the word, check
+whether the build that failed could ever have met the number.
 
 ## What is enforced
 

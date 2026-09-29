@@ -476,7 +476,7 @@ pub fn process(pid: i32) -> Answer<Row> {
             return Answer::Known(row);
         }
         // **`proc_pidinfo` refuses an unreaped child, and that is not the same
-        // as the child being gone.** Measured by `Silber.pty` on a real Mac on
+        // as the child being gone.** Measured on a real Mac on
         // 2026-09-03, for zombie pid 92893:
         //
         //     proc_listpids           contains=1
@@ -592,7 +592,7 @@ fn page_size_kb() -> u64 {
 
 /// `sysctl KERN_PROC_PID`, the only macOS API that answers for a zombie.
 ///
-/// Field offsets into `kinfo_proc`, measured on a Mac by `Silber.pty` on
+/// Field offsets into `kinfo_proc`, measured on a Mac on
 /// 2026-09-03 with an `offsetof` probe compiled warnings-as-errors, and
 /// checked identical against both the 26.5 and 15.4 SDKs:
 ///
@@ -1016,8 +1016,8 @@ mod tests {
     /// **This tests the guard, not the offset.** It writes the pid at
     /// `P_PID_OFFSET` and reads it back from the same constant, so it stays
     /// green whatever that constant is — I changed 40 to 44 and it still
-    /// passed. Only a Mac can prove the number, and `Silber.pty` did, against
-    /// two SDKs.
+    /// passed. Only a Mac can prove the number, and one did, against two
+    /// SDKs.
     ///
     /// What this pins is the thing that makes a wrong number safe: **a layout
     /// that cannot find itself is not a layout**, so a bad offset returns "I
@@ -1196,7 +1196,7 @@ mod tests {
     /// On Linux the corpse keeps a row with state `Z`, so the table says
     /// `Known(false)`. On macOS libproc stops listing it the moment it exits,
     /// even before `wait`, so the table says `NotPresent`. Measured on a real
-    /// Mac by `Silber.pty` on 2026-09-03: the child was seen once as `S`, and
+    /// Mac on 2026-09-03: the child was seen once as `S`, and
     /// every read after that was `NotPresent`.
     ///
     /// An earlier version of this test asserted the Linux mechanism and failed

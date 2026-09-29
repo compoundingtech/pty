@@ -18,4 +18,4 @@ Examples:
   pty attach myserver
   pty attach -r myserver
   pty attach --no-restart myserver
-  pty attach --remote hetzner myshell
+  pty attach --remote example-host myshell

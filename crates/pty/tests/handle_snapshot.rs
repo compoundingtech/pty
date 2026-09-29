@@ -116,7 +116,7 @@ fn alternate_screen_flag() {
     assert!(!h.modes().alt_screen);
     h.kill();
     // Leaves the alternate screen only after the test has seen it entered;
-    // a fixed 0.1 s window was missed under load (3 runs in 600 on hetz).
+    // a fixed 0.1 s window was missed under load (3 runs in 600 on a Linux host).
     let h = sh("printf '\\033[?1049h'; read x; printf '\\033[?1049l'; sleep 10", 24, 80, 0);
     wait_until(&h, |h| h.modes().alt_screen);
     h.write(b"\n");
