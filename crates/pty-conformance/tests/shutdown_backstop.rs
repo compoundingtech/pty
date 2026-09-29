@@ -25,8 +25,8 @@ fn backstop_force_exits_and_reaps_a_frozen_child() {
     assert!(pid_alive(child_pid));
     let daemon_pid = d.pid();
     kill_pid(daemon_pid, libc::SIGTERM);
-    assert!(poll_for(Duration::from_secs(4), || !pid_alive(daemon_pid)), "daemon did not force-exit");
-    assert!(poll_for(Duration::from_secs(4), || !pid_alive(child_pid)), "frozen child was not reaped");
+    assert!(poll_for(Duration::from_secs(4), || process_exited(daemon_pid)), "daemon did not force-exit");
+    assert!(poll_for(Duration::from_secs(4), || process_exited(child_pid)), "frozen child was not reaped");
     kill_pid(child_pid, libc::SIGKILL);
 }
 
@@ -38,5 +38,5 @@ fn prompt_shutdown_is_undisturbed() {
     let daemon_pid = d.pid();
     assert!(pid_alive(daemon_pid));
     kill_pid(daemon_pid, libc::SIGTERM);
-    assert!(poll_for(Duration::from_secs(3), || !pid_alive(daemon_pid)), "daemon did not exit promptly");
+    assert!(poll_for(Duration::from_secs(3), || process_exited(daemon_pid)), "daemon did not exit promptly");
 }

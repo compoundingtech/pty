@@ -5,6 +5,7 @@
 use pty_terminal::{
     CellSize, ColorSnap, Modes, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
+use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
@@ -16,6 +17,18 @@ fn pixel_queries_use_a_declared_cell_size() {
     a.set_cell_size(CellSize { width: 10, height: 21 });
     a.write(b"\x1b[16t\x1b[14t");
     assert_eq!(a.take_pty_replies(), b"\x1b[6;21;10t\x1b[4;504;800t");
+}
+
+#[test]
+fn replay_restores_the_pen_for_text_written_after_attach() {
+    let mut source = actor();
+    source.write(b"\x1b[4:3;58:2::255:0:0mBEFORE ");
+    let mut late = actor();
+    late.write(source.serialize(SerializeOpts::ATTACH).as_bytes());
+    late.write(b"AFTER");
+    let pen = late.terminal().cursor_style().unwrap();
+    assert_eq!(pen.underline, Underline::Curly);
+    assert_eq!(pen.underline_color, StyleColor::Rgb(RgbColor { r: 255, g: 0, b: 0 }));
 }
 
 // ── alt-screen prefix (tests/screen-replay-altscreen.test.ts) ──

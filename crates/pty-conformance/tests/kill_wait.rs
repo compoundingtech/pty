@@ -19,7 +19,7 @@ fn daemon_is_gone_when_kill_returns() {
     let out = rig.pty(&["kill", "kw"]);
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "killed");
-    assert!(!pid_alive(pid), "daemon {pid} still alive after kill returned");
+    assert!(process_exited(pid), "daemon {pid} still alive after kill returned");
 }
 
 /// node: tests/kill-wait.test.ts:54
@@ -47,9 +47,9 @@ fn shutdown_does_not_resurrect_removed_metadata() {
     assert!(meta.exists());
     std::fs::remove_file(&meta).unwrap();
     kill_pid(pid, libc::SIGTERM);
-    let _ = poll_for(Duration::from_secs(6), || !pid_alive(pid));
+    let _ = poll_for(Duration::from_secs(6), || process_exited(pid));
     std::thread::sleep(Duration::from_millis(400));
-    assert!(!pid_alive(pid), "daemon {pid} did not exit on SIGTERM");
+    assert!(process_exited(pid), "daemon {pid} did not exit on SIGTERM");
     assert!(!meta.exists(), "metadata was resurrected");
     let stray: Vec<String> = std::fs::read_dir(rig.root())
         .unwrap()
