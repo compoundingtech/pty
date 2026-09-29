@@ -121,14 +121,15 @@ pub fn run(args: &[String]) -> CliResult {
 
 /// The environment can be scrubbed by `env -u`, sudo or a login shell while
 /// the caller is still a descendant of the target's terminal session.
-fn inside_target_session(name: &str) -> bool {
+fn inside_target_session(name: &str) -> Option<bool> {
     // SAFETY: getsid(0) reads the calling process's session id.
     let sid = unsafe { libc::getsid(0) };
     if sid <= 0 {
-        return false;
+        return None;
     }
     client::stats::query_stats_with_timeout(name, std::time::Duration::from_millis(500))
-        .is_ok_and(|stats| stats.process.alive && stats.process.pid == Some(sid))
+        .ok()
+        .map(|stats| stats.process.alive && stats.process.pid == Some(sid))
 }
 
 /// `cmdAttach`.
@@ -144,10 +145,20 @@ fn attach_session(
     };
 
     if session.status == SessionStatus::Running {
-        if !force && inside_target_session(name) {
-            eprintln!("pty attach: already inside pty session \"{name}\".");
-            eprintln!("  Detach first (Ctrl+\\) and re-run from outside.");
-            return Ok(1);
+        if !force {
+            match inside_target_session(name) {
+                Some(true) => {
+                    eprintln!("pty attach: already inside pty session \"{name}\".");
+                    eprintln!("  Detach first (Ctrl+\\) and re-run from outside.");
+                    return Ok(1);
+                }
+                None => {
+                    eprintln!("pty attach: cannot verify the current session for \"{name}\".");
+                    eprintln!("  Retry when the session responds, or pass --force to attach anyway.");
+                    return Ok(1);
+                }
+                Some(false) => {}
+            }
         }
         return Ok(do_attach(name, stream_fd));
     }
