@@ -129,6 +129,8 @@ pub enum ClientError {
     ClosedBeforeScreen(String),
     /// `queryStats` got no STATUS packet within its budget.
     StatsTimeout(String),
+    /// The daemon spoke a newer packet type instead of answering the query.
+    OutdatedClient(String),
     /// The STATUS payload was not JSON.
     InvalidStats(String),
     /// A readiness control request produced no matching packet in its budget.
@@ -154,6 +156,10 @@ impl fmt::Display for ClientError {
                 write!(f, "Connection to \"{name}\" closed before screen received.")
             }
             ClientError::StatsTimeout(name) => write!(f, "Timeout querying stats for \"{name}\""),
+            ClientError::OutdatedClient(name) => write!(
+                f,
+                "Protocol version mismatch for \"{name}\": the client is outdated; upgrade the client to talk to this daemon."
+            ),
             ClientError::InvalidStats(name) => {
                 write!(f, "Invalid stats response from \"{name}\"")
             }
