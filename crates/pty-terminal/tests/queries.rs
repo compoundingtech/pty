@@ -72,9 +72,12 @@ fn color_queries_answer_with_st_whatever_the_query_terminator() {
         assert_eq!(data, b"", "{q:?} must not reach DATA");
         assert_eq!(a.take_pty_replies(), reply, "{q:?}");
     }
-    // Node answers only the first index of a multi-query and consumes it.
+    // Answer every queried slot in a multi-query, in request order.
     assert_eq!(a.write(b"\x1b]4;1;?;2;?\x07"), b"");
-    assert_eq!(a.take_pty_replies(), b"\x1b]4;1;rgb:0000/0000/0000\x1b\\");
+    assert_eq!(
+        a.take_pty_replies(),
+        b"\x1b]4;1;rgb:0000/0000/0000\x1b\\\x1b]4;2;rgb:0000/0000/0000\x1b\\"
+    );
     // A non-query OSC 10 (a set) passes through and is not answered.
     let set = b"\x1b]10;rgb:ffff/0000/0000\x07";
     assert_eq!(a.write(set), set);
