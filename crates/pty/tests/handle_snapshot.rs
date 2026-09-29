@@ -24,6 +24,15 @@ fn sh(script: &str, rows: u16, cols: u16, scrollback: usize) -> TerminalHandle {
     spawn("sh", &["-c", script], rows, cols, scrollback)
 }
 
+/// Wait until `pred` holds, reading the handle as output arrives.
+///
+/// **Wait for the whole state the test then asserts.** A child's output can
+/// arrive in more than one read, so a predicate that holds partway through
+/// (the cursor has reached row 2, the first line has wrapped, the screen has
+/// scrolled once) lets the assertions run on a half-drawn screen.
+/// `cursor_row_advances_with_newlines` and
+/// `scroll_offset_keeps_flags_and_cells_aligned` failed that way in CI on
+/// 2026-09-28.
 fn wait_until(h: &TerminalHandle, mut pred: impl FnMut(&TerminalHandle) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -57,7 +66,7 @@ fn initial_cursor_is_origin() {
 #[test]
 fn cursor_moves_when_output_is_written() {
     let h = sh("printf 'hello'; sleep 10", 24, 80, 0);
-    wait_until(&h, |h| h.cursor().1 > 0);
+    wait_until(&h, |h| h.cursor().1 >= 5);
     assert_eq!(h.cursor().0, 0);
     assert_eq!(h.cursor().1, 5);
     h.kill();
@@ -67,7 +76,7 @@ fn cursor_moves_when_output_is_written() {
 #[test]
 fn cursor_row_advances_with_newlines() {
     let h = sh("printf 'a\\nb\\nc'; sleep 10", 24, 80, 0);
-    wait_until(&h, |h| h.cursor().0 >= 2);
+    wait_until(&h, |h| h.cursor().0 >= 2 && h.cursor().1 >= 1);
     assert_eq!(h.cursor().0, 2);
     assert_eq!(h.cursor().1, 1);
     h.kill();
@@ -88,8 +97,12 @@ fn mouse_mode_tracks_1000_1002_1003() {
         h.kill();
     }
 
-    let h = sh("printf '\\033[?1000h'; sleep 0.1; printf '\\033[?1000l'; sleep 10", 24, 80, 0);
+    // The mode is turned off only after the test has seen it on: with a
+    // fixed 0.1 s in between, a test thread that was not scheduled in that
+    // window never saw it on at all.
+    let h = sh("printf '\\033[?1000h'; read x; printf '\\033[?1000l'; sleep 10", 24, 80, 0);
     wait_until(&h, |h| h.modes().mouse_tracking());
+    h.write(b"\n");
     wait_until(&h, |h| !h.modes().mouse_tracking());
     h.kill();
 }
@@ -102,8 +115,11 @@ fn alternate_screen_flag() {
     let h = spawn("cat", &[], 24, 80, 0);
     assert!(!h.modes().alt_screen);
     h.kill();
-    let h = sh("printf '\\033[?1049h'; sleep 0.1; printf '\\033[?1049l'; sleep 10", 24, 80, 0);
+    // Leaves the alternate screen only after the test has seen it entered;
+    // a fixed 0.1 s window was missed under load (3 runs in 600 on hetz).
+    let h = sh("printf '\\033[?1049h'; read x; printf '\\033[?1049l'; sleep 10", 24, 80, 0);
     wait_until(&h, |h| h.modes().alt_screen);
+    h.write(b"\n");
     wait_until(&h, |h| !h.modes().alt_screen);
     h.kill();
 }
@@ -152,7 +168,7 @@ fn one_wrapped_flag_per_visible_row() {
 #[test]
 fn continuation_rows_are_flagged_when_a_long_line_overflows() {
     let h = sh("printf 'a%.0s' $(seq 1 120); sleep 5", 12, 40, 0);
-    wait_until(&h, |h| h.snapshot(0).wrapped.iter().any(|&f| f));
+    wait_until(&h, |h| h.snapshot(0).text().matches('a').count() >= 120);
     let g = h.snapshot(0);
     assert!(!g.wrapped[0]);
     assert!(g.wrapped[1]);
@@ -174,7 +190,8 @@ fn short_lines_produce_no_wrapped_flags() {
 #[test]
 fn scroll_offset_keeps_flags_and_cells_aligned() {
     let h = sh("for i in $(seq 1 30); do echo line $i; done; sleep 5", 10, 40, 100);
-    wait_until(&h, |h| h.buffer_length() > h.rows() as usize);
+    wait_until(&h, |h| h.snapshot(0).text().contains("line 30"));
+    assert!(h.buffer_length() > h.rows() as usize);
     let g0 = h.snapshot(0);
     assert_eq!(g0.wrapped.len(), g0.rows.len());
     let g5 = h.snapshot(5);
@@ -275,7 +292,7 @@ fn palette_indices_are_preserved_and_truecolor_is_not_indexed() {
 #[test]
 fn attributes_wide_chars_and_graphemes() {
     let h = sh("printf '\\033[1;2;3;4;7;9mS\\033[0m\\344\\270\\255e\\314\\201'; sleep 10", 3, 20, 0);
-    wait_until(&h, |h| h.cursor().1 >= 4);
+    wait_until(&h, |h| h.snapshot(0).rows[0][3].text == "e\u{301}");
     let g = h.snapshot(0);
     let s = &g.rows[0][0];
     assert!(s.bold && s.dim && s.italic && s.underline && s.inverse && s.strikethrough);
