@@ -45,6 +45,8 @@ pub struct SpawnParams {
     pub isolate_env: bool,
     /// Written only when non-empty.
     pub extra_env: EnvMap,
+    /// Selected inherited values retained across permanent-session respawns.
+    pub session_env: Option<EnvMap>,
     /// Written only when non-empty.
     pub unset_env: Vec<String>,
     /// The verbatim replacement environment; exclusive with the three above.
@@ -107,6 +109,7 @@ pub fn apply_persisted_launch_options(params: &mut SpawnParams, meta: &registry:
     {
         params.extra_env = extra.clone();
     }
+    params.session_env = meta.session_env.clone();
     if let Some(unset) = &meta.unset_env
         && !unset.is_empty()
     {
@@ -201,6 +204,7 @@ pub fn config_for(params: &SpawnParams) -> DaemonConfig {
         display_name: params.display_name.clone().filter(|d| !d.is_empty()),
         isolate_env: params.isolate_env.then_some(true),
         extra_env: (!params.extra_env.is_empty()).then(|| params.extra_env.clone()),
+        session_env: params.session_env.clone(),
         unset_env: (!params.unset_env.is_empty()).then(|| params.unset_env.clone()),
         env: params.env.clone(),
         startup_lease: params.startup_lease.clone(),
