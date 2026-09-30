@@ -1,0 +1,350 @@
+import {
+  defaultActionlintConfig,
+  githubWorkflow,
+  githubWorkflowEvent,
+} from '../../repos/effect-utils/genie/external.ts'
+import { nixSetupSteps } from './shared.ts'
+
+// Release keeps its GitHub-hosted runners. The Debian 12 container sets the
+// glibc floor of the Linux asset, and macos-14 is the host this Nix-to-portable
+// rewrite was proven on. Namespace's macOS profile is not known to match that
+// SDK and image contract, and moving a release build host needs its own
+// portability evidence, not a CI migration.
+
+// Build the two binaries we can prove, verify each is portable OFF the machine
+// that built it, and attach them to a release, together with the libghostty-vt
+// static library each platform built, so a project can depend on pty-terminal
+// or pty-testkit without Zig (README: "Depending on pty-terminal or pty-testkit
+// without Zig").
+//
+// `workflow_dispatch` builds and verifies WITHOUT publishing, so the artifacts
+// can be proved before anything is public. Pushing a `v*` tag does the same and
+// then publishes.
+export default githubWorkflow({
+  name: "Release",
+  on: {
+    push: {
+      tags: [
+        "v*",
+      ],
+    },
+    workflow_dispatch: githubWorkflowEvent.all,
+  },
+  permissions: {
+    contents: "write",
+  },
+  env: {
+    // build.rs derives the version sha by running git in the checkout, and falls
+    // back to the string "unknown" when that fails. It DID fail in the Debian
+    // container: actions/checkout and the container disagree about directory
+    // ownership, so git refused, and the first Linux asset built here reported
+    // 0.13.0-rust+unknown while the macOS one reported the real sha.
+    //
+    // A release binary that cannot say which commit it is defeats the point of
+    // having releases. It is the exact failure that made this rollout necessary:
+    // a binary had been serving a machine for five days and nobody could tell
+    // which build it was without reading its version string.
+    //
+    // PTY_BUILD_SHA is build.rs's own escape hatch and it takes precedence over
+    // git, so setting it here makes the version independent of whether git works
+    // in any given environment.
+    PTY_BUILD_SHA: "${{ github.sha }}",
+  },
+  // A JOB PASSING IS NOT EVIDENCE ABOUT THE JOB THAT FAILED.
+  //
+  // This workflow builds on two platforms, and twice in one afternoon a fix was
+  // written for a failure on one of them, was itself platform-dependent, and
+  // passed on the platform that had never had the original problem:
+  //
+  //   1. The Linux asset reported `0.13.0-rust+unknown` because git refused inside
+  //      the container. macOS reported the real sha, so the green macOS job was
+  //      taken as evidence the approach was sound. It was evidence about macOS.
+  //
+  //   2. The fix for that used `${GITHUB_SHA::7}`. The container runs `sh`, where
+  //      that is a "Bad substitution"; the macOS runner uses bash and accepted it.
+  //      A fix for a platform-dependent bug, failing platform-dependently.
+  //
+  // The rule is not "prefer cut over substring expansion". It is that a green job
+  // on platform A says nothing about platform B, so a fix goes into BOTH jobs and
+  // is verified in both shells, even when only one of them was broken. Otherwise
+  // the next failure looks like a new bug rather than the same one.
+  jobs: {
+    // ── Linux: cargo, NOT nix ────────────────────────────────────────────────
+    //
+    // The documented cargo route already produces an ordinary, portable binary:
+    // measured 2026-09-05, it needs only linux-vdso, libgcc_s, libc.so.6 and the
+    // standard loader. Nix would produce a binary whose interpreter and libraries
+    // live in /nix/store, which is the opposite of what a release asset needs.
+    //
+    // The container is the point. A binary links against the glibc it was built
+    // with and refuses to start on anything older, and that floor is set by the
+    // BUILD HOST, not by this code: two symbols the Rust standard library uses for
+    // process spawning decide it. Building on ubuntu-latest would stamp
+    // GLIBC_2.39 on the asset and lock out Ubuntu 22.04, Debian 12 and RHEL 9.
+    // Debian 12 gives GLIBC_2.34 and covers them. See the README table.
+    "linux-x86_64": {
+      "runs-on": "ubuntu-latest",
+      container: "debian:12",
+      "timeout-minutes": 60,
+      steps: [
+        {
+          name: "Build tools",
+          run: `apt-get update -qq
+apt-get install -y -qq curl xz-utils git build-essential pkg-config ca-certificates
+`,
+        },
+        {
+          uses: "actions/checkout@v4",
+        },
+        {
+          name: "Rust",
+          run: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
+  | sh -s -- -y --profile minimal --default-toolchain stable
+echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+`,
+        },
+        // Pinned by version AND checksum. libghostty-vt-sys requires exactly
+        // 0.15.2; a newer Zig is refused by the Ghostty build.
+        {
+          name: "Zig 0.15.2",
+          run: `url=https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+sha=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+curl -sSfL "$url" -o /tmp/zig.tar.xz
+echo "$sha  /tmp/zig.tar.xz" | sha256sum -c -
+mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+echo "/opt/zig" >> "$GITHUB_PATH"
+`,
+        },
+        // `cut`, not ${GITHUB_SHA::7}. The container job runs `sh -e`, where that
+        // substring form is a bashism and fails with "Bad substitution"; the
+        // macOS runner uses bash and accepted it. That is the same asymmetry as
+        // the bug this step exists to fix, one layer up, so it is written to work
+        // in both shells rather than in the one that happened to be tested.
+        {
+          name: "Short sha, to match the convention used everywhere else",
+          run: "echo \"PTY_BUILD_SHA=$(echo \"$GITHUB_SHA\" | cut -c1-7)\" >> \"$GITHUB_ENV\"",
+        },
+        {
+          name: "Build",
+          run: "cargo build --release -p pty",
+        },
+        // A release asset that only runs where it was built is worse than no
+        // asset, because it fails at the user rather than at the build.
+        {
+          name: "Prove it is portable off this machine",
+          run: `bin=target/release/pty
+echo "== dynamic dependencies =="; ldd "$bin"
+if ldd "$bin" | grep -q "/nix/store"; then
+  echo "FAIL: links something in /nix/store"; exit 1
+fi
+floor=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
+echo "== glibc floor: $floor =="
+echo "glibc floor: \\\`$floor\\\`" >> "$GITHUB_STEP_SUMMARY"
+v=$("$bin" --version)
+echo "== version: $v =="
+case "$v" in *unknown*)
+  echo "FAIL: the binary cannot say which commit it is."
+  echo "An asset reporting +unknown is unusable for deciding whether a machine is up to date."
+  exit 1 ;;
+esac
+`,
+        },
+        {
+          name: "Stage the asset",
+          run: `mkdir -p dist
+cp target/release/pty dist/pty-x86_64-unknown-linux-gnu
+( cd dist && sha256sum pty-x86_64-unknown-linux-gnu > pty-x86_64-unknown-linux-gnu.sha256 )
+`,
+        },
+        {
+          uses: "actions/upload-artifact@v4",
+          with: {
+            name: "pty-x86_64-unknown-linux-gnu",
+            path: "dist/",
+            "if-no-files-found": "error",
+          },
+        },
+        // The release build above built libghostty-vt with Zig (ReleaseFast) on
+        // Debian 12. Package that static library with a relocatable pkg-config
+        // file, then refuse to ship it unless pty-terminal and pty-testkit build
+        // and pass against it with Zig off PATH.
+        {
+          name: "Package libghostty-vt",
+          run: `sh scripts/package-libghostty-vt.sh x86_64-unknown-linux-gnu \\
+  target/release/build/libghostty-vt-sys-*/out/ghostty-install \\
+  target/release/build/libghostty-vt-sys-*/out/ghostty-src/LICENSE dist-lib
+`,
+        },
+        {
+          name: "Prove the library builds pty-terminal and pty-testkit without Zig",
+          run: "sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-x86_64-unknown-linux-gnu.tar.gz",
+        },
+        {
+          uses: "actions/upload-artifact@v4",
+          with: {
+            name: "libghostty-vt-x86_64-unknown-linux-gnu",
+            path: "dist-lib/",
+            "if-no-files-found": "error",
+          },
+        },
+      ],
+    },
+    // ── macOS: nix, because cargo cannot build here ──────────────────────────
+    //
+    // Ghostty pins Zig 0.15.2 and that Zig cannot link the macOS 26.5 SDK, so the
+    // cargo route fails outright. Nix works, and the macOS job in ci proved a
+    // runner can do it: `nix build` plus the workspace suite in 14m29s.
+    //
+    // But a Nix-built macOS binary is NOT relocatable as it comes out. Measured on
+    // a real artifact 2026-09-07: `otool -L` reported
+    // /nix/store/...-libiconv-115.100.1/lib/libiconv.2.dylib, an absolute store
+    // path. Shipping that gives a file that runs for us and fails on every machine
+    // without that exact store. So the load commands are rewritten to the system
+    // copies and the result is GATED, not trusted.
+    "macos-arm64": {
+      "runs-on": "macos-14",
+      "timeout-minutes": 90,
+      steps: [
+        {
+          uses: "actions/checkout@v4",
+        },
+        ...nixSetupSteps(),
+        // `cut`, not ${GITHUB_SHA::7}. The container job runs `sh -e`, where that
+        // substring form is a bashism and fails with "Bad substitution"; the
+        // macOS runner uses bash and accepted it. That is the same asymmetry as
+        // the bug this step exists to fix, one layer up, so it is written to work
+        // in both shells rather than in the one that happened to be tested.
+        {
+          name: "Short sha, to match the convention used everywhere else",
+          run: "echo \"PTY_BUILD_SHA=$(echo \"$GITHUB_SHA\" | cut -c1-7)\" >> \"$GITHUB_ENV\"",
+        },
+        {
+          run: "nix build --print-build-logs",
+        },
+        {
+          name: "Take it out of the store and cut it loose",
+          run: `mkdir -p dist
+cp result/bin/pty dist/pty
+chmod u+w dist/pty
+bin=dist/pty
+
+echo "== before =="; otool -L "$bin"
+
+# Every /nix/store dylib becomes its /usr/lib counterpart. These are
+# system libraries that exist on any macOS; the store copy is an
+# artifact of how nix builds, not a real dependency on nix.
+otool -L "$bin" | awk 'NR>1 {print $1}' | grep '^/nix/store' | while read -r p; do
+  echo "  rewriting $p"
+  install_name_tool -change "$p" "/usr/lib/$(basename "$p")" "$bin"
+done
+
+# An LC_RPATH into the store would leave a dangling search path.
+otool -l "$bin" | awk '/LC_RPATH/{r=1} r && /^ *path /{print $2; r=0}' \\
+  | grep '^/nix/store' | while read -r rp; do
+  echo "  deleting rpath $rp"
+  install_name_tool -delete_rpath "$rp" "$bin"
+done
+
+# install_name_tool invalidates the signature, and macOS on Apple
+# silicon will not run an unsigned or mis-signed binary. Ad-hoc is
+# what the linker applies by default and what the README's Gatekeeper
+# test was run against.
+codesign --force --sign - "$bin"
+
+echo "== after =="; otool -L "$bin"
+`,
+        },
+        {
+          name: "Refuse to ship anything that still needs /nix/store",
+          run: `bin=dist/pty
+if otool -L "$bin" | grep -q '/nix/store' || otool -l "$bin" | grep -q '/nix/store'; then
+  echo "FAIL: the binary still references /nix/store."
+  echo "It would run here and fail on any machine without that exact store path."
+  otool -L "$bin"; otool -l "$bin" | grep -A2 LC_RPATH || true
+  exit 1
+fi
+echo "no /nix/store references remain"
+codesign --verify --verbose "$bin"
+v=$("$bin" --version)
+echo "== version: $v =="
+case "$v" in *unknown*)
+  echo "FAIL: the binary cannot say which commit it is."
+  exit 1 ;;
+esac
+`,
+        },
+        {
+          name: "Stage the asset",
+          run: `mv dist/pty dist/pty-aarch64-apple-darwin
+( cd dist && shasum -a 256 pty-aarch64-apple-darwin > pty-aarch64-apple-darwin.sha256 )
+`,
+        },
+        {
+          uses: "actions/upload-artifact@v4",
+          with: {
+            name: "pty-aarch64-apple-darwin",
+            path: "dist/",
+            "if-no-files-found": "error",
+          },
+        },
+        // Reuse the native package already linked by pty's Nix build.
+        {
+          name: "Package libghostty-vt",
+          run: `native=$(nix build .#libghostty-vt --no-link --print-out-paths)
+sh scripts/package-libghostty-vt.sh aarch64-apple-darwin \\
+  "$native" "$native/share/licenses/libghostty-vt/LICENSE" dist-lib
+`,
+        },
+        // OUTSIDE Nix, with the runner's own cargo and linker and no Zig: the
+        // case the archive exists for.
+        {
+          name: "Prove the library builds pty-terminal and pty-testkit without Zig or Nix",
+          run: `command -v pkg-config >/dev/null || brew install pkgconf
+sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-aarch64-apple-darwin.tar.gz
+`,
+        },
+        {
+          uses: "actions/upload-artifact@v4",
+          with: {
+            name: "libghostty-vt-aarch64-apple-darwin",
+            path: "dist-lib/",
+            "if-no-files-found": "error",
+          },
+        },
+      ],
+    },
+    // Only on a tag. A dispatch run stops after the two jobs above, so the assets
+    // can be proved before anything is published.
+    publish: {
+      needs: [
+        "linux-x86_64",
+        "macos-arm64",
+      ],
+      if: "startsWith(github.ref, 'refs/tags/v')",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 10,
+      steps: [
+        {
+          uses: "actions/download-artifact@v4",
+          with: {
+            path: "dist",
+          },
+        },
+        {
+          name: "Attach to the release",
+          env: {
+            GH_TOKEN: "${{ github.token }}",
+          },
+          run: `find dist -type f | sort
+gh release create "\${GITHUB_REF_NAME}" \\
+  --repo "\${GITHUB_REPOSITORY}" \\
+  --title "\${GITHUB_REF_NAME}" \\
+  --notes "Built and verified by .github/workflows/release.yml. Each pty binary is checked to reference no /nix/store path, and each libghostty-vt archive is checked to build and test pty-terminal and pty-testkit with no Zig, before it is attached. To use an archive, see the README: Depending on pty-terminal or pty-testkit without Zig." \\
+  $(find dist -type f | sort | tr '\\n' ' ')
+`,
+        },
+      ],
+    },
+  },
+  actionlint: defaultActionlintConfig,
+})

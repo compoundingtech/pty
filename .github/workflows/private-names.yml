@@ -1,13 +1,18 @@
+# Generated file - DO NOT EDIT
+# Source: private-names.yml.genie.ts
+
 name: Private names
 
 on:
-  pull_request:
+  pull_request: null
   push:
     branches: [main]
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: Private names
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

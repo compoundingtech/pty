@@ -1,22 +1,33 @@
+# Generated file - DO NOT EDIT
+# Source: test.yml.genie.ts
+
 name: Test
+
 on:
-  pull_request:
+  pull_request: null
   push:
     branches: [main]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/determinate-nix-action@v3
-
-      # Reporting only. Neither passes on main today — 1093 fmt diffs and 50
-      # clippy warnings, measured 2026-09-05 — so gating either one needs a
-      # cleanup commit first, which is a separate decision from adding CI.
-      # Printing the counts keeps the debt visible instead of hidden behind a
-      # check nobody enabled.
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
       - name: Formatting and clippy (reporting only)
         run: |
           n=$(nix develop --command cargo fmt --all -- --check 2>/dev/null | grep -c '^Diff in' || true)
@@ -27,6 +38,5 @@ jobs:
 
       - name: Build
         run: nix develop --command cargo build --workspace --release
-
       - name: Workspace tests
         run: nix develop --command ./scripts/ci-test-workspace.sh

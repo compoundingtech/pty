@@ -181,23 +181,42 @@ Three conditions travel with that result:
 - **This result does not transfer to a published asset.** The same test, with
   its removal control, has to run against the first one we ship.
 
-### CI is Linux only, on purpose
+### Pull-request CI is Linux only, on purpose
 
-Both workflows run on `ubuntu-latest`. Nothing in CI builds or tests this on a
-Mac.
+Pull-request workflows run on Namespace's `namespace-profile-linux-x86-64`.
+Release builds retain hosted Ubuntu with a Debian 12 container and `macos-14`;
+they do not provide macOS coverage for each pull request.
 
 That matters more here than it usually would.
 [`crates/pty-core/src/proctable.rs`](crates/pty-core/src/proctable.rs) carries a
 macOS process-table reader that no Linux job ever compiles: libproc, plus a
 sysctl fallback with hand-declared `kinfo_proc` struct offsets. Offsets are
 exactly the kind of thing a new macOS moves. **So a change to that reader, or a
-macOS SDK change, breaks the Mac build and CI does not notice.**
+macOS SDK change, can break the Mac build without pull-request CI noticing.**
 
 This is a decision, not an oversight. The tool runs on two Macs every day, so a
 broken Mac build surfaces immediately in use, and human use is the detection
 mechanism. That trade holds while the daily users are the affected users. If
-this ever ships to people who are not in the room, the trade changes and the
-macOS job comes back — via Nix, because Cargo cannot build it there.
+this ever ships to people who are not in the room, the trade changes and a
+pull-request macOS job comes back — via Nix, because Cargo cannot build it there.
+
+All workflows and `.github/repo-settings.json` are generated from their
+neighboring `.genie.ts` sources. The generator has its own shell so ordinary
+`nix develop` and Rust CI do not build generator tooling:
+
+```sh
+nix develop .#genie -c genie
+nix develop .#genie -c genie --check
+```
+
+That shell links the pinned effect-utils flake source into `repos/effect-utils`;
+the generators import it directly, without installing npm dependencies.
+The public effect-utils binary cache is read-only for this repository.
+Formatting and clippy remain report-only until their existing debt is addressed.
+The declared required checks are `Nix build`, `Private names`, `Test`,
+`Conformance gate`, and `genie freshness`. An administrator must apply the
+generated settings only after the Namespace jobs have passed once; generating
+the settings does not change GitHub's live configuration.
 
 ## Usage
 

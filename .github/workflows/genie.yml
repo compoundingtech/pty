@@ -1,7 +1,7 @@
 # Generated file - DO NOT EDIT
-# Source: nix.yml.genie.ts
+# Source: genie.yml.genie.ts
 
-name: Nix
+name: Genie
 
 on:
   pull_request: null
@@ -9,13 +9,20 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    name: Nix build
+  freshness:
+    name: genie freshness
+    timeout-minutes: 15
     runs-on:
       [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
-    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -28,10 +35,6 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
-      - name: Native binding contract and runtime closure
-        run: |
-          nix build --no-link --print-build-logs \
-            .#checks.x86_64-linux.libghostty-contract \
-            .#checks.x86_64-linux.libghostty-runtime-closure
-      - run: nix build --print-build-logs
-      - run: ./result/bin/pty --version
+      - name: Check generated files
+        shell: bash
+        run: "nix develop '.#genie' -c genie --check"
