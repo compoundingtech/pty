@@ -216,7 +216,7 @@ enum Backend {
         writer: Box<dyn Write + Send>,
     },
     Attach {
-        session: SessionRef,
+        connector: Box<dyn Fn() -> io::Result<UnixStream> + Send>,
         opts: AttachOptions,
         stream: Option<UnixStream>,
         tx: Sender<Msg>,
@@ -360,11 +360,11 @@ impl Core {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
-        if (cols, rows) == (self.actor.cols(), self.actor.rows()) {
-            return;
-        }
         match &mut self.backend {
             Backend::Spawn { master, .. } => {
+                if (cols, rows) == (self.actor.cols(), self.actor.rows()) {
+                    return;
+                }
                 let _ = master.resize(PtySize {
                     rows,
                     cols,
@@ -373,7 +373,7 @@ impl Core {
                 });
             }
             Backend::Attach { stream, opts, .. } => {
-                if opts.readonly {
+                if opts.readonly || (cols, rows) == (opts.cols, opts.rows) {
                     return;
                 }
                 if let Some(s) = stream {
@@ -383,9 +383,11 @@ impl Core {
                     });
                     let _ = s.flush();
                 }
-                // Applied locally as well: a daemon that speaks GEOMETRY will
-                // confirm (or correct) the effective size; one that does not
-                // has resized the PTY to what we asked for.
+                // Requested size is durable across reconnects. Only GEOMETRY
+                // may change the emulator's effective shared-min size.
+                opts.cols = cols;
+                opts.rows = rows;
+                return;
             }
         }
         self.actor.resize(cols, rows);
@@ -395,7 +397,7 @@ impl Core {
 
     fn reconnect(&mut self) -> io::Result<()> {
         let Backend::Attach {
-            session,
+            connector,
             opts,
             stream,
             tx,
@@ -415,7 +417,7 @@ impl Core {
             st.exit_code = None;
             st.attempt = self.attempt.0;
         }
-        let new_stream = connect_and_attach(session, opts, self.attempt, tx.clone())?;
+        let new_stream = connect_and_attach(connector.as_ref(), opts, self.attempt, tx.clone())?;
         *stream = Some(new_stream);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -483,8 +485,8 @@ impl Core {
                     }
                     if let Some((w, h)) = cell_pixels(opts) {
                         let _ = s.write_all(&encode_resize_with_cell(
-                            self.actor.rows(),
-                            self.actor.cols(),
+                            opts.rows,
+                            opts.cols,
                             w,
                             h,
                         ));
@@ -571,12 +573,12 @@ fn cell_pixels(opts: &AttachOptions) -> Option<(u16, u16)> {
 /// Connect to the daemon, send ATTACH, and start a reader thread that tags
 /// every packet with `attempt`.
 fn connect_and_attach(
-    session: &SessionRef,
+    connector: &(dyn Fn() -> io::Result<UnixStream> + Send),
     opts: &AttachOptions,
     attempt: AttemptId,
     tx: Sender<Msg>,
 ) -> io::Result<UnixStream> {
-    let stream = UnixStream::connect(session.socket_path())?;
+    let stream = connector()?;
     // Node has no read-only ATTACH: a read-only client sends PEEK, which the
     // daemon answers with GEOMETRY + SCREEN and then keeps streaming DATA to.
     let hello = if opts.readonly {
@@ -746,9 +748,20 @@ impl TerminalHandle {
     /// connected and ATTACH was sent; use [`TerminalHandle::wait_ready`] to
     /// wait for the first SCREEN.
     pub fn attach(session: SessionRef, opts: AttachOptions) -> io::Result<TerminalHandle> {
+        Self::attach_with_connector(move || UnixStream::connect(session.socket_path()), opts)
+    }
+
+    /// Attach over a caller-owned transport factory speaking the framed PTY
+    /// protocol. The factory opens a fresh stream for initial attachment and
+    /// every explicit reconnect; a socketpair can bridge any byte carrier.
+    /// Dropping or closing the handle shuts down the active stream.
+    pub fn attach_with_connector(
+        connector: impl Fn() -> io::Result<UnixStream> + Send + 'static,
+        opts: AttachOptions,
+    ) -> io::Result<TerminalHandle> {
         let (tx, rx) = mpsc::channel::<Msg>();
         let attempt = AttemptId(1);
-        let stream = connect_and_attach(&session, &opts, attempt, tx.clone())?;
+        let stream = connect_and_attach(&connector, &opts, attempt, tx.clone())?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 ready: false,
@@ -772,7 +785,7 @@ impl TerminalHandle {
                 attempt,
                 shared: core_shared,
                 backend: Backend::Attach {
-                    session,
+                    connector: Box::new(connector),
                     opts,
                     stream: Some(stream),
                     tx: core_tx,
@@ -865,8 +878,9 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Input(data.to_vec()));
     }
 
-    /// Resize the PTY (spawn) or request a resize (attach). No-op when the
-    /// size is unchanged or the handle is read-only.
+    /// Resize a spawned PTY immediately, or request an attached daemon's size.
+    /// Attached emulators wait for GEOMETRY (the shared writable-client
+    /// minimum); repeated requested dimensions and read-only resizes are no-ops.
     pub fn resize(&self, cols: u16, rows: u16) {
         let _ = self.tx.send(Msg::Resize { cols, rows });
     }
@@ -1249,10 +1263,7 @@ mod tests {
             attempt: AttemptId(1),
             shared,
             backend: Backend::Attach {
-                session: SessionRef {
-                    root: PathBuf::from("/nonexistent"),
-                    id: "x".into(),
-                },
+                connector: Box::new(|| Err(io::Error::other("no test connection"))),
                 opts: AttachOptions::default(),
                 stream: None,
                 tx: tx.clone(),
