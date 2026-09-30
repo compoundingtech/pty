@@ -265,6 +265,13 @@ fn inspect_linux(
     };
     let expected_local = encode_linux_proc_address(local_ip);
     let expected_remote = encode_linux_proc_address(remote_ip);
+    let mapped = match (local_ip, remote_ip) {
+        (IpAddr::V4(local), IpAddr::V4(remote)) => Some((
+            encode_linux_proc_address(local.to_ipv6_mapped().into()),
+            encode_linux_proc_address(remote.to_ipv6_mapped().into()),
+        )),
+        _ => None,
+    };
     let table_name = if local_ip.is_ipv4() { "tcp" } else { "tcp6" };
     let local_port = format!("{:04X}", tuple.remote_port);
     let remote_port = format!("{:04X}", tuple.local_port);
@@ -281,17 +288,31 @@ fn inspect_linux(
         let Some(rows) = parse_linux_tcp_table(&table) else {
             return unavailable(format!("socket-table-invalid:{pid}"));
         };
-        let inodes: HashSet<String> = rows
-            .into_iter()
-            .filter(|row| {
-                row.state == "01"
-                    && row.local_address == expected_local
-                    && row.local_port == local_port
-                    && row.remote_address == expected_remote
-                    && row.remote_port == remote_port
-            })
-            .map(|row| row.inode)
-            .collect();
+        let mut inodes = HashSet::new();
+        let mut collect_matches = |rows: Vec<LinuxTcpRow>, local: &str, remote: &str| {
+            inodes.extend(
+                rows.into_iter()
+                    .filter(|row| {
+                        row.state == "01"
+                            && row.local_address == local
+                            && row.local_port == local_port
+                            && row.remote_address == remote
+                            && row.remote_port == remote_port
+                    })
+                    .map(|row| row.inode),
+            );
+        };
+        collect_matches(rows, &expected_local, &expected_remote);
+        if let Some((mapped_local, mapped_remote)) = &mapped {
+            // IPv4 peers of a dual-stack listener appear only in tcp6.
+            // An absent tcp6 table is normal on IPv6-disabled kernels.
+            if let Ok(table) = std::fs::read_to_string(base.join("net/tcp6")) {
+                let Some(rows) = parse_linux_tcp_table(&table) else {
+                    return unavailable(format!("socket-table-invalid:{pid}"));
+                };
+                collect_matches(rows, mapped_local, mapped_remote);
+            }
+        }
         if inodes.is_empty() {
             continue;
         }
@@ -486,6 +507,37 @@ mod tests {
         // may concurrently spawn descendants whose identities legitimately
         // fail closed. The socket and descriptor tables remain the real
         // kernel observations under test.
+        assert_eq!(
+            inspect_with(
+                pid,
+                &LiveIdentity::new("owner"),
+                &tuple,
+                || pty_core::proctable::table_from_shape(&format!("{pid} 1 {pid} S owner")),
+                Path::new("/proc"),
+            ),
+            AcceptedSocketOwnershipResult::Owned { pid }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dual_stack_accepted_ipv4_socket_is_owned() {
+        let Ok(listener) = std::net::TcpListener::bind("[::]:0") else {
+            return; // IPv6 unavailable.
+        };
+        let port = listener.local_addr().unwrap().port();
+        let Ok(client) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+            return; // This kernel defaults to IPV6_V6ONLY.
+        };
+        let client_address = client.local_addr().unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        let tuple = TcpConnectionTuple {
+            local_address: client_address.ip().to_string(),
+            local_port: client_address.port(),
+            remote_address: "127.0.0.1".to_string(),
+            remote_port: port,
+        };
+        let pid = std::process::id() as i32;
         assert_eq!(
             inspect_with(
                 pid,
