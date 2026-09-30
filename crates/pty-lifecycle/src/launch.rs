@@ -539,7 +539,7 @@ fn wait_for_publication(
         // whole `DEFAULT_START_TIMEOUT` and then reports a timeout, when the
         // true answer was on disk in the first iteration.
         //
-        // Measured on a Mac by `Silber.pty` on 2026-09-03: the losing
+        // Measured on a Mac on 2026-09-03: the losing
         // `pty run` took 30.06 s against a 30 s budget and said
         // "Timed out waiting for daemon publication" instead of
         // "is already running".

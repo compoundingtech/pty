@@ -228,8 +228,8 @@ fn close_without_exit_says_the_session_ended_and_exits_0() {
 /// assumes.** Linux hands the peer the bytes that were already in flight and
 /// then fails its next read with `ECONNRESET`. Measured 2026-09-02: errno 104
 /// after the data. On Apple silicon the same sequence ends in a plain end of
-/// stream, which `Silber.mandat-macos` found on 2026-09-02 by this test
-/// failing there five times out of five, natively and under nix.
+/// stream, which this test found on 2026-09-02 by failing there five times
+/// out of five, natively and under nix.
 ///
 /// **This is not a difference between the two pty implementations.** The Node
 /// client decides the same way, on `err.code === "ECONNRESET"`

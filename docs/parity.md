@@ -2,8 +2,9 @@
 
 This document maps the distance between this Rust port and the Node `pty`
 (`@compoundingtech/pty` 0.12.0). It lists every surface a drop-in replacement
-must carry, what the Rust port has today, and what is missing. It is the input
-to the plan that closes the gap. Section 12 records the decisions taken on it.
+must carry, what the Rust port has, and what is missing. Section 12 records
+the decisions taken on it. How the workspace is built is in
+[architecture.md](architecture.md).
 
 Compared versions, read on 2026-08-29:
 
@@ -286,7 +287,8 @@ Capabilities the session manager and a `pty-layout`-class program need:
   widget with border, focus color, selection highlight, and cursor report.
 - Session manager: list with running/exited markers, display name and id,
   cwd with `~`, command, `(exited 2h ago)`, `[permanent]`, inline tags; fuzzy
-  filter with `host/session` syntax; relay host groups; keys `↑↓ ⏎ q esc
+  filter with `host/session` syntax and readline-style editing (`applyTextKey`:
+  ctrl+w/u/k, word motion, cursor); relay host groups; keys `↑↓ ⏎ q esc
   ctrl+c ctrl+g`; attach and return to the list; one-key create (`$SHELL` in
   `$HOME`, random id, no display name); restart of an exited session;
   `--preselect-new`; `--filter-tag` inheritance; 1 s refresh; theme file.
@@ -344,53 +346,6 @@ Decided on 2026-08-29. Each row records the decision.
 | `up`/`down` and `pty.toml` | S | Kept. Already ported; the binding rule needs the tag pair. |
 | `queryStats` waiting out its 2 s timeout on a daemon that closes without STATUS, and `peek -f` hanging on a plain close | S | Not reproduced, on purpose. Both end promptly instead. Deliberate improvements, not gaps — accepted, decision 0006. |
 
-## 12a. How st2 chooses the `pty` binary
-
-**From `PATH`, and nothing else.** `PtyCli.bin` is the literal `"pty"` in both
-of st2's non-test constructors (`src/run.rs:378` and `:435` on `origin/main`,
-read 2026-09-01). There is no environment variable that selects it.
-
-**`ST2_PTY_BIN` is real but unshipped**, so it is easy to believe in and wrong
-to rely on. It exists only on st2's `pty-rust` branch, added by `b63abfb`, and
-that branch is not merged: `origin/main` has zero occurrences. Nothing running
-today reads it, so no agent can opt one task onto a different build.
-
-**That matters for the cutover.** Every staged rollout in `docs/parity-plan.md`
-that begins "`ST2_PTY_BIN` on one agent" needs that st2 branch shipped first,
-or it needs a different mechanism. Putting the Rust `pty` on `PATH` is the only
-selection st2 supports as it stands.
-
-## 12b. Known red that is not a missing verb
-
-**The whole workspace suite is green as of 2026-09-02: 1293 tests, none
-failing.** The three entries this section used to list are gone, and two of
-them were not what they were labelled.
-
-| Test | What it turned out to be |
-|---|---|
-| `scrollback_fidelity.rs::alt_screen_and_normal_scrollback_both_survive_reconnect` | A real gap, now fixed. The replay carried only the alternate screen, so a client that reconnected while a full-screen program ran saw a blank screen the moment that program exited. libghostty offers no reader for the screen that is not in use, so the daemon now copies the normal screen at the moment the child switches away from it. |
-| `fixtures_protocol.rs::a_client_that_never_reads_does_not_starve_the_others` | **Not flaky, and this file said it was, twice.** It is a throughput bound that only an optimized build meets. One megabyte of child output through a session with nobody attached: 9.4 s unoptimized, 0.22 s optimized, 0.25 s with the Node tool. The shipped binary is faster than Node; the test build is about forty times slower than either. The budget is now widened when the binary under test is the workspace's own test build. |
-| `rm_immediate_reuse.rs::rm_waits_out_the_old_generation_before_permitting_replacement` | Has not failed since. Left as it was. |
-
-**"Flaky" was the wrong word for the middle one and it cost four days.** A test
-that fails at random under load and a test that states a bound the profile
-cannot meet look identical from the outside, and only one of them is a
-scheduling accident. Calling it flaky ends the investigation. See
-docs/hardening.md for the same lesson from the other side: a red test inside a
-red suite is invisible, and a suite that runs a binary it never built is a
-green that measured nothing.
-
-**One surface of the suite is known to be unexamined.** 105 of the 467
-substring assertions in the suite check that output *contains* a short common
-word. Most are safe, because the word is a marker the test itself printed into
-the session and nothing else could have produced it. The rest are the shape
-that failed before: `exited`, `removed`, `killed`, `busy`, `not found`,
-`restarted`, `vanished`, `null`. Three tests of exactly that shape were passing
-for the wrong reason during the 2026-08-31 build, each matching its word in
-output that had nothing to do with what it was checking, and each was found by
-accident rather than on purpose. Treat a pass from one of them as unproven
-until somebody has read it.
-
 ## 12c. What differs because the kernel differs
 
 Checked on 2026-09-02, on Linux here and on Apple silicon by another machine.
@@ -442,55 +397,29 @@ that let its child speak before a client was listening, and a detached client
 counted twice was a daemon race both implementations share and only a slower
 machine can see (decision 0007).
 
-## 13. In flight, not on `main`
+## 13. Known limitations shared with Node
 
-Checked again on 2026-09-02.
-
-| Where | What | Where it stands |
-|---|---|---|
-| Node PR #168 | Persist `lastOutputAtMs`, the time the child last printed | **Merged 2026-08-29, the day this plan was approved, and nobody noticed.** Now ported: the daemon stamps it, persists it at most once a second, and carries it into the exit record. The running stamp lives in the `.activity/<name>.json` sidecar rather than the record (decision 0015). See `crates/pty-conformance/tests/output_activity.rs`. |
-| Node PR #173 | Bounded `keep` retention in gc: `--keep-max-age <dur>` (default `7d`, `0` sweeps now), keep-expired reported apart from the plain sweep | **Merged 2026-09-04**, and ported the same day: `pty gc --keep-max-age`, `registry::is_keep_expired` / `DEFAULT_KEEP_MAX_AGE_MS`, `crates/pty-conformance/tests/gc_keep_expiry.rs`. Node's own suite cannot be cross-run here yet — the installed Node binary is 0.12.0, which predates the flag. |
-| Node PRs #131, #133 | Generation-bound activity status; revision-guarded send | Both still drafts. Watch. |
-| Node PR #60 | Lean core: delete `up`/`down`, gc respawn, flapping | Still held. Superseded by `st2`. Informs section 12. |
-| Node issue #167 | `--isolate-env` drops `TERM_PROGRAM` and `GHOSTTY_*`, so a full-screen program cannot tell what terminal it is in | Open. This port carries the same allow-list, so it has the same problem. Fixing it means changing both. |
-| Node issue #163 | The `PTY_ROOT` / `PTY_SESSION_DIR` disagreement warns on stderr, and the callers that need the warning throw stderr away | Open. This port carries the same warning. |
-| Node issue #107 | No `--version`, and three numbers claim to be the version | Open there. Settled here: `0.13.x-rust+<short-sha>`, and `--version` prints it. |
-
-**The lesson from #168 is about the tracking, not the field.** This table said
-"track" and nothing tracked it. A row that names a thing to watch, with nobody
-named to watch it and no check that looks, is a note rather than a mechanism.
-The port was two days behind the tool it copies and the map still said the
-change was in flight. Ask what would have caught it, not who should have
-looked.
+- **`--isolate-env` drops `TERM_PROGRAM` and `GHOSTTY_*`**, so a full-screen
+  program cannot tell what terminal it is in. This port carries Node's
+  allow-list, so it has the same problem, and fixing it means changing both.
+- **The `PTY_ROOT` / `PTY_SESSION_DIR` disagreement warns on stderr**, and the
+  callers that need the warning throw stderr away. This port carries the same
+  warning.
 
 ## 14. Build, packaging, and verification
 
 | Item | Status | Note |
 |---|---|---|
 | Binary name `pty`; daemon re-execs `current_exe()` | have | The binary path must outlive its sessions. |
-| Rust edition 2024, let-chains (≥ 1.88) | have | The README says edition 2024 and Rust 1.88; checked 2026-09-02. |
+| Rust edition 2024, let-chains | have | `rust-version` in `Cargo.toml` is the floor. |
 | `libghostty-vt-sys` needs Zig 0.15.2 and fetches Ghostty source at build | have | A nix package needs a fixed-output fetch. |
-| `flake.nix` for this repo | have | Added on `parity`. `st2`'s flake still pins the Node `pty`. |
-| Completion files vendored byte for byte | have | Added on `parity`; `checks.completions` compares them. |
+| `flake.nix` for this repo | have | |
+| Completion files vendored byte for byte | have | `checks.completions` compares them. |
 | Version string | decided | `0.13.x-rust+<short-sha>`: one minor above the Node line, a `rust` pre-release tag, and the commit. |
-| Node test corpus: 120 files, 31k lines; 13 VRS requirements each mapped to test files | oracle | The plan decides which suites to port, which to run as black-box CLI tests against both binaries. |
+| Node test corpus: 120 files, 31k lines; 13 VRS requirements each mapped to test files | oracle | `docs/conformance.md` maps each suite to its Rust port or black-box test. |
 | Shared fixtures `tests/fixtures/parity/{screens,shapes}.json` | have | Node-owned, vendored here byte-identical. Extend per section 6. |
-| Rust tests today: 173 at `e4d6cda` | have | 1293 on `parity` at 2026-09-02, all passing. |
 
-## 15. Rough size of the whole
-
-| Area | Size |
-|---|---|
-| CLI verbs and text (sections 3) | XL |
-| Daemon protocol semantics (section 4) | L |
-| Registry: locks, generation, events, metadata (section 5) | L |
-| Terminal fixtures and decisions (section 6) | M |
-| Remote (section 7) | M |
-| Testing library, Rust + TypeScript (section 8) | L |
-| TUI library + session manager (section 9) | XL |
-| Embedding API and shared crates (section 10) | L |
-| Mixed-fleet rig (section 11) | M |
-| Packaging and completions (section 14) | M |
+## 15. Sources
 
 Sources for this map: the Node source and its tests at `500eab2`, and — all in
 the `compoundingtech/pty` (Node) repository — its `docs/vrs`,

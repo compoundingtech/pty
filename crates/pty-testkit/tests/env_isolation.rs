@@ -16,7 +16,7 @@ fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 fn always_scrubs_pty_session_and_server_config() {
     let env = build_spawn_env(
         &kv(&[
-            ("PTY_SESSION", "silber.pty"),
+            ("PTY_SESSION", "example.pty"),
             ("PTY_SERVER_CONFIG", "{}"),
             ("HOME", "/h"),
         ]),

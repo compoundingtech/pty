@@ -5,6 +5,8 @@
 //! printed (`pty help`, `pty <cmd> --help`, ...), captured by running it under a
 //! scratch `PTY_ROOT`, trailing newline included. Nothing is generated or
 //! reformatted here; a text changes only when its fixture is re-captured.
+//! One edit since the capture: the `--remote` examples in `attach`, `list`,
+//! `peek` and `send` name an invented peer, `example-host`.
 //!
 //! The two deferred commands (`recover`, `test`) keep the Node help so the
 //! binary stays a drop-in; the commands themselves report that they are not

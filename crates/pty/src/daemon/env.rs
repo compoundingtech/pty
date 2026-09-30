@@ -287,7 +287,7 @@ mod tests {
             &cfg,
             "g",
             &src(&[
-                ("PATH", "/home/user/bin:/usr/bin"),
+                ("PATH", "/home/example/bin:/usr/bin"),
                 ("LANG", "en_US.UTF-8"),
                 ("LC_CTYPE", "en_US.UTF-8"),
                 ("DISPLAY", ":77"),

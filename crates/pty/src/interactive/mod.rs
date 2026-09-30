@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use pty_core::registry::{self, SessionInfo, TagMap};
 use pty_tui::app::RenderCtx;
 use pty_tui::input::KeyEvent;
+use pty_tui::line_edit::{TextFieldState, apply_text_key, render_field_spans};
 use pty_tui::ratatui::Frame;
 use pty_tui::ratatui::layout::{Constraint, Direction, Layout, Rect};
 use pty_tui::ratatui::style::{Modifier, Style};
@@ -92,7 +93,7 @@ struct Picker {
     all: Vec<SessionInfo>,
     /// The rows the filter left, in the order they are drawn.
     shown: Vec<Row>,
-    filter: String,
+    filter: TextFieldState,
     /// Tags every listed session must carry, from `--filter-tag`. A new
     /// session inherits them.
     filter_tags: TagMap,
@@ -113,7 +114,7 @@ impl Picker {
         let mut picker = Picker {
             all: Vec::new(),
             shown: Vec::new(),
-            filter: String::new(),
+            filter: TextFieldState::empty(),
             filter_tags: opts.filter_tags,
             region: ScrollRegion::new(0, 10),
             preselect_new: opts.preselect_new,
@@ -161,7 +162,7 @@ impl Picker {
     ///
     /// node: the manager's fuzzy ranking
     fn rebuild_rows(&mut self) {
-        let query = self.filter.trim();
+        let query = self.filter.text.trim();
         let mut scored: Vec<(i64, &SessionInfo)> = Vec::new();
         for s in &self.all {
             match row::score(s, query) {
@@ -184,8 +185,12 @@ impl Picker {
         }
     }
 
-    fn set_filter(&mut self, filter: String) {
+    fn set_filter(&mut self, filter: TextFieldState) {
+        let text_changed = filter.text != self.filter.text;
         self.filter = filter;
+        if !text_changed {
+            return;
+        }
         self.rebuild_rows();
         self.region = self.region.update(self.shown.len(), None);
         self.region.selected = self.region.selected.min(self.shown.len().saturating_sub(1));
@@ -217,26 +222,17 @@ impl Screen<()> for Picker {
                 if self.filter.is_empty() {
                     app.quit(0);
                 } else {
-                    self.set_filter(String::new());
+                    self.set_filter(TextFieldState::empty());
                 }
-            }
-            "backspace" => {
-                let mut f = self.filter.clone();
-                f.pop();
-                self.set_filter(f);
             }
             "c" if key.ctrl => app.quit(130),
             "g" if key.ctrl => self.cycle_theme(app),
             // `q` quits only when it would not be filter text.
             "q" if !key.ctrl && !key.alt && self.filter.is_empty() => app.quit(0),
+            // Readline-style editing: ctrl+w, ctrl+u, ctrl+k, word motion, …
             _ => {
-                if !key.ctrl
-                    && !key.alt
-                    && let Some(text) = &key.ch
-                {
-                    let mut f = self.filter.clone();
-                    f.push_str(text);
-                    self.set_filter(f);
+                if let Some(filter) = apply_text_key(&self.filter, key) {
+                    self.set_filter(filter);
                 }
             }
         }
@@ -329,13 +325,11 @@ impl Picker {
                     .add_modifier(Modifier::DIM),
             ));
         } else {
-            spans.push(Span::styled(
-                self.filter.clone(),
+            spans.extend(render_field_spans(
+                &self.filter.text,
+                self.filter.cursor,
+                true,
                 Style::default().fg(to_ratatui(ctx.theme.fg1)),
-            ));
-            spans.push(Span::styled(
-                " ",
-                Style::default().add_modifier(Modifier::REVERSED),
             ));
         }
         Line::from(spans)

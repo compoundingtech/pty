@@ -330,7 +330,7 @@ fn status_after_exit_and_mode_flags() {
     // escapes have been read and parsed. Asserting straight after it is a race
     // that only loses when the child is slow.
     //
-    // Silber.pty hit it on a Mac under suite load, on this exact line, with
+    // It failed on a Mac under suite load, on this exact line, with
     // `sgrMouse` still false. Reproduced on Linux by giving the child a
     // `sleep 0.4` before its `printf`, which is what the load was doing.
     assert!(

@@ -476,8 +476,8 @@ fn terminate_process_group_with(
 /// That is the kill over-claiming again, in the other direction.
 ///
 /// macOS never had this: libproc stops listing a process the moment it exits.
-/// `Silber.pty` measured that on a real Mac on 2026-09-03, and chasing why its
-/// zombie test failed is what found this.
+/// That was measured on a real Mac on 2026-09-03, and chasing why its zombie
+/// test failed there is what found this.
 ///
 /// **One process, not the whole table.** A full table read costs about as much
 /// as 473 single reads (measured on Linux, 2026-09-03: 4.21 ms against
@@ -805,7 +805,7 @@ mod real_group_tests {
         // An earlier version of this test spawned the binary, so on the one
         // platform where process groups are the whole escalation story, the
         // test could not run at all. `process_group(0)` is the same thing
-        // without the command. Reported from a real Mac by `Silber.pty` on
+        // without the command. Reported from a real Mac on
         // 2026-09-03.
         use std::os::unix::process::CommandExt;
         let mut child = std::process::Command::new("sh")

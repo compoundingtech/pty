@@ -110,6 +110,48 @@ fn typing_filters_the_list_and_escape_clears_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The filter takes the readline editing keys every other text field does.
+///
+/// node: `src/tui/interactive.ts` delegates filter keys to `applyTextKey`
+#[test]
+fn the_filter_takes_readline_editing_keys() {
+    let _serial = serial();
+    let root = unique_root();
+    run_pty(&root, &["run", "-d", "--id", "alpha", "--no-display-name", "--", "cat"]);
+    run_pty(&root, &["run", "-d", "--id", "bravo", "--no-display-name", "--", "cat"]);
+
+    let mut s = open_picker(&root);
+    s.wait_for_text("bravo", 8000).expect("bravo listed");
+
+    s.type_str("x alp");
+    s.wait_for_text("Filter: x alp", 8000).expect("typed filter");
+    s.press("ctrl+w").expect("ctrl+w");
+    // Only the filter line: session rows can match "alp" on their own.
+    s.wait_for(
+        |ss| {
+            ss.text
+                .lines()
+                .find(|l| l.contains("Filter:"))
+                .is_some_and(|l| l.trim_end_matches([' ', '│']).ends_with("Filter: x"))
+        },
+        8000,
+        "ctrl+w to delete the word behind the cursor",
+    )
+    .expect("ctrl+w deletes the word behind");
+
+    s.press("ctrl+u").expect("ctrl+u");
+    s.wait_for_text("type to filter", 8000).expect("ctrl+u clears to the start");
+    s.wait_for_text("alpha", 8000).expect("alpha back once the filter is empty");
+    s.wait_for_text("bravo", 8000).expect("bravo back once the filter is empty");
+
+    s.type_str("q");
+    s.close();
+    for id in ["alpha", "bravo"] {
+        run_pty(&root, &["kill", id]);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn q_quits_only_when_the_filter_is_empty() {
     let _serial = serial();

@@ -19,4 +19,4 @@ Flags:
 Examples:
   pty send myserver "hello"
   pty send myserver --seq "git status" --seq key:return        # 0.3s gap by default
-  pty send --remote hetzner myserver --seq "ls" --seq key:return
+  pty send --remote example-host myserver --seq "ls" --seq key:return
