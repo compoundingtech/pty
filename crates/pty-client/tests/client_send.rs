@@ -6,7 +6,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use pty_client::{
@@ -31,11 +31,17 @@ fn status_body(bracketed_paste: bool) -> String {
 }
 
 fn collect_with_status(mut socket: UnixStream, bracketed_paste: bool) -> Vec<Packet> {
-    socket.set_read_timeout(Some(T)).unwrap();
+    // send_data may close before this handler runs. Darwin rejects setting
+    // socket options after peer close, so bound readiness instead of changing
+    // the accepted socket. Partial packets must not reset the overall deadline.
+    let deadline = Instant::now() + T;
     let mut reader = PacketReader::new();
     let mut out = Vec::new();
     let mut buf = [0; 4096];
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "fake daemon read deadline expired");
+        wait_unread(&socket, remaining);
         match socket.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
