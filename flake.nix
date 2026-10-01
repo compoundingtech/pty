@@ -99,6 +99,8 @@
         ];
 
         # Ghostty's native producer needs SDK discovery tools on Darwin.
+        # Release runners use Namespace, but the build SDK remains this pinned
+        # Nix SDK rather than the runner image's native SDK (q11).
         darwinBuildInputs = lib.optionals pkgs.stdenv.isDarwin [
           pkgs.apple-sdk_15
           pkgs.xcbuild

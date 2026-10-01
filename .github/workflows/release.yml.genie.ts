@@ -3,13 +3,11 @@ import {
   githubWorkflow,
   githubWorkflowEvent,
 } from '../../repos/effect-utils/genie/external.ts'
-import { nixSetupSteps } from './shared.ts'
+import { linuxRunner, macosRunner, nixSetupSteps } from './shared.ts'
 
-// Release keeps its GitHub-hosted runners. The Debian 12 container sets the
-// glibc floor of the Linux asset, and macos-14 is the host this Nix-to-portable
-// rewrite was proven on. Namespace's macOS profile is not known to match that
-// SDK and image contract, and moving a release build host needs its own
-// portability evidence, not a CI migration.
+// q11 approves Namespace release runners, with both platforms verified through
+// workflow_dispatch before publishing. Debian 12 still sets the Linux glibc
+// floor; the pinned Nix SDK, not the Namespace host SDK, builds the macOS asset.
 
 // Build the two binaries we can prove, verify each is portable OFF the machine
 // that built it, and attach them to a release, together with the libghostty-vt
@@ -31,7 +29,7 @@ export default githubWorkflow({
     workflow_dispatch: githubWorkflowEvent.all,
   },
   permissions: {
-    contents: "write",
+    contents: "read",
   },
   env: {
     // build.rs derives the version sha by running git in the checkout, and falls
@@ -83,7 +81,7 @@ export default githubWorkflow({
     // GLIBC_2.39 on the asset and lock out Ubuntu 22.04, Debian 12 and RHEL 9.
     // Debian 12 gives GLIBC_2.34 and covers them. See the README table.
     "linux-x86_64": {
-      "runs-on": "ubuntu-latest",
+      "runs-on": linuxRunner,
       container: "debian:12",
       "timeout-minutes": 60,
       steps: [
@@ -202,7 +200,7 @@ cp target/release/pty dist/pty-x86_64-unknown-linux-gnu
     // without that exact store. So the load commands are rewritten to the system
     // copies and the result is GATED, not trusted.
     "macos-arm64": {
-      "runs-on": "macos-14",
+      "runs-on": macosRunner,
       "timeout-minutes": 90,
       steps: [
         {
@@ -313,14 +311,17 @@ sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-aarch64-apple-darwin.ta
         },
       ],
     },
-    // Only on a tag. A dispatch run stops after the two jobs above, so the assets
-    // can be proved before anything is published.
+    // Only a pushed tag may publish. A dispatch against a tag must also remain
+    // read-only and stop after building and proving the two platform assets.
     publish: {
       needs: [
         "linux-x86_64",
         "macos-arm64",
       ],
-      if: "startsWith(github.ref, 'refs/tags/v')",
+      if: "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+      permissions: {
+        contents: "write",
+      },
       "runs-on": "ubuntu-latest",
       "timeout-minutes": 10,
       steps: [

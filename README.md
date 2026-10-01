@@ -184,8 +184,14 @@ Three conditions travel with that result:
 ### Pull-request CI is Linux only, on purpose
 
 Pull-request workflows run on Namespace's `namespace-profile-linux-x86-64`.
-Release builds retain hosted Ubuntu with a Debian 12 container and `macos-14`;
-they do not provide macOS coverage for each pull request.
+Release builds run on Namespace's Linux and macOS profiles. Linux still builds
+inside Debian 12 to preserve the glibc floor, and macOS still uses the pinned Nix
+SDK before relocation and ad-hoc signing. This does not provide macOS coverage
+for each pull request.
+
+The release workflow's manual dispatch builds and verifies both platforms
+without publishing, even when dispatched against a tag. Only a pushed `v*` tag
+can run the publishing job; dispatch jobs have read-only repository permissions.
 
 That matters more here than it usually would.
 [`crates/pty-core/src/proctable.rs`](crates/pty-core/src/proctable.rs) carries a
@@ -417,7 +423,7 @@ it for two targets:
 | Asset | Built on |
 |---|---|
 | `libghostty-vt-x86_64-unknown-linux-gnu.tar.gz` | Debian 12, Zig 0.15.2 |
-| `libghostty-vt-aarch64-apple-darwin.tar.gz` | macOS 14, in the Nix shell |
+| `libghostty-vt-aarch64-apple-darwin.tar.gz` | Namespace macOS arm64, in the pinned Nix shell |
 
 `pty-terminal` turns on `libghostty-vt-sys`'s `pkg-config` feature. When
 pkg-config can find `libghostty-vt-static`, cargo links that archive and never
