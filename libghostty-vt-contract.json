@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "rustBindingsVersion": "0.2.1",
+  "ghosttyRev": "a887df42c56f6de86c0fe6da9c4eeca37931e083",
+  "sourceHash": "sha256-1Zz65SCk3rkJ9+Q0MmyNOTNiDSLBRIHRd3IvFM4iNXw=",
+  "zigVersion": "0.15.2",
+  "zigDepsHash": "sha256-PnM+hZIlLyQwK8vJgd/Bhjt1lNIz06T8FahwliRmMrY=",
+  "pkgConfigStatic": "libghostty-vt-static",
+  "pkgConfigShared": "libghostty-vt"
+}

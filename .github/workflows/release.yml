@@ -143,8 +143,9 @@ jobs:
       # and pass against it with Zig off PATH.
       - name: Package libghostty-vt
         run: |
-          sh scripts/package-libghostty-vt.sh x86_64-unknown-linux-gnu target/release \
-            target/release/build/libghostty-vt-sys-*/out/ghostty-src dist-lib
+          sh scripts/package-libghostty-vt.sh x86_64-unknown-linux-gnu \
+            target/release/build/libghostty-vt-sys-*/out/ghostty-install \
+            target/release/build/libghostty-vt-sys-*/out/ghostty-src/LICENSE dist-lib
       - name: Prove the library builds pty-terminal and pty-testkit without Zig
         run: sh scripts/prove-libghostty-vt.sh dist-lib/libghostty-vt-x86_64-unknown-linux-gnu.tar.gz
       - uses: actions/upload-artifact@v4
@@ -241,15 +242,12 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      # `nix build` keeps its build directory to itself, so libghostty-vt is
-      # built again with cargo in the Nix shell, which has the SDK and the
-      # pinned Ghostty source that plain cargo on current macOS lacks.
-      - name: Build libghostty-vt in the Nix shell
-        run: nix develop --command cargo build --release -p pty-terminal
+      # Reuse the native package already linked by pty's Nix build.
       - name: Package libghostty-vt
         run: |
-          nix develop --command sh -c \
-            'sh scripts/package-libghostty-vt.sh aarch64-apple-darwin target/release "$GHOSTTY_SOURCE_DIR" dist-lib'
+          native=$(nix build .#libghostty-vt --no-link --print-out-paths)
+          sh scripts/package-libghostty-vt.sh aarch64-apple-darwin \
+            "$native" "$native/share/licenses/libghostty-vt/LICENSE" dist-lib
       # OUTSIDE Nix, with the runner's own cargo and linker and no Zig: the
       # case the archive exists for.
       - name: Prove the library builds pty-terminal and pty-testkit without Zig or Nix
