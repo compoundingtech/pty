@@ -224,6 +224,137 @@ fn readonly_attach_drops_input() {
     rig.kill("r");
 }
 
+#[test]
+fn shared_min_resize_does_not_speculatively_reflow_the_larger_writer() {
+    let rig = Rig::new();
+    rig.run("min", "exec cat");
+    let small = TerminalHandle::attach(
+        rig.session("min"),
+        AttachOptions { cols: 40, rows: 10, ..Default::default() },
+    ).expect("small writer");
+    assert!(small.wait_ready(Duration::from_secs(5)));
+    let large = TerminalHandle::attach(
+        rig.session("min"),
+        AttachOptions { cols: 80, rows: 24, ..Default::default() },
+    ).expect("large writer");
+    assert!(large.wait_ready(Duration::from_secs(5)));
+    assert_eq!((large.cols(), large.rows()), (40, 10));
+    let events = large.subscribe();
+    large.resize(120, 30);
+    // The snapshot request is processed after RESIZE on the actor thread.
+    let grid = large.snapshot(0);
+    assert_eq!((grid.cols, grid.rows_n), (40, 10));
+    assert!(!events.try_iter().any(|ev| ev == HandleEvent::Geometry(30, 120)));
+
+    // Release the competing minimum: the daemon must remember the larger
+    // request, and only its GEOMETRY may reflow that writer.
+    small.kill();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (large.cols(), large.rows()) != (120, 30) {
+        assert!(Instant::now() < deadline, "requested geometry was not retained");
+        large.wait_rev(large.rev(), Duration::from_millis(50));
+    }
+    assert_eq!((large.snapshot(0).cols, large.snapshot(0).rows_n), (120, 30));
+    large.kill();
+}
+
+fn read_protocol_packet(stream: &mut std::os::unix::net::UnixStream) -> pty_core::protocol::Packet {
+    use std::io::Read;
+    let mut header = [0; 5];
+    stream.read_exact(&mut header).expect("frame header");
+    let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+    let mut bytes = header.to_vec();
+    bytes.resize(5 + length, 0);
+    stream.read_exact(&mut bytes[5..]).expect("frame payload");
+    pty_core::protocol::PacketReader::new().feed(&bytes).unwrap().remove(0)
+}
+
+#[test]
+fn connector_socketpair_preserves_effective_geometry_paste_and_reconnect_request() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use pty_core::protocol::{MessageType, decode_size, encode_geometry, encode_screen};
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let h = TerminalHandle::attach_with_connector(move || {
+        let (client, daemon) = UnixStream::pair()?;
+        daemon.set_read_timeout(Some(Duration::from_secs(5)))?;
+        opened_tx.send(daemon).map_err(std::io::Error::other)?;
+        Ok(client)
+    }, AttachOptions::default()).expect("connector attach");
+    let mut daemon = opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let hello = read_protocol_packet(&mut daemon);
+    assert_eq!(hello.type_, MessageType::Attach);
+    assert_eq!(decode_size(&hello.payload), (24, 80));
+    daemon.write_all(&encode_geometry(10, 40)).unwrap();
+    daemon.write_all(&encode_screen(b"\x1b[?2004hbaseline")).unwrap();
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    let events = h.subscribe();
+
+    h.resize(120, 30);
+    let resize = read_protocol_packet(&mut daemon);
+    assert_eq!(resize.type_, MessageType::Resize);
+    assert_eq!(decode_size(&resize.payload), (30, 120));
+    assert_eq!((h.snapshot(0).cols, h.rows()), (40, 10));
+    assert!(!events.try_iter().any(|ev| ev == HandleEvent::Geometry(30, 120)));
+
+    // Requesting the effective dimensions is still a changed request.
+    h.resize(40, 10);
+    let resize = read_protocol_packet(&mut daemon);
+    assert_eq!(decode_size(&resize.payload), (10, 40));
+    h.resize(120, 30);
+    assert_eq!(decode_size(&read_protocol_packet(&mut daemon).payload), (30, 120));
+    h.resize(120, 30); // Duplicate requested dimensions must not send RESIZE.
+    h.send_paste("one\ntwo");
+    let paste = read_protocol_packet(&mut daemon);
+    assert_eq!(paste.type_, MessageType::Data);
+    assert_eq!(paste.payload, b"\x1b[200~one\ntwo\x1b[201~");
+
+    let attempt = h.attempt();
+    h.reconnect().expect("fresh connector");
+    assert!(h.attempt() > attempt);
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Detach);
+    let mut replacement = opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let hello = read_protocol_packet(&mut replacement);
+    assert_eq!(hello.type_, MessageType::Attach);
+    assert_eq!(decode_size(&hello.payload), (30, 120));
+    replacement.write_all(&encode_geometry(12, 50)).unwrap();
+    replacement.write_all(&encode_screen(b"replacement")).unwrap();
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    assert_eq!((h.cols(), h.rows()), (50, 12));
+    assert_eq!(h.plain(Range::Viewport), "replacement");
+    h.kill();
+    assert_eq!(read_protocol_packet(&mut replacement).type_, MessageType::Detach);
+}
+
+#[test]
+fn readonly_connector_peeks_and_prohibits_input_and_resize() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use pty_core::protocol::{MessageType, encode_geometry, encode_screen};
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let h = TerminalHandle::attach_with_connector(
+        move || client.try_clone(),
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector");
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+    daemon.write_all(&encode_geometry(10, 40)).unwrap();
+    daemon.write_all(&encode_screen(b"readonly")).unwrap();
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    h.write(b"forbidden");
+    h.send_paste("also forbidden");
+    h.resize(120, 30);
+    let grid = h.snapshot(0);
+    assert_eq!((grid.cols, grid.rows_n), (40, 10));
+    h.kill();
+    // Closing is an ordered barrier: the first frame after PEEK must be
+    // DETACH, not any of the prohibited DATA or RESIZE requests.
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Detach);
+}
+
 /// node-daemon-protocol-disk.md §1.12 / conformance fixture "attach identity
 /// with a replacement under the same id": `--id a`, exit, `--id a` again — a
 /// reconnect reaches the replacement, and nothing from the old daemon (its
