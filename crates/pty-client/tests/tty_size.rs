@@ -4,13 +4,14 @@ use pty_client::tty::size_or_default;
 fn a_zero_sized_terminal_uses_a_usable_default() {
     let mut master = 0;
     let mut slave = 0;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: openpty fills the two descriptors and reads the supplied size.
+    // SAFETY: openpty fills the descriptors; Darwin's signature requires a
+    // mutable size pointer, and size remains valid throughout the call.
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -18,7 +19,7 @@ fn a_zero_sized_terminal_uses_a_usable_default() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &size,
+                &mut size,
             )
         },
         0
