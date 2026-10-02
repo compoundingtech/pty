@@ -1,6 +1,10 @@
+# Generated file - DO NOT EDIT
+# Source: conformance.yml.genie.ts
+
 name: Conformance
+
 on:
-  pull_request:
+  pull_request: null
   push:
     branches: [main]
 
@@ -8,70 +12,31 @@ env:
   SHARDS: 4
 
 jobs:
-  # Each shard runs a slice of the conformance files against BOTH binaries.
-  # Slicing by file rather than by binary keeps the two sides on the same
-  # runner: the suite drives real processes through real PTYs and races under
-  # load, so adding a second binary's work to a shard's CPU is exactly what we
-  # do not want.
-  #
-  # Sharding is here because the work parallelises across machines and does not
-  # compress on one. The long pole is COMPILING the seventy debug test
-  # binaries, not running them: measured 2026-09-05 across all 140 invocations,
-  # the reported test time totals 5.1 minutes and no single invocation exceeds
-  # 12.5 seconds, while the compile before the first result took about 26.
-  #
-  # Do not target test runtime here. An earlier version of this comment said
-  # the tests were the cost, from a five-file sample that happened to contain
-  # the one seven-second outlier. That sample was not representative and the
-  # claim was wrong. If someone wants a bigger win than sharding, it is in the
-  # compile: a shared cargo cache, or building the test binaries once and
-  # distributing them, rather than four runners each compiling the workspace.
   shard:
-    runs-on: ubuntu-latest
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        # Keep this list and SHARDS above in step. The combine job counts the
-        # results it receives and refuses if the two disagree.
         index: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
       - uses: actions/setup-node@v4
         with:
-          # The runtime is a pinned input, not a detail. It can change results,
-          # so pinning only the reference COMMIT is not enough to make a
-          # comparison reproducible.
-          #
-          # 22 matches the major the Node pty's own CI uses. Changing it is a
-          # deliberate act: expect the divergence ledger to change with it.
-          #
-          # This comment used to say the Node binary truncates
-          # `pty completions fish` on a pipe under Node v24.18.0 and not under
-          # Node 22, and gave that as the reason for the pin. That was wrong.
-          # Measured on Linux x86_64 on 2026-09-08, at the same pinned commit
-          # 86dcc5e, with both runtimes:
-          #
-          #   node v22.23.2   fish piped 8192 bytes, to a file 12138
-          #   node v24.18.0   fish piped 8192 bytes, to a file 12138
-          #
-          # It truncates on both. The variable is the PIPE, not the major.
-          # Node's stdout is asynchronous to a pipe and synchronous to a file,
-          # and the old `completions` branch called `process.exit()` before the
-          # buffer drained, so output stopped at one 8192-byte pipe buffer.
-          # The three shells make that plain at the same commit: bash is 5275
-          # bytes and survives, zsh is 8327 and fish is 12138 and both stop at
-          # 8192. Node fixed it in pty#178 by setting `process.exitCode` and
-          # returning; that commit is one past this pin.
-          #
-          # The pin is still right, for the reason above it. The reason given
-          # for it was not.
           node-version: 22
-
-      # The reference commit is pinned rather than tracked. A checkout seven
-      # commits behind produced eight false divergences on 2026-09-05, and
-      # every one was an artifact of the stale reference.
       - name: Build the Node pty at the pinned commit
         run: |
           ref=$(cat crates/pty-conformance/node-ref)
@@ -83,8 +48,7 @@ jobs:
 
       - name: Build
         run: nix develop --command cargo build --workspace --release
-
-      - name: Conformance, both binaries, shard ${{ matrix.index }}
+      - name: "Conformance, both binaries, shard ${{ matrix.index }}"
         env:
           PTY_NODE_CHECKOUT: /tmp/node-pty
         run: |
@@ -154,18 +118,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: red-${{ matrix.index }}
+          name: "red-${{ matrix.index }}"
           path: |
             target/conformance/red.txt
             target/conformance/shard.log
             target/conformance/retry.log
+
           if-no-files-found: error
           retention-days: 14
-
   gate:
     needs: shard
     if: always()
-    runs-on: ubuntu-latest
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -173,14 +138,6 @@ jobs:
         with:
           pattern: red-*
           path: /tmp/red
-
-      # THE CHECK RUNS ONCE, OVER THE COMBINED SET. Do not move it into the
-      # shards. `check-divergences.py` fails in two directions, and the second
-      # one — a recorded divergence that no longer happens — can only be
-      # decided by knowing the divergence appeared in NO shard. A per-shard
-      # check sees a quarter of the tests, so every entry belonging to another
-      # shard looks stale to it, and the gate would fail every run for a reason
-      # that is not true.
       - name: Combine and gate
         run: |
           # A missing shard is not a pass. If one shard died, its slice of the
@@ -201,3 +158,5 @@ jobs:
           echo "combined divergences from all $SHARDS shards:"
           cat /tmp/red/all.txt
           python3 scripts/check-divergences.py /tmp/red/all.txt
+
+    name: Conformance gate

@@ -6,3 +6,7 @@ node_modules
 # Local agent and editor configuration, never committed
 /.convoy/
 /.claude/settings.local.json
+
+# Genie: flake-input source link and per-run lock files
+/repos/
+/tmp/genie-locks/

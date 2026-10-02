@@ -1,0 +1,49 @@
+{
+  "$genie": {
+    "source": ".github/repo-settings.json.genie.ts",
+    "warning": "DO NOT EDIT - changes will be overwritten"
+  },
+  "repository": {
+    "allow_auto_merge": true,
+    "delete_branch_on_merge": true
+  },
+  "rulesets": [
+    {
+      "name": "main",
+      "enforcement": "active",
+      "target": "branch",
+      "conditions": {
+        "ref_name": {
+          "include": ["refs/heads/main"],
+          "exclude": []
+        }
+      },
+      "rules": [
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "required_status_checks": [
+              {
+                "context": "Nix build"
+              },
+              {
+                "context": "Private names"
+              },
+              {
+                "context": "Test"
+              },
+              {
+                "context": "Conformance gate"
+              },
+              {
+                "context": "genie freshness"
+              }
+            ]
+          }
+        }
+      ],
+      "bypass_actors": []
+    }
+  ]
+}

@@ -1,9 +1,22 @@
 {
   description = "pty - persistent terminal sessions with detach/attach, in Rust on libghostty";
 
+  nixConfig = {
+    extra-substituters = [ "https://overeng-effect-utils.cachix.org" ];
+    extra-trusted-public-keys = [
+      "overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # Generator tooling only. Its own nixpkgs is kept so the pty build toolchain
+    # does not change and the published genie artifacts stay substitutable.
+    effect-utils = {
+      url = "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
+      inputs.flake-utils.follows = "flake-utils";
+    };
   };
 
   outputs =
@@ -11,6 +24,7 @@
       self,
       nixpkgs,
       flake-utils,
+      effect-utils,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -85,6 +99,8 @@
         ];
 
         # Ghostty's native producer needs SDK discovery tools on Darwin.
+        # Release runners use Namespace, but the build SDK remains this pinned
+        # Nix SDK rather than the runner image's native SDK (q11).
         darwinBuildInputs = lib.optionals pkgs.stdenv.isDarwin [
           pkgs.apple-sdk_15
           pkgs.xcbuild
@@ -361,6 +377,15 @@
           env = {
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
+        };
+
+        # Keep generator tooling out of the Rust build and test shell.
+        devShells.genie = pkgs.mkShell {
+          packages = [ effect-utils.packages.${system}.genie ];
+          shellHook = ''
+            mkdir -p repos
+            ln -sfn ${effect-utils} repos/effect-utils
+          '';
         };
       }
     ) // {
