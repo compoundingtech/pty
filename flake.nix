@@ -27,20 +27,18 @@
         # from the flake's own metadata. A dirty tree reports its base commit,
         # the same way `git rev-parse --short HEAD` does for a local build.
         buildSha = self.shortRev or (lib.removeSuffix "-dirty" (self.dirtyShortRev or "dirty"));
+        ghosttyContract = builtins.fromJSON (builtins.readFile ./libghostty-vt-contract.json);
 
-        # The Ghostty commit that libghostty-vt-sys 0.2.1 pins (its build.rs:7).
-        # That build script clones it at build time unless GHOSTTY_SOURCE_DIR
-        # names a checkout, and lets `zig build` fetch Ghostty's own packages
-        # unless GHOSTTY_ZIG_SYSTEM_DIR names a pre-populated package directory.
-        # The build sandbox has no network, so both are fixed-output fetches.
-        ghosttyRev = "a887df42c56f6de86c0fe6da9c4eeca37931e083";
+        # The native artifact owns source and Zig-package fetching. Rust
+        # consumers link its pkg-config archive and never invoke Zig.
+        ghosttyRev = ghosttyContract.ghosttyRev;
         ghosttyShortRev = lib.substring 0 7 ghosttyRev;
 
         ghosttySrc = pkgs.fetchgit {
           name = "ghostty-${ghosttyShortRev}-src";
           url = "https://github.com/ghostty-org/ghostty.git";
           rev = ghosttyRev;
-          hash = "sha256-1Zz65SCk3rkJ9+Q0MmyNOTNiDSLBRIHRd3IvFM4iNXw=";
+          hash = ghosttyContract.sourceHash;
         };
 
         # Ghostty's zig package cache, in the layout `zig build --system <dir>`
@@ -77,7 +75,7 @@
           '';
 
           outputHashMode = "recursive";
-          outputHash = "sha256-PnM+hZIlLyQwK8vJgd/Bhjt1lNIz06T8FahwliRmMrY=";
+          outputHash = ghosttyContract.zigDepsHash;
         };
 
         completionShells = [
@@ -86,12 +84,46 @@
           "fish"
         ];
 
-        # Needed to build at all on a Mac; see the note beside their use.
+        # Ghostty's native producer needs SDK discovery tools on Darwin.
         darwinBuildInputs = lib.optionals pkgs.stdenv.isDarwin [
           pkgs.apple-sdk_15
           pkgs.xcbuild
           pkgs.cctools
         ];
+
+        libghostty-vt = assert ghosttyContract.zigVersion == pkgs.zig_0_15.version; pkgs.stdenv.mkDerivation {
+          pname = "libghostty-vt";
+          version = ghosttyContract.rustBindingsVersion;
+          src = ghosttySrc;
+          nativeBuildInputs = [ pkgs.zig_0_15 ] ++ darwinBuildInputs;
+          dontConfigure = true;
+          dontUseZigBuild = true;
+          dontUseZigCheck = true;
+          dontUseZigInstall = true;
+          buildPhase = ''
+            runHook preBuild
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            zig build -j2 -Demit-lib-vt=true -Doptimize=ReleaseFast \
+              -Demit-xcframework=false -Dapp-runtime=none \
+              --system ${ghosttyZigDeps} --prefix "$out"
+            runHook postBuild
+          '';
+          dontInstall = true;
+          # stdenv does not strip archive members by default. Their DWARF paths
+          # otherwise retain Zig and the immutable Zig package cache at runtime.
+          postFixup = ''
+            strip -S "$out/lib/libghostty-vt.a"
+            mkdir -p "$out/share/licenses/libghostty-vt"
+            cp LICENSE "$out/share/licenses/libghostty-vt/LICENSE"
+            cp ${./libghostty-vt-contract.json} "$out/share/libghostty-vt-contract.json"
+          '';
+          passthru = {
+            inherit ghosttyRev;
+            rustBindingsVersion = ghosttyContract.rustBindingsVersion;
+            contract = ghosttyContract;
+          };
+          meta.license = lib.licenses.mit;
+        };
 
         pty = pkgs.rustPlatform.buildRustPackage {
           pname = "pty";
@@ -104,52 +136,11 @@
 
           nativeBuildInputs = [
             pkgs.installShellFiles
-            pkgs.zig_0_15
-          ]
-          # Darwin only, and each one removes a named failure. Measured on
-          # Apple silicon on 2026-09-02, added one at a time:
-          #
-          #   nothing          `DarwinSdkNotFound`
-          #   + the first two  `libtool: FileNotFound`
-          #   + all three      builds
-          #
-          # `DarwinSdkNotFound` is not Zig failing against a recent macOS. It
-          # is Ghostty's own `build.zig` asking for a NATIVE libc installation
-          # inside a sandbox that has none (`SharedDeps.zig` `findNative`, by
-          # way of its bench target). No build flag avoids it: `build.zig`
-          # constructs the bench target unconditionally and only gates
-          # installing it. So the SDK has to be present rather than skipped.
-          #
-          # `apple-sdk_15` is what was proved to work, and it resolves to an
-          # SDK that reports 14.4. **`apple-sdk_26` is untested**, and the
-          # native failure this replaced tracked an SDK version of 26.x, so
-          # the version here may be load-bearing rather than incidental. Do
-          # not raise it without building on a Mac.
-          #
-          # **`xcbuild` is here for a reason that may not last, and the reason
-          # is worth reading before anyone removes it.** On a Mac's own shell,
-          # isolated one input at a time, it is the only one of the three that
-          # makes a plain `zig build` link at all — and it works by BREAKING
-          # SDK detection. nixpkgs' `xcrun` cannot find an SDK, so Zig stops
-          # looking at the host's Xcode SDK and falls back to its own bundled
-          # libSystem stub; the emitted link line carries no `-syslibroot`.
-          # **If nixpkgs' `xcbuild` ever gains working SDK detection this
-          # breaks again**, and the failure will look like a Zig-versus-macOS
-          # problem rather than a packaging one, which is how it cost somebody
-          # an afternoon the first time.
-          ++ darwinBuildInputs;
+            pkgs.pkg-config
+          ];
+          buildInputs = [ libghostty-vt ];
 
-          # zig's setup hook would otherwise replace cargo's build, check, and
-          # install phases; zig is only here for libghostty-vt-sys's build script.
-          dontUseZigBuild = true;
-          dontUseZigCheck = true;
-          dontUseZigInstall = true;
-
-          env = {
-            PTY_BUILD_SHA = buildSha;
-            GHOSTTY_SOURCE_DIR = "${ghosttySrc}";
-            GHOSTTY_ZIG_SYSTEM_DIR = "${ghosttyZigDeps}";
-          };
+          env.PTY_BUILD_SHA = buildSha;
 
           # Completions are the files vendored from the Node repo, which the
           # binary embeds and prints from `pty completions <shell>`;
@@ -249,11 +240,47 @@
       {
         packages.pty = pty;
         packages.default = pty;
+        packages.libghostty-vt = libghostty-vt;
+        devShells.libghostty-consumer = pkgs.mkShell {
+          packages = [ pkgs.cargo pkgs.rustc pkgs.pkg-config ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.mold ];
+          buildInputs = [ libghostty-vt ];
+        };
 
         # `nix flake check` builds the package, its pty-core tests, and the
         # installed-binary smoke checks below.
         checks.pty = pty;
         checks.fleet-liveness = ptyFleetLiveness;
+        checks.libghostty-contract =
+          let
+            lock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
+            sys = lib.findSingle (p: p.name == "libghostty-vt-sys")
+              (throw "missing sys crate") (throw "multiple sys crates") lock.package;
+            archive = pkgs.fetchurl {
+              url = "https://static.crates.io/crates/libghostty-vt-sys/libghostty-vt-sys-${sys.version}.crate";
+              sha256 = sys.checksum;
+            };
+          in pkgs.runCommand "libghostty-contract" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            tar -xf ${archive}
+            python ${self}/scripts/check-libghostty-contract.py \
+              --sys-source "$PWD/libghostty-vt-sys-${sys.version}"
+            touch "$out"
+          '';
+        checks.libghostty-runtime-closure =
+          let closure = pkgs.closureInfo { rootPaths = [ libghostty-vt ]; };
+          in pkgs.runCommand "libghostty-runtime-closure" { } ''
+            while IFS= read -r path; do
+              case "$path" in
+                *-zig-*|*-ghostty-*-src|*-ghostty-*-zig-deps)
+                  echo "native runtime closure retains toolchain/source: $path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < ${closure}/store-paths
+            echo "PASS: native runtime closure contains no Zig/source/cache"
+            touch "$out"
+          '';
 
         # The installed completion files are the ones the binary prints, byte
         # for byte. Both come from completions/ at the repo root; this proves the
@@ -311,7 +338,7 @@
             pkgs.rust-analyzer
             pkgs.rustc
             pkgs.rustfmt
-            pkgs.zig_0_15
+            pkgs.pkg-config
 
             # The package build has this and the shell did not, so a
             # `cargo test --workspace` in here failed two line-editing tests
@@ -319,11 +346,8 @@
             # drives readline through `bash`, and stdenv's bash is built
             # without it.
             pkgs.bashInteractive
-          ]
-          # Likewise: without these a `cargo test --workspace` in this shell
-          # does not get as far as the tests on a Mac. It fails building
-          # libghostty.
-          ++ darwinBuildInputs;
+          ];
+          buildInputs = [ libghostty-vt ];
 
           # `nix develop` appends `nix-shell.XXXXXX` to `TMPDIR`, and on a
           # Mac that pushes a session's socket path past the 104-byte kernel
@@ -334,14 +358,15 @@
             export TMPDIR=''${PTY_DEV_TMPDIR:-/tmp}
           '';
 
-          # The same pre-fetched Ghostty as the package, so a `cargo build` in
-          # this shell fetches nothing.
           env = {
-            GHOSTTY_SOURCE_DIR = "${ghosttySrc}";
-            GHOSTTY_ZIG_SYSTEM_DIR = "${ghosttyZigDeps}";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
         };
       }
-    );
+    ) // {
+      lib.libghosttyContract = builtins.fromJSON (builtins.readFile ./libghostty-vt-contract.json);
+      overlays.default = final: prev: {
+        libghostty-vt = self.packages.${prev.stdenv.hostPlatform.system}.libghostty-vt;
+      };
+    };
 }

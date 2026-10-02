@@ -88,11 +88,12 @@ nix run . -- help
 nix profile install github:compoundingtech/pty-rust
 ```
 
-The flake builds hermetically: Ghostty's source and its Zig packages are
-fixed-output fetches, so `nix build` needs no network beyond the Nix cache.
-`nix flake check` also runs the test suite and verifies that the installed
-completion files are what the binary prints. `nix develop` opens a shell with
-the Rust toolchain and Zig, pointed at the same pre-fetched Ghostty.
+The flake builds hermetically: Ghostty's source and Zig packages are
+fixed-output fetches, and one native `libghostty-vt` package builds the C
+library. Cargo links that archive through pkg-config. `nix flake check`
+also verifies the native compatibility contract and runtime closure, runs
+the package tests, and checks installed completions. `nix develop` supplies
+the Rust toolchain and the same native artifact, without Zig.
 
 With Cargo (see the build requirements below):
 
@@ -354,21 +355,39 @@ A Cargo workspace of nine crates under `crates/`:
 
 - Rust 1.90 or newer (edition 2024; `rust-version` is pinned in `Cargo.toml`,
   and `libghostty-vt-sys` 0.2.1 needs 1.90).
-- Zig 0.15.2 on `PATH`, and `git`: the `libghostty-vt-sys` crate builds
-  Ghostty's terminal core from source with Zig. (A project that only depends
-  on `pty-terminal` or `pty-testkit` can use a release's prebuilt library
-  instead; see below.) The version is exact. Ghostty
-  refuses 0.16.0, and 0.15.2 cannot link the macOS 26.5 SDK, so a source build
-  on current macOS needs Nix.
-- The first build clones Ghostty at the commit `libghostty-vt-sys` pins and
-  lets Zig fetch Ghostty's own packages; both are cached under `target/` after
-  that. To build without network, point `GHOSTTY_SOURCE_DIR` at a Ghostty
-  checkout and `GHOSTTY_ZIG_SYSTEM_DIR` at a populated Zig package directory
-  (`flake.nix` shows how both are produced).
+- In the Nix shell: `pkg-config` and the shared native artifact are supplied
+  automatically; Rust builds do not require Zig.
+- Outside Nix: either use the prebuilt release library below, or put Zig
+  0.15.2 and `git` on `PATH`. Without a pkg-config archive,
+  `libghostty-vt-sys` builds Ghostty from source. Ghostty requires exactly
+  0.15.2, which cannot link the macOS 26.5 SDK; use Nix or a release archive
+  on current macOS.
+- Unmanaged source builds clone the sys crate's pinned Ghostty commit and
+  cache Zig packages under `target/`. `GHOSTTY_SOURCE_DIR` and
+  `GHOSTTY_ZIG_SYSTEM_DIR` can override these inputs, but must be unset for
+  pkg-config consumers because source overrides take precedence.
 
 ```sh
 cargo build --release                        # target/release/pty
 ```
+
+### Shared native Nix artifact
+
+`nix build .#libghostty-vt` builds the native library once, separately from
+Cargo, with static/shared libraries, C headers, and pkg-config metadata.
+`overlays.default` exposes this exact output as `pkgs.libghostty-vt`.
+`lib.libghosttyContract` names its Ghostty commit, Rust binding version, and
+toolchain pins; `checks.libghostty-contract` checks the actual locked sys
+crate's source against it. `checks.libghostty-runtime-closure` rejects
+accidental Zig/source/cache references in the artifact's runtime closure.
+
+The default developer shell and `libghostty-consumer` shell supply the
+native artifact and pkg-config without Zig. The latter is a minimal Rust
+consumer environment, including Linux's mold linker. Clear ambient
+`GHOSTTY_SOURCE_DIR` and `GHOSTTY_ZIG_SYSTEM_DIR` before entering either shell.
+The native package installs its compatibility contract and license under
+`share/`; the macOS release job packages this output rather than compiling
+Ghostty again through Cargo.
 
 ### Depending on pty-terminal or pty-testkit without Zig
 

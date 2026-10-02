@@ -13,5 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Native binding contract and runtime closure
+        run: |
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.libghostty-contract \
+            .#checks.x86_64-linux.libghostty-runtime-closure
       - run: nix build --print-build-logs
       - run: ./result/bin/pty --version
