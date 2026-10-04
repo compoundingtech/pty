@@ -406,6 +406,14 @@ toolchain pins; `checks.libghostty-contract` checks the actual locked sys
 crate's source against it. `checks.libghostty-runtime-closure` rejects
 accidental Zig/source/cache references in the artifact's runtime closure.
 
+On Linux the package names its Zig target (`-Dtarget=<arch>-linux-gnu
+-Dcpu=baseline`) instead of building for the host. The libraries therefore
+run on any machine of their architecture and record the standard dynamic
+linker path, not the build host's /nix/store glibc. The build fails if any
+file under `lib/` contains a `/nix/store/` string, so a consumer that rejects
+store paths can link the archive. On macOS, Ghostty already builds for a
+generic target.
+
 The default developer shell and `libghostty-consumer` shell supply the
 native artifact and pkg-config without Zig. The latter is a minimal Rust
 consumer environment, including Linux's mold linker. Clear ambient

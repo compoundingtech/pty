@@ -107,6 +107,17 @@
           pkgs.cctools
         ];
 
+        # On Linux the target is named. Without `-Dtarget` Zig builds for
+        # the host it runs on: the archive keeps that host's dynamic linker,
+        # a /nix/store glibc path, in read-only data, and its code is tuned
+        # to the build machine's CPU. A named target gives the standard
+        # loader path and baseline code, so a substituted archive runs on any
+        # machine of its architecture and carries no store path. Darwin needs
+        # no flag: Ghostty already swaps a native macOS target for a generic
+        # one (`genericMacOSTarget` in src/build/Config.zig).
+        zigTargetFlags = lib.optionalString pkgs.stdenv.hostPlatform.isLinux
+          "-Dtarget=${pkgs.stdenv.hostPlatform.parsed.cpu.name}-linux-gnu -Dcpu=baseline";
+
         libghostty-vt = assert ghosttyContract.zigVersion == pkgs.zig_0_15.version; pkgs.stdenv.mkDerivation {
           pname = "libghostty-vt";
           version = ghosttyContract.rustBindingsVersion;
@@ -119,7 +130,7 @@
           buildPhase = ''
             runHook preBuild
             export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
-            zig build -j2 -Demit-lib-vt=true -Doptimize=ReleaseFast \
+            zig build -j2 ${zigTargetFlags} -Demit-lib-vt=true -Doptimize=ReleaseFast \
               -Demit-xcframework=false -Dapp-runtime=none \
               --system ${ghosttyZigDeps} --prefix "$out"
             runHook postBuild
@@ -129,6 +140,16 @@
           # otherwise retain Zig and the immutable Zig package cache at runtime.
           postFixup = ''
             strip -S "$out/lib/libghostty-vt.a"
+            # Consumers that refuse any /nix/store string link these files
+            # into their own artifacts. The pkg-config files under share/
+            # name this output's prefix, which is their job.
+            for lib in "$out"/lib/*; do
+              if grep -q -a '/nix/store/' "$lib"; then
+                echo "$lib contains a /nix/store path:" >&2
+                grep -a -o '/nix/store/[[:graph:]]*' "$lib" | sort -u >&2
+                exit 1
+              fi
+            done
             mkdir -p "$out/share/licenses/libghostty-vt"
             cp LICENSE "$out/share/licenses/libghostty-vt/LICENSE"
             cp ${./libghostty-vt-contract.json} "$out/share/libghostty-vt-contract.json"
