@@ -14,3 +14,4 @@ libghostty-vt.workspace = true
 # "Depending on pty-terminal or pty-testkit without Zig".
 libghostty-vt-sys.workspace = true
 png.workspace = true
+pty-core = { path = "../pty-core" }

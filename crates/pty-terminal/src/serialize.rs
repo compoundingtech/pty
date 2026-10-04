@@ -279,7 +279,15 @@ struct ActiveScan {
 /// serializer keeps them as `SGR bg` + `ECH n`; this re-emits them the same
 /// way, so those cells come back as background-only cells, not spaces.
 fn scan_active(term: &Terminal) -> ActiveScan {
-    let rows = term.rows().unwrap_or(0);
+    scan_rows(term, term.rows().unwrap_or(0), |x, y| Point::Active(PointCoordinate { x, y: y as u32 }))
+}
+
+/// Restore background-only cells the VT formatter omits, in one selected history row.
+pub(crate) fn history_background(term: &Terminal, y: u32) -> String {
+    scan_rows(term, 1, |x, row| Point::History(PointCoordinate { x, y: y + u32::from(row) })).bg_fixups
+}
+
+fn scan_rows(term: &Terminal, rows: u16, point: impl Fn(u16, u16) -> Point) -> ActiveScan {
     let cols = term.cols().unwrap_or(0);
     let mut last_text_row = None;
     let mut bg_fixups = String::new();
@@ -289,7 +297,7 @@ fn scan_active(term: &Terminal) -> ActiveScan {
         let mut has_text = false;
         for x in 0..cols {
             let cell = term
-                .grid_ref(Point::Active(PointCoordinate { x, y: y as u32 }))
+                .grid_ref(point(x, y))
                 .ok()
                 .and_then(|g| g.cell().ok());
             let Some(cell) = cell else { continue };

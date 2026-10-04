@@ -36,6 +36,7 @@
 pub mod actor;
 pub mod graphics;
 pub mod input;
+pub mod history;
 pub mod queries;
 pub mod screenshot;
 pub mod serialize;

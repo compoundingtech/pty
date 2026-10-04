@@ -145,3 +145,57 @@ fn a_widened_terminal_reports_the_history_it_can_still_hold() {
     assert_eq!(a.scrollback_capacity(), 24 + a.scrollback());
     assert_eq!(a.scrollback_request(), DEFAULT_SCROLLBACK);
 }
+
+fn page(a: &mut TerminalActor, before: Option<String>) -> (Vec<String>, Option<String>) {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let HistoryResponse::Page { rows, next_before, .. } =
+        a.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before })
+    else { panic!("expected history page") };
+    let text = rows.into_iter().map(|row| {
+        let mut replay = TerminalActor::new(2, 80, 0);
+        replay.write(row.ansi.as_bytes());
+        replay.plain(Range::Viewport)
+    }).collect();
+    (text, next_before)
+}
+
+#[test]
+fn history_pages_remain_anchored_across_append_and_report_retention_loss() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (first, cursor) = page(&mut actor, None);
+    assert_eq!(first, ["L8", "L9"]);
+    actor.write(b"L12\r\nL13\r\n");
+    let (older, _) = page(&mut actor, cursor.clone());
+    assert_eq!(older, ["L6", "L7"]);
+    fill(&mut actor, 5_000);
+    assert!(matches!(
+        actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }),
+        HistoryResponse::CursorGap
+    ));
+}
+
+#[test]
+fn history_rejects_reset_geometry_generation_and_alternate_without_consuming_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    let request = HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor };
+    assert!(matches!(actor.history("different-owner", &request), HistoryResponse::StaleGeneration));
+    actor.write(b"\x1b[?1049hALT\r\nALT\r\nALT");
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::AlternateScreen));
+    actor.write(b"\x1b[?1049l");
+    assert_eq!(page(&mut actor, request.before.clone()).0, ["L6", "L7"]);
+    actor.resize(40, 3);
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1b[3J");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1bc");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+}
