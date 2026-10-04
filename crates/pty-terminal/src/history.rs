@@ -186,7 +186,13 @@ fn append_span(
         .with_kitty_keyboard(false)
         .with_selection(&selection);
     let mut formatter = Formatter::new(term, options).map_err(|_| HistoryResponse::Unavailable)?;
-    let length = formatter.format_len().map_err(|_| HistoryResponse::Unavailable)?;
+    // format_len treats a native SUCCESS with zero bytes as InvalidValue. The
+    // buffer API preserves that valid empty result and reports nonempty sizes.
+    let length = match formatter.format_buf(&mut []) {
+        Ok(length) => length,
+        Err(Error::OutOfSpace { required }) => required,
+        Err(_) => return Err(HistoryResponse::Unavailable),
+    };
     write!(out, "\x1b[1;{}H\x1b[0m\x1b]8;;", start + 1)
         .map_err(|_| HistoryResponse::Unavailable)?;
     if out.len() + uri.len() + 2 + length > MAX_ROW_BYTES {
@@ -194,16 +200,17 @@ fn append_span(
     }
     out.extend_from_slice(uri);
     out.extend_from_slice(b"\x1b\\");
-    let offset = out.len();
-    out.resize(offset + length, 0);
-    let written = formatter.format_buf(&mut out[offset..]).map_err(|_| HistoryResponse::Unavailable)?;
-    out.truncate(offset + written);
     if length == 0 {
         let backgrounds = crate::serialize::history_background(term, y, start, end);
         if out.len() + backgrounds.len() > MAX_ROW_BYTES {
             return Err(HistoryResponse::TooLarge);
         }
         out.extend_from_slice(backgrounds.as_bytes());
+    } else {
+        let offset = out.len();
+        out.resize(offset + length, 0);
+        let written = formatter.format_buf(&mut out[offset..]).map_err(|_| HistoryResponse::Unavailable)?;
+        out.truncate(offset + written);
     }
     Ok(())
 }

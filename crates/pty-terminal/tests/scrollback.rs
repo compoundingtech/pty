@@ -207,7 +207,7 @@ fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
     use libghostty_vt::terminal::{Point, PointCoordinate};
     use pty_core::protocol::{HistoryRequest, HistoryResponse};
     let mut owner = TerminalActor::new(2, 8, 100);
-    owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/first\x1b\\A界\x1b]8;;\x1b\\\x1b[0mZ\x1b]8;;https://example.test/second\x1b\\e\u{301}\x1b]8;;\x1b\\\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\nDONE\r\nLAST".as_bytes());
+    owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/first\x1b\\A界\x1b]8;;\x1b\\\x1b[0mZ\x1b]8;;https://example.test/second\x1b\\e\u{301}\x1b]8;;\x1b\\\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n\r\nDONE\r\nLAST".as_bytes());
     let HistoryResponse::Page { rows, .. } = owner.history("owner", &HistoryRequest {
         expected_generation: "owner".into(), limit: 200, before: None,
     }) else { panic!("expected retained history") };
@@ -243,6 +243,14 @@ fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
     for column in 0..8 {
         let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
         assert!(matches!(cell.style().unwrap().bg_color, StyleColor::Palette(index) if index.0 == 4));
+        assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
+    }
+    replay.reset();
+    replay.write(rows[2].ansi.as_bytes());
+    assert_eq!(replay.plain(Range::Viewport), "");
+    for column in 0..8 {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        assert!(matches!(cell.style().unwrap().bg_color, StyleColor::None));
         assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
     }
 }
