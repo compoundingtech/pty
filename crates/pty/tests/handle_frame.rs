@@ -3,14 +3,15 @@
 //! bytes, but must not publish between the grid and mode changes inside one packet.
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use pty::{AttachOptions, Frame, HandleEvent, TerminalHandle};
+use pty::{AttachOptions, Frame, FrameObserver, HandleEvent, TerminalHandle};
 use pty_core::protocol::{MessageType, PacketReader, encode_data, encode_screen};
-use pty_terminal::{CellSize, GraphicsOptions, PixelFormat, PlacementPosition};
+use pty_terminal::{CellSize, GraphicsOptions, PixelFormat, PlacementPosition, Range};
 
 // A deadlock bound, not a latency/performance assertion.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,7 +59,7 @@ fn next_dirty(events: &mpsc::Receiver<HandleEvent>, after: u64) -> u64 {
     }
 }
 
-fn attached(graphics: bool) -> (Arc<TerminalHandle>, UnixStream, mpsc::Receiver<HandleEvent>) {
+fn unobserved(graphics: bool) -> (Arc<TerminalHandle>, UnixStream, mpsc::Receiver<HandleEvent>) {
     let (client, mut daemon) = UnixStream::pair().unwrap();
     daemon.set_read_timeout(Some(TIMEOUT)).unwrap();
     daemon.set_write_timeout(Some(TIMEOUT)).unwrap();
@@ -67,14 +68,46 @@ fn attached(graphics: bool) -> (Arc<TerminalHandle>, UnixStream, mpsc::Receiver<
             .expect("socketpair attach"),
     );
     read_attach(&mut daemon);
+    let initial = h.frame();
+    assert_eq!(initial.rev, 0);
+    assert!(initial.grid.rows.is_empty());
     let events = h.subscribe();
-    let before = h.frame().rev;
+    let before = h.rev();
     daemon.write_all(&encode_screen(b"\x1b[?1006lA")).unwrap();
+    let rev = next_dirty(&events, before);
     assert!(h.wait_ready(TIMEOUT));
-    assert_batch(&h.frame());
+    // The cheap actor RPC is a barrier, not an implicit frame capture.
+    assert_eq!(h.plain(Range::Viewport), "A");
+    assert_eq!(h.rev(), rev);
+    assert!(Arc::ptr_eq(&initial, &h.frame()));
+    (h, daemon, events)
+}
+
+fn attached(
+    graphics: bool,
+) -> (Arc<TerminalHandle>, UnixStream, mpsc::Receiver<HandleEvent>, FrameObserver) {
+    let (h, daemon, events) = unobserved(graphics);
+    let before = h.frame().rev;
+    let observer = h.observe_frames();
     let rev = next_dirty(&events, before);
     assert_eq!(h.frame().rev, rev);
-    (h, daemon, events)
+    assert_batch(&h.frame());
+    (h, daemon, events, observer)
+}
+
+fn update_unobserved(
+    h: &TerminalHandle,
+    daemon: &mut UnixStream,
+    events: &mpsc::Receiver<HandleEvent>,
+    bytes: &[u8],
+) -> u64 {
+    let before = h.rev();
+    daemon.write_all(&encode_data(bytes)).unwrap();
+    let rev = next_dirty(events, before);
+    // Wait until the actor has applied the output without forcing a capture.
+    let _ = h.plain(Range::Viewport);
+    assert_eq!(h.rev(), rev);
+    rev
 }
 
 fn update(
@@ -121,8 +154,94 @@ fn assert_image_generations(frame: &Frame) {
 }
 
 #[test]
+fn unobserved_writes_update_state_but_leave_the_frame_stale() {
+    let (h, mut daemon, events) = unobserved(false);
+    let held = h.frame();
+    let rev = update_unobserved(&h, &mut daemon, &events, b"\x1b[?1006h\x1b[HB");
+    assert!(rev > held.rev);
+    assert!(h.modes().sgr_mouse);
+    assert_eq!(h.cursor(), (0, 1, true));
+    assert_eq!((h.rows(), h.cols()), (3, 20));
+    assert_eq!(h.plain(Range::Viewport), "B");
+    // Legacy reads remain explicit actor RPCs, not reads of the stale frame.
+    assert_eq!(h.snapshot(0).rows[0][0].text, "B");
+    assert!(Arc::ptr_eq(&held, &h.frame()));
+    h.kill();
+}
+
+#[test]
+fn acquiring_first_observer_wakes_idle_actor_without_new_output() {
+    let (h, _daemon, events) = unobserved(false);
+    let before = h.frame();
+    let applied = h.rev();
+    let observer = h.observe_frames();
+    let dirty = next_dirty(&events, before.rev);
+    let frame = h.frame();
+    assert_eq!(dirty, applied);
+    assert_eq!(frame.rev, applied);
+    assert!(!Arc::ptr_eq(&before, &frame));
+    assert_batch(&frame);
+    // Observation captures the existing revision; it does not apply output.
+    assert_eq!(h.rev(), applied);
+    drop(observer);
+    h.kill();
+}
+
+#[test]
+fn dropping_last_observer_stops_capture_even_with_a_live_subscription() {
+    let (h, mut daemon, events, observer) = attached(false);
+    let held = update(&h, &mut daemon, &events, b"\x1b[?1006h\x1b[HB");
+    drop(observer);
+    let rev = update_unobserved(&h, &mut daemon, &events, b"\x1b[?1006l\x1b[HA");
+    assert!(rev > held.rev);
+    assert!(!h.modes().sgr_mouse);
+    assert!(held.modes.sgr_mouse);
+    assert!(Arc::ptr_eq(&held, &h.frame()));
+    let before = held.rev;
+    let _observer = h.observe_frames();
+    assert_eq!(next_dirty(&events, before), rev);
+    assert_eq!(h.frame().rev, rev);
+    assert_batch(&h.frame());
+    h.kill();
+}
+
+#[test]
+fn multiple_observers_keep_capturing_until_the_last_guard_drops() {
+    let (h, mut daemon, events, first) = attached(false);
+    let second = h.observe_frames();
+    drop(first);
+    let held = update(&h, &mut daemon, &events, b"\x1b[?1006h\x1b[HB");
+    assert_batch(&held);
+    drop(second);
+    let rev = update_unobserved(&h, &mut daemon, &events, b"\x1b[?1006l\x1b[HA");
+    assert!(rev > held.rev);
+    assert!(!h.modes().sgr_mouse);
+    assert!(Arc::ptr_eq(&held, &h.frame()));
+    h.kill();
+}
+
+#[test]
+fn live_frame_request_forces_capture_without_an_observer() {
+    let (h, mut daemon, events) = unobserved(false);
+    let stale = h.frame();
+    let rev = update_unobserved(&h, &mut daemon, &events, b"\x1b[?1006h\x1b[HB");
+    assert!(Arc::ptr_eq(&stale, &h.frame()));
+    let frame = h.request_frame(0).recv_timeout(TIMEOUT).expect("explicit live capture");
+    assert_eq!(frame.rev, rev);
+    assert_batch(&frame);
+    assert!(frame.modes.sgr_mouse);
+    assert!(Arc::ptr_eq(&frame, &h.frame()));
+    assert_eq!(next_dirty(&events, stale.rev), rev);
+    // An explicit request does not leave automatic observation enabled.
+    let next = update_unobserved(&h, &mut daemon, &events, b"\x1b[?1006l\x1b[HA");
+    assert!(next > frame.rev);
+    assert!(Arc::ptr_eq(&frame, &h.frame()));
+    h.kill();
+}
+
+#[test]
 fn dirty_exposes_complete_frames_and_retained_frames_do_not_change() {
-    let (h, mut daemon, events) = attached(false);
+    let (h, mut daemon, events, _observer) = attached(false);
     let old = h.frame();
     assert_batch(&old);
     let old_grid = old.grid.clone();
@@ -146,66 +265,191 @@ fn dirty_exposes_complete_frames_and_retained_frames_do_not_change() {
 }
 
 #[test]
-fn concurrent_frame_reads_remain_consistent_under_continuous_output() {
-    let (h, mut daemon, _) = attached(false);
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer_stop = Arc::clone(&stop);
-    let (writer_tx, writer_rx) = mpsc::channel();
+fn concurrent_frame_reads_remain_consistent_across_finite_output_bursts() {
+    let (h, mut daemon, _, _observer) = attached(false);
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let h = Arc::clone(&h);
             let events = h.subscribe();
-            let (done_tx, done_rx) = mpsc::channel();
+            let (burst_tx, burst_rx) = mpsc::channel::<String>();
+            let (ack_tx, ack_rx) = mpsc::channel();
             let thread = std::thread::spawn(move || {
                 let mut last_rev = h.frame().rev;
-                let mut observed = 0;
-                while observed < 64 {
-                    let dirty = next_dirty(&events, last_rev);
-                    for _ in 0..16 {
-                        let frame = h.frame();
-                        assert!(frame.rev >= dirty, "Dirty preceded publication");
-                        assert!(frame.rev >= last_rev, "publication moved backwards");
-                        assert_batch(&frame);
-                        if frame.rev > last_rev {
-                            observed += 1;
+                while let Ok(tail) = burst_rx.recv_timeout(TIMEOUT) {
+                    let mut dirty = last_rev;
+                    loop {
+                        let mut complete = false;
+                        for _ in 0..16 {
+                            let frame = h.frame();
+                            assert!(frame.rev >= dirty, "Dirty preceded publication");
+                            assert!(frame.rev >= last_rev, "publication moved backwards");
+                            assert_batch(&frame);
                             last_rev = frame.rev;
+                            let row: String =
+                                frame.grid.rows[1].iter().map(|cell| cell.text.as_str()).collect();
+                            complete |= row.trim_end() == tail;
                         }
+                        if complete {
+                            ack_tx.send(last_rev).unwrap();
+                            break;
+                        }
+                        dirty = next_dirty(&events, last_rev);
                     }
                 }
-                done_tx.send(()).unwrap();
             });
-            (done_rx, thread)
+            (burst_tx, ack_rx, thread)
         })
         .collect();
-    let writer = std::thread::spawn(move || {
-        let batches = [
-            encode_data(b"\x1b[?1006h\x1b[HB"),
-            encode_data(b"\x1b[?1006l\x1b[HA"),
-        ];
-        let result = (|| -> io::Result<()> {
-            while !writer_stop.load(Ordering::Acquire) {
-                for batch in &batches {
-                    daemon.write_all(batch)?;
-                }
-            }
-            Ok(())
-        })();
-        let _ = writer_tx.send(result);
-    });
-    // Always stop output before propagating a reader failure, including a
-    // blocked actor-RPC implementation of frame().
-    let results: Vec<_> = readers.iter().map(|(rx, _)| rx.recv_timeout(TIMEOUT)).collect();
-    stop.store(true, Ordering::Release);
-    let writer_result = writer_rx.recv_timeout(TIMEOUT);
-    h.kill();
-    for result in results {
-        result.expect("frame reader must finish while output continues");
+    for burst in 0..64 {
+        let tail = format!("tail-{burst}");
+        for (tx, _, _) in &readers {
+            tx.send(tail.clone()).unwrap();
+        }
+        let mut packets = Vec::new();
+        for _ in 0..16 {
+            packets.extend(encode_data(b"\x1b[?1006h\x1b[HB"));
+            packets.extend(encode_data(b"\x1b[?1006l\x1b[HA"));
+        }
+        packets.extend(encode_data(
+            format!("\x1b[2;1H{tail}\x1b[?1006l\x1b[HA").as_bytes(),
+        ));
+        daemon.write_all(&packets).unwrap();
+        // Pause the producer until both readers see the complete burst tail.
+        // This checks consistency; the separate backlogged-output test checks progress.
+        for (_, rx, _) in &readers {
+            let rev = rx.recv_timeout(TIMEOUT).expect("reader saw complete burst tail");
+            assert_eq!(rev, h.frame().rev);
+        }
     }
-    writer_result.expect("output writer stopped").expect("continuous output");
-    writer.join().unwrap();
-    for (_, reader) in readers {
+    h.kill();
+    for (tx, _, reader) in readers {
+        drop(tx);
         reader.join().unwrap();
     }
+}
+
+#[test]
+fn observed_frame_advances_while_output_is_backlogged_before_the_tail() {
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(TIMEOUT)).unwrap();
+    daemon.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let probe = client.try_clone().unwrap();
+    let send_buffer: libc::c_int = 4096;
+    // SAFETY: the live socket descriptor and integer option storage are valid.
+    assert_eq!(unsafe {
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&send_buffer as *const libc::c_int).cast(),
+            std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+        )
+    }, 0);
+    let h = Arc::new(
+        TerminalHandle::attach_with_connector(
+            move || client.try_clone(),
+            AttachOptions { rows: 48, cols: 160, ..options(false) },
+        )
+        .unwrap(),
+    );
+    read_attach(&mut daemon);
+    let events = h.subscribe();
+    let before = h.rev();
+    daemon.write_all(&encode_screen(b"\x1b[?1006lA")).unwrap();
+    next_dirty(&events, before);
+    assert!(h.wait_ready(TIMEOUT));
+    assert_eq!(h.plain(Range::Viewport), "A");
+    let before = h.frame().rev;
+    let _observer = h.observe_frames();
+    next_dirty(&events, before);
+    let held = h.frame();
+    let held_grid = held.grid.clone();
+    let held_modes = held.modes.clone();
+
+    let input = vec![b'i'; 64 * 1024];
+    let read_input_header = |daemon: &mut UnixStream| {
+        let mut header = [0; 5];
+        daemon.read_exact(&mut header).expect("actor entered its input write");
+        assert_eq!(MessageType::from_u8(header[0]), MessageType::Data);
+        assert_eq!(u32::from_be_bytes(header[1..].try_into().unwrap()) as usize, input.len());
+    };
+    // Park the actor, but not its independent socket reader, in an input write.
+    // Reading only the header leaves more payload than the socket can buffer.
+    h.write(&input);
+    read_input_header(&mut daemon);
+    let blocked_at = Instant::now();
+    let suffix = b"\x1b[2J\x1b[2;1Hpending\x1b[?1006h\x1b[HB";
+    let mut output = vec![b'x'; 64 * 1024 - suffix.len()];
+    output.extend_from_slice(suffix);
+    let packet = encode_data(&output);
+    for _ in 0..256 {
+        daemon.write_all(&packet).unwrap();
+    }
+    // Confirm transport consumption while the actor remains parked. Since a
+    // packet is larger than the reader's read buffer, earlier complete packets
+    // have already been queued even if its final read is still being decoded.
+    // Wait for the real-clock deadline precondition, not a scheduling sleep.
+    loop {
+        let mut pending: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one integer through valid, aligned storage.
+        assert_eq!(unsafe { libc::ioctl(probe.as_raw_fd(), libc::FIONREAD, &mut pending) }, 0);
+        if pending == 0 && blocked_at.elapsed() >= Duration::from_millis(32) {
+            break;
+        }
+        assert!(blocked_at.elapsed() < TIMEOUT, "socket reader did not consume the backlog");
+        std::thread::yield_now();
+    }
+    // A second input write is queued behind that known output backlog. It
+    // prevents a drain-only actor from publishing once it reaches the end.
+    h.write(&input);
+    let mut discarded = vec![0; input.len()];
+    daemon.read_exact(&mut discarded).unwrap();
+    read_input_header(&mut daemon);
+
+    let deadline = Instant::now() + TIMEOUT;
+    let progressed = loop {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(HandleEvent::Dirty(rev)) if rev > held.rev => break Some((rev, h.frame())),
+            Ok(_) => {}
+            Err(_) => break None,
+        }
+    };
+    // The producer has not sent its final tail, and the actor is still parked
+    // behind queued output. Capture the evidence before releasing either.
+    let frame_before_tail = h.frame();
+    daemon.read_exact(&mut discarded).unwrap();
+    let (dirty, progressed) = progressed.expect("observed frame starved behind queued output");
+    assert!(progressed.rev >= dirty, "Dirty preceded publication");
+    assert!(progressed.rev > held.rev);
+    assert!(frame_before_tail.rev >= progressed.rev);
+    assert_eq!((progressed.grid.rows_n, progressed.grid.cols), (48, 160));
+    assert_eq!(progressed.grid.rows[0][0].text, "B");
+    assert!(progressed.modes.sgr_mouse);
+    assert_eq!(progressed.grid.cursor, (0, 1, true));
+    let marker = |frame: &Frame| {
+        frame.grid.rows[1].iter().map(|cell| cell.text.as_str()).collect::<String>()
+            .trim_end().to_owned()
+    };
+    assert_eq!(marker(&progressed), "pending");
+    assert_eq!(marker(&frame_before_tail), "pending");
+
+    daemon.write_all(&encode_data(b"\x1b[2;1Htail\x1b[K\x1b[?1006l\x1b[HA")).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let tail = loop {
+        let frame = h.frame();
+        if marker(&frame) == "tail" {
+            break frame;
+        }
+        events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("final tail published");
+    };
+    assert!(tail.rev > progressed.rev);
+    assert_eq!(tail.grid.rows[0][0].text, "A");
+    assert!(!tail.modes.sgr_mouse);
+    assert_eq!(held.grid, held_grid);
+    assert_eq!(held.modes, held_modes);
+    assert_eq!(marker(&progressed), "pending", "held progress frame changed");
+    h.kill();
 }
 
 #[test]
@@ -233,6 +477,7 @@ fn published_reads_and_history_request_do_not_wait_for_a_blocked_actor() {
     );
     read_attach(&mut daemon);
     let events = h.subscribe();
+    let _observer = h.observe_frames();
     let before = h.frame().rev;
     daemon.write_all(&encode_screen(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5")).unwrap();
     next_dirty(&events, before);
@@ -248,24 +493,27 @@ fn published_reads_and_history_request_do_not_wait_for_a_blocked_actor() {
     let read_handle = Arc::clone(&h);
     let reader = std::thread::spawn(move || {
         let frame = read_handle.frame();
-        let grid = read_handle.snapshot(0);
-        let graphics = read_handle.graphics(0);
+        let live = read_handle.request_frame(0);
         let history = read_handle.request_frame(2);
-        let _ = read_tx.send((frame, grid, graphics, history));
+        let _ = read_tx.send((frame, live, history));
     });
     let reads = read_rx.recv_timeout(TIMEOUT);
-    let history_was_pending = reads.as_ref().ok().map(|(_, _, _, history)| {
-        matches!(history.try_recv(), Err(mpsc::TryRecvError::Empty))
+    let requests_were_pending = reads.as_ref().ok().map(|(_, live, history)| {
+        matches!(live.try_recv(), Err(mpsc::TryRecvError::Empty))
+            && matches!(history.try_recv(), Err(mpsc::TryRecvError::Empty))
     });
     // Release before any assertion that could fail, so a regression cannot
     // leave the connector thread permanently parked.
     release_tx.send(()).unwrap();
     let reconnected = reconnected_rx.recv_timeout(TIMEOUT);
-    let (frame, grid, graphics, history) = reads.expect("published reads waited for the actor");
-    assert!(history_was_pending.unwrap(), "history must be captured by the actor");
+    let (frame, live, history) = reads.expect("frame read or request submission waited for the actor");
+    assert!(requests_were_pending.unwrap(), "requests must be captured by the actor");
     assert!(Arc::ptr_eq(&frame, &held));
-    assert_eq!(grid, held.grid);
-    assert_eq!(graphics, held.graphics);
+    let live = live.recv_timeout(TIMEOUT).expect("queued live capture completed");
+    assert_eq!(live.rev, held.rev);
+    assert_eq!(live.grid, held.grid);
+    assert_eq!(live.graphics, held.graphics);
+    assert_eq!(live.modes, held.modes);
     assert!(reconnected.expect("reconnect returned").is_err());
     let history = history.recv_timeout(TIMEOUT).expect("queued history read completed");
     assert_eq!(history.rev, held.rev);
@@ -280,7 +528,7 @@ fn published_reads_and_history_request_do_not_wait_for_a_blocked_actor() {
 
 #[test]
 fn held_image_generations_survive_replacement_and_deletion_and_reuse_unchanged_pixels() {
-    let (h, mut daemon, events) = attached(true);
+    let (h, mut daemon, events, _observer) = attached(true);
     let initial = format!(
         "{}{}{}{}",
         transmit(IMAGE_ID),
@@ -346,7 +594,7 @@ fn held_image_generations_survive_replacement_and_deletion_and_reuse_unchanged_p
 
 #[test]
 fn explicit_history_frame_aligns_grid_graphics_modes_and_image_generations() {
-    let (h, mut daemon, events) = attached(true);
+    let (h, mut daemon, events, _observer) = attached(true);
     let bytes = format!(
         "\x1b[2J\x1b[H\x1b[?1006hL0\r\n{}{}\x1b[2;1HL1\r\nL2\r\nL3\r\nL4\r\nL5",
         transmit(IMAGE_ID),

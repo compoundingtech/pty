@@ -14,6 +14,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +32,8 @@ use pty_terminal::{
     CellGrid, CellSize, GraphicsOptions, GraphicsState, ImageBytes, KeyEvent, Modes,
     MouseEvent, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Identifies one connection attempt (or the spawned child). Bumped by
 /// [`TerminalHandle::reconnect`]; frames tagged with an older id are ignored.
@@ -117,7 +120,7 @@ impl Default for AttachOptions {
 
 /// One immutable, internally consistent terminal update.
 ///
-/// [`TerminalHandle::frame`] publishes the live viewport; an explicit
+/// [`TerminalHandle::frame`] reads the observed live viewport; an explicit
 /// [`TerminalHandle::request_frame`] captures a window into history. Retaining
 /// this value keeps its cells and pixels valid even when the actor replaces or
 /// deletes an image. Renderer-specific clipping and texture policy stay with
@@ -144,10 +147,27 @@ impl Frame {
     }
 }
 
+/// An opt-in lease for automatic live frame publication.
+///
+/// Keep it while a surface needs live frames. Lifecycle subscriptions alone
+/// do not capture cells or pixels. Dropping the last lease stops future
+/// automatic captures; an already-running capture may still finish.
+#[must_use = "dropping the observer disables automatic frame publication"]
+pub struct FrameObserver {
+    shared: Arc<Shared>,
+}
+
+impl Drop for FrameObserver {
+    fn drop(&mut self) {
+        self.shared.observers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// What a subscriber hears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleEvent {
-    /// The screen changed; the new revision.
+    /// Applied terminal updates, coalesced at queue drain or the observed
+    /// publication interval. Observed frame publication precedes this event.
     Dirty(u64),
     /// The title changed (deduplicated).
     Title(String),
@@ -182,8 +202,9 @@ enum Msg {
     ChildExited { attempt: AttemptId, code: i32 },
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
-    Snapshot { offset: usize, reply: Sender<CellGrid> },
+    Snapshot { offset: usize, reply: Sender<(u64, CellGrid)> },
     CaptureFrame { offset: usize, reply: Sender<Arc<Frame>> },
+    ObserveFrames,
     Plain { range: Range, reply: Sender<String> },
     Serialize { opts: SerializeOpts, reply: Sender<String> },
     Graphics { offset: usize, reply: Sender<GraphicsState> },
@@ -226,6 +247,7 @@ struct State {
     /// The last published image-storage generation, so a consumer can tell
     /// an image change from any other dirty frame without asking the actor.
     graphics_generation: u64,
+    snap_cache: Option<(u64, CellGrid)>,
 }
 
 struct Shared {
@@ -233,6 +255,7 @@ struct Shared {
     cv: Condvar,
     subs: Mutex<Vec<Sender<HandleEvent>>>,
     frame: ArcSwap<Frame>,
+    observers: AtomicUsize,
 }
 
 impl Shared {
@@ -260,6 +283,8 @@ struct Core {
     attempt: AttemptId,
     shared: Arc<Shared>,
     backend: Backend,
+    dirty: bool,
+    last_publish: Instant,
 }
 
 impl Core {
@@ -291,26 +316,25 @@ impl Core {
         }
     }
 
-    /// Publish the actor's state to the handle side, bump the revision, and
-    /// fan out events.
+    /// Publish cheap actor metadata, bump the revision, and fan out events.
+    /// Cell/pixel capture is separate and coalesced at the end of a burst.
     fn publish(&mut self) {
         let events = self.actor.take_events();
-        let frame = Arc::new(self.capture_frame(self.rev() + 1, 0));
-        let generation = frame.graphics.generation;
-        let (rev, graphics_changed) = {
+        let generation = self.actor.graphics_generation();
+        let graphics_changed = {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.rev = frame.rev;
-            st.cols = frame.grid.cols;
-            st.rows = frame.grid.rows_n;
-            st.modes = frame.modes.clone();
-            st.cursor = (frame.grid.cursor.1, frame.grid.cursor.0, frame.grid.cursor.2);
+            st.rev += 1;
+            st.snap_cache = None;
+            st.cols = self.actor.cols();
+            st.rows = self.actor.rows();
+            st.modes = self.actor.modes();
+            st.cursor = self.actor.cursor();
             st.title = self.actor.title();
-            st.base_y = frame.grid.base_y;
-            st.len = frame.grid.len;
+            st.base_y = self.actor.base_y();
+            st.len = self.actor.buffer_length();
             let changed = st.graphics_generation != generation;
             st.graphics_generation = generation;
-            self.shared.frame.store(frame);
-            (st.rev, changed)
+            changed
         };
         self.shared.cv.notify_all();
         for ev in events {
@@ -325,7 +349,33 @@ impl Core {
         if graphics_changed {
             self.shared.emit(HandleEvent::Graphics(generation));
         }
+        self.dirty = true;
+    }
+
+    /// Capture at the end of a queued burst, only for active readers or an
+    /// explicit barrier. No terminal reads or allocations while idle.
+    fn flush_frame(&mut self, force: bool) {
+        if !self.dirty && !force {
+            return;
+        }
+        let rev = self.rev();
+        if force || self.shared.observers.load(Ordering::Acquire) > 0 {
+            self.shared.frame.store(Arc::new(self.capture_frame(rev, 0)));
+            self.last_publish = Instant::now();
+        }
+        self.dirty = false;
         self.shared.emit(HandleEvent::Dirty(rev));
+    }
+
+    /// Bound observed progress while more input remains queued. The clock is
+    /// untouched for unobserved terminals and idle/unchanged batches.
+    fn flush_due(&mut self) {
+        if self.dirty
+            && self.shared.observers.load(Ordering::Acquire) > 0
+            && self.last_publish.elapsed() >= FRAME_INTERVAL
+        {
+            self.flush_frame(false);
+        }
     }
 
     fn on_output(&mut self, bytes: Vec<u8>) {
@@ -349,6 +399,7 @@ impl Core {
                 // from here would reach the child twice.
                 let _ = self.actor.take_pty_replies();
                 self.publish();
+                self.flush_frame(false);
                 {
                     let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.ready = true;
@@ -375,12 +426,14 @@ impl Core {
     }
 
     fn on_exit(&mut self, code: i32) {
+        self.publish();
+        self.flush_frame(false);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.exit_code = Some(code);
             st.ready = true;
         }
-        self.publish();
+        self.shared.cv.notify_all();
         self.shared.emit(HandleEvent::Exited(code));
     }
 
@@ -507,15 +560,21 @@ impl Core {
             Msg::Input(b) => self.input(&b),
             Msg::Resize { cols, rows } => self.resize(cols, rows),
             Msg::Snapshot { offset, reply } => {
-                let _ = reply.send(self.actor.snapshot(offset));
+                let _ = reply.send((self.rev(), self.actor.snapshot(offset)));
             }
             Msg::CaptureFrame { offset, reply } => {
                 let frame = if offset == 0 {
+                    self.flush_frame(true);
                     self.shared.frame.load_full()
                 } else {
                     Arc::new(self.capture_frame(self.rev(), offset))
                 };
                 let _ = reply.send(frame);
+            }
+            Msg::ObserveFrames => {
+                if self.shared.observers.load(Ordering::Acquire) > 0 {
+                    self.dirty = true;
+                }
             }
             Msg::Plain { range, reply } => {
                 let _ = reply.send(self.actor.plain(range));
@@ -615,11 +674,21 @@ impl Core {
 
 fn run(mut core: Core, rx: Receiver<Msg>) {
     core.publish();
-    while let Ok(msg) = rx.recv() {
+    core.flush_frame(false);
+    'actor: while let Ok(msg) = rx.recv() {
         if !core.dispatch(msg) {
             break;
         }
+        core.flush_due();
+        while let Ok(msg) = rx.try_recv() {
+            if !core.dispatch(msg) {
+                break 'actor;
+            }
+            core.flush_due();
+        }
+        core.flush_frame(false);
     }
+    core.flush_frame(false);
     core.shutdown();
 }
 
@@ -752,6 +821,7 @@ impl TerminalHandle {
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
             frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let attempt = AttemptId(1);
 
@@ -794,6 +864,8 @@ impl TerminalHandle {
                 attempt,
                 shared: core_shared,
                 backend: Backend::Spawn { master, writer },
+                dirty: false,
+                last_publish: Instant::now(),
             };
             run(core, rx);
         });
@@ -840,6 +912,7 @@ impl TerminalHandle {
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
             frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let core_shared = shared.clone();
         let core_tx = tx.clone();
@@ -854,6 +927,8 @@ impl TerminalHandle {
                     stream: Some(stream),
                     tx: core_tx,
                 },
+                dirty: false,
+                last_publish: Instant::now(),
             };
             run(core, rx);
         });
@@ -866,8 +941,8 @@ impl TerminalHandle {
         Ok(handle)
     }
 
-    /// The actor thread publishes once before it reads any input; reads
-    /// made after construction see the terminal, not the placeholder.
+    /// Publish cheap metadata before construction returns. Frame capture is
+    /// separately opt-in and can remain at its initial revision-zero value.
     fn wait_first_publish(&self) {
         self.wait_state(Duration::from_secs(5), |st| st.rev >= 1 || st.closed);
     }
@@ -949,15 +1024,37 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Resize { cols, rows });
     }
 
-    /// The latest complete live viewport, without asking or locking the actor.
+    /// The last published live viewport, without asking or locking the actor.
     ///
-    /// The actor swaps this immutable value before notifying subscribers with
-    /// [`HandleEvent::Dirty`]. Slow readers may skip revisions; a held frame
-    /// remains valid through subsequent output, resize or image deletion.
-    /// Subscribe before the first read to avoid missing an update between
-    /// reading the initial frame and registering for notifications.
+    /// Keep a [`TerminalHandle::observe_frames`] lease for automatic updates.
+    /// With no observer this can be stale; before any capture it is an empty
+    /// revision-zero frame. Acquiring a lease wakes the actor, but does not
+    /// wait for its first capture. Use [`TerminalHandle::request_frame`] at
+    /// zero offset for explicit asynchronous initial/admission readiness.
+    ///
+    /// Observed updates are captured when the input queue drains, or after an
+    /// applied batch once 16 ms has elapsed since publication, before
+    /// [`HandleEvent::Dirty`]. This also advances frames during a sustained
+    /// backlog, without a timer thread. A single batch and its capture can
+    /// extend that interval; this is not a hard realtime deadline.
+    /// Slow readers can skip revisions; held frames stay valid.
+    /// Subscribe before observing to avoid missing the first notification.
     pub fn frame(&self) -> Arc<Frame> {
         self.shared.frame.load_full()
+    }
+
+    /// Opt in to automatic live frames until this lease is dropped.
+    ///
+    /// Lifecycle [`TerminalHandle::subscribe`] receivers do not opt in. The
+    /// first lease queues a wake-up so an idle terminal gets an initial frame.
+    /// Neither acquiring nor dropping the lease waits for the actor.
+    /// An already-buffered unobserved `Dirty` is not initial-frame readiness;
+    /// use [`TerminalHandle::request_frame`] at zero offset for that barrier.
+    pub fn observe_frames(&self) -> FrameObserver {
+        if self.shared.observers.fetch_add(1, Ordering::AcqRel) == 0 {
+            let _ = self.tx.send(Msg::ObserveFrames);
+        }
+        FrameObserver { shared: Arc::clone(&self.shared) }
     }
 
     /// Request one consistent viewport-sized window into history.
@@ -965,7 +1062,8 @@ impl TerminalHandle {
     /// This queues an actor read and returns immediately. Wait on the receiver
     /// in a worker, or use `try_recv` from a UI. The revision and buffer
     /// coordinates belong to the moment the actor processes the request, not
-    /// when it was queued. A zero offset returns the published live frame.
+    /// when it was queued. Zero offset forces and publishes a live capture
+    /// after messages queued before this request, even without an observer.
     /// Closing the actor disconnects any requests it has not processed.
     pub fn request_frame(&self, scroll_offset: usize) -> Receiver<Arc<Frame>> {
         let (reply, rx) = mpsc::channel();
@@ -973,27 +1071,38 @@ impl TerminalHandle {
         rx
     }
 
-    /// The cell grid `scroll_offset` rows back into history (0 = live).
-    ///
-    /// Live reads clone the published grid without asking the actor. History
-    /// reads wait for an actor reply; prefer [`TerminalHandle::request_frame`]
-    /// when a consistent asynchronous history frame is needed.
+    /// The cell grid `scroll_offset` rows back into history (0 = live). The
+    /// live grid is cached per revision. This explicit read can wait for the
+    /// actor; use [`TerminalHandle::frame`] with an observer for nonblocking
+    /// rendering, or [`TerminalHandle::request_frame`] for async history.
     pub fn snapshot(&self, scroll_offset: usize) -> CellGrid {
         if scroll_offset == 0 {
-            return self.frame().grid.clone();
+            let cached = self.state(|st| {
+                st.snap_cache
+                    .as_ref()
+                    .filter(|(rev, _)| *rev == st.rev)
+                    .map(|(_, g)| g.clone())
+            });
+            if let Some(g) = cached {
+                return g;
+            }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::Snapshot {
-                offset: scroll_offset,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
+        if self.tx.send(Msg::Snapshot { offset: scroll_offset, reply: reply_tx }).is_err() {
             return CellGrid::default();
         }
-        reply_rx.recv().unwrap_or_default()
+        match reply_rx.recv() {
+            Ok((rev, grid)) => {
+                if scroll_offset == 0 {
+                    let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if st.rev == rev {
+                        st.snap_cache = Some((rev, grid.clone()));
+                    }
+                }
+                grid
+            }
+            Err(_) => CellGrid::default(),
+        }
     }
 
     /// The plain-text screen (asks the actor).
@@ -1028,13 +1137,10 @@ impl TerminalHandle {
     ///
     /// Empty (and `enabled: false`) when the handle was built without
     /// [`SpawnOptions::graphics`] / [`AttachOptions::graphics`].
-    /// Live reads clone published metadata; history reads wait for the actor.
+    /// This explicit read waits for the actor.
     /// For grid, modes and pixels from the same update, use
     /// [`TerminalHandle::frame`] or [`TerminalHandle::request_frame`].
     pub fn graphics(&self, scroll_offset: usize) -> GraphicsState {
-        if scroll_offset == 0 {
-            return self.frame().graphics.clone();
-        }
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .tx
@@ -1336,6 +1442,7 @@ mod tests {
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
             frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let core = Core {
             actor: TerminalActor::new(5, 20, 0),
@@ -1347,6 +1454,8 @@ mod tests {
                 stream: None,
                 tx: tx.clone(),
             },
+            dirty: false,
+            last_publish: Instant::now(),
         };
         (core, tx)
     }
@@ -1414,4 +1523,38 @@ mod tests {
         assert!(core.actor.modes().cursor_hidden);
         assert_eq!(core.actor.modes().kitty_stack, vec![7]);
     }
+
+    #[test]
+    fn pending_updates_capture_on_interval_without_a_queue_drain() {
+        let (mut core, _tx) = detached_core();
+        core.shared.observers.store(1, Ordering::Release);
+        core.publish();
+        core.flush_frame(false);
+        let initial = core.shared.frame.load_full();
+        // Control the clock boundary, not thread scheduling or correctness
+        // sleeps: no interval expires during this deliberately pending burst.
+        core.last_publish = Instant::now() + Duration::from_secs(60);
+        for n in 0..1000 {
+            let mode = if n % 2 == 0 { 'l' } else { 'h' };
+            core.dispatch(Msg::Output {
+                attempt: AttemptId(1),
+                bytes: format!("\x1b[2J\x1b[H{n}\x1b[?1006{mode}").into_bytes(),
+            });
+            core.flush_due();
+            assert!(Arc::ptr_eq(&initial, &core.shared.frame.load_full()));
+        }
+        // Input has not drained; expiry alone must publish the applied tail.
+        core.last_publish = Instant::now() - FRAME_INTERVAL;
+        core.flush_due();
+        let frame = core.shared.frame.load_full();
+        assert_eq!(frame.rev, initial.rev + 1000);
+        assert_eq!(frame.grid.rows[0][..3].iter()
+            .map(|cell| cell.text.as_str()).collect::<String>(), "999");
+        assert!(frame.modes.sgr_mouse);
+        assert!(!Arc::ptr_eq(&initial, &frame));
+    }
 }
+
+#[cfg(test)]
+#[path = "frame_bench.rs"]
+mod frame_bench;

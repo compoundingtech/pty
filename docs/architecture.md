@@ -52,6 +52,22 @@ Writing to the terminal is synchronous, so a `SCREEN` cut always reflects every
 byte received before it. There is no `Arc<Mutex<Terminal>>`, and the
 libghostty `Terminal`, which is not `Send`, never leaves that thread.
 
+**Embedding handles publish immutable frames only while observed.**
+`TerminalHandle::observe_frames()` returns an owned lease; lifecycle
+`subscribe()` receivers alone never trigger cell or pixel captures. The
+handle's actor publishes an `Arc<Frame>` before `Dirty` when its queue drains,
+and checks a 16 ms publication interval after each applied message so a
+sustained backlog still advances frames. There is no capture timer thread;
+one message, its capture, or scheduling can extend the interval.
+`frame()` atomically reads the latest published grid, modes, graphics and
+owned image generations without waiting for the actor. It is initially empty
+and may be stale without a lease. `request_frame(0)` is an asynchronous
+initial/admission barrier after previously queued messages; nonzero requests
+capture a consistent history window. Unchanged pixels share an `Arc`, and
+retained frames survive image replacement or deletion. The synchronous
+snapshot/graphics/image reads remain explicit actor APIs; clipping, texture
+allocation and compositing stay with the renderer.
+
 **Locks keep Node's file protocol where the two share a root**: a no-replace
 claim, the holder's decimal pid, one stale steal, release by unlink, and the
 event lock taken before the creation lock. Rust publishes the lock complete by

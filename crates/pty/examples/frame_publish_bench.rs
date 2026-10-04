@@ -70,9 +70,14 @@ fn handle_smoke() -> Result<(), Box<dyn Error>> {
         SpawnOptions::default(),
     )?;
     let events = terminal.subscribe();
+    let _observer = terminal.observe_frames();
+    // Pre-observation lifecycle Dirty events can still be buffered. An explicit
+    // initial barrier establishes publication before interpreting that queue.
+    let _initial = terminal.request_frame(0).recv_timeout(Duration::from_secs(5))?;
     terminal.write(b"\n");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut saw_label_dirty = false;
+    let mut saw_exit = false;
     loop {
         let event = events.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
         match event {
@@ -87,12 +92,15 @@ fn handle_smoke() -> Result<(), Box<dyn Error>> {
             }
             HandleEvent::Exited(code) => {
                 assert_eq!(code, 0);
-                break;
+                saw_exit = true;
             }
             _ => {}
         }
+        if saw_exit && saw_label_dirty {
+            break;
+        }
     }
-    let frame = terminal.frame();
+    let frame = terminal.request_frame(0).recv_timeout(Duration::from_secs(5))?;
     let row: String = frame.grid.rows[0].iter().map(|cell| cell.text.as_str()).collect();
     assert!(saw_label_dirty, "subscribed Dirty exposed the child's frame");
     assert_eq!(row.trim_end(), "frame-smoke");
