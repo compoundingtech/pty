@@ -476,12 +476,12 @@ fn published_reads_and_history_request_do_not_wait_for_a_blocked_actor() {
         .unwrap(),
     );
     read_attach(&mut daemon);
-    let events = h.subscribe();
     let _observer = h.observe_frames();
-    let before = h.frame().rev;
     daemon.write_all(&encode_screen(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5")).unwrap();
-    next_dirty(&events, before);
-    let held = h.frame();
+    assert!(h.wait_ready(TIMEOUT), "initial SCREEN was applied");
+    // A constructor Dirty may predate observation. Establish the explicit
+    // initial-frame barrier before intentionally blocking the actor.
+    let held = h.request_frame(0).recv_timeout(TIMEOUT).expect("initial frame barrier");
     assert_eq!(held.grid.base_y, 3);
     let (reconnected_tx, reconnected_rx) = mpsc::channel();
     let reconnect_handle = Arc::clone(&h);
