@@ -1,7 +1,10 @@
 //! Retained primary history reads with owner-local, tracked backwards boundaries.
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
+use libghostty_vt::cell::CellWide;
+use libghostty_vt::error::Error;
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::TrackedGridRef;
 use libghostty_vt::selection::Selection;
@@ -75,39 +78,17 @@ impl History {
         let mut bytes = 0;
         for y in start..end {
             let point = |x| Point::History(PointCoordinate { x, y: y as u32 });
-            let (Ok(first), Ok(last)) = (term.grid_ref(point(0)), term.grid_ref(point(columns.saturating_sub(1)))) else {
+            let Ok(first) = term.grid_ref(point(0)) else {
                 return HistoryResponse::Unavailable;
             };
             let Ok(wrapped) = first.row().and_then(|row| row.is_wrap_continuation()) else {
                 return HistoryResponse::Unavailable;
             };
-            let selection = Selection::new(first, last, false);
-            let options = FormatterOptions::new()
-                .with_format(Format::Vt)
-                .with_unwrap(false)
-                .with_trim(false)
-                .with_cursor(false)
-                .with_modes(false)
-                .with_kitty_keyboard(false)
-                .with_selection(&selection);
-            let Ok(mut formatter) = Formatter::new(term, options) else {
-                return HistoryResponse::Unavailable;
+            let mut ansi = match row_ansi(term, y as u32, columns) {
+                Ok(ansi) => ansi,
+                Err(error) => return error,
             };
-            let Ok(length) = formatter.format_len() else {
-                return HistoryResponse::Unavailable;
-            };
-            bytes += length;
-            if length > MAX_ROW_BYTES || bytes > MAX_PAGE_BYTES {
-                return HistoryResponse::TooLarge;
-            }
-            let mut buffer = vec![0; length];
-            let Ok(written) = formatter.format_buf(&mut buffer) else {
-                return HistoryResponse::Unavailable;
-            };
-            buffer.truncate(written);
-            let Ok(mut ansi) = String::from_utf8(buffer) else {
-                return HistoryResponse::Unavailable;
-            };
+            bytes += ansi.len();
             let backgrounds = crate::serialize::history_background(term, y as u32);
             bytes += backgrounds.len();
             if ansi.len() + backgrounds.len() > MAX_ROW_BYTES || bytes > MAX_PAGE_BYTES {
@@ -133,6 +114,95 @@ impl History {
         };
         HistoryResponse::Page { columns, retained_rows, rows, next_before }
     }
+}
+
+/// Ghostty's VT formatter omits cell hyperlinks (its hyperlink extra is only the
+/// cursor's current link). Format disjoint cell-link spans, preserving each span's
+/// original styles/text through the formatter and emitting OSC 8 ourselves.
+fn row_ansi(term: &Terminal<'_, '_>, y: u32, columns: u16) -> Result<String, HistoryResponse> {
+    let mut out = Vec::new();
+    let mut current_uri = Vec::new();
+    let mut next_uri = Vec::new();
+    let mut current_len = 0;
+    let mut start = 0;
+    let mut column = 0;
+    while column < columns {
+        let cell = term.grid_ref(Point::History(PointCoordinate { x: column, y }))
+            .map_err(|_| HistoryResponse::Unavailable)?;
+        let wide = cell.cell().and_then(|cell| cell.wide())
+            .map_err(|_| HistoryResponse::Unavailable)?;
+        if matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail) {
+            column += 1;
+            continue;
+        }
+        let length = match cell.hyperlink_uri(&mut next_uri) {
+            Ok(length) => length,
+            Err(Error::OutOfSpace { required }) if required <= MAX_ROW_BYTES => {
+                next_uri.resize(required, 0);
+                cell.hyperlink_uri(&mut next_uri).map_err(|_| HistoryResponse::Unavailable)?
+            }
+            Err(Error::OutOfSpace { .. }) => return Err(HistoryResponse::TooLarge),
+            Err(_) => return Err(HistoryResponse::Unavailable),
+        };
+        if next_uri[..length].iter().any(|byte| *byte < 0x20 || *byte == 0x7f)
+            || std::str::from_utf8(&next_uri[..length]).is_err()
+        {
+            return Err(HistoryResponse::Unavailable);
+        }
+        if current_uri[..current_len] != next_uri[..length] {
+            if start < column {
+                append_span(term, y, start, column - 1, &current_uri[..current_len], &mut out)?;
+            }
+            std::mem::swap(&mut current_uri, &mut next_uri);
+            current_len = length;
+            start = column;
+        }
+        column = column.saturating_add(if wide == CellWide::Wide { 2 } else { 1 });
+    }
+    append_span(term, y, start, columns.saturating_sub(1), &current_uri[..current_len], &mut out)?;
+    let close = b"\x1b]8;;\x1b\\\x1b[0m";
+    if out.len() + close.len() > MAX_ROW_BYTES {
+        return Err(HistoryResponse::TooLarge);
+    }
+    out.extend_from_slice(close);
+    String::from_utf8(out).map_err(|_| HistoryResponse::Unavailable)
+}
+
+fn append_span(
+    term: &Terminal<'_, '_>,
+    y: u32,
+    start: u16,
+    end: u16,
+    uri: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), HistoryResponse> {
+    let first = term.grid_ref(Point::History(PointCoordinate { x: start, y }))
+        .map_err(|_| HistoryResponse::Unavailable)?;
+    let last = term.grid_ref(Point::History(PointCoordinate { x: end, y }))
+        .map_err(|_| HistoryResponse::Unavailable)?;
+    let selection = Selection::new(first, last, false);
+    let options = FormatterOptions::new()
+        .with_format(Format::Vt)
+        .with_unwrap(false)
+        .with_trim(false)
+        .with_cursor(false)
+        .with_modes(false)
+        .with_kitty_keyboard(false)
+        .with_selection(&selection);
+    let mut formatter = Formatter::new(term, options).map_err(|_| HistoryResponse::Unavailable)?;
+    let length = formatter.format_len().map_err(|_| HistoryResponse::Unavailable)?;
+    write!(out, "\x1b[1;{}H\x1b[0m\x1b]8;;", start + 1)
+        .map_err(|_| HistoryResponse::Unavailable)?;
+    if out.len() + uri.len() + 2 + length > MAX_ROW_BYTES {
+        return Err(HistoryResponse::TooLarge);
+    }
+    out.extend_from_slice(uri);
+    out.extend_from_slice(b"\x1b\\");
+    let offset = out.len();
+    out.resize(offset + length, 0);
+    let written = formatter.format_buf(&mut out[offset..]).map_err(|_| HistoryResponse::Unavailable)?;
+    out.truncate(offset + written);
+    Ok(())
 }
 
 #[cfg(test)]
