@@ -84,17 +84,14 @@ impl History {
             let Ok(wrapped) = first.row().and_then(|row| row.is_wrap_continuation()) else {
                 return HistoryResponse::Unavailable;
             };
-            let mut ansi = match row_ansi(term, y as u32, columns) {
+            let ansi = match row_ansi(term, y as u32, columns) {
                 Ok(ansi) => ansi,
                 Err(error) => return error,
             };
             bytes += ansi.len();
-            let backgrounds = crate::serialize::history_background(term, y as u32);
-            bytes += backgrounds.len();
-            if ansi.len() + backgrounds.len() > MAX_ROW_BYTES || bytes > MAX_PAGE_BYTES {
+            if bytes > MAX_PAGE_BYTES {
                 return HistoryResponse::TooLarge;
             }
-            ansi.push_str(&backgrounds);
             rows.push(HistoryRow { ansi, wrapped });
         }
         let next_before = if start == 0 {
@@ -202,6 +199,13 @@ fn append_span(
     out.resize(offset + length, 0);
     let written = formatter.format_buf(&mut out[offset..]).map_err(|_| HistoryResponse::Unavailable)?;
     out.truncate(offset + written);
+    if length == 0 {
+        let backgrounds = crate::serialize::history_background(term, y, start, end);
+        if out.len() + backgrounds.len() > MAX_ROW_BYTES {
+            return Err(HistoryResponse::TooLarge);
+        }
+        out.extend_from_slice(backgrounds.as_bytes());
+    }
     Ok(())
 }
 

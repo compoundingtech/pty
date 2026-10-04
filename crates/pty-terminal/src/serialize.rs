@@ -279,23 +279,24 @@ struct ActiveScan {
 /// serializer keeps them as `SGR bg` + `ECH n`; this re-emits them the same
 /// way, so those cells come back as background-only cells, not spaces.
 fn scan_active(term: &Terminal) -> ActiveScan {
-    scan_rows(term, term.rows().unwrap_or(0), |x, y| Point::Active(PointCoordinate { x, y: y as u32 }))
+    scan_rows(term, term.rows().unwrap_or(0), 0..term.cols().unwrap_or(0),
+        |x, y| Point::Active(PointCoordinate { x, y: y as u32 }))
 }
 
-/// Restore background-only cells the VT formatter omits, in one selected history row.
-pub(crate) fn history_background(term: &Terminal, y: u32) -> String {
-    scan_rows(term, 1, |x, row| Point::History(PointCoordinate { x, y: y + u32::from(row) })).bg_fixups
+/// Restore background-only cells omitted from one selected history span.
+pub(crate) fn history_background(term: &Terminal, y: u32, start: u16, end: u16) -> String {
+    scan_rows(term, 1, start..end.saturating_add(1),
+        |x, row| Point::History(PointCoordinate { x, y: y + u32::from(row) })).bg_fixups
 }
 
-fn scan_rows(term: &Terminal, rows: u16, point: impl Fn(u16, u16) -> Point) -> ActiveScan {
-    let cols = term.cols().unwrap_or(0);
+fn scan_rows(term: &Terminal, rows: u16, columns: std::ops::Range<u16>, point: impl Fn(u16, u16) -> Point) -> ActiveScan {
     let mut last_text_row = None;
     let mut bg_fixups = String::new();
     for y in 0..rows {
         // (start x, run length, SGR params) of background-only runs.
         let mut runs: Vec<(u16, u16, String)> = Vec::new();
         let mut has_text = false;
-        for x in 0..cols {
+        for x in columns.start..columns.end {
             let cell = term
                 .grid_ref(point(x, y))
                 .ok()
