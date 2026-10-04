@@ -186,11 +186,17 @@ fn append_span(
         .with_kitty_keyboard(false)
         .with_selection(&selection);
     let mut formatter = Formatter::new(term, options).map_err(|_| HistoryResponse::Unavailable)?;
-    // format_len treats a native SUCCESS with zero bytes as InvalidValue. The
-    // buffer API preserves that valid empty result and reports nonempty sizes.
-    let length = match formatter.format_buf(&mut []) {
+    // format_len preserves native nonempty sizes; format_buf's OutOfSpace drops
+    // them. The former maps SUCCESS(0) to InvalidValue, so verify only that case
+    // through the buffer API, which preserves genuine zero-byte success.
+    let length = match formatter.format_len() {
         Ok(length) => length,
-        Err(Error::OutOfSpace { required }) => required,
+        Err(Error::InvalidValue) => {
+            if !matches!(formatter.format_buf(&mut []), Ok(0)) {
+                return Err(HistoryResponse::Unavailable);
+            }
+            0
+        }
         Err(_) => return Err(HistoryResponse::Unavailable),
     };
     write!(out, "\x1b[1;{}H\x1b[0m\x1b]8;;", start + 1)
