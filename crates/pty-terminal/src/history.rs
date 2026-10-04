@@ -3,10 +3,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use libghostty_vt::cell::CellWide;
 use libghostty_vt::error::Error;
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::screen::TrackedGridRef;
+use libghostty_vt::screen::{CellWide, TrackedGridRef};
 use libghostty_vt::selection::Selection;
 use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace, Terminal};
 use pty_core::protocol::{HistoryRequest, HistoryResponse, HistoryRow};

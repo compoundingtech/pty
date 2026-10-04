@@ -202,7 +202,7 @@ fn history_rejects_reset_geometry_generation_and_alternate_without_consuming_cur
 
 #[test]
 fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
-    use libghostty_vt::cell::CellWide;
+    use libghostty_vt::screen::CellWide;
     use libghostty_vt::style::StyleColor;
     use libghostty_vt::terminal::{Point, PointCoordinate};
     use pty_core::protocol::{HistoryRequest, HistoryResponse};
