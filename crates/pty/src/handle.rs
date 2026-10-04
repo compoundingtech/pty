@@ -18,6 +18,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
+
 use portable_pty::{CommandBuilder, MasterPty};
 use pty_spawn::PtySize;
 use pty_core::protocol::{
@@ -113,6 +115,35 @@ impl Default for AttachOptions {
     }
 }
 
+/// One immutable, internally consistent terminal update.
+///
+/// [`TerminalHandle::frame`] publishes the live viewport; an explicit
+/// [`TerminalHandle::request_frame`] captures a window into history. Retaining
+/// this value keeps its cells and pixels valid even when the actor replaces or
+/// deletes an image. Renderer-specific clipping and texture policy stay with
+/// the consumer.
+#[derive(Debug, Default)]
+pub struct Frame {
+    /// The actor revision this frame was captured from.
+    pub rev: u64,
+    /// Cells, cursor, geometry and buffer coordinates for this window.
+    pub grid: CellGrid,
+    /// Input and display modes from the same actor update.
+    pub modes: Modes,
+    /// Image descriptions and placement geometry for this window.
+    pub graphics: GraphicsState,
+    /// Owned pixels matching `graphics.images`, shared across unchanged
+    /// generations. Only images with placements are captured.
+    pub images: Vec<Arc<ImageBytes>>,
+}
+
+impl Frame {
+    /// Pixels for `id` from this frame, never from a newer actor generation.
+    pub fn image_bytes(&self, id: u32) -> Option<&Arc<ImageBytes>> {
+        self.images.iter().find(|image| image.desc.id == id)
+    }
+}
+
 /// What a subscriber hears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleEvent {
@@ -151,7 +182,8 @@ enum Msg {
     ChildExited { attempt: AttemptId, code: i32 },
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
-    Snapshot { offset: usize, reply: Sender<(u64, CellGrid)> },
+    Snapshot { offset: usize, reply: Sender<CellGrid> },
+    CaptureFrame { offset: usize, reply: Sender<Arc<Frame>> },
     Plain { range: Range, reply: Sender<String> },
     Serialize { opts: SerializeOpts, reply: Sender<String> },
     Graphics { offset: usize, reply: Sender<GraphicsState> },
@@ -194,13 +226,13 @@ struct State {
     /// The last published image-storage generation, so a consumer can tell
     /// an image change from any other dirty frame without asking the actor.
     graphics_generation: u64,
-    snap_cache: Option<(u64, CellGrid)>,
 }
 
 struct Shared {
     state: Mutex<State>,
     cv: Condvar,
     subs: Mutex<Vec<Sender<HandleEvent>>>,
+    frame: ArcSwap<Frame>,
 }
 
 impl Shared {
@@ -239,24 +271,45 @@ impl Core {
             .rev
     }
 
+    fn capture_frame(&self, rev: u64, offset: usize) -> Frame {
+        let previous = self.shared.frame.load();
+        let graphics = self.actor.graphics_state(offset);
+        let images = graphics.images.iter().filter_map(|desc| {
+            if let Some(image) = previous.image_bytes(desc.id)
+                && image.desc == *desc
+            {
+                return Some(Arc::clone(image));
+            }
+            self.actor.image_bytes(desc.id).map(Arc::new)
+        }).collect();
+        Frame {
+            rev,
+            grid: self.actor.snapshot(offset),
+            modes: self.actor.modes(),
+            graphics,
+            images,
+        }
+    }
+
     /// Publish the actor's state to the handle side, bump the revision, and
     /// fan out events.
     fn publish(&mut self) {
         let events = self.actor.take_events();
-        let generation = self.actor.graphics_generation();
+        let frame = Arc::new(self.capture_frame(self.rev() + 1, 0));
+        let generation = frame.graphics.generation;
         let (rev, graphics_changed) = {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.rev += 1;
-            st.snap_cache = None;
-            st.cols = self.actor.cols();
-            st.rows = self.actor.rows();
-            st.modes = self.actor.modes();
-            st.cursor = self.actor.cursor();
+            st.rev = frame.rev;
+            st.cols = frame.grid.cols;
+            st.rows = frame.grid.rows_n;
+            st.modes = frame.modes.clone();
+            st.cursor = (frame.grid.cursor.1, frame.grid.cursor.0, frame.grid.cursor.2);
             st.title = self.actor.title();
-            st.base_y = self.actor.base_y();
-            st.len = self.actor.buffer_length();
+            st.base_y = frame.grid.base_y;
+            st.len = frame.grid.len;
             let changed = st.graphics_generation != generation;
             st.graphics_generation = generation;
+            self.shared.frame.store(frame);
             (st.rev, changed)
         };
         self.shared.cv.notify_all();
@@ -295,11 +348,12 @@ impl Core {
                 // The daemon's own terminal answers queries; a second answer
                 // from here would reach the child twice.
                 let _ = self.actor.take_pty_replies();
+                self.publish();
                 {
                     let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.ready = true;
                 }
-                self.publish();
+                self.shared.cv.notify_all();
             }
             MessageType::Data => {
                 self.actor.write(&packet.payload);
@@ -453,7 +507,15 @@ impl Core {
             Msg::Input(b) => self.input(&b),
             Msg::Resize { cols, rows } => self.resize(cols, rows),
             Msg::Snapshot { offset, reply } => {
-                let _ = reply.send((self.rev(), self.actor.snapshot(offset)));
+                let _ = reply.send(self.actor.snapshot(offset));
+            }
+            Msg::CaptureFrame { offset, reply } => {
+                let frame = if offset == 0 {
+                    self.shared.frame.load_full()
+                } else {
+                    Arc::new(self.capture_frame(self.rev(), offset))
+                };
+                let _ = reply.send(frame);
             }
             Msg::Plain { range, reply } => {
                 let _ = reply.send(self.actor.plain(range));
@@ -689,6 +751,7 @@ impl TerminalHandle {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
         });
         let attempt = AttemptId(1);
 
@@ -776,6 +839,7 @@ impl TerminalHandle {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
         });
         let core_shared = shared.clone();
         let core_tx = tx.clone();
@@ -885,19 +949,38 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Resize { cols, rows });
     }
 
-    /// The cell grid `scroll_offset` rows back into history (0 = live). The
-    /// live grid is cached per revision.
+    /// The latest complete live viewport, without asking or locking the actor.
+    ///
+    /// The actor swaps this immutable value before notifying subscribers with
+    /// [`HandleEvent::Dirty`]. Slow readers may skip revisions; a held frame
+    /// remains valid through subsequent output, resize or image deletion.
+    /// Subscribe before the first read to avoid missing an update between
+    /// reading the initial frame and registering for notifications.
+    pub fn frame(&self) -> Arc<Frame> {
+        self.shared.frame.load_full()
+    }
+
+    /// Request one consistent viewport-sized window into history.
+    ///
+    /// This queues an actor read and returns immediately. Wait on the receiver
+    /// in a worker, or use `try_recv` from a UI. The revision and buffer
+    /// coordinates belong to the moment the actor processes the request, not
+    /// when it was queued. A zero offset returns the published live frame.
+    /// Closing the actor disconnects any requests it has not processed.
+    pub fn request_frame(&self, scroll_offset: usize) -> Receiver<Arc<Frame>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::CaptureFrame { offset: scroll_offset, reply });
+        rx
+    }
+
+    /// The cell grid `scroll_offset` rows back into history (0 = live).
+    ///
+    /// Live reads clone the published grid without asking the actor. History
+    /// reads wait for an actor reply; prefer [`TerminalHandle::request_frame`]
+    /// when a consistent asynchronous history frame is needed.
     pub fn snapshot(&self, scroll_offset: usize) -> CellGrid {
         if scroll_offset == 0 {
-            let cached = self.state(|st| {
-                st.snap_cache
-                    .as_ref()
-                    .filter(|(rev, _)| *rev == st.rev)
-                    .map(|(_, g)| g.clone())
-            });
-            if let Some(g) = cached {
-                return g;
-            }
+            return self.frame().grid.clone();
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
@@ -910,18 +993,7 @@ impl TerminalHandle {
         {
             return CellGrid::default();
         }
-        match reply_rx.recv() {
-            Ok((rev, grid)) => {
-                if scroll_offset == 0 {
-                    let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if st.rev == rev {
-                        st.snap_cache = Some((rev, grid.clone()));
-                    }
-                }
-                grid
-            }
-            Err(_) => CellGrid::default(),
-        }
+        reply_rx.recv().unwrap_or_default()
     }
 
     /// The plain-text screen (asks the actor).
@@ -956,7 +1028,13 @@ impl TerminalHandle {
     ///
     /// Empty (and `enabled: false`) when the handle was built without
     /// [`SpawnOptions::graphics`] / [`AttachOptions::graphics`].
+    /// Live reads clone published metadata; history reads wait for the actor.
+    /// For grid, modes and pixels from the same update, use
+    /// [`TerminalHandle::frame`] or [`TerminalHandle::request_frame`].
     pub fn graphics(&self, scroll_offset: usize) -> GraphicsState {
+        if scroll_offset == 0 {
+            return self.frame().graphics.clone();
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .tx
@@ -1257,6 +1335,7 @@ mod tests {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
         });
         let core = Core {
             actor: TerminalActor::new(5, 20, 0),
