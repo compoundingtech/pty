@@ -295,6 +295,25 @@ caller names rather than `$PTY_ROOT`: `send_in`, `peek_screen_in`,
 and can be fenced to one session generation. The crate docs list where each
 operation lives.
 
+`pty_client::history::read_in(root, name, &request, timeout)` reads a bounded
+backwards page of retained primary-buffer rows without attaching, resizing, or
+sending input. Construct `pty_core::protocol::HistoryRequest` with the exact
+session metadata generation, a `limit` from 1 to 200, and `before: None` for
+the newest retained page. Rows exclude the live viewport and are ordered oldest
+to newest within each page; pass `next_before` unchanged to read older rows.
+Each row contains self-contained ANSI text (including styles and OSC 8 links)
+and its wrapping flag. History retained before a reader connects is available;
+this is terminal scrollback, not a transcript or an unlimited archive.
+
+Continuation boundaries remain anchored while output appends. Pruning, terminal
+reset, geometry changes, expired cursors (five minutes), and evicted cursor
+leases return `CursorGap`, rather than silently treating a cursor as an offset.
+At most 256 cursor leases are retained. `StaleGeneration` fences same-name
+session replacement even on an initial read; `AlternateScreen` does not consume
+a primary-buffer cursor. `InvalidRequest`, `Unavailable`, and `TooLarge` are
+explicit failures. Rows are limited to 64 KiB and pages to 2 MiB; oversized
+styled content is not truncated into a successful result.
+
 `attached_clients(&sessions, &ClientQuery)` queries an already-filtered
 `&[SessionInfo]` and returns one `ClientSet` per session, in the same order.
 
@@ -352,7 +371,7 @@ A Cargo workspace of nine crates under `crates/`:
   manifests, and the process table and process-tree termination. No terminal
   emulator, no Zig.
 - **`pty-client`** — the typed operations over a session's socket: list,
-  attach, peek and screen reads, send, stats, signal, stop and remove, each
+  attach, peek, screen and retained history reads, send, stats, signal, stop and remove, each
   also against a registry root the caller names. The `pty` binary's client
   commands print what these return. No terminal emulator, no Zig.
 - **`pty-spawn`** — open a PTY and start a child in it, and the typed owner
@@ -361,9 +380,10 @@ A Cargo workspace of nine crates under `crates/`:
 - **`pty-lifecycle`** — daemon launch, startup leases and garbage collection,
   importable by other programs. No terminal emulator, no Zig.
 - **`pty-terminal`** — terminal state and nothing else: bytes in; libghostty's
-  screen, cells, cursor, modes, kitty graphics, input encoding, query answers
-  and the VT/plain serializations out. It spawns no process and opens no PTY
-  or socket, so its only dependencies are libghostty and a PNG decoder.
+  screen, retained history, cells, cursor, modes, kitty graphics, input encoding,
+  query answers and VT/plain serializations out. It spawns no process and opens
+  no PTY or socket; dependencies are libghostty, a PNG decoder, and `pty-core`
+  for the shared typed history request and response.
 - **`pty-testkit`** — Playwright-style test sessions: spawn a process in a real
   PTY, feed it to libghostty, take screenshots, wait for text, send named keys.
 - **`pty-tui`** — the TUI library (ratatui + crossterm): pane, theme, focus,

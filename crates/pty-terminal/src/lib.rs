@@ -8,8 +8,8 @@
 //! **Bytes in, terminal state out, and nothing else.** This crate spawns no
 //! process, opens no PTY or socket, and starts no thread. Whatever feeds a
 //! terminal — the session daemon, the `pty` crate's `TerminalHandle`, the
-//! testkit's `Session` — owns the process and calls in here. Its only
-//! dependencies are libghostty and a PNG decoder.
+//! testkit's `Session` — owns the process and calls in here. Dependencies are
+//! libghostty, a PNG decoder, and `pty-core` for typed history messages.
 //!
 //! - [`actor`]: [`TerminalActor`], the synchronous owner of the terminal. Feed
 //!   it the child's output with [`TerminalActor::write`]; read the screen with
@@ -24,6 +24,8 @@
 //! - [`serialize`]: the ATTACH/PEEK replay (Node mode prefix + VT) and the
 //!   plain-text screen (viewport or full scrollback).
 //! - [`snapshot`]: [`CellGrid`], the typed cell grid for renderers.
+//! - [`history`]: bounded retained primary-buffer pages with generation-fenced,
+//!   tracked backwards cursors; ANSI rows preserve styles and cell links.
 //! - [`graphics`]: the kitty graphics state — bounded image bytes,
 //!   placements, source crops, and where each placement sits in the window
 //!   that was read — plus the replay block that carries it through
