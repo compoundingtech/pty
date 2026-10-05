@@ -21,6 +21,8 @@ const TERMINAL_SANITIZE_PREFIX: &str = concat!(
 );
 const HOST_COLOR_RESETS: &str = "\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
 const TERMINAL_SANITIZE_SUFFIX: &str = "\x1b[0 q\x1b>\x1b(B\x1b[<99u";
+/// Rust also turns xterm modifyOtherKeys off, which Node leaves set.
+const MODIFY_OTHER_KEYS_RESET: &str = "\x1b[>4m";
 const CURSOR_TO_BOTTOM: &str = "\x1b[999;1H";
 
 /// Run `pty attach` in a tty on a session that prints READY and exits with
@@ -50,7 +52,8 @@ fn after_sanitize(out: &str) -> &str {
     let i = out.find(TERMINAL_SANITIZE_PREFIX).unwrap_or_else(|| panic!("no sanitize prefix in {out:?}"));
     let tail = &out[i + TERMINAL_SANITIZE_PREFIX.len()..];
     let tail = tail.strip_prefix(HOST_COLOR_RESETS).unwrap_or(tail);
-    tail.strip_prefix(TERMINAL_SANITIZE_SUFFIX).unwrap_or_else(|| panic!("no sanitize suffix in {out:?}"))
+    let tail = tail.strip_prefix(TERMINAL_SANITIZE_SUFFIX).unwrap_or_else(|| panic!("no sanitize suffix in {out:?}"));
+    tail.strip_prefix(MODIFY_OTHER_KEYS_RESET).unwrap_or(tail)
 }
 
 /// The whole reset string, then cursor-to-bottom and the exit trailer, when
