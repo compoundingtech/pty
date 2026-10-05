@@ -202,6 +202,24 @@ fn double_tap_forwards_ctrl_backslash_and_kitty_encoding_is_normalized() {
     h.join().unwrap();
 }
 
+/// iTerm2 sends Ctrl+\ as `CSI 27 ; 5 ; 92 ~` once the session's program asks
+/// for modifyOtherKeys level 2, as vim and Claude Code do. One press detaches.
+#[test]
+fn modify_other_keys_ctrl_backslash_detaches() {
+    let (d, h) = daemon(|mut s| {
+        use std::io::Write;
+        s.write_all(&concat(&[encode_geometry(24, 80), encode_screen(b"ready")]))
+            .unwrap();
+        read_packets_until_eof(&mut s, T);
+    });
+    let run = start(d.connect(), None);
+    run.stdout.wait_for(T, |b| b.ends_with(b"ready"));
+    run.type_stdin(b"\x1b[27;5;92~");
+    let (outcome, _, _) = run.finish();
+    assert_eq!(outcome, AttachOutcome::Detached);
+    h.join().unwrap();
+}
+
 /// node: client.ts:686-690 — a close without error and without EXIT ends
 /// with the last known code (0), after saying the session ended.
 #[test]

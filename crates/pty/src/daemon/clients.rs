@@ -199,6 +199,16 @@ impl Daemon {
             MessageType::Resize => self.on_resize(id, &packet.payload),
             MessageType::Detach => self.on_detach(id),
             MessageType::Status => self.on_status(id, &packet.payload),
+            MessageType::ResetInputModes
+                if packet.payload.is_empty()
+                    && self
+                        .clients
+                        .get(&id)
+                        .is_some_and(|client| client.role == Role::Writable) =>
+            {
+                let output = self.actor.reset_input_modes();
+                self.broadcast(&pty_core::protocol::encode_data(&output));
+            }
             MessageType::AcceptedSocketOwnership => {
                 self.on_accepted_socket_ownership(id, &packet.payload);
             }

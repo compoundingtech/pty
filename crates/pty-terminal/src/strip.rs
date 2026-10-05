@@ -90,7 +90,7 @@ impl Csi {
     pub fn size_query(&self) -> Option<u16> {
         if self.final_byte == b't' && self.prefix.is_none() && self.intermediates.is_empty() {
             match self.params.as_slice() {
-                [14] | [16] | [18] => Some(self.params[0]),
+                [14] | [16] | [18] | [19] => Some(self.params[0]),
                 _ => None,
             }
         } else {
@@ -109,7 +109,11 @@ impl Csi {
     /// state query, which libghostty also answers locally, and to the geometry
     /// queries answered from the session's size.
     pub fn is_stripped_query(&self) -> bool {
-        self.is_da1_query()
+        (self.prefix == Some(b'?')
+            && self.final_byte == b'm'
+            && self.intermediates.is_empty()
+            && self.params == [4])
+            || self.is_da1_query()
             || self.is_da2_query()
             || self.is_dsr_query()
             || self.is_xtversion_query()
