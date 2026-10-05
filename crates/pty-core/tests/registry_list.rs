@@ -518,12 +518,15 @@ fn strict_clean_inventory_matches_default_and_preserves_root() {
 fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
     let dir = strict_root();
     let live = UnixListener::bind(dir.join("live.sock")).unwrap();
-    for name in ["dead-pid", "missing-pid", "recorded-exit"] {
+    for name in ["dead-pid", "recorded-exit"] {
         let listener = UnixListener::bind(dir.join(format!("{name}.sock"))).unwrap();
         drop(listener);
     }
     std::fs::write(dir.join("dead-pid.pid"), DEAD_PID.to_string()).unwrap();
-    std::fs::write(dir.join("recorded-exit.json"), br#"{"exitCode":7}"#).unwrap();
+    std::fs::write(
+        dir.join("recorded-exit.json"),
+        format!(r#"{{"exitCode":7,"daemonPid":{DEAD_PID}}}"#),
+    ).unwrap();
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(inventory.complete);
@@ -537,12 +540,11 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
         vec![
             ("dead-pid", SessionStatus::Vanished, None),
             ("live", SessionStatus::Running, None),
-            ("missing-pid", SessionStatus::Vanished, None),
             ("recorded-exit", SessionStatus::Exited, None),
         ]
     );
     assert_eq!(
-        inventory.entries[3].metadata.as_ref().unwrap().exit_code,
+        inventory.entries[2].metadata.as_ref().unwrap().exit_code,
         Some(7)
     );
     // The legacy scanner still omits dead pid-only sockets and defensively
@@ -554,11 +556,33 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
             .collect::<Vec<_>>(),
         vec![
             ("live", SessionStatus::Running),
-            ("missing-pid", SessionStatus::Running),
             ("recorded-exit", SessionStatus::Running),
         ]
     );
     drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_refused_socket_without_dead_pid_is_incomplete() {
+    let dir = strict_root();
+    let socket = dir.join("unknown.sock");
+    drop(UnixListener::bind(&socket).unwrap());
+    let options = registry::ListOptions::default();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::EntryUnreadable);
+    assert_eq!(inventory.errors[0].path, socket);
+    assert_eq!(inventory.entries[0].status, SessionStatus::Running);
+    // Recorded exit evidence without a known non-live process is still
+    // insufficient to disambiguate a refused listener.
+    std::fs::write(dir.join("unknown.json"), br#"{"exitCode":0}"#).unwrap();
+    assert!(!registry::list_sessions_strict_in(&dir, &options).complete);
+    std::fs::write(dir.join("unknown.pid"), DEAD_PID.to_string()).unwrap();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(inventory.complete);
+    assert!(inventory.errors.is_empty());
+    assert_eq!(inventory.entries[0].status, SessionStatus::Exited);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

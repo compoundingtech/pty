@@ -261,7 +261,13 @@ not just matching entries. Errors identify the affected `path`, a kebab-case
 `pid-malformed`, and `probe-timeout`. Missing roots, unreadable or
 malformed existing registry files, and socket probes that cannot finish within
 the scan deadline make the inventory incomplete; absent optional files and
-definitively missing or refused sockets do not. A definitively dead socket
+definitively missing sockets do not. Connection refusal is ambiguous (a full
+accept queue can cause it on macOS): on every platform, it requires a positive
+dead PID, or recorded exit evidence plus a positive dead `daemonPid`, before
+being treated as ended. Otherwise it reports `entry-unreadable` and exit 3.
+Strict companion files are opened non-blocking and checked through the opened
+descriptor; FIFOs, devices, and other non-regular files report `pid-unreadable`
+or `metadata-unreadable` without waiting for a writer. A definitively dead socket
 reports a retained entry as `exited` when exit evidence is recorded, otherwise
 `vanished`, rather than defensively `running` or omitted. Exit status is 0 for a
 complete inventory and 3 for an incomplete one; stdout still contains the

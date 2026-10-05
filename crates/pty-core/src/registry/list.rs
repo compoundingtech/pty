@@ -170,7 +170,27 @@ impl Scanner {
         kind: InventoryErrorKind,
         observed: bool,
     ) -> Option<Vec<u8>> {
-        match std::fs::read(path) {
+        let read = if self.strict {
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .and_then(|mut file| {
+                    // File::metadata uses fstat on the opened descriptor, not
+                    // a path lookup that could race a sidecar replacement.
+                    if !file.metadata()?.is_file() {
+                        return Err(std::io::Error::other("registry companion is not a regular file"));
+                    }
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                })
+        } else {
+            std::fs::read(path)
+        };
+        match read {
             Ok(bytes) => Some(bytes),
             Err(error) => {
                 // A dangling symlink is an existing but unreadable sidecar.
@@ -705,27 +725,29 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         .collect();
     let reachability =
         probe_socket_outcomes(&needs_probe, options.socket_probe_budget, |result| result);
-    for path in &needs_probe {
-        match reachability.get(path) {
-            None => scanner.error(
-                path,
-                InventoryErrorKind::ProbeTimeout,
-                "socket probe deadline elapsed",
-            ),
-            Some(Err(error)) if !socket_definitively_gone(error) => {
-                scanner.error(path, InventoryErrorKind::EntryUnreadable, error);
-            }
-            _ => {}
-        }
-    }
 
     for c in candidates {
         seen.insert(c.name.clone());
         let socket_reachable =
             c.pid_alive || reachability.get(&c.socket_path).is_some_and(Result::is_ok);
-        let socket_gone = reachability
-            .get(&c.socket_path)
-            .is_some_and(|result| result.as_ref().is_err_and(|error| socket_definitively_gone(error)));
+        let socket_gone = strict && reachability.get(&c.socket_path).is_some_and(|result| {
+            result.as_ref().is_err_and(|error| {
+                socket_definitively_gone(error, c.pid, c.pid_alive, c.metadata.as_ref())
+            })
+        });
+        if strict && !c.pid_alive {
+            match reachability.get(&c.socket_path) {
+                None => scanner.error(
+                    &c.socket_path,
+                    InventoryErrorKind::ProbeTimeout,
+                    "socket probe deadline elapsed",
+                ),
+                Some(Err(error)) if !socket_gone => {
+                    scanner.error(&c.socket_path, InventoryErrorKind::EntryUnreadable, error);
+                }
+                _ => {}
+            }
+        }
         if strict && !c.pid_alive && socket_gone {
             let status = if c.metadata.as_ref().is_some_and(|metadata| {
                 metadata.has_exited() || metadata.exit_code.is_some()
@@ -834,8 +856,25 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
     }
 }
 
-fn socket_definitively_gone(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ECONNREFUSED))
+fn socket_definitively_gone(
+    error: &std::io::Error,
+    pid: Option<i32>,
+    daemon_alive: bool,
+    metadata: Option<&SessionMetadata>,
+) -> bool {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => true,
+        // macOS also refuses a live listener with a full accept queue. Fail
+        // closed on every platform unless process/exit evidence corroborates.
+        Some(libc::ECONNREFUSED) => !daemon_alive && (
+            pid.is_some_and(|pid| pid > 0)
+                || metadata.is_some_and(|metadata| {
+                    (metadata.has_exited() || metadata.exit_code.is_some())
+                        && metadata.daemon_pid.is_some_and(|pid| pid > 0 && !pid_alive(pid))
+                })
+        ),
+        _ => false,
+    }
 }
 
 /// Look a session up by its immutable id only.

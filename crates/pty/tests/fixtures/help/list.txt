@@ -24,6 +24,8 @@ Strict inventory:
   Retained metadata and tags are included regardless of lifecycle, subject to
   the selected filters. Recorded generation, daemonStartToken, and recovery
   processStartToken are exposed when present; ordinary --json is unchanged.
+  Refused sockets without corroborating dead-PID evidence are incomplete
+  (entry-unreadable). Non-regular companions are unreadable, never waited on.
 
 Examples:
   pty list
