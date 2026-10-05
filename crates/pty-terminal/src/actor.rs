@@ -191,6 +191,10 @@ struct Shared {
     titles: Vec<String>,
 }
 
+/// Recover both keyboard stacks and mouse/paste/focus/keypad modes, retaining normal
+/// screen contents and scrollback. CAN/ST also cancel an unfinished control string.
+pub const RESET_INPUT_MODES: &[u8] = b"\x18\x1b\\\x1b[<99u\x1b[?1l\x1b[?66l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?2031l\x1b[?2048l\x1b[?1007h\x1b[>4;0m\x1b[?25h";
+
 /// The owner of a libghostty terminal. See the [module docs](self).
 pub struct TerminalActor {
     term: Terminal<'static, 'static>,
@@ -199,6 +203,7 @@ pub struct TerminalActor {
     /// Whether an attached terminal can answer OSC 52 clipboard reads.
     clipboard_client_available: bool,
     modes: Modes,
+    modify_other_keys: u16,
     /// Kitty keyboard stacks belong to their screen. This holds the stack
     /// for whichever screen is currently inactive.
     inactive_kitty_stack: Vec<u8>,
@@ -270,6 +275,7 @@ impl TerminalActor {
             scanner: OutputScanner::new(),
             clipboard_client_available: false,
             modes: Modes::default(),
+            modify_other_keys: 0,
             inactive_kitty_stack: Vec::new(),
             events: Vec::new(),
             last_title: None,
@@ -549,11 +555,30 @@ impl TerminalActor {
                         self.events.push(TerminalEvent::CursorVisible);
                     }
                     self.modes = Modes::default();
+                    self.modify_other_keys = 0;
                     self.normal_replay = None;
                     feed.extend_from_slice(b"\x1bc");
                     broadcast.extend_from_slice(b"\x1bc");
                 }
                 Token::Csi(c) => {
+                    if c.prefix == Some(b'>')
+                        && c.final_byte == b'm'
+                        && c.intermediates.is_empty()
+                        && c.params.first() == Some(&4)
+                    {
+                        self.modify_other_keys = c.params.get(1).copied().unwrap_or(0).min(2);
+                    }
+                    if c.prefix == Some(b'?')
+                        && c.final_byte == b'm'
+                        && c.intermediates.is_empty()
+                        && c.params == [4]
+                    {
+                        self.flush_feed(&mut feed);
+                        self.shared.borrow_mut().pty_replies.extend_from_slice(
+                            format!("\x1b[>4;{}m", self.modify_other_keys).as_bytes(),
+                        );
+                        continue;
+                    }
                     if let Some(query) = c.size_query() {
                         self.flush_feed(&mut feed);
                         let cell = self.cell_size().or_fallback();
@@ -562,6 +587,7 @@ impl TerminalActor {
                             14 => format!("\x1b[4;{};{}t", rows * cell.height, cols * cell.width),
                             16 => format!("\x1b[6;{};{}t", cell.height, cell.width),
                             18 => format!("\x1b[8;{rows};{cols}t"),
+                            19 => format!("\x1b[9;{rows};{cols}t"),
                             _ => unreachable!(),
                         };
                         self.shared
@@ -580,7 +606,10 @@ impl TerminalActor {
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);
                     } else if c.is_kitty_pop() {
-                        self.modes.kitty_stack.pop();
+                        let count = usize::from(c.params.first().copied().unwrap_or(1).max(1));
+                        self.modes
+                            .kitty_stack
+                            .truncate(self.modes.kitty_stack.len().saturating_sub(count));
                     } else if let Some((params, set)) = c.dec_modes() {
                         let was_alt = self.modes.alt_screen;
                         for &p in params {
@@ -735,6 +764,22 @@ impl TerminalActor {
             .resize(cols.max(1), rows.max(1), cell.width, cell.height);
     }
 
+    /// Recover input without erasing the normal screen or history. A writable surface
+    /// invokes this explicitly; reset bytes are output to clients, never input to the child.
+    pub fn reset_input_modes(&mut self) -> Vec<u8> {
+        self.scanner = OutputScanner::default();
+        self.term.vt_write(b"\x18\x1b\\");
+        let mut output = Vec::new();
+        if self.modes.alt_screen {
+            output.extend(self.write(b"\x1b[<99u\x1b[?1049l"));
+        }
+        output.extend(self.write(RESET_INPUT_MODES));
+        self.modes.kitty_stack.clear();
+        self.inactive_kitty_stack.clear();
+        self.take_pty_replies();
+        output
+    }
+
     /// Full reset (RIS): screen, scrollback, modes, title. The tracked mode
     /// flags and any partial sequence in the scanner are cleared too. Used
     /// before replaying a SCREEN.
@@ -742,6 +787,7 @@ impl TerminalActor {
         self.term.reset();
         self.scanner.reset();
         self.modes = Modes::default();
+        self.modify_other_keys = 0;
         self.inactive_kitty_stack.clear();
         self.cursor_shape_replay = None;
         self.cursor_color_replay = None;

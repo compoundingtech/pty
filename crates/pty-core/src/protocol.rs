@@ -34,6 +34,8 @@ pub enum MessageType {
     LifecycleCas,
     /// Server → Client: effective shared rows/cols (wire value 10).
     Geometry,
+    /// Writable client requests recovery of input modes after a crashed program.
+    ResetInputModes,
     /// An unrecognized wire byte, preserved verbatim.
     Unknown(u8),
 }
@@ -52,6 +54,7 @@ impl MessageType {
             6 => MessageType::Peek,
             7 => MessageType::Status,
             10 => MessageType::Geometry,
+            11 => MessageType::ResetInputModes,
             8 => MessageType::AcceptedSocketOwnership,
             9 => MessageType::LifecycleCas,
             other => MessageType::Unknown(other),
@@ -72,6 +75,7 @@ impl MessageType {
             MessageType::AcceptedSocketOwnership => 8,
             MessageType::LifecycleCas => 9,
             MessageType::Geometry => 10,
+            MessageType::ResetInputModes => 11,
             MessageType::Unknown(b) => b,
         }
     }
