@@ -131,7 +131,7 @@ gap is in what the daemon does with the frames.
 | Message types 0–7 | have | |
 | `GEOMETRY` (10) after every `ATTACH`/`PEEK` and on every effective resize | missing | Node clients wait for it in machine mode. `deskset` and the TS testing library read it. |
 | Order per attach: `GEOMETRY → SCREEN → DATA* → EXIT?`; ordered cut with `terminal.write("", cb)`; settling/cutting/live phases; a newer `ATTACH`/`PEEK` supersedes a pending one | missing | Rust sends `SCREEN` at once. Node folds output that arrives during the cut into `SCREEN`. |
-| 80 ms redraw settle after a resize before the cut; `nudgeRedraw` (`cols-1` then back) when the attach size differs | missing | |
+| 80 ms redraw settle after a resize before the cut; `nudgeRedraw` (`cols-1` then back) when the attach size differs | have, narrowed | Rust nudges only when the cut lands inside the settle of the last resize. A resizing attach already waited the settle out, and an attach that min-wins leaves unchanged never resized the child, so the child sees one SIGWINCH per resizing attach instead of three. |
 | Client roles: command (no `ATTACH`), writable-attached, readonly (`PEEK`); roles replace each other on one socket | missing | Rust writes `DATA` and applies `RESIZE` from any socket. |
 | Effective geometry = per-axis minimum over writable-attached clients; readonly never constrains; last geometry sticks with zero writers | missing | Rust: last non-neutral attach wins. Rust extra: `ATTACH` flag byte `0x01` geometry-neutral. Record as a decision or drop. |
 | Mode prefix before `SCREEN`: `?1049h` (attach only), mouse `1000/1002/1003/1006`, `?25l`, kitty stack | partial | Rust replays modes and cursor through libghostty. Exact bytes to verify. |

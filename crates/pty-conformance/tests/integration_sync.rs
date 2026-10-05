@@ -501,7 +501,7 @@ fn skips_the_redraw_sigwinch_nudge_at_the_sessions_current_size() {
 
 /// node: tests/integration.test.ts:1045
 #[test]
-fn still_nudges_when_the_attaching_clients_size_differs() {
+fn signals_the_child_when_the_attaching_clients_size_differs() {
     let rig = Rig::new();
     let marker = winch_reporter(&rig, "winch2");
     let mut c = rig.connect("winch2");
@@ -509,6 +509,41 @@ fn still_nudges_when_the_attaching_clients_size_differs() {
     wait_until("SIGWINCH marker", || {
         std::fs::read_to_string(&marker).map(|s| s.contains("WINCH")).unwrap_or(false)
     });
+}
+
+/// The attach's own resize waits out the redraw settle before the SCREEN
+/// cut, so the child's redraw is already in it: no redraw nudge follows and
+/// the child sees one SIGWINCH. Node always nudges a size-differing attach.
+#[test]
+fn a_resizing_attach_costs_the_child_one_sigwinch() {
+    if is_node() {
+        return;
+    }
+    let rig = Rig::new();
+    let marker = winch_reporter(&rig, "winch3");
+    let mut c = rig.connect("winch3");
+    attach_and_wait_screen(&mut c, 20, 70);
+    std::thread::sleep(Duration::from_millis(400));
+    let winches = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(winches.lines().count(), 1, "SIGWINCHes: {winches:?}");
+}
+
+/// A larger attacher behind a smaller writer leaves min-wins unchanged: the
+/// child is not resized, and its screen is already current, so it is not
+/// nudged either. Node nudges whenever the attach size differs.
+#[test]
+fn an_attach_that_min_wins_leaves_unchanged_sends_no_sigwinch() {
+    if is_node() {
+        return;
+    }
+    let rig = Rig::new();
+    let marker = winch_reporter(&rig, "winch4");
+    let mut small = rig.connect("winch4");
+    attach_and_wait_screen(&mut small, 24, 80);
+    let mut large = rig.connect("winch4");
+    attach_and_wait_screen(&mut large, 82, 113);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!marker.exists(), "SIGWINCH for an attach that changed nothing");
 }
 
 /// node: tests/integration.test.ts:1067
