@@ -475,6 +475,14 @@ pub fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 ///
 /// node: src/sessions.ts:2129-2175
 pub fn probe_sockets_within_budget(paths: &[PathBuf], budget: Duration) -> HashMap<PathBuf, bool> {
+    probe_socket_outcomes(paths, budget, |result| result.is_ok())
+}
+
+fn probe_socket_outcomes<T>(
+    paths: &[PathBuf],
+    budget: Duration,
+    answer: impl Fn(std::io::Result<()>) -> T,
+) -> HashMap<PathBuf, T> {
     enum Probe {
         /// Connect due at the instant held: the first attempt, or
         /// `RETRY_TICK` after a full accept queue.
@@ -507,11 +515,11 @@ pub fn probe_sockets_within_budget(paths: &[PathBuf], budget: Duration) -> HashM
             {
                 *probe = match unix_connect::connect(path) {
                     Connect::Connected(_) => {
-                        results.insert(path.clone(), true);
+                        results.insert(path.clone(), answer(Ok(())));
                         Probe::Answered
                     }
-                    Connect::Failed(_) => {
-                        results.insert(path.clone(), false);
+                    Connect::Failed(error) => {
+                        results.insert(path.clone(), answer(Err(error)));
                         Probe::Answered
                     }
                     Connect::InProgress(stream) => Probe::InProgress(stream),
@@ -542,8 +550,8 @@ pub fn probe_sockets_within_budget(paths: &[PathBuf], budget: Duration) -> HashM
                 continue;
             }
             if let Probe::InProgress(stream) = &probes[i] {
-                let connected = matches!(stream.take_error(), Ok(None));
-                results.insert(paths[i].clone(), connected);
+                let result = stream.take_error().and_then(|error| error.map_or(Ok(()), Err));
+                results.insert(paths[i].clone(), answer(result));
                 probes[i] = Probe::Answered;
             }
         }
@@ -584,10 +592,12 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
-/// observation alongside the usual best-effort sessions. Optional absent
-/// companions are allowed; existing metadata and PID files are checked even
-/// when their session is omitted. Strict PID validation requires a complete,
-/// positive decimal i32; classification retains the legacy leading-integer parse.
+/// observation alongside retained sessions. Definitively absent or refused
+/// sockets retain an exited or vanished row; unknown probe failures and
+/// timeouts make the inventory incomplete. Optional absent companions are
+/// allowed; existing metadata and PID files are checked even when their session
+/// is omitted. Strict PID validation requires a complete, positive decimal i32;
+/// classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
     scan_sessions(root, options, true)
 }
@@ -693,21 +703,45 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         .filter(|c| !c.pid_alive)
         .map(|c| c.socket_path.clone())
         .collect();
-    let reachability = probe_sockets_within_budget(&needs_probe, options.socket_probe_budget);
+    let reachability =
+        probe_socket_outcomes(&needs_probe, options.socket_probe_budget, |result| result);
     for path in &needs_probe {
-        if !reachability.contains_key(path) {
-            scanner.error(
+        match reachability.get(path) {
+            None => scanner.error(
                 path,
                 InventoryErrorKind::ProbeTimeout,
                 "socket probe deadline elapsed",
-            );
+            ),
+            Some(Err(error)) if !socket_definitively_gone(error) => {
+                scanner.error(path, InventoryErrorKind::EntryUnreadable, error);
+            }
+            _ => {}
         }
     }
 
     for c in candidates {
         seen.insert(c.name.clone());
-        let socket_reachable = c.pid_alive || reachability.get(&c.socket_path) == Some(&true);
-        if c.pid_alive || socket_reachable {
+        let socket_reachable =
+            c.pid_alive || reachability.get(&c.socket_path).is_some_and(Result::is_ok);
+        let socket_gone = reachability
+            .get(&c.socket_path)
+            .is_some_and(|result| result.as_ref().is_err_and(|error| socket_definitively_gone(error)));
+        if strict && !c.pid_alive && socket_gone {
+            let status = if c.metadata.as_ref().is_some_and(|metadata| {
+                metadata.has_exited() || metadata.exit_code.is_some()
+            }) {
+                SessionStatus::Exited
+            } else {
+                SessionStatus::Vanished
+            };
+            sessions.push(SessionInfo {
+                name: c.name,
+                socket_path: c.socket_path,
+                pid: None,
+                status,
+                metadata: c.metadata,
+            });
+        } else if c.pid_alive || socket_reachable {
             let metadata = c.metadata;
             let status = if metadata.as_ref().is_some_and(SessionMetadata::has_exited) {
                 SessionStatus::Exited
@@ -798,6 +832,10 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         entries: sessions,
         errors: scanner.errors,
     }
+}
+
+fn socket_definitively_gone(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ECONNREFUSED))
 }
 
 /// Look a session up by its immutable id only.

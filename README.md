@@ -244,17 +244,29 @@ you need access to sessions created there.
 
 `pty list --json --strict` reports one registry as
 `{"root":"…","complete":true,"entries":[…],"errors":[]}`. The root is resolved
-through global `--root`, `PTY_ROOT`, or the default above. Entries use the same
-JSON shape, ordering, and tag/status/age filters as ordinary `--json` (including
-optional `--clients`). The entire root is scanned before filtering: `complete`
-describes the full scan, not just matching entries. Errors identify the affected
-`path`, a kebab-case `kind`, and optional `detail`. Missing roots, unreadable or
+through global `--root`, `PTY_ROOT`, or the default above and returned verbatim:
+there is no canonicalization, and path aliases (including symlinks) are not
+folded into one registry identity. Entries preserve ordinary `--json` row fields,
+ordering, tags, and tag/status/age filters (including optional `--clients`).
+Strict entries additionally expose recorded `generation` and `daemonStartToken`
+when present; a token recorded in `recovery.processStartToken` is exposed
+explicitly as `processStartToken`, not relabeled as `daemonStartToken`. Absent
+identity fields remain absent. All retained metadata records are included,
+including Starting, Ready, and Terminal lifecycle tags, subject only to the
+selected filters; lifecycle state is not itself a visibility filter. The
+entire root is scanned before filtering: `complete` describes the full scan,
+not just matching entries. Errors identify the affected `path`, a kebab-case
+`kind`, and optional `detail`. Kinds are `root-missing`, `root-unreadable`,
+`entry-unreadable`, `metadata-unreadable`, `metadata-malformed`, `pid-unreadable`,
+`pid-malformed`, and `probe-timeout`. Missing roots, unreadable or
 malformed existing registry files, and socket probes that cannot finish within
 the scan deadline make the inventory incomplete; absent optional files and
-definitively missing or refused sockets do not. Exit status is 0 for a complete
-inventory and 3 for an incomplete one; stdout still contains the envelope.
-`--strict` requires `--json` and cannot be combined with `--summary` or `--remote`.
-Ordinary listings keep their existing best-effort behavior.
+definitively missing or refused sockets do not. A definitively dead socket
+reports a retained entry as `exited` when exit evidence is recorded, otherwise
+`vanished`, rather than defensively `running` or omitted. Exit status is 0 for a
+complete inventory and 3 for an incomplete one; stdout still contains the
+envelope. `--strict` requires `--json` and cannot be combined with `--summary` or
+`--remote`. Ordinary listings keep their existing bytes and best-effort behavior.
 
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.

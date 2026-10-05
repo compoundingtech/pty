@@ -515,6 +515,54 @@ fn strict_clean_inventory_matches_default_and_preserves_root() {
 }
 
 #[test]
+fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
+    let dir = strict_root();
+    let live = UnixListener::bind(dir.join("live.sock")).unwrap();
+    for name in ["dead-pid", "missing-pid", "recorded-exit"] {
+        let listener = UnixListener::bind(dir.join(format!("{name}.sock"))).unwrap();
+        drop(listener);
+    }
+    std::fs::write(dir.join("dead-pid.pid"), DEAD_PID.to_string()).unwrap();
+    std::fs::write(dir.join("recorded-exit.json"), br#"{"exitCode":7}"#).unwrap();
+    let options = registry::ListOptions::default();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(inventory.complete);
+    assert!(inventory.errors.is_empty());
+    assert_eq!(
+        inventory
+            .entries
+            .iter()
+            .map(|session| (session.name.as_str(), session.status, session.pid))
+            .collect::<Vec<_>>(),
+        vec![
+            ("dead-pid", SessionStatus::Vanished, None),
+            ("live", SessionStatus::Running, None),
+            ("missing-pid", SessionStatus::Vanished, None),
+            ("recorded-exit", SessionStatus::Exited, None),
+        ]
+    );
+    assert_eq!(
+        inventory.entries[3].metadata.as_ref().unwrap().exit_code,
+        Some(7)
+    );
+    // The legacy scanner still omits dead pid-only sockets and defensively
+    // reports a socket without a PID as running.
+    assert_eq!(
+        registry::list_sessions_in(&dir, &options)
+            .iter()
+            .map(|session| (session.name.as_str(), session.status))
+            .collect::<Vec<_>>(),
+        vec![
+            ("live", SessionStatus::Running),
+            ("missing-pid", SessionStatus::Running),
+            ("recorded-exit", SessionStatus::Running),
+        ]
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn strict_missing_root_is_incomplete_without_creating_it() {
     let dir = root().join(unique_name("missing"));
     let options = registry::ListOptions::default();
@@ -676,6 +724,19 @@ fn strict_reports_permission_denied_root_and_sidecars() {
             registry::InventoryErrorKind::PidUnreadable
         ]
     );
+    let socket = dir.join("denied.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert!(inventory.errors.iter().any(|error| {
+        error.path == socket && error.kind == registry::InventoryErrorKind::EntryUnreadable
+    }));
+    assert_eq!(
+        inventory.entries.iter().find(|session| session.name == "denied").unwrap().status,
+        SessionStatus::Running
+    );
+    drop(listener);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -708,6 +769,13 @@ fn strict_timeout_is_incomplete_but_refused_socket_is_complete() {
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(inventory.complete);
     assert!(inventory.errors.is_empty());
-    assert!(inventory.entries.is_empty());
+    assert_eq!(
+        inventory
+            .entries
+            .iter()
+            .map(|session| (session.name.as_str(), session.status, session.pid))
+            .collect::<Vec<_>>(),
+        vec![("busy", SessionStatus::Vanished, None)]
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
