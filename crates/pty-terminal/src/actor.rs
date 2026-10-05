@@ -194,6 +194,7 @@ struct Shared {
 /// The owner of a libghostty terminal. See the [module docs](self).
 pub struct TerminalActor {
     term: Terminal<'static, 'static>,
+    history: crate::history::History,
     shared: Rc<RefCell<Shared>>,
     scanner: OutputScanner,
     /// Whether an attached terminal can answer OSC 52 clipboard reads.
@@ -266,6 +267,7 @@ impl TerminalActor {
         queries::install(&mut term);
         TerminalActor {
             term,
+            history: crate::history::History::default(),
             shared,
             scanner: OutputScanner::new(),
             clipboard_client_available: false,
@@ -534,6 +536,7 @@ impl TerminalActor {
                     // The scanner holds a trailing ESC until the next write,
                     // so a split ESC c also arrives here as one raw token.
                     if b.windows(2).any(|bytes| bytes == b"\x1bc") {
+                        self.history.invalidate();
                         self.cursor_shape_replay = None;
                         self.cursor_color_replay = None;
                     }
@@ -541,6 +544,7 @@ impl TerminalActor {
                     broadcast.extend_from_slice(&b);
                 }
                 Token::Ris => {
+                    self.history.invalidate();
                     self.flush_feed(&mut feed);
                     self.inactive_kitty_stack.clear();
                     self.cursor_shape_replay = None;
@@ -554,6 +558,9 @@ impl TerminalActor {
                     broadcast.extend_from_slice(b"\x1bc");
                 }
                 Token::Csi(c) => {
+                    if c.final_byte == b'J' && c.prefix.is_none() && c.param(0, 0) == 3 {
+                        self.history.invalidate();
+                    }
                     if let Some(query) = c.size_query() {
                         self.flush_feed(&mut feed);
                         let cell = self.cell_size().or_fallback();
@@ -729,6 +736,9 @@ impl TerminalActor {
     /// stay as they are: a resize is a change of grid, not of font, and
     /// dropping them would make every placement's geometry unanswerable.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        if self.cols() != cols.max(1) || self.rows() != rows.max(1) {
+            self.history.invalidate();
+        }
         let cell = self.cell.or_fallback();
         let _ = self
             .term
@@ -739,6 +749,7 @@ impl TerminalActor {
     /// flags and any partial sequence in the scanner are cleared too. Used
     /// before replaying a SCREEN.
     pub fn reset(&mut self) {
+        self.history.invalidate();
         self.term.reset();
         self.scanner.reset();
         self.modes = Modes::default();
@@ -754,6 +765,15 @@ impl TerminalActor {
         if let Some(opts) = self.graphics {
             self.enable_graphics(opts);
         }
+    }
+
+    /// Read retained main-buffer history without input, resize, or changing the viewport.
+    pub fn history(
+        &mut self,
+        generation: &str,
+        request: &pty_core::protocol::HistoryRequest,
+    ) -> pty_core::protocol::HistoryResponse {
+        self.history.page(&self.term, self.modes.alt_screen, generation, request)
     }
 
     /// The plain-text screen: rows right-trimmed of never-written cells

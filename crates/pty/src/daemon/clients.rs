@@ -195,6 +195,7 @@ impl Daemon {
         match packet.type_ {
             MessageType::Attach => self.on_attach(id, &packet.payload),
             MessageType::Peek => self.on_peek(id, &packet.payload),
+            MessageType::History => self.on_history(id, &packet.payload),
             MessageType::Data => self.on_data(id, &packet.payload),
             MessageType::Resize => self.on_resize(id, &packet.payload),
             MessageType::Detach => self.on_detach(id),
@@ -265,6 +266,26 @@ impl Daemon {
             None
         };
         self.schedule_cut(id, generation, CutKind::Attach { size_matched }, delay);
+    }
+
+    fn on_history(&mut self, id: u64, payload: &[u8]) {
+        use pty_core::protocol::{HistoryRequest, HistoryResponse, encode_packet};
+        if !self.clients.contains_key(&id) {
+            return;
+        }
+        let response = if self.exited {
+            HistoryResponse::Unavailable
+        } else if payload.len() > 1_024 {
+            HistoryResponse::InvalidRequest
+        } else {
+            match serde_json::from_slice::<HistoryRequest>(payload) {
+                Ok(request) => self.actor.history(&self.generation, &request),
+                Err(_) => HistoryResponse::InvalidRequest,
+            }
+        };
+        if let Ok(payload) = serde_json::to_vec(&response) {
+            self.clients[&id].send(encode_packet(MessageType::History, &payload));
+        }
     }
 
     /// node: src/server.ts:998-1020

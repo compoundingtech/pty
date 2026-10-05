@@ -145,3 +145,121 @@ fn a_widened_terminal_reports_the_history_it_can_still_hold() {
     assert_eq!(a.scrollback_capacity(), 24 + a.scrollback());
     assert_eq!(a.scrollback_request(), DEFAULT_SCROLLBACK);
 }
+
+fn page(a: &mut TerminalActor, before: Option<String>) -> (Vec<String>, Option<String>) {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let HistoryResponse::Page { rows, next_before, .. } =
+        a.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before })
+    else { panic!("expected history page") };
+    let text = rows.into_iter().map(|row| {
+        let mut replay = TerminalActor::new(2, 80, 0);
+        replay.write(row.ansi.as_bytes());
+        replay.plain(Range::Viewport)
+    }).collect();
+    (text, next_before)
+}
+
+#[test]
+fn history_pages_remain_anchored_across_append_and_report_retention_loss() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (first, cursor) = page(&mut actor, None);
+    assert_eq!(first, ["L8", "L9"]);
+    actor.write(b"L12\r\nL13\r\n");
+    let (older, _) = page(&mut actor, cursor.clone());
+    assert_eq!(older, ["L6", "L7"]);
+    fill(&mut actor, 5_000);
+    assert!(matches!(
+        actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }),
+        HistoryResponse::CursorGap
+    ));
+}
+
+#[test]
+fn history_rejects_reset_geometry_generation_and_alternate_without_consuming_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    let request = HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor };
+    assert!(matches!(actor.history("different-owner", &request), HistoryResponse::StaleGeneration));
+    actor.write(b"\x1b[?1049hALT\r\nALT\r\nALT");
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::AlternateScreen));
+    actor.write(b"\x1b[?1049l");
+    assert_eq!(page(&mut actor, request.before.clone()).0, ["L6", "L7"]);
+    actor.resize(40, 3);
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1b[3J");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1bc");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+}
+
+#[test]
+fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
+    use libghostty_vt::screen::{CellContentTag, CellWide};
+    use libghostty_vt::style::StyleColor;
+    use libghostty_vt::terminal::{Point, PointCoordinate};
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    // Erased backgrounds live in cell content; written glyphs use the SGR style.
+    let background = |actor: &TerminalActor, column| {
+        let grid = actor.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        let cell = grid.cell().unwrap();
+        match cell.content_tag().unwrap() {
+            CellContentTag::BgColorPalette => StyleColor::Palette(cell.bg_color_palette().unwrap()),
+            CellContentTag::BgColorRgb => StyleColor::Rgb(cell.bg_color_rgb().unwrap()),
+            _ => grid.style().unwrap().bg_color,
+        }
+    };
+    let mut owner = TerminalActor::new(2, 8, 100);
+    owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/first\x1b\\A界\x1b]8;;\x1b\\\x1b[0mZ\x1b]8;;https://example.test/second\x1b\\e\u{301}\x1b]8;;\x1b\\\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n\r\nDONE\r\nLAST".as_bytes());
+    let HistoryResponse::Page { rows, .. } = owner.history("owner", &HistoryRequest {
+        expected_generation: "owner".into(), limit: 200, before: None,
+    }) else { panic!("expected retained history") };
+    let mut replay = TerminalActor::new(2, 8, 0);
+    replay.write(rows[0].ansi.as_bytes());
+    assert_eq!(replay.plain(Range::Viewport).trim_end(), "A界Ze\u{301}");
+    let mut uri = [0_u8; 256];
+    for (column, expected) in [
+        (0, "https://example.test/first"),
+        (1, "https://example.test/first"),
+        (3, ""),
+        (4, "https://example.test/second"),
+        (5, ""),
+    ] {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        let length = cell.hyperlink_uri(&mut uri).unwrap();
+        assert_eq!(std::str::from_utf8(&uri[..length]).unwrap(), expected, "column {column}");
+    }
+    let first = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 })).unwrap().style().unwrap();
+    assert!(first.bold && first.strikethrough);
+    assert!(matches!(first.fg_color, StyleColor::Palette(index) if index.0 == 1));
+    let wide = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 1, y: 0 })).unwrap();
+    assert_eq!(wide.cell().unwrap().wide().unwrap(), CellWide::Wide);
+    let unlinked = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 3, y: 0 })).unwrap().style().unwrap();
+    assert!(!unlinked.bold && !unlinked.strikethrough);
+    assert!(matches!(unlinked.fg_color, StyleColor::None));
+    for column in 5..8 {
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
+    }
+    replay.reset();
+    replay.write(rows[1].ansi.as_bytes());
+    for column in 0..8 {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
+        assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
+    }
+    replay.reset();
+    replay.write(rows[2].ansi.as_bytes());
+    assert_eq!(replay.plain(Range::Viewport), "");
+    for column in 0..8 {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        assert!(matches!(background(&replay, column), StyleColor::None));
+        assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
+    }
+}
