@@ -242,6 +242,19 @@ registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
+`pty root --json` reports root resolution without creating directories, reading
+registry records, or contacting daemons:
+`{"effective":{"path":"/var/lib/pty","source":"PTY_ROOT"},"nativeDefault":{"path":"/home/user/.local/state/pty/h-<hostname-hash>"}}`.
+The effective source is `flag` for global `--root`, otherwise `PTY_ROOT`,
+`PTY_SESSION_DIR`, or `default`, in that order (empty environment values are
+ignored). The native default always comes from `default_session_dir()` and
+does not inherit any registry override, even inside a managed `PTY_ROOT`.
+Paths are returned as resolved, with no canonicalization or alias folding.
+Plain `pty root` prints two labelled lines, `Effective` (including the source)
+and `Native default`. Existing legacy-variable notices remain on stderr,
+including with JSON. The report alone is exempt from the socket root-length
+backstop so an over-long root can be diagnosed; other commands remain guarded.
+
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.
 It is opt-in because it asks every running daemon (up to 16 at a time, with

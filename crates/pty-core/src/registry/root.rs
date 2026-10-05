@@ -72,6 +72,28 @@ pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Where the effective registry root was selected. CLI `--root` provenance
+/// is tracked by the dispatcher, which exports its value as `PTY_ROOT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// An embedding application's thread-local [`with_root`] override.
+    Scoped,
+    PtyRoot,
+    PtySessionDir,
+    Default,
+}
+
+impl RootSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scoped => "scoped",
+            Self::PtyRoot => "PTY_ROOT",
+            Self::PtySessionDir => "PTY_SESSION_DIR",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// Resolve the session registry directory: the root of an enclosing
 /// [`with_root`] on this thread, else `$PTY_ROOT`, else the deprecated
 /// `$PTY_SESSION_DIR` (with a one-time notice on stderr unless
@@ -79,8 +101,14 @@ pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
 ///
 /// node: src/sessions.ts:82-110
 pub fn session_dir() -> PathBuf {
+    resolve_session_dir().0
+}
+
+/// Resolve the effective registry path and its source without touching the
+/// registry. Paths are returned as selected, never canonicalized.
+pub fn resolve_session_dir() -> (PathBuf, RootSource) {
     if let Some(root) = SCOPED_ROOT.with(|scoped| scoped.borrow().clone()) {
-        return root;
+        return (root, RootSource::Scoped);
     }
     let root = env_non_empty("PTY_ROOT");
     let legacy = env_non_empty("PTY_SESSION_DIR");
@@ -95,7 +123,7 @@ pub fn session_dir() -> PathBuf {
                 "pty: both PTY_ROOT and PTY_SESSION_DIR are set — using PTY_ROOT ({root}); PTY_SESSION_DIR ({legacy}) is ignored (deprecated). For isolation, set PTY_ROOT."
             );
         }
-        return PathBuf::from(root);
+        return (PathBuf::from(root), RootSource::PtyRoot);
     }
     if let Some(legacy) = legacy {
         if !silent && !WARNED_LEGACY_ROOT_ENV.swap(true, Ordering::SeqCst) {
@@ -104,9 +132,9 @@ pub fn session_dir() -> PathBuf {
                 "pty: PTY_SESSION_DIR is deprecated; use PTY_ROOT (same shape, canonical name)."
             );
         }
-        return PathBuf::from(legacy);
+        return (PathBuf::from(legacy), RootSource::PtySessionDir);
     }
-    default_session_dir()
+    (default_session_dir(), RootSource::Default)
 }
 
 /// Create the session dir (mode 0700) if missing.

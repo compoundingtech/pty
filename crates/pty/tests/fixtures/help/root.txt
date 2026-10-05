@@ -1,0 +1,16 @@
+Usage: pty root [--json]
+
+Report the effective registry root and the native default without reading or
+creating registry files or contacting a daemon.
+
+Flags:
+  --json   Emit {effective: {path, source}, nativeDefault: {path}} as JSON
+
+Effective source: flag (--root), PTY_ROOT, PTY_SESSION_DIR, or default.
+The native default is independent of --root and registry environment overrides.
+Paths are returned as resolved, without canonicalization or alias folding.
+This command is exempt from the socket root-length backstop so it can report
+an over-long root. Other commands retain that backstop.
+
+Plain output has two labelled lines: Effective and Native default.
+PTY_SESSION_DIR deprecation notices retain their existing stderr behavior.

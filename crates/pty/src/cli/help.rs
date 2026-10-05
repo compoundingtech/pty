@@ -67,6 +67,7 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
         "down" => fixture!("down"),
         "test" => fixture!("test"),
         "remote-serve" => fixture!("remote-serve"),
+        "root" => fixture!("root"),
         _ => return None,
     })
 }
