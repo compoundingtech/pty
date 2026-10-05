@@ -244,7 +244,7 @@ you need access to sessions created there.
 
 `pty root --json` reports root resolution without creating directories, reading
 registry records, or contacting daemons:
-`{"effective":{"path":"/var/lib/pty","source":"PTY_ROOT"},"nativeDefault":{"path":"/home/user/.local/state/pty/h-<hostname-hash>"}}`.
+`{"effective":{"path":"/var/lib/pty","source":"PTY_ROOT"},"nativeDefault":{"path":"/home/example/.local/state/pty/h-<hostname-hash>"}}`.
 The effective source is `flag` for global `--root`, otherwise `PTY_ROOT`,
 `PTY_SESSION_DIR`, or `default`, in that order (empty environment values are
 ignored). The native default always comes from `default_session_dir()` and
