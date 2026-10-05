@@ -202,10 +202,20 @@ fn history_rejects_reset_geometry_generation_and_alternate_without_consuming_cur
 
 #[test]
 fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
-    use libghostty_vt::screen::CellWide;
+    use libghostty_vt::screen::{CellContentTag, CellWide};
     use libghostty_vt::style::StyleColor;
     use libghostty_vt::terminal::{Point, PointCoordinate};
     use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    // Erased backgrounds live in cell content; written glyphs use the SGR style.
+    let background = |actor: &TerminalActor, column| {
+        let grid = actor.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        let cell = grid.cell().unwrap();
+        match cell.content_tag().unwrap() {
+            CellContentTag::BgColorPalette => StyleColor::Palette(cell.bg_color_palette().unwrap()),
+            CellContentTag::BgColorRgb => StyleColor::Rgb(cell.bg_color_rgb().unwrap()),
+            _ => grid.style().unwrap().bg_color,
+        }
+    };
     let mut owner = TerminalActor::new(2, 8, 100);
     owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/first\x1b\\A界\x1b]8;;\x1b\\\x1b[0mZ\x1b]8;;https://example.test/second\x1b\\e\u{301}\x1b]8;;\x1b\\\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n\r\nDONE\r\nLAST".as_bytes());
     let HistoryResponse::Page { rows, .. } = owner.history("owner", &HistoryRequest {
@@ -235,14 +245,13 @@ fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
     assert!(!unlinked.bold && !unlinked.strikethrough);
     assert!(matches!(unlinked.fg_color, StyleColor::None));
     for column in 5..8 {
-        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
-        assert!(matches!(cell.style().unwrap().bg_color, StyleColor::Palette(index) if index.0 == 4));
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
     }
     replay.reset();
     replay.write(rows[1].ansi.as_bytes());
     for column in 0..8 {
         let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
-        assert!(matches!(cell.style().unwrap().bg_color, StyleColor::Palette(index) if index.0 == 4));
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
         assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
     }
     replay.reset();
@@ -250,7 +259,7 @@ fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
     assert_eq!(replay.plain(Range::Viewport), "");
     for column in 0..8 {
         let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
-        assert!(matches!(cell.style().unwrap().bg_color, StyleColor::None));
+        assert!(matches!(background(&replay, column), StyleColor::None));
         assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
     }
 }
