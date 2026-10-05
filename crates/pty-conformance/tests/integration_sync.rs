@@ -484,7 +484,8 @@ fn winch_reporter(rig: &Rig, id: &str) -> std::path::PathBuf {
         m = marker.display()
     );
     shell(rig, id, &script, DaemonOpts::no_display_name());
-    std::thread::sleep(Duration::from_millis(100));
+    // READY follows the trap, and a resize before the trap is ignored.
+    rig.wait_for_screen(id, "READY");
     marker
 }
 
