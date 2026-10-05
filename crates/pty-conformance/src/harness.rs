@@ -1366,6 +1366,7 @@ pub fn type_name(t: MessageType) -> &'static str {
         MessageType::AcceptedSocketOwnership => "ACCEPTED_SOCKET_OWNERSHIP",
         MessageType::LifecycleCas => "LIFECYCLE_CAS",
         MessageType::Geometry => "GEOMETRY",
+        MessageType::ResetInputModes => "RESET_INPUT_MODES",
         MessageType::Unknown(_) => "UNKNOWN",
     }
 }
