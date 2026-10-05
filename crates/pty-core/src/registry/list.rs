@@ -108,6 +108,128 @@ impl Default for ListOptions {
     }
 }
 
+/// A read-only inventory, including evidence that the observation is incomplete.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inventory {
+    pub root: PathBuf,
+    pub complete: bool,
+    pub entries: Vec<SessionInfo>,
+    pub errors: Vec<InventoryError>,
+}
+
+/// Why a strict inventory could not completely observe the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InventoryErrorKind {
+    RootMissing,
+    RootUnreadable,
+    EntryUnreadable,
+    MetadataUnreadable,
+    MetadataMalformed,
+    PidUnreadable,
+    PidMalformed,
+    ProbeTimeout,
+}
+
+/// An observation failure at an exact registry path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InventoryError {
+    #[serde(serialize_with = "serialize_inventory_path")]
+    pub path: PathBuf,
+    pub kind: InventoryErrorKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+fn serialize_inventory_path<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
+struct Scanner {
+    strict: bool,
+    errors: Vec<InventoryError>,
+}
+
+impl Scanner {
+    fn error(&mut self, path: &Path, kind: InventoryErrorKind, detail: impl ToString) {
+        if self.strict {
+            self.errors.push(InventoryError {
+                path: path.to_path_buf(),
+                kind,
+                detail: Some(detail.to_string()),
+            });
+        }
+    }
+
+    fn read_optional(
+        &mut self,
+        path: &Path,
+        kind: InventoryErrorKind,
+        observed: bool,
+    ) -> Option<Vec<u8>> {
+        match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                // A dangling symlink is an existing but unreadable sidecar.
+                if self.strict
+                    && (observed
+                        || error.kind() != std::io::ErrorKind::NotFound
+                        || std::fs::symlink_metadata(path).is_ok())
+                {
+                    self.error(path, kind, error);
+                }
+                None
+            }
+        }
+    }
+
+    fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
+        let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
+        let result = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|value| {
+            if !value.is_object() {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "metadata must be a JSON object",
+                ));
+            }
+            serde_json::from_value(value)
+        });
+        match result {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                self.error(path, InventoryErrorKind::MetadataMalformed, error);
+                None
+            }
+        }
+    }
+
+    fn pid(&mut self, path: &Path, observed: bool) -> Option<i32> {
+        let bytes = self.read_optional(path, InventoryErrorKind::PidUnreadable, observed)?;
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(content) => content.trim(),
+            Err(error) => {
+                self.error(path, InventoryErrorKind::PidMalformed, error);
+                return None;
+            }
+        };
+        if self.strict
+            && (content.is_empty()
+                || !content.bytes().all(|byte| byte.is_ascii_digit())
+                || !content.parse::<i32>().is_ok_and(|pid| pid > 0))
+        {
+            self.error(
+                path,
+                InventoryErrorKind::PidMalformed,
+                "expected a positive decimal PID",
+            );
+        }
+        // Listing remains byte-compatible with Node's tolerant parseInt.
+        parse_leading_int(content)
+    }
+}
+
 /// Is a process with `pid` alive? `kill(pid, 0)` succeeding or failing with
 /// `EPERM` (exists, not ours) both count as alive.
 ///
@@ -458,15 +580,88 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    let Ok(dir) = std::fs::read_dir(root) else {
-        return Vec::new();
+    scan_sessions(root, options, false).entries
+}
+
+/// Observe `root` without creating or repairing it, reporting every incomplete
+/// observation alongside the usual best-effort sessions. Optional absent
+/// companions are allowed; existing metadata and PID files are checked even
+/// when their session is omitted. Strict PID validation requires a complete,
+/// positive decimal i32; classification retains the legacy leading-integer parse.
+pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
+    scan_sessions(root, options, true)
+}
+
+fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory {
+    let mut scanner = Scanner {
+        strict,
+        errors: Vec::new(),
     };
-    let mut entries: Vec<String> = dir
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| !is_tmp_name(n))
-        .collect();
+    let dir = match std::fs::read_dir(root) {
+        Ok(dir) => dir,
+        Err(error) => {
+            let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                InventoryErrorKind::RootMissing
+            } else {
+                InventoryErrorKind::RootUnreadable
+            };
+            scanner.error(root, kind, error);
+            return Inventory {
+                root: root.to_path_buf(),
+                complete: scanner.errors.is_empty(),
+                entries: Vec::new(),
+                errors: scanner.errors,
+            };
+        }
+    };
+    let mut entries = Vec::new();
+    for entry in dir {
+        match entry {
+            Ok(entry) => match entry.file_name().into_string() {
+                Ok(name) if !is_tmp_name(&name) => entries.push(name),
+                Ok(_) => {}
+                Err(_) => scanner.error(
+                    &entry.path(),
+                    InventoryErrorKind::EntryUnreadable,
+                    "entry name is not UTF-8",
+                ),
+            },
+            Err(error) => scanner.error(root, InventoryErrorKind::EntryUnreadable, error),
+        }
+    }
     entries.sort();
+
+    // Read each companion once; strict also validates pid-only records.
+    let names: BTreeSet<&str> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .strip_suffix(".sock")
+                .or_else(|| entry.strip_suffix(".json"))
+                .or_else(|| strict.then(|| entry.strip_suffix(".pid")).flatten())
+        })
+        .collect();
+    let mut records = HashMap::new();
+    for name in names {
+        let metadata_name = format!("{name}.json");
+        let pid_name = format!("{name}.pid");
+        let metadata = scanner.metadata(
+            &root.join(&metadata_name),
+            entries.binary_search(&metadata_name).is_ok(),
+        );
+        let pid = scanner
+            .pid(
+                &root.join(&pid_name),
+                entries.binary_search(&pid_name).is_ok(),
+            )
+            .or_else(|| {
+                let metadata = metadata.as_ref()?;
+                let pid = metadata.daemon_pid?;
+                let token = metadata.process_start_token()?;
+                (read_process_start_token(pid).as_deref() == Some(token)).then_some(pid)
+            });
+        records.insert(name, (metadata, pid));
+    }
 
     let mut sessions: Vec<SessionInfo> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -476,17 +671,19 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
         socket_path: PathBuf,
         pid: Option<i32>,
         pid_alive: bool,
+        metadata: Option<SessionMetadata>,
     }
     let candidates: Vec<Candidate> = entries
         .iter()
         .filter_map(|e| e.strip_suffix(".sock"))
         .map(|name| {
-            let pid = read_pid_with_in(root, name, None);
+            let (metadata, pid) = records.remove(name).expect("socket record was observed");
             Candidate {
                 name: name.to_string(),
                 socket_path: root.join(format!("{name}.sock")),
                 pid,
                 pid_alive: pid.is_some_and(pid_alive),
+                metadata,
             }
         })
         .collect();
@@ -497,12 +694,21 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
         .map(|c| c.socket_path.clone())
         .collect();
     let reachability = probe_sockets_within_budget(&needs_probe, options.socket_probe_budget);
+    for path in &needs_probe {
+        if !reachability.contains_key(path) {
+            scanner.error(
+                path,
+                InventoryErrorKind::ProbeTimeout,
+                "socket probe deadline elapsed",
+            );
+        }
+    }
 
     for c in candidates {
         seen.insert(c.name.clone());
         let socket_reachable = c.pid_alive || reachability.get(&c.socket_path) == Some(&true);
         if c.pid_alive || socket_reachable {
-            let metadata = read_metadata_at(&root.join(format!("{}.json", c.name)));
+            let metadata = c.metadata;
             let status = if metadata.as_ref().is_some_and(SessionMetadata::has_exited) {
                 SessionStatus::Exited
             } else {
@@ -516,7 +722,7 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
                 metadata,
             });
         } else if c.pid.is_some() {
-            if let Some(metadata) = read_metadata_at(&root.join(format!("{}.json", c.name))) {
+            if let Some(metadata) = c.metadata {
                 let vanished = metadata.exited_at.is_none() && metadata.exit_code.is_none();
                 sessions.push(SessionInfo {
                     name: c.name,
@@ -531,7 +737,7 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
                 });
             }
         } else {
-            let metadata = read_metadata_at(&root.join(format!("{}.json", c.name)));
+            let metadata = c.metadata;
             let status = if metadata.as_ref().is_some_and(SessionMetadata::has_exited) {
                 SessionStatus::Exited
             } else {
@@ -551,10 +757,10 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
         if seen.contains(name) {
             continue;
         }
-        let Some(metadata) = read_metadata_at(&root.join(format!("{name}.json"))) else {
+        let (metadata, pid) = records.remove(name).expect("metadata record was observed");
+        let Some(metadata) = metadata else {
             continue;
         };
-        let pid = read_pid_with_in(root, name, Some(&metadata));
         if let Some(pid) = pid
             && pid_alive(pid)
         {
@@ -586,7 +792,12 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
     }
 
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
-    sessions
+    Inventory {
+        root: root.to_path_buf(),
+        complete: scanner.errors.is_empty(),
+        entries: sessions,
+        errors: scanner.errors,
+    }
 }
 
 /// Look a session up by its immutable id only.

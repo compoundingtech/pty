@@ -9,11 +9,113 @@ mod cli_common;
 use cli_common::{DEAD_PID, Rig, iso_now};
 use serde_json::json;
 
+#[test]
+fn strict_requires_json_and_rejects_other_inventory_views() {
+    let rig = Rig::new();
+    for args in [
+        vec!["list", "--strict"],
+        vec!["ls", "--strict", "--clients"],
+    ] {
+        let out = rig.run(&args);
+        assert_eq!(out.code, 1);
+        assert_eq!(out.stderr, "--strict requires --json\n");
+        assert!(out.stdout.is_empty());
+    }
+    for flag in ["--summary", "--remote"] {
+        let out = rig.run(&["list", "--json", "--strict", flag]);
+        assert_eq!(out.code, 1);
+        assert_eq!(
+            out.stderr,
+            "--strict is incompatible with --summary and --remote\n"
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let out = rig.run(&["list", "--json", "--strict", "--remote", "peer"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn strict_preserves_entry_serialization_and_filters() {
+    let rig = Rig::new();
+    rig.write_meta(
+        "old",
+        json!({"createdAt": iso_now(-7_200_000), "tags": {"env": "prod"}}),
+    );
+    rig.write_meta("recent", json!({"exitCode": 0, "exitedAt": iso_now(0)}));
+    let filters = [
+        "--status",
+        "vanished",
+        "--older-than",
+        "1h",
+        "--filter-tag",
+        "env=prod",
+    ];
+    let mut ordinary = vec!["list", "--json"];
+    ordinary.extend(filters);
+    let expected = rig.ok(&ordinary).json();
+    let mut strict = vec!["ls", "--json", "--strict"];
+    strict.extend(filters);
+    let out = rig.ok(&strict);
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(rig.root));
+    assert_eq!(inventory["complete"], true);
+    assert_eq!(inventory["entries"], expected);
+    assert_eq!(inventory["errors"], json!([]));
+    assert_eq!(out.stdout.lines().count(), 1);
+}
+
+#[test]
+fn strict_reports_full_scan_errors_even_when_entries_are_filtered_out() {
+    let rig = Rig::new();
+    rig.write_meta("good", json!({"exitCode": 0}));
+    std::fs::write(rig.path("bad.json"), "{").unwrap();
+    let out = rig.run(&["list", "--json", "--strict", "--status", "running"]);
+    assert_eq!(out.code, 3);
+    assert!(out.stderr.is_empty());
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(rig.root));
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["entries"], json!([]));
+    assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
+        error["path"] == json!(rig.path("bad.json")) && error["kind"] == "metadata-malformed"
+    }));
+    assert_eq!(
+        rig.ok(&["list", "--json", "--status", "exited"]).json()[0]["name"],
+        "good"
+    );
+}
+
+#[test]
+fn strict_missing_root_uses_global_root_and_returns_an_envelope() {
+    let rig = Rig::new();
+    let missing = rig.scratch.join("missing");
+    let out = rig.run(&[
+        "list",
+        "--json",
+        "--strict",
+        "--root",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, 3);
+    assert!(out.stderr.is_empty());
+    assert!(!missing.exists());
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(missing));
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["entries"], json!([]));
+    assert_eq!(inventory["errors"][0]["path"], json!(missing));
+    assert_eq!(inventory["errors"][0]["kind"], "root-missing");
+}
+
 /// node: tests/list-filters.test.ts:119-159, 193-210
 #[test]
 fn json_status_and_key_order() {
     let rig = Rig::new();
-    rig.write_meta("van", json!({"displayCommand": "sleep 1", "tags": {"a": "1"}}));
+    rig.write_meta(
+        "van",
+        json!({"displayCommand": "sleep 1", "tags": {"a": "1"}}),
+    );
     rig.write_meta(
         "ex",
         json!({"exitCode": 0, "exitedAt": iso_now(0), "displayName": "friendly"}),
@@ -35,7 +137,17 @@ fn json_status_and_key_order() {
     let keys: Vec<&String> = van.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["name", "status", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "tags"]
+        [
+            "name",
+            "status",
+            "pid",
+            "command",
+            "cwd",
+            "createdAt",
+            "exitCode",
+            "exitedAt",
+            "tags"
+        ]
     );
     let ex = arr.iter().find(|s| s["name"] == "ex").unwrap();
     assert_eq!(ex["status"], "exited");
@@ -43,7 +155,17 @@ fn json_status_and_key_order() {
     let keys: Vec<&String> = ex.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["name", "status", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "displayName"]
+        [
+            "name",
+            "status",
+            "pid",
+            "command",
+            "cwd",
+            "createdAt",
+            "exitCode",
+            "exitedAt",
+            "displayName"
+        ]
     );
     assert_eq!(
         arr.iter().find(|s| s["name"] == "deadpid").unwrap()["status"],
@@ -59,7 +181,10 @@ fn json_status_and_key_order() {
 #[test]
 fn status_and_age_filters() {
     let rig = Rig::new();
-    rig.write_meta("old", json!({"createdAt": iso_now(-2 * 3_600_000), "tags": {"env": "prod"}}));
+    rig.write_meta(
+        "old",
+        json!({"createdAt": iso_now(-2 * 3_600_000), "tags": {"env": "prod"}}),
+    );
     rig.write_meta("recent", json!({"exitCode": 1, "exitedAt": iso_now(0)}));
     let names = |args: &[&str]| -> Vec<String> {
         rig.ok(args)
@@ -72,33 +197,69 @@ fn status_and_age_filters() {
     };
     assert_eq!(names(&["list", "--json", "--status", "vanished"]), ["old"]);
     assert_eq!(names(&["list", "--json", "--status", "exited"]), ["recent"]);
-    assert_eq!(names(&["list", "--json", "--status", "running"]), Vec::<String>::new());
+    assert_eq!(
+        names(&["list", "--json", "--status", "running"]),
+        Vec::<String>::new()
+    );
     assert_eq!(names(&["list", "--json", "--older-than", "1h"]), ["old"]);
     assert_eq!(names(&["list", "--json", "--newer-than", "1h"]), ["recent"]);
     assert_eq!(
-        names(&["list", "--json", "--older-than", "1h", "--filter-tag", "env=prod"]),
+        names(&[
+            "list",
+            "--json",
+            "--older-than",
+            "1h",
+            "--filter-tag",
+            "env=prod"
+        ]),
         ["old"]
     );
     assert_eq!(
-        names(&["list", "--json", "--older-than", "1h", "--filter-tag", "env=dev"]),
+        names(&[
+            "list",
+            "--json",
+            "--older-than",
+            "1h",
+            "--filter-tag",
+            "env=dev"
+        ]),
         Vec::<String>::new()
     );
 
     let out = rig.run(&["list", "--status", "bogus"]);
     assert_eq!(out.code, 1);
-    assert_eq!(out.stderr, "--status expects one of: running, exited, vanished\n");
+    assert_eq!(
+        out.stderr,
+        "--status expects one of: running, exited, vanished\n"
+    );
     let out = rig.run(&["list", "--status"]);
-    assert_eq!(out.stderr, "--status expects one of: running, exited, vanished\n");
+    assert_eq!(
+        out.stderr,
+        "--status expects one of: running, exited, vanished\n"
+    );
     let out = rig.run(&["list", "--older-than", "1week"]);
     assert_eq!(out.code, 1);
-    assert_eq!(out.stderr, "--older-than expects a duration like 30s, 5m, 2h, 1d\n");
+    assert_eq!(
+        out.stderr,
+        "--older-than expects a duration like 30s, 5m, 2h, 1d\n"
+    );
     let out = rig.run(&["list", "--newer-than"]);
-    assert_eq!(out.stderr, "--newer-than expects a duration like 30s, 5m, 2h, 1d\n");
+    assert_eq!(
+        out.stderr,
+        "--newer-than expects a duration like 30s, 5m, 2h, 1d\n"
+    );
     let out = rig.run(&["list", "--filter-tag", "nope"]);
     assert_eq!(out.code, 1);
     assert_eq!(out.stderr, "--filter-tag expects \"key=value\"\n");
     // Unknown tokens are ignored.
-    assert_eq!(rig.ok(&["list", "--json", "--bogus", "extra"]).json().as_array().unwrap().len(), 2);
+    assert_eq!(
+        rig.ok(&["list", "--json", "--bogus", "extra"])
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 /// node: tests/list-filters.test.ts:298-362
@@ -117,7 +278,10 @@ fn summary_text_and_json() {
     );
     let s = rig.ok(&["list", "--json", "--summary"]).json();
     assert_eq!(s["total"], 2);
-    assert_eq!(s["byStatus"], json!({"running": 0, "exited": 1, "vanished": 1}));
+    assert_eq!(
+        s["byStatus"],
+        json!({"running": 0, "exited": 1, "vanished": 1})
+    );
     assert_eq!(s["oldest"]["name"], "old");
     assert_eq!(s["oldest"]["status"], "exited");
     assert_eq!(s["oldest"]["displayName"], "Old One");
@@ -129,7 +293,9 @@ fn summary_text_and_json() {
     let keys: Vec<&String> = s["oldest"].as_object().unwrap().keys().collect();
     assert_eq!(keys, ["name", "status", "ageSeconds", "displayName"]);
 
-    let s = rig.ok(&["list", "--json", "--summary", "--status", "vanished"]).json();
+    let s = rig
+        .ok(&["list", "--json", "--summary", "--status", "vanished"])
+        .json();
     assert_eq!(s["total"], 1);
     assert_eq!(s["oldest"]["name"], "recent");
     assert_eq!(s["newest"]["name"], "recent");
@@ -144,7 +310,11 @@ fn summary_text_and_json() {
         rig2.ok(&["list", "--summary"]).stdout,
         "1 session — 1 vanished\noldest: only (vanished, 1m5s)\n"
     );
-    assert_eq!(rig2.ok(&["list", "--json", "--summary", "--status", "exited"]).json(), json!({"total": 0, "byStatus": {"running": 0, "exited": 0, "vanished": 0}, "oldest": null, "newest": null}));
+    assert_eq!(
+        rig2.ok(&["list", "--json", "--summary", "--status", "exited"])
+            .json(),
+        json!({"total": 0, "byStatus": {"running": 0, "exited": 0, "vanished": 0}, "oldest": null, "newest": null})
+    );
 }
 
 /// node: tests/list-filters.test.ts:386-437
@@ -210,11 +380,26 @@ fn json_tags_and_filters() {
     rig.write_meta("c", json!({"tags": {}}));
     rig.write_meta("d", json!({}));
     let arr = rig.ok(&["list", "--json"]).json();
-    let a = arr.as_array().unwrap().iter().find(|s| s["name"] == "a").unwrap();
+    let a = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "a")
+        .unwrap();
     assert_eq!(a["tags"], json!({"owner": "myapp", "layout": "work"}));
-    let c = arr.as_array().unwrap().iter().find(|s| s["name"] == "c").unwrap();
+    let c = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "c")
+        .unwrap();
     assert_eq!(c["tags"], json!({}));
-    let d = arr.as_array().unwrap().iter().find(|s| s["name"] == "d").unwrap();
+    let d = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "d")
+        .unwrap();
     assert!(d.get("tags").is_none());
     let names = |args: &[&str]| -> Vec<String> {
         rig.ok(args)
@@ -225,9 +410,19 @@ fn json_tags_and_filters() {
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect()
     };
-    assert_eq!(names(&["list", "--json", "--filter-tag", "layout=work"]), ["a", "b"]);
     assert_eq!(
-        names(&["list", "--json", "--filter-tag", "layout=work", "--filter-tag", "owner=myapp"]),
+        names(&["list", "--json", "--filter-tag", "layout=work"]),
+        ["a", "b"]
+    );
+    assert_eq!(
+        names(&[
+            "list",
+            "--json",
+            "--filter-tag",
+            "layout=work",
+            "--filter-tag",
+            "owner=myapp"
+        ]),
         ["a"]
     );
 }
@@ -258,7 +453,10 @@ fn a_named_peer_that_cannot_be_dialed_is_a_host_group_with_an_error() {
     assert!(v["local"].is_array(), "{v}");
     assert_eq!(v["remote"][0]["label"], "somepeer", "{v}");
     assert!(
-        !v["remote"][0]["error"].as_str().unwrap_or_default().is_empty(),
+        !v["remote"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "{v}"
     );
 }

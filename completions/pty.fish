@@ -119,6 +119,7 @@ complete -c pty -n '__pty_using_command events' -l wait -d 'Wait for a specific 
 complete -c pty -n '__pty_using_command events' -l timeout -s t -d 'Timeout (seconds) for --wait'
 complete -c pty -n '__pty_using_command events' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command list ls' -l json -d 'Emit JSON'
+complete -c pty -n '__pty_using_command list ls' -l strict -d 'With --json, emit per-root inventory; exit 3 if incomplete'
 complete -c pty -n '__pty_using_command list ls' -l clients -d 'With --json, include attached clients'
 complete -c pty -n '__pty_using_command list ls' -l tags -d 'Include internal bookkeeping tags'
 complete -c pty -n '__pty_using_command list ls' -l filter-tag -d 'Filter to k=v (repeatable, ALL match)'

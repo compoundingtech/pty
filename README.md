@@ -242,6 +242,20 @@ registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
+`pty list --json --strict` reports one registry as
+`{"root":"…","complete":true,"entries":[…],"errors":[]}`. The root is resolved
+through global `--root`, `PTY_ROOT`, or the default above. Entries use the same
+JSON shape, ordering, and tag/status/age filters as ordinary `--json` (including
+optional `--clients`). The entire root is scanned before filtering: `complete`
+describes the full scan, not just matching entries. Errors identify the affected
+`path`, a kebab-case `kind`, and optional `detail`. Missing roots, unreadable or
+malformed existing registry files, and socket probes that cannot finish within
+the scan deadline make the inventory incomplete; absent optional files and
+definitively missing or refused sockets do not. Exit status is 0 for a complete
+inventory and 3 for an incomplete one; stdout still contains the envelope.
+`--strict` requires `--json` and cannot be combined with `--summary` or `--remote`.
+Ordinary listings keep their existing best-effort behavior.
+
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.
 It is opt-in because it asks every running daemon (up to 16 at a time, with

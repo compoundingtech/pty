@@ -117,6 +117,7 @@ _pty() {
         list|ls)
           _arguments \
             '--json[Emit JSON]' \
+            '--strict[With --json, emit per-root inventory; exit 3 if incomplete]' \
             '--clients[With --json, include attached clients]' \
             '--tags[Include internal bookkeeping tags]' \
             '--filter-tag[Filter to k=v (repeatable, ALL match)]' \

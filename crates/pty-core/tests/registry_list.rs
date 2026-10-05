@@ -475,3 +475,239 @@ fn session_metadata_defaults_for_sparse_records() {
     assert_eq!(m.extra.get("name"), Some(&json!(name)));
     assert_eq!(find(&name).status, SessionStatus::Vanished);
 }
+
+fn strict_root() -> std::path::PathBuf {
+    let dir = root().join(unique_name("strict"));
+    std::fs::create_dir(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn strict_clean_inventory_matches_default_and_preserves_root() {
+    let dir = strict_root();
+    std::fs::write(dir.join("retained.json"), br#"{"exitCode":0}"#).unwrap();
+    std::fs::write(dir.join("orphan.pid"), DEAD_PID.to_string()).unwrap();
+    std::fs::write(dir.join("ignored.tmp.bad.json"), b"not json").unwrap();
+    let socket = dir.join("socket.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let options = registry::ListOptions::default();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(inventory.complete);
+    assert!(inventory.errors.is_empty());
+    assert_eq!(inventory.root, dir);
+    assert_eq!(
+        inventory.entries,
+        registry::list_sessions_in(&dir, &options)
+    );
+    assert_eq!(
+        inventory
+            .entries
+            .iter()
+            .map(|s| (s.name.as_str(), s.status))
+            .collect::<Vec<_>>(),
+        vec![
+            ("retained", SessionStatus::Exited),
+            ("socket", SessionStatus::Running)
+        ]
+    );
+    drop(listener);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_missing_root_is_incomplete_without_creating_it() {
+    let dir = root().join(unique_name("missing"));
+    let options = registry::ListOptions::default();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert!(inventory.entries.is_empty());
+    assert_eq!(
+        inventory.errors[0].kind,
+        registry::InventoryErrorKind::RootMissing
+    );
+    assert_eq!(inventory.errors[0].path, dir);
+    assert!(!dir.exists());
+    assert!(registry::list_sessions_in(&dir, &options).is_empty());
+}
+
+#[test]
+fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records() {
+    use registry::InventoryErrorKind::{MetadataMalformed, PidMalformed};
+    let dir = strict_root();
+    std::fs::write(dir.join("good.json"), b"{}").unwrap();
+    for (name, content) in [
+        ("broken", "{"),
+        ("array", "[]"),
+        ("wrongtype", r#"{"command":42}"#),
+    ] {
+        std::fs::write(dir.join(format!("{name}.json")), content).unwrap();
+    }
+    for (name, content) in [
+        ("empty", ""),
+        ("zero", "0"),
+        ("negative", "-1"),
+        ("overflow", "2147483648"),
+        ("junk", "42junk"),
+    ] {
+        std::fs::write(dir.join(format!("{name}.pid")), content).unwrap();
+    }
+    // A legacy suffix remains valid for classification, but not strict evidence.
+    std::fs::write(dir.join("legacy.json"), b"{}").unwrap();
+    std::fs::write(
+        dir.join("legacy.pid"),
+        format!("{}junk", std::process::id()),
+    )
+    .unwrap();
+    let options = registry::ListOptions::default();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert_eq!(
+        inventory.entries,
+        registry::list_sessions_in(&dir, &options)
+    );
+    assert_eq!(
+        inventory
+            .entries
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["good", "legacy"]
+    );
+    assert_eq!(inventory.entries[1].status, SessionStatus::Running);
+    let actual: Vec<_> = inventory
+        .errors
+        .iter()
+        .map(|error| {
+            (
+                error.path.file_name().unwrap().to_str().unwrap(),
+                error.kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            ("array.json", MetadataMalformed),
+            ("broken.json", MetadataMalformed),
+            ("empty.pid", PidMalformed),
+            ("junk.pid", PidMalformed),
+            ("legacy.pid", PidMalformed),
+            ("negative.pid", PidMalformed),
+            ("overflow.pid", PidMalformed),
+            ("wrongtype.json", MetadataMalformed),
+            ("zero.pid", PidMalformed),
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_reports_unreadable_companions_and_non_utf8_entries() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = strict_root();
+    std::fs::create_dir(dir.join("bad.json")).unwrap();
+    std::fs::create_dir(dir.join("orphan.pid")).unwrap();
+    let non_utf8 = dir.join(std::ffi::OsString::from_vec(b"bad-\xff.json".to_vec()));
+    std::fs::write(&non_utf8, b"{}").unwrap();
+    let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+    assert!(!inventory.complete);
+    assert!(inventory.entries.is_empty());
+    for (path, kind) in [
+        (non_utf8, registry::InventoryErrorKind::EntryUnreadable),
+        (
+            dir.join("bad.json"),
+            registry::InventoryErrorKind::MetadataUnreadable,
+        ),
+        (
+            dir.join("orphan.pid"),
+            registry::InventoryErrorKind::PidUnreadable,
+        ),
+    ] {
+        assert!(
+            inventory
+                .errors
+                .iter()
+                .any(|error| error.path == path && error.kind == kind)
+        );
+    }
+    let encoded = serde_json::to_value(&inventory.errors).unwrap();
+    assert!(
+        encoded
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error["kind"] == "entry-unreadable")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_reports_permission_denied_root_and_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root bypasses mode bits, so EACCES cannot be proved under that uid.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = strict_root();
+    let options = registry::ListOptions::default();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!inventory.complete);
+    assert_eq!(
+        inventory.errors[0].kind,
+        registry::InventoryErrorKind::RootUnreadable
+    );
+    for file in ["bad.json", "orphan.pid"] {
+        let path = dir.join(file);
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0)).unwrap();
+    }
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert_eq!(
+        inventory
+            .errors
+            .iter()
+            .map(|error| error.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            registry::InventoryErrorKind::MetadataUnreadable,
+            registry::InventoryErrorKind::PidUnreadable
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_timeout_is_incomplete_but_refused_socket_is_complete() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let dir = strict_root();
+    let busy = dir.join("busy.sock");
+    let listener = UnixListener::bind(&busy).unwrap();
+    // Linux admits one connection with backlog zero. Hold it without accepting
+    // so the scanner's nonblocking connect gets EAGAIN until its deadline.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let queued = UnixStream::connect(&busy).unwrap();
+    std::fs::write(dir.join("busy.pid"), DEAD_PID.to_string()).unwrap();
+    let options = registry::ListOptions {
+        socket_probe_budget: Duration::ZERO,
+    };
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!inventory.complete);
+    assert_eq!(
+        inventory.errors[0].kind,
+        registry::InventoryErrorKind::ProbeTimeout
+    );
+    assert_eq!(inventory.errors[0].path, busy);
+    assert!(inventory.entries.is_empty());
+    drop(queued);
+    drop(listener);
+    let inventory = registry::list_sessions_strict_in(&dir, &options);
+    assert!(inventory.complete);
+    assert!(inventory.errors.is_empty());
+    assert!(inventory.entries.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}

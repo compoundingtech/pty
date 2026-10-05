@@ -125,6 +125,7 @@ fn relay_peers() -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 pub struct ListOptions {
     pub json: bool,
+    pub strict: bool,
     pub show_tags: bool,
     pub remote: bool,
     pub remote_peer: Option<String>,
@@ -211,6 +212,7 @@ pub fn run(args: &[String]) -> CliResult {
         .map(|(_, a)| a.as_str())
         .collect();
     opts.json = remaining.contains(&"--json");
+    opts.strict = remaining.contains(&"--strict");
     opts.show_tags = remaining.contains(&"--tags");
     opts.summary = remaining.contains(&"--summary");
     opts.clients = remaining.contains(&"--clients");
@@ -240,7 +242,10 @@ fn created_at(s: &SessionInfo) -> Option<&str> {
 
 /// The filtered, sorted sessions.
 fn select(opts: &ListOptions) -> Vec<SessionInfo> {
-    let mut sessions = registry::list_sessions();
+    select_sessions(registry::list_sessions(), opts)
+}
+
+fn select_sessions(mut sessions: Vec<SessionInfo>, opts: &ListOptions) -> Vec<SessionInfo> {
     if !opts.filter_tags.is_empty() {
         sessions.retain(|s| {
             matches_all_tags(
@@ -389,7 +394,8 @@ fn session_json(s: &SessionInfo, clients: Option<&ClientSet>) -> Value {
     );
     m.insert(
         "cwd".into(),
-        meta.map(|m| Value::from(m.cwd.as_str())).unwrap_or(Value::Null),
+        meta.map(|m| Value::from(m.cwd.as_str()))
+            .unwrap_or(Value::Null),
     );
     m.insert(
         "createdAt".into(),
@@ -464,10 +470,7 @@ fn remote_host_json(h: &RemoteHost) -> Value {
     );
     m.insert(
         "error".into(),
-        h.error
-            .as_deref()
-            .map(Value::from)
-            .unwrap_or(Value::Null),
+        h.error.as_deref().map(Value::from).unwrap_or(Value::Null),
     );
     Value::Object(m)
 }
@@ -476,7 +479,27 @@ fn remote_host_json(h: &RemoteHost) -> Value {
 ///
 /// node: src/cli.ts:2165-2446
 pub fn cmd_list(opts: &ListOptions) -> CliResult {
-    let sessions = select(opts);
+    if opts.strict && !opts.json {
+        return Err(CliError("--strict requires --json".to_string()));
+    }
+    if opts.strict && (opts.summary || opts.remote || opts.remote_peer.is_some()) {
+        return Err(CliError(
+            "--strict is incompatible with --summary and --remote".to_string(),
+        ));
+    }
+    let inventory = opts.strict.then(|| {
+        registry::list_sessions_strict_in(
+            &registry::session_dir(),
+            &registry::ListOptions::default(),
+        )
+    });
+    let (inventory, sessions) = match inventory {
+        Some(mut inventory) => {
+            let sessions = select_sessions(std::mem::take(&mut inventory.entries), opts);
+            (Some(inventory), sessions)
+        }
+        None => (None, select(opts)),
+    };
     let remote_hosts = if opts.remote_peer.is_some() || opts.remote {
         remote_list_hosts(opts.remote_peer.as_deref())
     } else {
@@ -516,6 +539,17 @@ pub fn cmd_list(opts: &ListOptions) -> CliResult {
                 .map(|(i, s)| session_json(s, clients.get(i)))
                 .collect(),
         );
+        if let Some(inventory) = inventory {
+            let complete = inventory.complete;
+            let envelope = serde_json::json!({
+                "root": inventory.root.to_string_lossy(),
+                "complete": complete,
+                "entries": local,
+                "errors": inventory.errors,
+            });
+            println!("{envelope}");
+            return Ok(if complete { 0 } else { 3 });
+        }
         if opts.remote && !remote_hosts.is_empty() {
             let mut m = Map::new();
             m.insert("local".into(), local);
@@ -656,7 +690,11 @@ pub fn cmd_list(opts: &ListOptions) -> CliResult {
             println!("\x1b[1m{}\x1b[0m \x1b[31m(error: {err})\x1b[0m", host.label);
             continue;
         }
-        println!("\x1b[1m{}\x1b[0m ({} sessions):", host.label, host.sessions.len());
+        println!(
+            "\x1b[1m{}\x1b[0m ({} sessions):",
+            host.label,
+            host.sessions.len()
+        );
         let mut sorted: Vec<&RemoteSession> = host.sessions.iter().collect();
         sorted.sort_by(|a, b| {
             let ka = a.display_name.as_deref().unwrap_or(&a.name);
@@ -738,11 +776,18 @@ mod tests {
             serde_json::json!([])
         );
         let unknown = session_json(&running, Some(&ClientSet::Unknown));
-        assert!(unknown.get("clients").is_some_and(Value::is_null), "{unknown}");
+        assert!(
+            unknown.get("clients").is_some_and(Value::is_null),
+            "{unknown}"
+        );
         // Not requested: no key, exactly as without --clients.
         assert!(session_json(&running, None).get("clients").is_none());
         for status in [SessionStatus::Exited, SessionStatus::Vanished] {
-            assert!(session_json(&session(status), Some(&known)).get("clients").is_none());
+            assert!(
+                session_json(&session(status), Some(&known))
+                    .get("clients")
+                    .is_none()
+            );
         }
     }
 }

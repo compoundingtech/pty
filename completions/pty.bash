@@ -61,7 +61,7 @@ _pty() {
       fi
       ;;
     list|ls)
-      COMPREPLY=($(compgen -W "--json --clients --tags --filter-tag --remote --status --older-than --newer-than --summary" -- "${cur}"))
+      COMPREPLY=($(compgen -W "--json --strict --clients --tags --filter-tag --remote --status --older-than --newer-than --summary" -- "${cur}"))
       ;;
     stats)
       if [[ "${cur}" == -* ]]; then

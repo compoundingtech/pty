@@ -54,6 +54,8 @@ Observe:
   pty stats --json                        Emit stats as JSON (one snapshot)
   pty list                                List sessions (text; alias: pty ls)
   pty list --json                         List sessions as JSON
+  pty list --json --strict                Per-root inventory envelope; exit 3 if incomplete
+                                          (incompatible with --summary and --remote)
   pty list --tags                         Include internal bookkeeping tags (ptyfile*, strategy.*)
   pty list --filter-tag key=value         Filter to sessions with the tag (repeatable, ALL must match)
   pty list --remote <peer>                List a fabric peer's sessions (over fabric)
