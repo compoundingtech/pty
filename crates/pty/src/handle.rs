@@ -40,6 +40,21 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttemptId(pub u64);
 
+/// How [`TerminalHandle::wait_ready_outcome`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadyOutcome {
+    /// The first SCREEN of the current attempt was parsed (or the session
+    /// reported EXIT); a spawned child is ready at once.
+    Ready,
+    /// The handle was closed or killed before it was ready.
+    Closed,
+    /// The current attempt's stream went away before it was ready, and no
+    /// reconnect is in flight.
+    Disconnected,
+    /// Neither happened within the timeout.
+    TimedOut,
+}
+
 /// A session daemon to attach to: `<root>/<id>.sock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
@@ -233,6 +248,9 @@ struct State {
     rev: u64,
     ready: bool,
     connected: bool,
+    /// A reconnect is between dropping the old stream and attaching the new
+    /// one; `connected` is false but the attempt can still become ready.
+    connecting: bool,
     closed: bool,
     exit_code: Option<i32>,
     attempt: u64,
@@ -521,16 +539,18 @@ impl Core {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.ready = false;
             st.connected = false;
+            st.connecting = true;
             st.exit_code = None;
             st.attempt = self.attempt.0;
         }
-        let new_stream = connect_and_attach(connector.as_ref(), opts, self.attempt, tx.clone())?;
-        *stream = Some(new_stream);
+        let attached = connect_and_attach(connector.as_ref(), opts, self.attempt, tx.clone());
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.connected = true;
+            st.connecting = false;
+            st.connected = attached.is_ok();
         }
         self.shared.cv.notify_all();
+        *stream = Some(attached?);
         self.shared.emit(HandleEvent::Connected(self.attempt));
         Ok(())
     }
@@ -974,9 +994,30 @@ impl TerminalHandle {
 
     /// Block until the handle is ready: a spawned child immediately; an
     /// attach once the first SCREEN of the current attempt has been parsed
-    /// (or the session reported EXIT). Returns false on timeout or close.
+    /// (or the session reported EXIT). Returns false on timeout, close or
+    /// disconnect; [`TerminalHandle::wait_ready_outcome`] says which.
     pub fn wait_ready(&self, timeout: Duration) -> bool {
-        self.wait_state(timeout, |st| st.ready) && !self.state(|st| st.closed)
+        self.wait_ready_outcome(timeout) == ReadyOutcome::Ready
+    }
+
+    /// [`TerminalHandle::wait_ready`], telling a close or a lost stream
+    /// apart from a timeout. Neither can produce a SCREEN any more, so both
+    /// return as soon as they happen instead of sleeping out `timeout`.
+    pub fn wait_ready_outcome(&self, timeout: Duration) -> ReadyOutcome {
+        let mut outcome = ReadyOutcome::TimedOut;
+        self.wait_state(timeout, |st| {
+            outcome = if st.closed {
+                ReadyOutcome::Closed
+            } else if st.ready {
+                ReadyOutcome::Ready
+            } else if !st.connected && !st.connecting {
+                ReadyOutcome::Disconnected
+            } else {
+                return false;
+            };
+            true
+        });
+        outcome
     }
 
     /// Whether the first SCREEN of the current attempt has been parsed.
