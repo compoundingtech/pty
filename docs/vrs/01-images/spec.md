@@ -39,7 +39,7 @@ Requirements `PTY.IMG-R01` through `PTY.IMG-R10` are in
 | PNG normalization | `crates/pty-terminal/src/graphics.rs` — `PngDecoder`, `expand`, `install_png_decoder`, `MAX_DECODED_PNG_BYTES` (64 MiB) |
 | Cell metric wire | `crates/pty-core/src/protocol.rs` — `encode_attach_with_cell`, `encode_resize_with_cell`, `decode_cell` |
 | Client and daemon adoption | `crates/pty/src/daemon/clients.rs` — `adopt_cell_size`; `crates/pty/src/daemon/lifecycle.rs` — `terminal_actor` |
-| Embedding surface | `crates/pty/src/handle.rs` — `TerminalHandle::graphics`, `image_bytes`, `set_cell_size`, `graphics_generation`, `HandleEvent::Graphics` |
+| Embedding surface | `crates/pty/src/handle.rs` — `TerminalHandle::frame`, `observe_frames`, `request_frame`, `graphics`, `image_bytes`, `set_cell_size`, `graphics_generation`, `Frame::image_bytes`, `HandleEvent::Graphics` |
 
 ## Admission and bound
 
@@ -70,8 +70,11 @@ child never transmits holds nothing.
 
 `TerminalActor::graphics_state(scroll_offset)` (and
 `TerminalHandle::graphics(scroll_offset)`) answers for the same window
-`snapshot(scroll_offset)` reads, so a grid and a graphics state taken with one
-offset line up cell for cell (`PTY.IMG-R03`). A cursor-positioned placement is
+`snapshot(scroll_offset)` reads (`PTY.IMG-R03`). Independent handle reads can
+observe different actor updates: use an observed `TerminalHandle::frame()`
+for the live viewport, or `request_frame(scroll_offset)` for history, to keep
+cells, modes, placements and owned pixels from one consistent update.
+A cursor-positioned placement is
 located by its own screen-space rectangle, which answers for any window and
 reports a negative origin row when its top has scrolled above the active area.
 A virtual placement has no position of its own, so `scan_placeholders` decodes
@@ -84,8 +87,13 @@ Source rectangles are resolved on read and on replay: the protocol's `w=`/`h=`
 default of "the whole dimension" is expanded and then clamped to the image, so
 a crop is a concrete rectangle everywhere it is reported (`PTY.IMG-R04`).
 
-`image_bytes(id)` copies the pixels once, on request, keyed by
-`ImageDesc::generation`.
+The explicit actor and handle `image_bytes(id)` APIs copy pixels on request,
+keyed by `ImageDesc::generation`. An immutable `Frame` captures pixels for
+placed images alongside its grid and graphics state. Later frames reuse
+the same `Arc<ImageBytes>` when the full image description, including its
+generation, is unchanged. Held frames keep their exact pixels alive after
+replacement (including same-size replacement) or deletion. A frame's
+`image_bytes(id)` never fetches a newer actor generation.
 
 ## Replay wire form
 
@@ -200,6 +208,14 @@ Test names are function names in the files given. `graphics.rs` is under
 | `PTY.IMG-R08` | `actor.rs` (`enable_graphics`), `graphics.rs` (`GraphicsOptions`) | None. Enforced by leaving the file, temporary-file, and shared-memory media disabled; backed by [decision 0012](../../decisions/0012-kitty-graphics-replay.md) only. A regression here would not fail the suite. |
 | `PTY.IMG-R09` | `graphics.rs` (`PngDecoder`, `expand`, `MAX_DECODED_PNG_BYTES`) | `graphics.rs::a_grayscale_png_is_stored_as_rgba`, `raising_the_storage_limit_keeps_the_cell_size_and_decodes_png`, `handle.rs::a_late_attach_gets_the_image_the_child_drew_before_it_connected` |
 | `PTY.IMG-R10` | `graphics.rs` (`generation`), `handle.rs` (`HandleEvent::Graphics`) | `handle.rs::a_spawned_child_that_draws_an_image_is_queryable_through_the_handle`, `graphics.rs::a_delete_from_the_child_drops_the_placement_and_the_bytes`, `scrolling_moves_the_placement_and_scrollback_still_finds_it`, `a_resize_keeps_the_image_and_reprojects_it` |
+
+`crates/pty/tests/handle_frame.rs` additionally covers immutable embedding
+frames: `held_image_generations_survive_replacement_and_deletion_and_reuse_unchanged_pixels`
+checks retained and reused pixel generations, including same-size replacement;
+`explicit_history_frame_aligns_grid_graphics_modes_and_image_generations`
+checks consistent history windows; and
+`observed_frame_advances_while_output_is_backlogged_before_the_tail` checks
+publication progress while the actor input remains backlogged.
 
 Run the whole map with `cargo test -p pty-terminal -p pty-core` and
 `cargo test -p pty --test handle`; the image
