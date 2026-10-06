@@ -240,6 +240,47 @@ fn strict_fifo_companions_return_an_incomplete_envelope_without_blocking() {
     }
 }
 
+#[test]
+fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let rig = Rig::new();
+    struct FifoCleanup(std::path::PathBuf);
+    impl Drop for FifoCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    std::fs::write(rig.path("bad.json"), "{").unwrap();
+    let _cleanup = FifoCleanup(rig.path("bad.pid"));
+    let path = std::ffi::CString::new(rig.path("bad.pid").as_os_str().as_bytes()).unwrap();
+    // SAFETY: the path is a valid NUL-terminated string.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    for args in [vec!["list"], vec!["list", "--json"]] {
+        let mut child = rig.cmd(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("ordinary list blocked on an orphan PID FIFO");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        if args.contains(&"--json") {
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(), json!([]));
+        }
+    }
+}
+
 /// node: tests/list-filters.test.ts:119-159, 193-210
 #[test]
 fn json_status_and_key_order() {

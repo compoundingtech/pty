@@ -273,6 +273,9 @@ reports a retained entry as `exited` when exit evidence is recorded, otherwise
 complete inventory and 3 for an incomplete one; stdout still contains the
 envelope. `--strict` requires `--json` and cannot be combined with `--summary` or
 `--remote`. Ordinary listings keep their existing bytes and best-effort behavior.
+An ordinary listing skips invalid metadata-only records before reading their
+PID companions; strict inventory instead validates those companions and reports
+special files as unreadable without blocking.
 
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.

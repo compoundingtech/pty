@@ -679,6 +679,15 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
             &root.join(&metadata_name),
             entries.binary_search(&metadata_name).is_ok(),
         );
+        // Ordinary listing skips invalid metadata-only records before touching
+        // their PID companion, which may be a blocking special file.
+        if !strict
+            && metadata.is_none()
+            && entries.binary_search(&format!("{name}.sock")).is_err()
+        {
+            records.insert(name, (None, None));
+            continue;
+        }
         let pid = scanner
             .pid(
                 &root.join(&pid_name),
