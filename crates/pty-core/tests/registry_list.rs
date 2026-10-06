@@ -680,12 +680,21 @@ fn strict_reports_unreadable_companions_and_non_utf8_entries() {
     std::fs::create_dir(dir.join("bad.json")).unwrap();
     std::fs::create_dir(dir.join("orphan.pid")).unwrap();
     let non_utf8 = dir.join(std::ffi::OsString::from_vec(b"bad-\xff.json".to_vec()));
-    std::fs::write(&non_utf8, b"{}").unwrap();
+    let has_non_utf8_entry = match std::fs::write(&non_utf8, b"{}") {
+        Ok(()) => true,
+        // APFS requires Unicode-normalizable names and rejects this fixture with EILSEQ.
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!(
+                "skipping non-UTF-8 entry sub-case: filesystem cannot represent non-UTF-8 names ({error})"
+            );
+            false
+        }
+        Err(error) => panic!("creating non-UTF-8 fixture: {error}"),
+    };
     let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
     assert!(!inventory.complete);
     assert!(inventory.entries.is_empty());
     for (path, kind) in [
-        (non_utf8, registry::InventoryErrorKind::EntryUnreadable),
         (
             dir.join("bad.json"),
             registry::InventoryErrorKind::MetadataUnreadable,
@@ -702,14 +711,19 @@ fn strict_reports_unreadable_companions_and_non_utf8_entries() {
                 .any(|error| error.path == path && error.kind == kind)
         );
     }
-    let encoded = serde_json::to_value(&inventory.errors).unwrap();
-    assert!(
-        encoded
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|error| error["kind"] == "entry-unreadable")
-    );
+    if has_non_utf8_entry {
+        assert!(inventory.errors.iter().any(|error| {
+            error.path == non_utf8 && error.kind == registry::InventoryErrorKind::EntryUnreadable
+        }));
+        let encoded = serde_json::to_value(&inventory.errors).unwrap();
+        assert!(
+            encoded
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error["kind"] == "entry-unreadable")
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
