@@ -63,6 +63,17 @@ scrollback access, and activity or exit events. `libghostty::Terminal` is not
 `Send`, so one clear actor must own it and publish typed events or snapshots to
 consumers.
 
+Rust renderers can use `TerminalHandle::subscribe()`, then retain an
+`observe_frames()` lease and read `frame()` on `HandleEvent::Dirty`. Each
+immutable `Arc<Frame>` contains one consistent grid, mode state, graphics
+placement set and owned image generations; readers do not wait for the actor.
+Use `request_frame(0)` on a preparation worker for initial readiness, or a
+nonzero offset for an asynchronous history window. Without an observer, the
+last published frame can be stale; lifecycle subscribers do not incur capture
+cost. Publication coalesces queued updates and advances during sustained
+output at an inline 16 ms interval, not a hard realtime deadline. See
+[architecture.md](docs/architecture.md) for ownership and publication details.
+
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
 the required behavior. Track the compatibility matrix, crate boundaries, and
