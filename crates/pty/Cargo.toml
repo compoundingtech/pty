@@ -13,6 +13,7 @@ name = "pty"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap.workspace = true
 pty-spawn = { path = "../pty-spawn" }
 libc.workspace = true
 libghostty-vt.workspace = true

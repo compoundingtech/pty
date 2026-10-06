@@ -12,6 +12,7 @@ repository = "https://github.com/compoundingtech/pty-rust"
 [workspace.dependencies]
 # External crates, pinned to the versions in Cargo.lock.
 libc = "0.2.186"
+arc-swap = "1.9.2"
 #
 # Both libghostty crates are pinned EXACTLY. A release's libghostty-vt archive
 # is built from the Ghostty commit this libghostty-vt-sys version pins, and
