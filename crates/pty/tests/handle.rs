@@ -417,6 +417,63 @@ fn wait_ready_returns_when_the_daemon_hangs_up_before_the_first_screen() {
     assert!(!h.is_ready());
 }
 
+/// A reconnect in flight is not a disconnect: its new attempt can still
+/// become ready. Once that reconnect fails, the waiter learns it at once.
+#[test]
+fn wait_ready_holds_through_a_reconnect_and_returns_when_it_fails() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc, Arc};
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let calls = AtomicUsize::new(0);
+    let h = Arc::new(TerminalHandle::attach_with_connector(
+        move || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return client.try_clone();
+            }
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            Err(std::io::Error::other("daemon is gone"))
+        },
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector"));
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+
+    let reconnect = {
+        let h = h.clone();
+        std::thread::spawn(move || h.reconnect())
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).expect("reconnect reached the connector");
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let waiter = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+            outcome_tx.send((outcome, Instant::now())).unwrap();
+        })
+    };
+    assert!(
+        outcome_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a reconnect in flight must not end the wait"
+    );
+
+    let failed_at = Instant::now();
+    release_tx.send(()).unwrap();
+    assert!(reconnect.join().unwrap().is_err());
+    let (outcome, returned_at) = outcome_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a failed reconnect wakes the waiter");
+    waiter.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Disconnected);
+    assert!(returned_at >= failed_at);
+}
+
 /// node-daemon-protocol-disk.md §1.12 / conformance fixture "attach identity
 /// with a replacement under the same id": `--id a`, exit, `--id a` again — a
 /// reconnect reaches the replacement, and nothing from the old daemon (its
