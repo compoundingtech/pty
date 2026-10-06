@@ -519,8 +519,7 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
     let dir = strict_root();
     let live = UnixListener::bind(dir.join("live.sock")).unwrap();
     for name in ["dead-pid", "recorded-exit"] {
-        let listener = UnixListener::bind(dir.join(format!("{name}.sock"))).unwrap();
-        drop(listener);
+        stale_socket(&dir.join(format!("{name}.sock")));
     }
     std::fs::write(dir.join("dead-pid.pid"), DEAD_PID.to_string()).unwrap();
     std::fs::write(
@@ -567,7 +566,7 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
 fn strict_refused_socket_without_dead_pid_is_incomplete() {
     let dir = strict_root();
     let socket = dir.join("unknown.sock");
-    drop(UnixListener::bind(&socket).unwrap());
+    stale_socket(&socket);
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
