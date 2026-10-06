@@ -27,6 +27,7 @@ pub const TERMINAL_SANITIZE: &str = concat!(
     "\x1b>",       // reset application keypad mode (DECKPNM)
     "\x1b(B",      // reset G0 charset to ASCII
     "\x1b[<99u",   // pop all Kitty keyboard protocol levels
+    "\x1b[>4m",    // reset xterm modifyOtherKeys, which vim and Claude Code set
 );
 
 /// Move the cursor to the bottom of the visible screen so status messages

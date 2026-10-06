@@ -199,6 +199,16 @@ impl Daemon {
             MessageType::Resize => self.on_resize(id, &packet.payload),
             MessageType::Detach => self.on_detach(id),
             MessageType::Status => self.on_status(id, &packet.payload),
+            MessageType::ResetInputModes
+                if packet.payload.is_empty()
+                    && self
+                        .clients
+                        .get(&id)
+                        .is_some_and(|client| client.role == Role::Writable) =>
+            {
+                let output = self.actor.reset_input_modes();
+                self.broadcast(&pty_core::protocol::encode_data(&output));
+            }
             MessageType::AcceptedSocketOwnership => {
                 self.on_accepted_socket_ownership(id, &packet.payload);
             }
@@ -502,7 +512,14 @@ impl Daemon {
 
     /// Node's `beginInitialScreenCut` callback: SCREEN from the live
     /// terminal, then live, then EXIT when the child is already gone, then
-    /// the redraw nudge for an attacher whose size differed.
+    /// the redraw nudge for an attacher whose size differed and whose cut
+    /// came before the child had the redraw settle to answer the last resize.
+    ///
+    /// The nudge is skipped when the child already had that time (the
+    /// attach's own resize waited it out, so its redraw is in the SCREEN) and
+    /// when min-wins left the size unchanged (the child was never resized and
+    /// the terminal's screen is already current): a resizing attach then
+    /// costs the child exactly one SIGWINCH.
     ///
     /// node: src/server.ts:1213-1252
     pub(crate) fn cut(&mut self, id: u64) {
@@ -539,6 +556,7 @@ impl Daemon {
         if let CutKind::Attach { size_matched } = kind
             && !self.exited
             && !size_matched
+            && self.last_resize.is_some_and(|at| at.elapsed() < self.settle)
         {
             self.nudge_redraw();
         }

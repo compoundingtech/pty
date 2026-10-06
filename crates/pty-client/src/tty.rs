@@ -330,22 +330,31 @@ impl Drop for SigwinchPipe {
     }
 }
 
-/// Replace Kitty keyboard encodings of Ctrl+\ with the legacy byte. Caps Lock
-/// and Num Lock add their modifier bits even though they do not change the key.
+/// Replace the escape-sequence encodings of Ctrl+\ with the legacy byte.
+///
+/// The program in the session picks the encoding, because the attached
+/// terminal sees its keyboard-mode requests. Kitty keyboard flags give
+/// `CSI 92 ; 5 u`. Caps Lock and Num Lock add their modifier bits even though
+/// they do not change the key. xterm's modifyOtherKeys level 2
+/// (`CSI > 4 ; 2 m`) gives `CSI 27 ; 5 ; 92 ~` in xterm and iTerm2. iTerm2
+/// also drops any kitty flags when that request arrives. Claude Code sends
+/// kitty flags and then modifyOtherKeys 2, so in iTerm2 its sessions only
+/// ever send this form. Ghostty keeps sending 0x1c in that mode.
 pub fn normalize_detach_key(data: &[u8]) -> Vec<u8> {
-    const KITTY: [&[u8]; 4] = [
+    const ENCODINGS: [&[u8]; 5] = [
         b"\x1b[92;5u",
         b"\x1b[92;69u",
         b"\x1b[92;133u",
         b"\x1b[92;197u",
+        b"\x1b[27;5;92~",
     ];
-    if !KITTY.iter().any(|seq| data.windows(seq.len()).any(|w| w == *seq)) {
+    if !ENCODINGS.iter().any(|seq| data.windows(seq.len()).any(|w| w == *seq)) {
         return data.to_vec();
     }
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if let Some(seq) = KITTY.iter().find(|seq| data[i..].starts_with(**seq)) {
+        if let Some(seq) = ENCODINGS.iter().find(|seq| data[i..].starts_with(**seq)) {
             out.push(DETACH_KEY);
             i += seq.len();
         } else {
