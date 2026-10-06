@@ -355,6 +355,125 @@ fn readonly_connector_peeks_and_prohibits_input_and_resize() {
     assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Detach);
 }
 
+/// A readiness wait ends when the handle can no longer become ready: a
+/// caller that supersedes a pending PEEK by closing it must not leave a
+/// waiter sleeping out the whole timeout for a SCREEN that will never be
+/// parsed.
+#[test]
+fn wait_ready_returns_when_the_handle_closes_before_the_first_screen() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let h = Arc::new(TerminalHandle::attach_with_connector(
+        move || client.try_clone(),
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector"));
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+    // The daemon never answers; the caller gives up on this PEEK at 100 ms.
+    let closer = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            h.close();
+        })
+    };
+    let started = Instant::now();
+    let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+    let waited = started.elapsed();
+    closer.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Closed);
+    assert!(waited < Duration::from_secs(2), "waited {waited:?} after close");
+    assert!(!h.wait_ready(Duration::from_secs(10)), "a closed handle is never ready");
+    assert_eq!(h.wait_ready_outcome(Duration::from_secs(10)), ReadyOutcome::Closed);
+}
+
+#[test]
+fn wait_ready_returns_when_the_daemon_hangs_up_before_the_first_screen() {
+    use std::os::unix::net::UnixStream;
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let h = TerminalHandle::attach_with_connector(
+        move || client.try_clone(),
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector");
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+    let hangup = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(daemon);
+    });
+    let started = Instant::now();
+    let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+    let waited = started.elapsed();
+    hangup.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Disconnected);
+    assert!(waited < Duration::from_secs(2), "waited {waited:?} after hang-up");
+    assert!(!h.is_ready());
+}
+
+/// A reconnect in flight is not a disconnect: its new attempt can still
+/// become ready. Once that reconnect fails, the waiter learns it at once.
+#[test]
+fn wait_ready_holds_through_a_reconnect_and_returns_when_it_fails() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc, Arc};
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let calls = AtomicUsize::new(0);
+    let h = Arc::new(TerminalHandle::attach_with_connector(
+        move || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return client.try_clone();
+            }
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            Err(std::io::Error::other("daemon is gone"))
+        },
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector"));
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+
+    let reconnect = {
+        let h = h.clone();
+        std::thread::spawn(move || h.reconnect())
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).expect("reconnect reached the connector");
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let waiter = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+            outcome_tx.send((outcome, Instant::now())).unwrap();
+        })
+    };
+    assert!(
+        outcome_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a reconnect in flight must not end the wait"
+    );
+
+    let failed_at = Instant::now();
+    release_tx.send(()).unwrap();
+    assert!(reconnect.join().unwrap().is_err());
+    let (outcome, returned_at) = outcome_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a failed reconnect wakes the waiter");
+    waiter.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Disconnected);
+    assert!(returned_at >= failed_at);
+}
+
 /// node-daemon-protocol-disk.md §1.12 / conformance fixture "attach identity
 /// with a replacement under the same id": `--id a`, exit, `--id a` again — a
 /// reconnect reaches the replacement, and nothing from the old daemon (its

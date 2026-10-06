@@ -18,6 +18,6 @@
 pub mod handle;
 
 pub use handle::{
-    AttachOptions, AttemptId, Frame, FrameObserver, HandleEvent, SessionRef, SpawnOptions,
-    TerminalHandle,
+    AttachOptions, AttemptId, Frame, FrameObserver, HandleEvent, ReadyOutcome, SessionRef,
+    SpawnOptions, TerminalHandle,
 };
