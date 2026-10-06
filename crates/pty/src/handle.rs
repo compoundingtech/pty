@@ -1554,3 +1554,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&initial, &frame));
     }
 }
+
+#[cfg(test)]
+#[path = "frame_bench.rs"]
+mod frame_bench;
