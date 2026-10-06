@@ -43,10 +43,11 @@ pub use evidence::{
     get_session_exit_evidence, remove_session_generation,
 };
 pub use list::{
-    DEFAULT_SOCKET_PROBE_BUDGET, ListOptions, SessionInfo, SessionStatus, all_session_names,
-    ambiguous_reference_message, get_session, get_session_by_name, has_process_exited_for_reap,
-    list_sessions, list_sessions_in, list_sessions_with, pid_alive, probe_sockets_within_budget,
-    read_pid, read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
+    DEFAULT_SOCKET_PROBE_BUDGET, Inventory, InventoryError, InventoryErrorKind, ListOptions,
+    SessionInfo, SessionStatus, all_session_names, ambiguous_reference_message, get_session,
+    get_session_by_name, has_process_exited_for_reap, list_sessions, list_sessions_in,
+    list_sessions_strict_in, list_sessions_with, pid_alive, probe_sockets_within_budget, read_pid,
+    read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
     resolve_ref, session_exists, socket_reachable, wait_for_process_exit,
 };
 pub use lock::{

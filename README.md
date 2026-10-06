@@ -253,6 +253,41 @@ registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
+`pty list --json --strict` reports one registry as
+`{"root":"…","complete":true,"entries":[…],"errors":[]}`. The root is resolved
+through global `--root`, `PTY_ROOT`, or the default above and returned verbatim:
+there is no canonicalization, and path aliases (including symlinks) are not
+folded into one registry identity. Entries preserve ordinary `--json` row fields,
+ordering, tags, and tag/status/age filters (including optional `--clients`).
+Strict entries additionally expose recorded `generation` and `daemonStartToken`
+when present; a token recorded in `recovery.processStartToken` is exposed
+explicitly as `processStartToken`, not relabeled as `daemonStartToken`. Absent
+identity fields remain absent. All retained metadata records are included,
+including Starting, Ready, and Terminal lifecycle tags, subject only to the
+selected filters; lifecycle state is not itself a visibility filter. The
+entire root is scanned before filtering: `complete` describes the full scan,
+not just matching entries. Errors identify the affected `path`, a kebab-case
+`kind`, and optional `detail`. Kinds are `root-missing`, `root-unreadable`,
+`entry-unreadable`, `metadata-unreadable`, `metadata-malformed`, `pid-unreadable`,
+`pid-malformed`, and `probe-timeout`. Missing roots, unreadable or
+malformed existing registry files, and socket probes that cannot finish within
+the scan deadline make the inventory incomplete; absent optional files and
+definitively missing sockets do not. Connection refusal is ambiguous (a full
+accept queue can cause it on macOS): on every platform, it requires a positive
+dead PID, or recorded exit evidence plus a positive dead `daemonPid`, before
+being treated as ended. Otherwise it reports `entry-unreadable` and exit 3.
+Strict companion files are opened non-blocking and checked through the opened
+descriptor; FIFOs, devices, and other non-regular files report `pid-unreadable`
+or `metadata-unreadable` without waiting for a writer. A definitively dead socket
+reports a retained entry as `exited` when exit evidence is recorded, otherwise
+`vanished`, rather than defensively `running` or omitted. Exit status is 0 for a
+complete inventory and 3 for an incomplete one; stdout still contains the
+envelope. `--strict` requires `--json` and cannot be combined with `--summary` or
+`--remote`. Ordinary listings keep their existing bytes and best-effort behavior.
+An ordinary listing skips invalid metadata-only records before reading their
+PID companions; strict inventory instead validates those companions and reports
+special files as unreadable without blocking.
+
 `pty root --json` reports root resolution without creating directories, reading
 registry records, or contacting daemons:
 `{"effective":{"path":"/var/lib/pty","source":"PTY_ROOT"},"nativeDefault":{"path":"/home/example/.local/state/pty/h-<hostname-hash>"}}`.

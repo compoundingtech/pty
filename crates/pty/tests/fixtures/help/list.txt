@@ -1,4 +1,4 @@
-Usage: pty list [--json [--clients]] [--tags] [--filter-tag k=v] [--remote [<peer>]] [--status <s>] [--summary]
+Usage: pty list [--json [--clients] [--strict]] [--tags] [--filter-tag k=v] [--remote [<peer>]] [--status <s>] [--summary]
 
 List sessions (alias: pty ls). User tags show by default.
 
@@ -6,6 +6,8 @@ Flags:
   --json               Emit JSON
   --clients            With --json: add each running session's attached clients
                        (asks every daemon; ignored without --json)
+  --strict             With --json: emit a per-root inventory envelope; exit 3
+                       if incomplete (incompatible with --summary and --remote)
   --tags               Include internal bookkeeping tags (ptyfile*, strategy.*)
   --filter-tag k=v     Only sessions with the tag (repeatable, ALL must match)
   --remote <peer>      Also list a fabric peer's sessions (over fabric; the peer
@@ -16,7 +18,17 @@ Flags:
   --newer-than <dur>   Only sessions newer than a duration
   --summary            Print a one-line count summary instead of the list
 
+Strict inventory:
+  Root is resolved from --root, PTY_ROOT, or the default and returned verbatim:
+  no canonicalization; path aliases (including symlinks) are not folded.
+  Retained metadata and tags are included regardless of lifecycle, subject to
+  the selected filters. Recorded generation, daemonStartToken, and recovery
+  processStartToken are exposed when present; ordinary --json is unchanged.
+  Refused sockets without corroborating dead-PID evidence are incomplete
+  (entry-unreadable). Non-regular companions are unreadable, never waited on.
+
 Examples:
   pty list
   pty list --remote example-host
   pty list --filter-tag role=web --json
+  pty --root /var/lib/pty list --json --strict
