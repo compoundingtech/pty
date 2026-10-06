@@ -567,7 +567,7 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
 fn strict_refused_socket_without_dead_pid_is_incomplete() {
     let dir = strict_root();
     let socket = dir.join("unknown.sock");
-    drop(UnixListener::bind(&socket).unwrap());
+    stale_socket(&socket);
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
