@@ -23,6 +23,7 @@ _pty() {
     'events:Follow event log'
     'list:List sessions'
     'ls:Alias for list'
+    'root:Report effective and native default registry roots'
     'stats:Live CPU / memory / PIDs'
     'restart:SIGTERM + respawn'
     'kill:SIGTERM a running session'
@@ -126,6 +127,9 @@ _pty() {
             '--older-than[Only sessions older than a duration]' \
             '--newer-than[Only sessions newer than a duration]' \
             '--summary[One-line count summary instead of the list]'
+          ;;
+        root)
+          _arguments '--json[Emit root resolution as JSON]'
           ;;
         stats)
           _arguments \

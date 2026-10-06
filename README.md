@@ -63,6 +63,17 @@ scrollback access, and activity or exit events. `libghostty::Terminal` is not
 `Send`, so one clear actor must own it and publish typed events or snapshots to
 consumers.
 
+Rust renderers can use `TerminalHandle::subscribe()`, then retain an
+`observe_frames()` lease and read `frame()` on `HandleEvent::Dirty`. Each
+immutable `Arc<Frame>` contains one consistent grid, mode state, graphics
+placement set and owned image generations; readers do not wait for the actor.
+Use `request_frame(0)` on a preparation worker for initial readiness, or a
+nonzero offset for an asynchronous history window. Without an observer, the
+last published frame can be stale; lifecycle subscribers do not incur capture
+cost. Publication coalesces queued updates and advances during sustained
+output at an inline 16 ms interval, not a hard realtime deadline. See
+[architecture.md](docs/architecture.md) for ownership and publication details.
+
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
 the required behavior. Track the compatibility matrix, crate boundaries, and
@@ -276,6 +287,19 @@ envelope. `--strict` requires `--json` and cannot be combined with `--summary` o
 An ordinary listing skips invalid metadata-only records before reading their
 PID companions; strict inventory instead validates those companions and reports
 special files as unreadable without blocking.
+
+`pty root --json` reports root resolution without creating directories, reading
+registry records, or contacting daemons:
+`{"effective":{"path":"/var/lib/pty","source":"PTY_ROOT"},"nativeDefault":{"path":"/home/example/.local/state/pty/h-<hostname-hash>"}}`.
+The effective source is `flag` for global `--root`, otherwise `PTY_ROOT`,
+`PTY_SESSION_DIR`, or `default`, in that order (empty environment values are
+ignored). The native default always comes from `default_session_dir()` and
+does not inherit any registry override, even inside a managed `PTY_ROOT`.
+Paths are returned as resolved, with no canonicalization or alias folding.
+Plain `pty root` prints two labelled lines, `Effective` (including the source)
+and `Native default`. Existing legacy-variable notices remain on stderr,
+including with JSON. The report alone is exempt from the socket root-length
+backstop so an over-long root can be diagnosed; other commands remain guarded.
 
 `pty list --json --clients` adds `clients` to each running session: an array
 of `{ "pid": 1234, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z" }`.

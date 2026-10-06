@@ -62,6 +62,7 @@ Observe:
   pty list --filter-tag key=value         Filter to sessions with the tag (repeatable, ALL must match)
   pty list --remote <peer>                List a fabric peer's sessions (over fabric)
   pty list --remote                       Include remote sessions via pty-relay (when installed)
+  pty root [--json]                       Report effective and native default registry roots
   pty remote-serve --stdio                Serve remote access on-demand (fabric --exec spawns it per dial)
   pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 

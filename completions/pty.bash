@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata readiness evidence up down test remote-serve"
+  commands="run attach a exec peek send events list ls root stats restart kill recover rm remove gc tag tag-multi emit rename metadata readiness evidence up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -62,6 +62,9 @@ _pty() {
       ;;
     list|ls)
       COMPREPLY=($(compgen -W "--json --strict --clients --tags --filter-tag --remote --status --older-than --newer-than --summary" -- "${cur}"))
+      ;;
+    root)
+      COMPREPLY=($(compgen -W "--json" -- "${cur}"))
       ;;
     stats)
       if [[ "${cur}" == -* ]]; then

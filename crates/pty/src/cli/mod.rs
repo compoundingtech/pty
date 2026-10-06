@@ -27,6 +27,7 @@ pub mod readiness;
 pub mod remote_serve;
 pub mod rename;
 pub mod rm;
+pub mod root;
 pub mod tag;
 pub mod tag_multi;
 pub mod up;
@@ -166,6 +167,7 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
     // Global `--root <path>` can follow the subcommand, but `--` hands the
     // remaining arguments to the child of `run` unchanged.
     let command_end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut root_flag = false;
     if let Some(idx) = args[..command_end].iter().position(|a| a == "--root") {
         match args.get(idx + 1) {
             Some(val) if !val.starts_with('-') => {
@@ -173,18 +175,13 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
                 // the environment concurrently.
                 unsafe { std::env::set_var("PTY_ROOT", val) };
                 args.drain(idx..idx + 2);
+                root_flag = true;
             }
             _ => {
                 eprintln!("pty: --root requires a path (e.g. pty --root /var/lib/pty-eval list)");
                 return 1;
             }
         }
-    }
-
-    // Root-length backstop before any subcommand runs (cli.ts:703-717).
-    if let Some(msg) = registry::root_length_check() {
-        eprintln!("{msg}");
-        return 1;
     }
 
     // Subcommand detection: the first token that is not a flag, skipping the
@@ -222,6 +219,15 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
         .iter()
         .filter(|a| *a != "--preselect-new" && *a != "--force")
         .collect();
+
+    // Reporting the selected root must work even when it is too long for
+    // session sockets. Every other command retains the length backstop.
+    if !matches!(dispatch_args.first(), Some(command) if command.as_str() == "root")
+        && let Some(msg) = registry::root_length_check()
+    {
+        eprintln!("{msg}");
+        return 1;
+    }
 
     if dispatch_args.is_empty() {
         return finish(interactive(interactive_opts));
@@ -268,6 +274,7 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
         "rm" | "remove" => rm::run(rest),
         "test" => deferred::run("test"),
         "completions" => Ok(completions::run(rest)),
+        "root" => root::run(rest, root_flag),
         "version" | "--version" | "-v" | "-V" => version::run(),
         "help" | "--help" | "-h" => {
             help::print_usage();
