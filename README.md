@@ -101,7 +101,9 @@ nix profile install github:compoundingtech/pty-rust
 
 The flake builds hermetically: Ghostty's source and Zig packages are
 fixed-output fetches, and one native `libghostty-vt` package builds the C
-library. Cargo links that archive through pkg-config. `nix flake check`
+library. The source comes from a GitHub archive, without anonymous Git
+transport; its revision and unpacked source hash are pinned in
+`libghostty-vt-contract.json`. Cargo links that archive through pkg-config. `nix flake check`
 also verifies the native compatibility contract and runtime closure, runs
 the package tests, and checks installed completions. `nix develop` supplies
 the Rust toolchain and the same native artifact, without Zig.
