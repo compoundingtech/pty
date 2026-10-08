@@ -137,19 +137,19 @@ pub fn resolve_session_dir() -> (PathBuf, RootSource) {
     (default_session_dir(), RootSource::Default)
 }
 
-/// Create the session dir if missing and keep it owner-only (mode 0700).
+/// Create the session dir (mode 0700) if missing.
 ///
-/// Records under the root persist session environment values, so a directory
-/// something else created looser is tightened too, not only a fresh one.
-/// Best-effort, like Node's creation-time chmod.
+/// An existing root is left exactly as its owner set it — chmod would follow
+/// a symlinked root and change its target. The files under it are owner-only
+/// from their creating open ([`super::atomic::atomic_write`]), so a root
+/// someone deliberately shares stays shared while its records stay
+/// owner-only.
 ///
 /// node: src/sessions.ts:112-114
 pub fn ensure_session_dir() -> std::io::Result<PathBuf> {
     let dir = session_dir();
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir)?;
-    }
-    {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
@@ -302,5 +302,35 @@ mod tests {
         let scoped = Path::new("/tmp/pty-scoped-root-thread");
         let elsewhere = with_root(scoped, || std::thread::spawn(session_dir).join().unwrap());
         assert_ne!(elsewhere, scoped);
+    }
+
+    /// An existing root is never chmod'd — tightening would follow a symlinked
+    /// root and change its target. Owner-only records come from the creating
+    /// open, not from the directory.
+    #[test]
+    fn an_existing_root_keeps_its_mode_even_through_a_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!(
+                "pty-existing-root-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let target = base.join("target");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            with_root(&link, || {
+                ensure_session_dir().unwrap();
+            });
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "the symlinked root's target must keep its mode");
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

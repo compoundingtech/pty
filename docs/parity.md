@@ -345,7 +345,7 @@ Decided on 2026-08-29. Each row records the decision.
 | Rust-only `<name>.screen` file | S | Dropped once `lastLines` matches. |
 | Rust `run --rows/--cols` | S | Kept as an extension. Node persists rows/cols anyway. |
 | Rust `run --env KEY` (name only) | S | Kept as an extension. The value is read from the launching environment, so it never appears on the command line a supervisor or service manager records. The `KEY=VALUE` form still works but places the value on the command line; prefer `KEY` for anything sensitive. A name with no inherited value is a loud refusal. |
-| Registry files written owner-only (0600), temp files created 0600 at open, session root kept 0700 | S | Kept as an extension. Records persist `extraEnv`/`sessionEnv` values; the file mode is set by the creating open (no create-then-chmod window) and the 0700 session root is tightened when something created it looser. |
+| Registry files written owner-only (0600), temp files created 0600 at open | S | Kept as an extension. Records persist `extraEnv`/`sessionEnv` values; the file mode is set by the creating open (no create-then-chmod window). An existing session root keeps the mode its owner gave it — even a symlinked one — while a root this code creates is 0700. |
 | `up`/`down` and `pty.toml` | S | Kept. Already ported; the binding rule needs the tag pair. |
 | `queryStats` waiting out its 2 s timeout on a daemon that closes without STATUS, and `peek -f` hanging on a plain close | S | Not reproduced, on purpose. Both end promptly instead. Deliberate improvements, not gaps — accepted, decision 0006. |
 
