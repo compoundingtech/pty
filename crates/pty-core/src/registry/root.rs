@@ -137,13 +137,19 @@ pub fn resolve_session_dir() -> (PathBuf, RootSource) {
     (default_session_dir(), RootSource::Default)
 }
 
-/// Create the session dir (mode 0700) if missing.
+/// Create the session dir if missing and keep it owner-only (mode 0700).
+///
+/// Records under the root persist session environment values, so a directory
+/// something else created looser is tightened too, not only a fresh one.
+/// Best-effort, like Node's creation-time chmod.
 ///
 /// node: src/sessions.ts:112-114
 pub fn ensure_session_dir() -> std::io::Result<PathBuf> {
     let dir = session_dir();
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir)?;
+    }
+    {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }

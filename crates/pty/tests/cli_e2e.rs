@@ -725,6 +725,39 @@ fn run_env_name_only_keeps_values_off_the_command_line() {
     }
     assert!(seen, "the session child never received SEAT_TOKEN");
 
+    // No live process of the session carries the value on its command line:
+    // neither the daemon (which received it in its config) nor the session
+    // child (which received it in its environment).
+    #[cfg(target_os = "linux")]
+    {
+        let daemon: u32 = std::fs::read_to_string(root.join("envn.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut cmdlines = vec![std::fs::read(format!("/proc/{daemon}/cmdline")).unwrap()];
+        if let Ok(children) =
+            std::fs::read_to_string(format!("/proc/{daemon}/task/{daemon}/children"))
+        {
+            for child in children.split_whitespace() {
+                if let Ok(cmdline) = std::fs::read(format!("/proc/{child}/cmdline")) {
+                    cmdlines.push(cmdline);
+                }
+            }
+        }
+        assert!(
+            cmdlines.len() > 1,
+            "the session child was not found under the daemon"
+        );
+        for cmdline in &cmdlines {
+            let text = String::from_utf8_lossy(cmdline).replace('\0', " ");
+            assert!(
+                !text.contains(SECRET),
+                "a session process carries the value on its command line: {text}"
+            );
+        }
+    }
+
     // The daemon persists the resolved value so a restart reproduces the
     // same environment — and that record is owner-only.
     let record_path = root.join("envn.json");
