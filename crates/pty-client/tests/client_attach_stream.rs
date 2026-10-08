@@ -65,7 +65,6 @@ fn start(
         let params = AttachParams {
             name: "fixture",
             socket,
-            remote: false,
             reconnect,
             stream_fd,
             max_reconnect_attempts: max_attempts,
@@ -208,6 +207,26 @@ fn exit_inside_the_detach_window_wins() {
             MessageType::Exit
         ]
     );
+    h.join().unwrap();
+}
+
+#[test]
+fn typed_rejection_fails_the_machine_transport_without_fabricating_exit() {
+    let (d, h) = daemon_after_attach(|mut socket| {
+        use std::io::Write;
+        socket.write_all(&concat(&[
+            encode_geometry(24, 80),
+            encode_screen(b"live"),
+            pty_core::protocol::encode_packet(MessageType::Unknown(12), &[0]),
+        ])).unwrap();
+    });
+    let done = start(d.connect(), true, None, None, false).finish();
+    assert_eq!(done.outcome, AttachOutcome::Exited(1));
+    assert!(done.stdout.is_empty());
+    assert!(stderr_text(&done).contains("client too slow"));
+    assert!(stderr_text(&done).contains("connection lost"));
+    assert!(!stderr_text(&done).contains("session ended"));
+    assert_eq!(types(&done.stream), vec![MessageType::Geometry, MessageType::Screen]);
     h.join().unwrap();
 }
 
@@ -498,8 +517,7 @@ fn reconnect_requires_a_fresh_screen_after_geometry() {
     h.join().unwrap();
 }
 
-/// node: client.ts:706-749 — a refused route ends the machine stream with
-/// `[<name> session ended]` on stderr and exit 1.
+/// A refused route ends the machine stream as a transport failure.
 #[test]
 fn reconnect_refusal_ends_the_machine_stream_with_exit_1() {
     let (d, h) = daemon_after_attach(|mut s| {
@@ -519,7 +537,7 @@ fn reconnect_refusal_ends_the_machine_stream_with_exit_1() {
     assert_eq!(done.outcome, AttachOutcome::Exited(1));
     assert_eq!(
         stderr_text(&done),
-        "\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n[fixture session ended]\n"
+        "\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n[connection lost to fixture]\n"
     );
     assert_eq!(
         types(&done.stream),

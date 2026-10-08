@@ -55,6 +55,13 @@ When that difference changes behavior, record a decision that states the Node
 behavior, the Rust behavior, the reason, the client effect, and the conformance
 test.
 
+Transport failures are an explicit exception: the 2026-10-08
+[PTY.TRL-R11 decision](docs/vrs/02-session-trailers/requirements.md) preserves
+banner, successful-detach and received-EXIT bytes, while EOF without EXIT
+reports connection loss with a non-zero status. The
+[socket close-path contract](docs/architecture.md) defines the optional
+rejection reason and the EOF fallback.
+
 The embedding API should serve the Rust CLI and other Rust clients through one
 implementation. Its terminal handle should eventually provide the capabilities
 that Node's `@myobie/pty/tui` `PtyHandle` provides: attach lifecycle, input,

@@ -46,4 +46,4 @@ This node defines what an interactive client says when it stops showing a sessio
 ### Must be one rendering
 
 - **PTY.TRL-R10 Shared line:** `pty list` and the trailers must render a session's line with the same code, and `pty list` output must stay byte-identical.
-- **PTY.TRL-R11 Cross-runtime parity:** The Node pty and pty-rust must emit byte-identical banners and trailers.
+- **PTY.TRL-R11 Cross-runtime parity:** The Node pty and pty-rust must emit byte-identical banners, successful detach trailers, and received-EXIT trailers. Transport failures are excluded: following PTY.TRL-R08, an attachment loss is not proof that the session ended. Decision 2026-10-08: narrow parity to preserve truthful transport-failure reporting.

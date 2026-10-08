@@ -36,6 +36,8 @@ pub enum MessageType {
     Geometry,
     /// Writable client requests recovery of input modes after a crashed program.
     ResetInputModes,
+    /// Server → Client: attachment failure, not a child exit (wire value 12).
+    ConnectionError,
     /// An unrecognized wire byte, preserved verbatim.
     Unknown(u8),
 }
@@ -55,6 +57,7 @@ impl MessageType {
             7 => MessageType::Status,
             10 => MessageType::Geometry,
             11 => MessageType::ResetInputModes,
+            12 => MessageType::ConnectionError,
             8 => MessageType::AcceptedSocketOwnership,
             9 => MessageType::LifecycleCas,
             other => MessageType::Unknown(other),
@@ -76,6 +79,7 @@ impl MessageType {
             MessageType::LifecycleCas => 9,
             MessageType::Geometry => 10,
             MessageType::ResetInputModes => 11,
+            MessageType::ConnectionError => 12,
             MessageType::Unknown(b) => b,
         }
     }
@@ -286,6 +290,35 @@ pub fn decode_attach_identity(payload: &[u8]) -> (Option<u32>, Option<String>) {
 /// Encode a DETACH.
 pub fn encode_detach() -> Vec<u8> {
     encode_packet(MessageType::Detach, &[])
+}
+
+/// A server-side attachment failure, independent of the child lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionErrorReason {
+    ClientTooSlow,
+}
+
+impl ConnectionErrorReason {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ClientTooSlow => "client too slow: outbound byte budget exceeded",
+        }
+    }
+}
+
+/// Frame 12 has a one-byte reason code; zero means the client exceeded its byte budget.
+pub fn encode_connection_error(reason: ConnectionErrorReason) -> [u8; 6] {
+    let code = match reason {
+        ConnectionErrorReason::ClientTooSlow => 0,
+    };
+    [MessageType::ConnectionError.as_u8(), 0, 0, 0, 1, code]
+}
+
+pub fn decode_connection_error(payload: &[u8]) -> Option<ConnectionErrorReason> {
+    match payload {
+        [0] => Some(ConnectionErrorReason::ClientTooSlow),
+        _ => None,
+    }
 }
 
 /// Encode a RESIZE.

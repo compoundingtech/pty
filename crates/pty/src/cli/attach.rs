@@ -256,7 +256,6 @@ fn attach_remote(peer: &str, name: &str, stream_fd: Option<std::os::fd::RawFd>) 
     let peer = peer.to_string();
     let target = name.to_string();
     let mut params = client::AttachParams::new(name, socket);
-    params.remote = true;
     params.stream_fd = stream_fd;
     params.peer = Some(peer.clone());
     params.reconnect = Some(Box::new(move || {
