@@ -60,15 +60,62 @@ pub fn is_tmp_name(file_name: &str) -> bool {
     file_name.contains(".tmp.")
 }
 
-/// Write `bytes` to `target` atomically. On failure the temporary file is
+/// Write `bytes` to `target` atomically. The file is created owner-only
+/// (0600): registry records carry session environment values
+/// (`extraEnv`/`sessionEnv`), so the 0700 session directory is the first lock
+/// and the file mode is the second. On failure the temporary file is
 /// unlinked and the error returned; the previous target is intact either way.
 ///
 /// node: src/sessions.ts:251-264
 pub fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = tmp_path_for(target);
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, target));
+    let result = std::fs::write(&tmp, bytes)
+        .and_then(|()| restrict_to_owner(&tmp))
+        .and_then(|()| std::fs::rename(&tmp, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registry records persist session environment values, so the published
+    /// file (and the in-flight temporary it renames over) must stay
+    /// owner-only even where the surrounding directory is looser.
+    #[test]
+    fn a_written_file_is_owner_only() {
+        let target = std::env::temp_dir().join(format!(
+            "pty-atomic-mode-{}-{}",
+            std::process::id(),
+            random_hex16()
+        ));
+        atomic_write(&target, b"{}").unwrap();
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777
+            }
+            #[cfg(not(unix))]
+            {
+                0o600
+            }
+        };
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&target);
+    }
 }

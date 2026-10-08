@@ -9,7 +9,7 @@ use pty_core::registry::{self, EnvMap, TagMap};
 use super::{CliResult, SpawnParams};
 use pty_lifecycle::StartupLeaseOptions;
 
-/// `pty run [--id X] [--name X] [--cwd D] [--tag k=v] [--env K=V]
+/// `pty run [--id X] [--name X] [--cwd D] [--tag k=v] [--env K=V | K]
 /// [--unset-env K] [--isolate-env] [--rows R] [--cols C] -- <cmd...>`
 pub fn run(args: &[String]) -> CliResult {
     let mut id: Option<String> = None;
@@ -98,19 +98,19 @@ pub fn run(args: &[String]) -> CliResult {
             }
             // An assignment whose `=` is missing or leading is rejected;
             // `KEY=` with an empty value is accepted. A repeated key keeps
-            // its first position and takes the last value.
+            // its first position and takes the last value. A bare `KEY` is
+            // the Rust-only form that reads the value from this process's
+            // environment, so a launcher can name a variable without putting
+            // its value on a command line.
             //
-            // node: src/cli.ts:811-814
+            // node: src/cli.ts:811-814 (assignment form only)
             "--env" => {
                 let tok = args.get(i + 1).cloned().unwrap_or_default();
-                match tok.find('=') {
-                    Some(eq) if eq > 0 => {
-                        extra_env.insert(tok[..eq].to_string(), tok[eq + 1..].to_string());
-                    }
-                    _ => {
-                        eprintln!("Invalid env format: \"{tok}\". Use --env KEY=VALUE");
-                        return Ok(1);
-                    }
+                if let Err(message) =
+                    insert_env_token(&mut extra_env, &tok, &|name| std::env::var_os(name))
+                {
+                    eprintln!("{message}");
+                    return Ok(1);
                 }
                 i += 2;
             }
@@ -455,4 +455,101 @@ fn create_or_attach(
         return Ok(0);
     }
     Ok(super::attach::do_attach(name, None))
+}
+
+/// Fold one `--env` token into `extra_env`. `KEY=VALUE` assigns the value
+/// verbatim; `KEY` alone resolves the value through `inherited`, so the value
+/// travels in the process environment instead of on the command line. A key
+/// that names no inherited value is a loud refusal — never a silently dropped
+/// variable.
+fn insert_env_token(
+    extra_env: &mut EnvMap,
+    token: &str,
+    inherited: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), String> {
+    if let Some(eq) = token.find('=') {
+        if eq == 0 {
+            return Err(format!(
+                "Invalid env format: \"{token}\". Use --env KEY=VALUE or --env KEY"
+            ));
+        }
+        extra_env.insert(token[..eq].to_string(), token[eq + 1..].to_string());
+        return Ok(());
+    }
+    if token.is_empty() {
+        return Err(format!(
+            "Invalid env format: \"{token}\". Use --env KEY=VALUE or --env KEY"
+        ));
+    }
+    match inherited(token) {
+        Some(value) => {
+            extra_env.insert(token.to_string(), value.to_string_lossy().into_owned());
+            Ok(())
+        }
+        None => Err(format!(
+            "pty run: --env {token} names no value in the inherited environment; \
+             pass --env {token}=VALUE"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn an_assignment_token_sets_the_value_verbatim() {
+        let mut env = EnvMap::new();
+        insert_env_token(&mut env, "PORT=3000", &resolve(&[])).unwrap();
+        insert_env_token(&mut env, "EMPTY=", &resolve(&[])).unwrap();
+        insert_env_token(&mut env, "PORT=4000", &resolve(&[])).unwrap();
+        assert_eq!(env.get("PORT").map(String::as_str), Some("4000"));
+        assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn a_name_only_token_reads_the_inherited_value() {
+        let mut env = EnvMap::new();
+        insert_env_token(
+            &mut env,
+            "SEAT_TOKEN",
+            &resolve(&[("SEAT_TOKEN", "kept-off-argv")]),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get("SEAT_TOKEN").map(String::as_str),
+            Some("kept-off-argv")
+        );
+    }
+
+    #[test]
+    fn a_name_only_token_without_an_inherited_value_refuses_loudly() {
+        let mut env = EnvMap::new();
+        let error = insert_env_token(&mut env, "SEAT_ABSENT", &resolve(&[])).unwrap_err();
+        assert!(
+            error.contains("--env SEAT_ABSENT names no value"),
+            "{error}"
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn malformed_tokens_are_rejected() {
+        let mut env = EnvMap::new();
+        for token in ["", "=VALUE"] {
+            assert!(insert_env_token(&mut env, token, &resolve(&[])).is_err());
+        }
+        assert!(env.is_empty());
+    }
 }
