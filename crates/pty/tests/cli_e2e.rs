@@ -680,6 +680,113 @@ fn run_force_creates_nested_session() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `--env KEY` (name only) resolves the value from the launcher's
+/// environment, so the value never appears on the `pty run` command line —
+/// the argv a supervisor or a service manager records — while the session
+/// still receives it and the daemon still persists it for restart. The
+/// registry record that carries the resolved value stays owner-only, and a
+/// name with no inherited value is a loud refusal, never a silent drop.
+#[test]
+fn run_env_name_only_keeps_values_off_the_command_line() {
+    let _serial = serial();
+    let root = unique_root();
+    const SECRET: &str = "synthetic-seat-secret-4f2a";
+
+    let (out, err, code) = run_pty_env(
+        &root,
+        &[
+            "run",
+            "-d",
+            "--id",
+            "envn",
+            "--env",
+            "SEAT_TOKEN",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$SEAT_TOKEN\" > \"$PTY_ROOT/envn.out\"; cat",
+        ],
+        &[("SEAT_TOKEN", SECRET)],
+    );
+    assert_eq!(code, 0, "run failed: {err}");
+    assert!(!out.contains(SECRET), "the value must not echo back: {out}");
+
+    // The session child received the value.
+    let marker = root.join("envn.out");
+    let mut seen = false;
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&marker)
+            && text == SECRET
+        {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen, "the session child never received SEAT_TOKEN");
+
+    // No live process of the session carries the value on its command line:
+    // neither the daemon (which received it in its config) nor the session
+    // child (which received it in its environment).
+    #[cfg(target_os = "linux")]
+    {
+        let daemon: u32 = std::fs::read_to_string(root.join("envn.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut cmdlines = vec![std::fs::read(format!("/proc/{daemon}/cmdline")).unwrap()];
+        if let Ok(children) =
+            std::fs::read_to_string(format!("/proc/{daemon}/task/{daemon}/children"))
+        {
+            for child in children.split_whitespace() {
+                if let Ok(cmdline) = std::fs::read(format!("/proc/{child}/cmdline")) {
+                    cmdlines.push(cmdline);
+                }
+            }
+        }
+        assert!(
+            cmdlines.len() > 1,
+            "the session child was not found under the daemon"
+        );
+        for cmdline in &cmdlines {
+            let text = String::from_utf8_lossy(cmdline).replace('\0', " ");
+            assert!(
+                !text.contains(SECRET),
+                "a session process carries the value on its command line: {text}"
+            );
+        }
+    }
+
+    // The daemon persists the resolved value so a restart reproduces the
+    // same environment — and that record is owner-only.
+    let record_path = root.join("envn.json");
+    let record = std::fs::read_to_string(&record_path).unwrap();
+    assert!(record.contains("SEAT_TOKEN"), "record:\n{record}");
+    assert!(record.contains(SECRET), "record:\n{record}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&record_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the record persists environment values and must stay owner-only"
+        );
+    }
+
+    // A name with no inherited value refuses loudly instead of dropping it.
+    let (_out2, err2, code2) = run_pty_env(
+        &root,
+        &["run", "-d", "--id", "envx", "--env", "SEAT_ABSENT", "--", "cat"],
+        &[],
+    );
+    assert_eq!(code2, 1);
+    assert!(err2.contains("--env SEAT_ABSENT names no value"), "{err2}");
+
+    let _ = run_pty(&root, &["kill", "envn"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn attach_double_tap_ctrl_backslash_sends_literal_not_detach() {
     let _serial = serial();
