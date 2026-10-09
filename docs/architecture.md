@@ -52,6 +52,12 @@ Writing to the terminal is synchronous, so a `SCREEN` cut always reflects every
 byte received before it. There is no `Arc<Mutex<Terminal>>`, and the
 libghostty `Terminal`, which is not `Send`, never leaves that thread.
 
+Client output queues are bounded by 64 MiB of queued and in-flight buffer
+capacity plus 64 bytes of metadata per item, not packet count. A large initial
+`SCREEN` and live output can wait behind a socket write without small writes
+exhausting an unrelated packet budget. Exceeding the byte budget immediately
+closes only that client's socket. The session and its child continue.
+
 **Embedding handles publish immutable frames only while observed.**
 `TerminalHandle::observe_frames()` returns an owned lease; lifecycle
 `subscribe()` receivers alone never trigger cell or pixel captures. The

@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ use pty_spawn::substrate::{ExitStatus, Lifecycle, SessionEvent, SessionOwner, Se
 use pty_terminal::{TerminalActor, serialize};
 
 use super::DaemonConfig;
-use super::clients::{Client, ClientFacts, OUTBOUND_QUEUE_PACKETS, Out, REDRAW_SETTLE, Role};
+use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE, Role};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
 use pty_core::process_tree::{
@@ -54,7 +54,7 @@ pub(crate) enum Msg {
     ChildExited(ExitStatus),
     Connect {
         id: u64,
-        tx: SyncSender<Out>,
+        tx: Sender<Out>,
         disconnect: UnixStream,
     },
     Packet {
@@ -604,7 +604,7 @@ fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
 /// One writer thread (packets → socket) and one reader thread (socket →
 /// [`Msg`]) per connection.
 fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
-    let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUTBOUND_QUEUE_PACKETS);
+    let (out_tx, out_rx) = mpsc::channel::<Out>();
     let Ok(mut wstream) = stream.try_clone() else {
         return;
     };
@@ -1546,7 +1546,7 @@ mod tests {
 
     #[test]
     fn command_socket_does_not_suppress_clipboard_fallback() {
-        let (tx, _rx) = mpsc::sync_channel(OUTBOUND_QUEUE_PACKETS);
+        let (tx, _rx) = mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
         clients.insert(1, Client::new(tx, disconnect, 24, 80));
