@@ -16,7 +16,8 @@ use pty_client::{
     CURSOR_TO_BOTTOM, ClientError, ClientIo, RouteRefusedError, TERMINAL_SANITIZE, connect_session,
 };
 use pty_core::protocol::{
-    MessageType, PacketReader, encode_data, encode_exit, encode_geometry, encode_screen,
+    ConnectionErrorReason, MessageType, PacketReader, encode_connection_error, encode_data,
+    encode_exit, encode_geometry, encode_screen,
 };
 
 const T: Duration = Duration::from_secs(5);
@@ -220,22 +221,50 @@ fn modify_other_keys_ctrl_backslash_detaches() {
     h.join().unwrap();
 }
 
-/// node: client.ts:686-690 — a close without error and without EXIT ends
-/// with the last known code (0), after saying the session ended.
+/// A socket close without EXIT is transport loss, not proof of a child exit.
 #[test]
-fn close_without_exit_says_the_session_ended_and_exits_0() {
+fn close_without_exit_reports_connection_lost_and_exits_1() {
     let (d, h) = daemon(|mut s| {
         use std::io::Write;
         s.write_all(&concat(&[encode_geometry(24, 80), encode_screen(b"x")]))
             .unwrap();
     });
     let (outcome, out, err) = start(d.connect(), None).finish();
-    assert_eq!(outcome, AttachOutcome::Exited(0));
+    assert_eq!(outcome, AttachOutcome::Exited(1));
     assert_eq!(
         out,
-        format!("\x1b[2J\x1b[Hx{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[demo session ended]\r\n")
+        format!("\x1b[2J\x1b[Hx{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[connection lost to demo]\r\n  reconnect: pty attach demo\r\n")
     );
     assert!(err.is_empty());
+    h.join().unwrap();
+}
+
+#[test]
+fn typed_rejection_reports_its_reason_and_exits_1() {
+    let (d, h) = daemon(|mut s| {
+        use std::io::Write;
+        s.write_all(&encode_connection_error(ConnectionErrorReason::ClientTooSlow)).unwrap();
+    });
+    let (outcome, out, err) = start(d.connect(), None).finish();
+    assert_eq!(outcome, AttachOutcome::Exited(1));
+    assert!(err.contains("client too slow"), "{err:?}");
+    assert!(out.contains("connection lost"), "{out:?}");
+    assert!(!out.contains("session ended"), "{out:?}");
+    h.join().unwrap();
+}
+
+#[test]
+fn truncated_rejection_then_eof_is_connection_loss() {
+    let (d, h) = daemon(|mut s| {
+        use std::io::Write;
+        let reason = encode_connection_error(ConnectionErrorReason::ClientTooSlow);
+        s.write_all(&reason[..reason.len() - 1]).unwrap();
+    });
+    let (outcome, out, err) = start(d.connect(), None).finish();
+    assert_eq!(outcome, AttachOutcome::Exited(1));
+    assert!(out.contains("connection lost"), "{out:?}");
+    assert!(!out.contains("session ended"), "{out:?}");
+    assert!(err.is_empty(), "{err:?}");
     h.join().unwrap();
 }
 
@@ -255,12 +284,8 @@ fn close_without_exit_says_the_session_ended_and_exits_0() {
 /// kernels. Neither client can report a reset that its kernel never
 /// delivered.
 ///
-/// **The consequence is worth knowing where the reset does not arrive:** a
-/// daemon that drops a client with input still unread is indistinguishable
-/// from one that closed politely, so `pty attach` ends quietly with the last
-/// known code instead of saying the session is gone. Every other way of
-/// losing a daemon — it exits, it is killed, its socket disappears — is
-/// reported the same way on both.
+/// Both reset and bare EOF are transport failures, independent of how the
+/// local kernel reports unread data at close.
 fn close_with_unread_data_reaches_the_peer_as_a_reset() -> bool {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
@@ -281,9 +306,9 @@ fn close_with_unread_data_reaches_the_peer_as_a_reset() -> bool {
     }
 }
 
-/// node: client.ts:672-681 — a reset maps to the not-found text.
+/// An established socket reset is transport loss, not evidence that the child ended.
 #[test]
-fn reset_maps_to_not_found_or_not_running() {
+fn reset_reports_connection_loss() {
     let (d, h) = daemon(|mut s| {
         use std::io::Write;
         s.write_all(&concat(&[encode_geometry(24, 80), encode_screen(b"x")]))
@@ -294,22 +319,23 @@ fn reset_maps_to_not_found_or_not_running() {
     let run = start(d.connect(), None);
     run.stdout.wait_for(T, |b| b.ends_with(b"x"));
     run.type_stdin(b"typed");
-    let (outcome, _, err) = run.finish();
+    let (outcome, out, err) = run.finish();
+    assert!(out.contains("connection lost"), "{out:?}");
+    assert!(!out.contains("session ended"), "{out:?}");
     if close_with_unread_data_reaches_the_peer_as_a_reset() {
         assert_eq!(outcome, AttachOutcome::Exited(1));
-        assert_eq!(err, "Session \"demo\" not found or not running.\n");
+        assert!(err.contains("Connection lost:"), "{err:?}");
     } else {
         // This kernel gave the client an ordinary end of stream, so there was
         // no reset to report. Pinned rather than skipped, so that a change in
         // either the kernel or the client is still caught here.
-        assert_eq!(outcome, AttachOutcome::Exited(0), "stderr: {err:?}");
+        assert_eq!(outcome, AttachOutcome::Exited(1), "stderr: {err:?}");
         assert!(err.is_empty(), "{err:?}");
     }
     h.join().unwrap();
 }
 
-/// node: client.ts:589-594 — an oversize frame is reported and the socket
-/// dropped; with no reconnect that is a silent close (code 0).
+/// An oversize frame is reported and the attachment fails.
 #[test]
 fn oversize_packet_prints_the_dropping_line() {
     let (d, h) = daemon(|mut s| {
@@ -320,7 +346,7 @@ fn oversize_packet_prints_the_dropping_line() {
         let _ = read_packets_until_eof(&mut s, T);
     });
     let (outcome, out, err) = start(d.connect(), None).finish();
-    assert_eq!(outcome, AttachOutcome::Exited(0));
+    assert_eq!(outcome, AttachOutcome::Exited(1));
     assert!(out.is_empty());
     assert_eq!(
         err,
@@ -329,10 +355,9 @@ fn oversize_packet_prints_the_dropping_line() {
     h.join().unwrap();
 }
 
-/// node: client.ts:709-729 — the reconnect status line goes to stdout, and a
-/// refused route prints `[<name> session ended]` and exits 0.
+/// A refused reconnect route does not supply a child EXIT frame.
 #[test]
-fn reconnect_refusal_prints_session_ended_and_exits_0() {
+fn reconnect_refusal_reports_connection_lost_and_exits_1() {
     let (d, h) = daemon(|mut s| {
         use std::io::Write;
         s.write_all(&concat(&[encode_geometry(24, 80), encode_screen(b"x")]))
@@ -340,11 +365,11 @@ fn reconnect_refusal_prints_session_ended_and_exits_0() {
     });
     let dial: Reconnect = Box::new(|| Err(RouteRefusedError("session \"demo\" not found".into())));
     let (outcome, out, err) = start(d.connect(), Some(dial)).finish();
-    assert_eq!(outcome, AttachOutcome::Exited(0));
+    assert_eq!(outcome, AttachOutcome::Exited(1));
     assert_eq!(
         out,
         format!(
-            "\x1b[2J\x1b[Hx\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[demo session ended]\r\n"
+            "\x1b[2J\x1b[Hx\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[connection lost to demo]\r\n  reconnect: pty attach demo\r\n"
         )
     );
     assert!(err.is_empty());

@@ -19,6 +19,14 @@ same JSON shapes. It uses the same exit codes. It writes the same files under
 `$PTY_ROOT`. It speaks the same socket protocol. A program that works with the
 Node `pty` works with the Rust `pty` without a change.
 
+**Transport-failure exception (2026-10-08).** PTY.TRL-R11 keeps banners,
+successful detach and received-EXIT trailers byte-identical. EOF without EXIT
+reports connection loss and exits 1 instead of claiming the session ended.
+Frame 12 optionally supplies the server's rejection reason; older readers
+ignore it. See [the trailer requirements](vrs/02-session-trailers/requirements.md)
+and [the close-path contract](architecture.md). This exception follows
+PTY.TRL-R08: a lost attachment is not a child-exit observation.
+
 **Wanted, not required: mixed fleet.** A Node client talks to a Rust daemon
 and a Rust client talks to a Node daemon, on the same `$PTY_ROOT`. Section 11
 lists what this costs beyond drop-in.
@@ -28,7 +36,7 @@ per part:
 
 | Surface | Parity rule |
 |---|---|
-| CLI, daemon, protocol, registry, remote | Drop-in. Same behavior, same bytes on disk and on the wire. |
+| CLI, daemon, protocol, registry, remote | Drop-in except the explicit transport-failure contract above. Same persisted state and existing normal-operation wire bytes. |
 | Testing library (`pty/testing`) | Same capabilities. A Rust crate and a TypeScript package. The API does not need to match the Node API. |
 | TUI framework (`pty/tui`) | Same capabilities. May be replaced by a new Rust TUI library. The interactive session manager is rebuilt on it. |
 
@@ -130,6 +138,7 @@ gap is in what the daemon does with the frames.
 | Frame `[type u8][len u32 BE][payload]`, 32 MiB cap, unknown types tolerated | have | |
 | Message types 0–7 | have | |
 | Embedded mode recovery (Rust extension) | have | Empty writable-only frame 11; output-side reset retains history. [Decision 0016](decisions/0016-embedded-surfaces-can-recover-input-modes.md). |
+| Attachment rejection (Rust extension) | have | Best-effort frame 12, reason `[0]` for memory-budget overflow. EOF or a truncated reason reports connection loss and exit 1; not a child EXIT. |
 | `GEOMETRY` (10) after every `ATTACH`/`PEEK` and on every effective resize | missing | Node clients wait for it in machine mode. `deskset` and the TS testing library read it. |
 | Order per attach: `GEOMETRY → SCREEN → DATA* → EXIT?`; ordered cut with `terminal.write("", cb)`; settling/cutting/live phases; a newer `ATTACH`/`PEEK` supersedes a pending one | missing | Rust sends `SCREEN` at once. Node folds output that arrives during the cut into `SCREEN`. |
 | 80 ms redraw settle after a resize before the cut; `nudgeRedraw` (`cols-1` then back) when the attach size differs | have, narrowed | Rust nudges only when the cut lands inside the settle of the last resize. A resizing attach already waited the settle out, and an attach that min-wins leaves unchanged never resized the child, so the child sees one SIGWINCH per resizing attach instead of three. |

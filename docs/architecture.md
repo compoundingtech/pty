@@ -58,6 +58,34 @@ capacity plus 64 bytes of metadata per item, not packet count. A large initial
 exhausting an unrelated packet budget. Exceeding the byte budget immediately
 closes only that client's socket. The session and its child continue.
 
+The server makes one non-blocking, best-effort attempt to send
+`ConnectionError` (wire tag 12, payload `[0]` for `ClientTooSlow`) before
+closing a client that exceeds that budget. A frame-wide writer lock prevents
+this reason from interleaving with a partially written `SCREEN`; a busy
+writer or full socket can prevent delivery. Older clients ignore the
+unrecognized frame. Attach and following peek clients treat bare EOF,
+including a truncated reason frame, as connection loss and exit non-zero.
+Only a received `EXIT` establishes the child's exit status. Intentional
+detach still succeeds without ending the child.
+
+Unknown reason payloads in frame 12 produce a generic attachment-rejection
+diagnostic. Established socket read errors also report connection loss,
+not that the session is missing. Initial connection failures keep their
+existing diagnostics. Embedded callers must adopt the updated client;
+replacing a server alone does not correct an old client's EOF reporting.
+`AttachParams` no longer carries the obsolete remote-error-wording flag;
+the peer and summary still identify remote trailer targets.
+
+| Server socket close path | Final signal | Interactive client result |
+| --- | --- | --- |
+| Outbound memory budget exceeded | Best-effort frame 12, then immediate shutdown | Connection loss, exit 1 |
+| Oversize/malformed inbound packet | Socket shutdown without EXIT | Connection loss, exit 1 |
+| Writer I/O error | Socket shutdown without EXIT | Connection loss, exit 1 |
+| Server shutdown, including fatal accept failure | EXIT only if already delivered | Received child status, otherwise connection loss and exit 1 |
+| Reader EOF/error | Client removed; writer drains/ends | No fabricated child status; intentional local detach remains successful |
+| Client DETACH | Write half closed; client removed | Detach succeeds without ending the child |
+| Child exit | EXIT with the child status | Received child status |
+
 **Embedding handles publish immutable frames only while observed.**
 `TerminalHandle::observe_frames()` returns an owned lease; lifecycle
 `subscribe()` receivers alone never trigger cell or pixel captures. The

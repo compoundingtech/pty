@@ -13,14 +13,14 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use pty_core::protocol::{
-    AttachedClient, MessageType, Packet, decode_attach_identity, decode_cell,
-    decode_peek, decode_size, encode_exit, encode_geometry, encode_screen,
+    AttachedClient, ConnectionErrorReason, MessageType, Packet, decode_attach_identity, decode_cell,
+    decode_peek, decode_size, encode_connection_error, encode_exit, encode_geometry, encode_screen,
     encode_status_response,
 };
 use pty_core::registry::{self, MutateOptions, MutateStatus};
@@ -118,6 +118,8 @@ pub struct Client {
     disconnect: UnixStream,
     pending_bytes: Arc<AtomicUsize>,
     rejected: AtomicBool,
+    /// Serializes entire frames, including a best-effort rejection.
+    pub write_lock: Arc<Mutex<()>>,
     pub role: Role,
     pub rows: u16,
     pub cols: u16,
@@ -136,12 +138,14 @@ impl Client {
         disconnect: UnixStream,
         rows: u16,
         cols: u16,
+        write_lock: Arc<Mutex<()>>,
     ) -> Client {
         Client {
             tx,
             disconnect,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             rejected: AtomicBool::new(false),
+            write_lock,
             role: Role::Command,
             rows,
             cols,
@@ -186,6 +190,21 @@ impl Client {
     fn reject_slow_client(&self) {
         if self.rejected.swap(true, Ordering::AcqRel) {
             return;
+        }
+        // Never interleave this frame with a partially written SCREEN. A busy
+        // writer or a full socket can prevent the reason from arriving; clients
+        // must also classify bare EOF as connection loss, not a child exit.
+        if let Ok(_guard) = self.write_lock.try_lock() {
+            let frame = encode_connection_error(ConnectionErrorReason::ClientTooSlow);
+            let flags = libc::MSG_DONTWAIT;
+            #[cfg(target_os = "linux")]
+            let flags = flags | libc::MSG_NOSIGNAL;
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: the stream owns the fd and frame is valid for its length.
+            // UnixStream sets SO_NOSIGPIPE on Apple platforms.
+            let _ = unsafe {
+                libc::send(self.disconnect.as_raw_fd(), frame.as_ptr().cast(), frame.len(), flags)
+            };
         }
         let _ = self.disconnect.shutdown(std::net::Shutdown::Both);
     }
@@ -631,7 +650,7 @@ mod bounded_queue_tests {
     fn small_packets_use_the_byte_budget_not_a_packet_limit() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
-        let client = Client::new(tx, disconnect, 24, 80);
+        let client = Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(())));
         for _ in 0..10_000 {
             client.send(vec![0; 16]);
         }
@@ -642,25 +661,40 @@ mod bounded_queue_tests {
     }
 
     #[test]
-    fn byte_budget_rejection_closes_without_waiting() {
+    fn byte_budget_rejection_sends_a_reason_and_closes_without_waiting() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (disconnect, mut peer) = UnixStream::pair().unwrap();
-        let client = Client::new(tx, disconnect, 24, 80);
+        let client = Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(())));
         for _ in 0..10 {
             client.send(vec![0; OUTBOUND_QUEUE_BYTES / 8 - OUTBOUND_ITEM_OVERHEAD]);
         }
         assert_eq!(client.pending_bytes.load(Ordering::Acquire), OUTBOUND_QUEUE_BYTES);
         peer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+        let mut reason = Vec::new();
+        peer.read_to_end(&mut reason).unwrap();
+        assert_eq!(reason, encode_connection_error(ConnectionErrorReason::ClientTooSlow));
         assert_eq!(rx.try_iter().count(), 8);
         assert_eq!(client.pending_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rejection_does_not_interleave_with_a_writers_partial_frame() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (disconnect, mut peer) = UnixStream::pair().unwrap();
+        let lock = Arc::new(Mutex::new(()));
+        let client = Client::new(tx, disconnect, 24, 80, Arc::clone(&lock));
+        let _writer = lock.lock().unwrap_or_else(|error| error.into_inner());
+        client.pending_bytes.store(OUTBOUND_QUEUE_BYTES, Ordering::Release);
+        client.send(vec![0; 1]);
+        peer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
     }
 
     #[test]
     fn queue_charges_allocation_capacity_until_the_in_flight_item_drops() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
-        let client = Client::new(tx, disconnect, 24, 80);
+        let client = Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(())));
         let mut bytes = Vec::with_capacity(4096);
         bytes.push(0);
         client.send(bytes);
@@ -669,5 +703,4 @@ mod bounded_queue_tests {
         drop(in_flight);
         assert_eq!(client.pending_bytes.load(Ordering::Acquire), 0);
     }
-
 }

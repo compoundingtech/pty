@@ -23,6 +23,18 @@ fn round_trips_data() {
 }
 
 #[test]
+fn connection_error_is_a_typed_non_exit_frame() {
+    use pty_core::protocol::{ConnectionErrorReason, decode_connection_error, encode_connection_error};
+    let frame = encode_connection_error(ConnectionErrorReason::ClientTooSlow);
+    assert_eq!(frame, [12, 0, 0, 0, 1, 0]);
+    let packet = PacketReader::new().feed(&frame).unwrap().remove(0);
+    assert_eq!(packet.type_, MessageType::ConnectionError);
+    assert_eq!(decode_connection_error(&packet.payload), Some(ConnectionErrorReason::ClientTooSlow));
+    assert_eq!(decode_connection_error(&[255]), None);
+    assert_eq!(decode_connection_error(&[]), None);
+}
+
+#[test]
 fn round_trips_attach() {
     let mut reader = PacketReader::new();
     let packets = reader.feed(&encode_attach(24, 80)).unwrap();

@@ -56,6 +56,7 @@ pub(crate) enum Msg {
         id: u64,
         tx: Sender<Out>,
         disconnect: UnixStream,
+        write_lock: Arc<Mutex<()>>,
     },
     Packet {
         id: u64,
@@ -605,6 +606,8 @@ fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
 /// [`Msg`]) per connection.
 fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     let (out_tx, out_rx) = mpsc::channel::<Out>();
+    let write_lock = Arc::new(Mutex::new(()));
+    let writer_lock = Arc::clone(&write_lock);
     let Ok(mut wstream) = stream.try_clone() else {
         return;
     };
@@ -615,6 +618,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(packet) => {
+                    let _guard = writer_lock.lock().unwrap_or_else(|error| error.into_inner());
                     if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
@@ -635,6 +639,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         id,
         tx: out_tx,
         disconnect,
+        write_lock,
     });
     let reader_tx = tx.clone();
     let reader = std::thread::Builder::new().spawn(move || {
@@ -812,10 +817,10 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx, disconnect } => {
+            Msg::Connect { id, tx, disconnect, write_lock } => {
                 self.clients.insert(
                     id,
-                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols()),
+                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols(), write_lock),
                 );
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
@@ -1549,7 +1554,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, disconnect, 24, 80));
+        clients.insert(1, Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))));
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(clipboard_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");

@@ -17,8 +17,8 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use pty_core::protocol::{
-    MessageType, Packet, PacketReader, decode_exit, encode_attach_with_identity_and_cell,
-    encode_data, encode_detach, encode_resize_with_cell,
+    MessageType, Packet, PacketReader, decode_connection_error, decode_exit,
+    encode_attach_with_identity_and_cell, encode_data, encode_detach, encode_resize_with_cell,
 };
 use pty_core::registry::now_epoch_ms;
 
@@ -30,9 +30,7 @@ use super::tty::{
     DETACH_KEY, DOUBLE_TAP_MS, FdWriter, RawMode, SigwinchPipe, is_tty, normalize_detach_key, poll,
     read_fd, tty_name, window_size_with_cell,
 };
-use super::{
-    ClientError, ClientIo, GoneSet, dropping_connection_line, is_gone, node_error_message,
-};
+use super::{ClientIo, dropping_connection_line, node_error_message};
 
 /// Re-establish the routed socket after a loud disconnect (`attach --remote`).
 /// `Ok(Some)` → re-attach over it; `Ok(None)` → transport failure, retry with
@@ -73,8 +71,6 @@ pub struct AttachParams<'a> {
     /// The connected session socket (local `<name>.sock`, or a routed remote
     /// socket).
     pub socket: UnixStream,
-    /// Selects the `Remote session …` wording (Node: a caller-supplied socket).
-    pub remote: bool,
     /// Reconnect after a loud disconnect (see [`Reconnect`]).
     pub reconnect: Option<Reconnect>,
     /// `--attach-stream-fd-v1 <fd>`: an already-validated descriptor.
@@ -93,7 +89,6 @@ impl<'a> AttachParams<'a> {
         AttachParams {
             name,
             socket,
-            remote: false,
             reconnect: None,
             stream_fd: None,
             max_reconnect_attempts: reconnect_max_attempts_from_env(),
@@ -130,7 +125,6 @@ enum Phase {
 
 struct Attach<'a> {
     name: &'a str,
-    remote: bool,
     io: ClientIo,
     socket: Option<UnixStream>,
     reader: PacketReader,
@@ -160,7 +154,6 @@ pub fn attach(params: AttachParams, io: &ClientIo) -> AttachOutcome {
     let AttachParams {
         name,
         socket,
-        remote,
         reconnect,
         stream_fd,
         max_reconnect_attempts,
@@ -169,7 +162,6 @@ pub fn attach(params: AttachParams, io: &ClientIo) -> AttachOutcome {
     } = params;
     let mut a = Attach {
         name,
-        remote,
         io: *io,
         socket: Some(socket),
         reader: PacketReader::new(),
@@ -284,6 +276,14 @@ impl Attach<'_> {
 
     fn handle_packets(&mut self, packets: Vec<Packet>) -> Option<AttachOutcome> {
         for p in packets {
+            if p.type_ == MessageType::ConnectionError {
+                let reason = decode_connection_error(&p.payload)
+                    .map_or("server rejected the attachment", |reason| reason.message());
+                self.clean_exit();
+                let _ = writeln!(FdWriter(self.io.stderr), "Connection lost: {reason}");
+                self.trailer(SessionEnd::ConnectionLost);
+                return Some(self.finish(1));
+            }
             if let Some(m) = self.machine.as_mut() {
                 match m.accept(&p) {
                     Err(failure) => {
@@ -362,16 +362,9 @@ impl Attach<'_> {
                     self.stderr(truncated_line(&detail).as_bytes());
                     return Some(self.finish(1));
                 }
-                let text = if is_gone(&e, GoneSet::Broad) {
-                    ClientError::NotReachable {
-                        name: self.name.to_string(),
-                        remote: self.remote,
-                    }
-                    .to_string()
-                } else {
-                    ClientError::Connection(node_error_message("read", None, &e)).to_string()
-                };
-                self.stderr(format!("{text}\n").as_bytes());
+                let detail = node_error_message("read", None, &e);
+                let _ = writeln!(FdWriter(self.io.stderr), "Connection lost: {detail}");
+                self.trailer(SessionEnd::ConnectionLost);
                 Some(self.finish(1))
             }
             None => {
@@ -379,13 +372,12 @@ impl Attach<'_> {
                     self.stderr(truncated_line("connection closed").as_bytes());
                     Some(self.finish(1))
                 } else {
-                    // The daemon went away without an EXIT (`pty kill`, a
-                    // crash): say so instead of dropping back to the shell
-                    // silently.
-                    if !self.session_exited && !self.dropped && self.machine.is_none() {
-                        self.trailer(SessionEnd::Ended);
+                    // EOF, including a truncated trailing frame, says nothing
+                    // about the child. Only an EXIT proves a session exit.
+                    if !self.session_exited && !self.dropped {
+                        self.trailer(SessionEnd::ConnectionLost);
                     }
-                    let code = self.exit_code;
+                    let code = if self.session_exited { self.exit_code } else { 1 };
                     Some(self.finish(code))
                 }
             }
@@ -415,11 +407,9 @@ impl Attach<'_> {
         let result = self.reconnect.as_mut()?();
         match result {
             Err(_refused) => {
-                // Reachable host that says the session is gone: clean give-up.
                 self.phase = Phase::Live;
-                self.trailer(SessionEnd::Ended);
-                let code = if self.machine.is_some() { 1 } else { 0 };
-                Some(self.finish(code))
+                self.trailer(SessionEnd::ConnectionLost);
+                Some(self.finish(1))
             }
             Ok(Some(fresh)) => {
                 self.socket = Some(fresh);
