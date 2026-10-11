@@ -90,7 +90,7 @@ Two facts from this table shape the plan:
 | `list` / `ls` | partial (M) | Missing `tags` in JSON, `--tags`, `--filter-tag`, `--status`, `--older-than`, `--newer-than`, `--summary`, `--remote [<peer>]`, sort by display name, the whole text layout with sections, colors, `[permanent]`/`[flapping]`, `~` paths, `timeAgo`. |
 | `remote-serve` | missing (M) | `--stdio` control protocol (`{"op":"list"}`, `{"op":"route"}`). The `--socket <path>` form is dropped. |
 | `stats` | partial (S) | Text output missing (Rust always prints JSON). JSON: add `clients.connections[]`, remove `geometryNeutral` or record it as a decision. Gone-session text. `--all` layout. |
-| `restart` | partial (M) | Missing `-y`, `--force`, running prompt, stateful-agent guard, gc bookkeeping tag strip, persisted `rows/cols/env` reuse, `ST_AGENT`/`ST_ROOT` scrub, `Session "<n>" restarted.`, nested note, attach after restart. |
+| `restart` | partial (M) | Missing `-y`, `--force`, running prompt, stateful-agent guard, gc bookkeeping tag strip, persisted `rows/cols/env` reuse, ambient `ST_AGENT`/`ST_ROOT`/`AGENT_TRACE_FILE` scrub (explicit `--env` values are preserved), `Session "<n>" restarted.`, nested note, attach after restart. |
 | `kill` | partial (S) | Exit 1 when not running (`not running` / `not found`), strip `strategy` on permanent, 7 s wait text, `Session "<n>" killed.`, ptyfile note. |
 | `recover` | deferred | Full authenticated rebind of a live daemon. Documented as absent. Section 12. |
 | `rm` / `remove` | partial (S) | Refuse when running, 7 s wait, generation check, `Session "<n>" removed.` / `not found`. |

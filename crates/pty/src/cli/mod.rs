@@ -100,9 +100,11 @@ pub fn require_ref(args: &[String], usage: &str) -> Result<String, CliError> {
 
 /// The variables a restarted session must not inherit from whoever asked
 /// for the restart.
+/// Explicit `--env` values are persisted and preserved by design.
+/// `AGENT_TRACE_FILE` is a per-session provenance path: the new process needs its own, never the old one.
 ///
 /// node: src/cli.ts:3869
-pub const RESTART_SCRUBBED_ENV: [&str; 2] = ["ST_AGENT", "ST_ROOT"];
+pub const RESTART_SCRUBBED_ENV: [&str; 3] = ["ST_AGENT", "ST_ROOT", "AGENT_TRACE_FILE"];
 
 /// Refuse a command that would nest a client inside the current session.
 /// Returns `Some(1)` when it refused, having printed the reason and the
