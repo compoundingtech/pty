@@ -1273,37 +1273,49 @@ impl TerminalHandle {
 
     /// The bytes [`TerminalHandle::send_key`] would write, without writing
     /// them. Empty for an event the child should not see.
+    ///
+    /// This waits for the terminal actor with no bound. Use
+    /// [`TerminalHandle::request_encode_key`] where the wait must be
+    /// abandoned, for example when the surface is detached during a stall.
     pub fn encode_key(&self, ev: &KeyEvent) -> Vec<u8> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::EncodeKey {
-                ev: ev.clone(),
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return Vec::new();
-        }
-        reply_rx.recv().unwrap_or_default()
+        self.request_encode_key(ev).recv().unwrap_or_default()
+    }
+
+    /// Queue a key encoding and return immediately.
+    ///
+    /// The receiver yields what [`TerminalHandle::encode_key`] would return,
+    /// computed from the modes the actor holds when it processes the request,
+    /// after messages queued before it. Wait with `recv_timeout` or poll with
+    /// `try_recv`, and drop the receiver to abandon the wait. Closing the actor
+    /// disconnects a request it has not processed, so a disconnected receiver
+    /// means no encoding, the same as an empty `encode_key`.
+    pub fn request_encode_key(&self, ev: &KeyEvent) -> Receiver<Vec<u8>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::EncodeKey { ev: ev.clone(), reply });
+        rx
     }
 
     /// The bytes [`TerminalHandle::send_mouse`] would write, or `None` when
     /// the child's mode does not report this event — which is how a surface
     /// learns it may keep the wheel for its own scrolling.
+    ///
+    /// This waits for the terminal actor with no bound. Use
+    /// [`TerminalHandle::request_encode_mouse`] where the wait must be
+    /// abandoned.
     pub fn encode_mouse(&self, ev: &MouseEvent) -> Option<Vec<u8>> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::EncodeMouse {
-                ev: *ev,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.recv().unwrap_or(None)
+        self.request_encode_mouse(ev).recv().unwrap_or(None)
+    }
+
+    /// Queue a mouse encoding and return immediately.
+    ///
+    /// The receiver yields what [`TerminalHandle::encode_mouse`] would return,
+    /// under the same ordering as [`TerminalHandle::request_encode_key`]. A
+    /// disconnected receiver (the actor closed first) is distinct from
+    /// `Ok(None)`, which means the child's mode does not report the event.
+    pub fn request_encode_mouse(&self, ev: &MouseEvent) -> Receiver<Option<Vec<u8>>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::EncodeMouse { ev: *ev, reply });
+        rx
     }
 
     /// The current revision; bumps on every change.
