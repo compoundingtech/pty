@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use pty::{AttachOptions, Frame, FrameObserver, HandleEvent, TerminalHandle};
 use pty_core::protocol::{MessageType, PacketReader, encode_data, encode_screen};
+use pty_terminal::input::{Key, KeyEvent, MouseButton, MouseEvent};
 use pty_terminal::{CellSize, GraphicsOptions, PixelFormat, PlacementPosition, Range};
 
 // A deadlock bound, not a latency/performance assertion.
@@ -524,6 +525,81 @@ fn published_reads_and_history_request_do_not_wait_for_a_blocked_actor() {
     h.kill();
     reader.join().unwrap();
     reconnect.join().unwrap();
+}
+
+#[test]
+fn encode_requests_can_be_abandoned_while_the_actor_is_blocked() {
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(TIMEOUT)).unwrap();
+    daemon.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let attempts = AtomicUsize::new(0);
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let h = Arc::new(
+        TerminalHandle::attach_with_connector(
+            move || {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return client.try_clone();
+                }
+                blocked_tx.send(()).map_err(io::Error::other)?;
+                // Disconnecting release_tx on test failure also releases the actor.
+                let _ = release_rx.recv();
+                Err(io::Error::other("intentional reconnect failure"))
+            },
+            options(false),
+        )
+        .unwrap(),
+    );
+    read_attach(&mut daemon);
+    daemon.write_all(&encode_screen(b"ready")).unwrap();
+    assert!(h.wait_ready(TIMEOUT), "initial SCREEN was applied");
+    let reconnect_handle = Arc::clone(&h);
+    let reconnect = std::thread::spawn(move || {
+        let _ = reconnect_handle.reconnect();
+    });
+    blocked_rx.recv_timeout(TIMEOUT).expect("actor entered connector");
+
+    let up = KeyEvent::press(Key::ArrowUp);
+    let click = MouseEvent::press(MouseButton::Left, 3, 4);
+    // Submission returns while the actor is blocked, and the reply is not ready.
+    let (submitted_tx, submitted_rx) = mpsc::channel();
+    let submit_handle = Arc::clone(&h);
+    let (submit_up, submit_click) = (up.clone(), click);
+    let submit = std::thread::spawn(move || {
+        let key = submit_handle.request_encode_key(&submit_up);
+        let abandoned_key = submit_handle.request_encode_key(&submit_up);
+        let mouse = submit_handle.request_encode_mouse(&submit_click);
+        let _ = submitted_tx.send((key, abandoned_key, mouse));
+    });
+    let submitted = submitted_rx.recv_timeout(TIMEOUT);
+    // Release before any assertion that could fail, so a regression cannot
+    // leave the connector thread permanently parked.
+    let pending = submitted.as_ref().ok().map(|(key, _, mouse)| {
+        (
+            key.recv_timeout(Duration::from_millis(50)),
+            mouse.recv_timeout(Duration::from_millis(50)),
+        )
+    });
+    let (key, abandoned_key, mouse) = submitted.expect("encode requests waited for the actor");
+    assert_eq!(pending.unwrap(), (Err(mpsc::RecvTimeoutError::Timeout), Err(mpsc::RecvTimeoutError::Timeout)));
+    // Abandoning a request is dropping its receiver; the actor must survive
+    // answering it.
+    drop(abandoned_key);
+    release_tx.send(()).unwrap();
+    assert_eq!(key.recv_timeout(TIMEOUT).expect("queued key encoding"), b"\x1b[A");
+    assert_eq!(mouse.recv_timeout(TIMEOUT).expect("queued mouse encoding"), None);
+    assert_eq!(h.encode_key(&up), b"\x1b[A", "the actor outlives an abandoned request");
+    reconnect.join().unwrap();
+    submit.join().unwrap();
+
+    // A closed actor disconnects the request instead of answering it.
+    h.kill();
+    let key = h.request_encode_key(&up);
+    let mouse = h.request_encode_mouse(&click);
+    assert!(matches!(key.recv_timeout(TIMEOUT), Err(mpsc::RecvTimeoutError::Disconnected)));
+    assert!(matches!(mouse.recv_timeout(TIMEOUT), Err(mpsc::RecvTimeoutError::Disconnected)));
+    assert!(h.encode_key(&up).is_empty());
+    assert_eq!(h.encode_mouse(&click), None);
 }
 
 #[test]
