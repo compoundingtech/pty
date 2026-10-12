@@ -209,6 +209,67 @@ fn fd_count(pid: i32) -> usize {
         .count()
 }
 
+/// Each open descriptor and what it points at, to name one that leaked.
+#[cfg(target_os = "linux")]
+fn fd_table(pid: i32) -> std::collections::BTreeMap<u32, String> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap_or_else(|e| panic!("read /proc/{pid}/fd: {e}"))
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let fd = entry.file_name().to_str()?.parse().ok()?;
+            // A descriptor can close between the listing and the read.
+            let target = std::fs::read_link(entry.path())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|e| format!("<{e}>"));
+            Some((fd, target))
+        })
+        .collect()
+}
+
+/// How many more descriptors of each kind `after` holds than `before`.
+/// Descriptor numbers and inodes are reused across attach cycles, so naming the
+/// kind (`socket`, `pipe`, `/dev/ptmx`) is what says which one leaked.
+#[cfg(target_os = "linux")]
+fn fd_kinds_over(
+    before: &std::collections::BTreeMap<u32, String>,
+    after: &std::collections::BTreeMap<u32, String>,
+) -> std::collections::BTreeMap<String, isize> {
+    fn kinds(table: &std::collections::BTreeMap<u32, String>) -> std::collections::BTreeMap<&str, isize> {
+        let mut kinds = std::collections::BTreeMap::new();
+        for target in table.values() {
+            let kind = target.split(":[").next().unwrap_or(target);
+            *kinds.entry(kind).or_insert(0) += 1;
+        }
+        kinds
+    }
+    let before = kinds(before);
+    kinds(after)
+        .into_iter()
+        .filter_map(|(kind, n)| {
+            let more = n - before.get(kind).copied().unwrap_or(0);
+            (more > 0).then(|| (kind.to_string(), more))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fd_kinds_over_names_what_was_added_and_ignores_reused_numbers() {
+    let table = |entries: &[(u32, &str)]| {
+        entries.iter().map(|(fd, target)| (*fd, target.to_string())).collect()
+    };
+    let before = table(&[(0, "/dev/null"), (3, "/dev/ptmx"), (5, "socket:[10]"), (6, "socket:[11]")]);
+    // fd 6 now holds a different socket, which is a reused slot and not a leak.
+    let reused = table(&[(0, "/dev/null"), (3, "/dev/ptmx"), (5, "socket:[10]"), (6, "socket:[99]")]);
+    assert!(fd_kinds_over(&before, &reused).is_empty());
+    // An extra socket and an extra pipe are named by kind; a closed fd is not negative.
+    let leaked = table(&[(0, "/dev/null"), (5, "socket:[10]"), (6, "socket:[99]"), (7, "socket:[12]"), (8, "pipe:[13]")]);
+    let over = fd_kinds_over(&before, &leaked);
+    assert_eq!(over.get("socket"), Some(&1));
+    assert_eq!(over.get("pipe"), Some(&1));
+    assert_eq!(over.len(), 2, "{over:?}");
+}
+
 fn attach_then_detach(rig: &Rig, id: &str) {
     let mut conn = rig.connect(id);
     conn.attach(24, 80);
@@ -240,7 +301,8 @@ fn repeated_attach_detach_keeps_daemon_fd_count_stable() {
         let pid = daemon.pid();
 
         attach_then_detach(&rig, &id);
-        let baseline = fd_count(pid);
+        let baseline_fds = fd_table(pid);
+        let baseline = baseline_fds.len();
         for _ in 0..FD_CYCLES {
             attach_then_detach(&rig, &id);
         }
@@ -250,10 +312,13 @@ fn repeated_attach_detach_keeps_daemon_fd_count_stable() {
             operation_budget(),
             &mut || fd_count(pid) <= baseline,
         );
-        let final_count = fd_count(pid);
+        let final_fds = fd_table(pid);
+        let final_count = final_fds.len();
         assert!(
             final_count <= baseline,
-            "daemon {pid} leaked fds across {FD_CYCLES} attach/detach cycles: baseline={baseline}, final={final_count}"
+            "daemon {pid} leaked fds across {FD_CYCLES} attach/detach cycles: baseline={baseline}, final={final_count}; \
+             more of: {:?}; baseline table: {baseline_fds:?}; final table: {final_fds:?}",
+            fd_kinds_over(&baseline_fds, &final_fds)
         );
 
         let stopped = rig.pty(&["kill", &id]);
