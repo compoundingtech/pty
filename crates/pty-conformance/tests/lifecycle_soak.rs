@@ -307,16 +307,17 @@ fn repeated_attach_detach_keeps_daemon_fd_count_stable() {
             attach_then_detach(&rig, &id);
         }
 
-        wait_until_for(
-            "daemon fd count to return to its warmed baseline",
-            operation_budget(),
-            &mut || fd_count(pid) <= baseline,
-        );
+        // A timeout here must not panic before the tables are read: the report
+        // is what says which descriptor is extra, and whether the count came
+        // back to the baseline at all before it was read again.
+        let budget = operation_budget();
+        let returned = poll_for(budget, || fd_count(pid) <= baseline);
         let final_fds = fd_table(pid);
         let final_count = final_fds.len();
         assert!(
             final_count <= baseline,
             "daemon {pid} leaked fds across {FD_CYCLES} attach/detach cycles: baseline={baseline}, final={final_count}; \
+             count at or under the baseline within {budget:?}: {returned}; \
              more of: {:?}; baseline table: {baseline_fds:?}; final table: {final_fds:?}",
             fd_kinds_over(&baseline_fds, &final_fds)
         );
