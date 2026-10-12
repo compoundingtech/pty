@@ -77,3 +77,16 @@ waited through the grace period before TERM. The foreground job should get \
 a chance to handle terminal hangup before the stronger termination signal. \
 Remove this entry if Node adopts the same grace period.
 """
+
+[[divergence]]
+test = "restart_env_scrub::restart_does_not_leak_the_restarters_identity"
+side = "node"
+kind = "node-defect"
+reason = """
+The pinned Node reference f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 predates \
+AGENT_TRACE_FILE scrubbing. In CI, its restarted child inherits the \
+restarter's trace path. Rust removes the ambient path, as it removes \
+ST_AGENT and ST_ROOT, so the new process can use its own provenance file. \
+Explicit persisted --env values remain unchanged. Remove this entry when \
+Node removes the same ambient trace path on restart.
+"""
