@@ -27,6 +27,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+pub mod argv;
+
 /// How long `ps` gets before the table is declared unreadable. Under contention
 /// `ps` is exactly the thing that goes quiet, so this bound is the point rather
 /// than a formality.
@@ -119,6 +121,14 @@ pub struct LiveIdentity(String);
 impl LiveIdentity {
     pub fn new(value: impl Into<String>) -> Self {
         LiveIdentity(value.into())
+    }
+
+    /// The text, for a record that is only ever compared with another
+    /// reading from this same module on the same boot. The launch-operation
+    /// record stores it next to the boot identity for exactly that reason;
+    /// it is still never compared with `recovery.processStartToken`.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

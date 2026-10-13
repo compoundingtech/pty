@@ -66,6 +66,44 @@ impl LockGuard {
     pub fn forget(mut self) {
         self.armed = false;
     }
+
+    /// Hand this lock to another live process. The owner record is replaced
+    /// in one rename by a complete record naming `pid`, so the pathname never
+    /// names nobody, and this guard stops releasing it. The new owner
+    /// releases it with [`release_file_lock_owned_by`]; if it dies first, the
+    /// lock is stale and stealable as usual. On failure the guard is dropped,
+    /// which releases the lock.
+    pub fn hand_over(mut self, pid: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = super::atomic::tmp_path_for(&self.path);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(pid.to_string().as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, &self.path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return written;
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+/// Release a lock that was handed to `pid`, only while it still names
+/// `pid`. Returns whether it did.
+pub fn release_file_lock_owned_by(lock_path: &Path, pid: u32) -> bool {
+    let named = std::fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|content| parse_leading_int(content.trim()));
+    if named == Some(pid as i32) {
+        release_file_lock(lock_path);
+        true
+    } else {
+        false
+    }
 }
 
 impl Drop for LockGuard {

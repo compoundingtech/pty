@@ -1,0 +1,697 @@
+//! The operation record, `<root>/operations/<h>.json`, and its lock,
+//! `<root>/operations/<h>.lock`.
+//!
+//! The record is created once, exclusively, and then only ever moved forward
+//! by compare-and-swap: every write names the revision it read and the writer
+//! it is, under `flock(LOCK_EX)` on the lock file. Holding the lock never
+//! grants writing by itself; the record's `writer` does. Nothing under `<h>`
+//! is ever deleted, so an `operationId` can never be launched twice.
+
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::proctable::{Answer, ProcTable};
+use crate::registry;
+
+/// The only schema version 1 writes and reads.
+pub const RECORD_SCHEMA: &str = "pty.launch-operation.v1";
+
+/// One process, exactly: a pid is never enough on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessId {
+    pub pid: u32,
+    /// The process table's start identity (`linux:<starttime>` or
+    /// `darwin:<sec>.<usec>`).
+    pub start_token: String,
+    pub boot_id: String,
+    pub uid: u32,
+}
+
+impl ProcessId {
+    /// This process.
+    pub fn current() -> Result<ProcessId, String> {
+        Self::of(std::process::id())
+    }
+
+    /// A live process this one can see, read once from the process table.
+    pub fn of(pid: u32) -> Result<ProcessId, String> {
+        let boot_id = crate::boot::read_boot_identity()
+            .ok_or_else(|| "the host boot identity is unavailable".to_string())?;
+        let start_token = match crate::proctable::process(pid as i32) {
+            Answer::Known(row) => row
+                .identity
+                .map(|identity| identity.as_str().to_string())
+                .ok_or_else(|| format!("process {pid} has no readable start identity"))?,
+            Answer::NotPresent => return Err(format!("process {pid} is not running")),
+            Answer::Unknown(_) => return Err(format!("process {pid} could not be read")),
+        };
+        Ok(ProcessId {
+            pid,
+            start_token,
+            boot_id,
+            // SAFETY: getuid(2) has no preconditions.
+            uid: unsafe { libc::getuid() },
+        })
+    }
+
+    /// Is this exact process gone, by `table`? A pid alone never answers:
+    /// another start token or another boot is another process, a zombie has
+    /// exited, and only a complete table can say a pid is absent.
+    pub fn liveness(&self, table: &ProcTable, boot_id: Option<&str>) -> Liveness {
+        if boot_id.is_some_and(|boot| boot != self.boot_id) {
+            return Liveness::Gone;
+        }
+        match table.row(self.pid as i32) {
+            Answer::Known(row) => match &row.identity {
+                Some(identity) if identity.as_str() != self.start_token => Liveness::Gone,
+                Some(_) if row.is_zombie() => Liveness::Gone,
+                Some(_) => Liveness::Live,
+                None => Liveness::Unknown("start-identity-unreadable"),
+            },
+            Answer::NotPresent if table.is_complete() => Liveness::Gone,
+            Answer::NotPresent => Liveness::Unknown("process-table-incomplete"),
+            Answer::Unknown(_) => Liveness::Unknown("process-table-unreadable"),
+        }
+    }
+}
+
+/// What a recorded identity's process is doing now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    Gone,
+    Unknown(&'static str),
+}
+
+/// Who may write the record next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterRole {
+    None,
+    Launcher,
+    Producer,
+    Recovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Writer {
+    pub role: WriterRole,
+    pub id: Option<ProcessId>,
+}
+
+impl Writer {
+    pub fn none() -> Writer {
+        Writer {
+            role: WriterRole::None,
+            id: None,
+        }
+    }
+
+    pub fn of(role: WriterRole, id: ProcessId) -> Writer {
+        Writer { role, id: Some(id) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum State {
+    Reserved,
+    Pending,
+    Cancelled,
+    Launched,
+    Transferred,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Reserved => "reserved",
+            State::Pending => "pending",
+            State::Cancelled => "cancelled",
+            State::Launched => "launched",
+            State::Transferred => "transferred",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Phase {
+    Reserved,
+    Claimed,
+    DaemonForking,
+    DaemonGated,
+    ChildForking,
+    ChildPreparing,
+    Held,
+}
+
+/// Why the operation was decided the way it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cause {
+    Cancel,
+    OwnerEof,
+    Malformed,
+    Occupied,
+    PredecessorMismatch,
+    Withdrawn,
+    ProducerLost,
+    Launch,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Decision {
+    pub cause: Cause,
+    pub at: String,
+    pub request_id: Option<String>,
+    pub observed: Option<String>,
+}
+
+impl Decision {
+    pub fn now(cause: Cause, request_id: Option<String>, observed: Option<String>) -> Decision {
+        Decision {
+            cause,
+            at: registry::now_iso8601(),
+            request_id,
+            observed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Participants {
+    pub launcher: Option<ProcessId>,
+    pub producer: Option<ProcessId>,
+    pub child: Option<ProcessId>,
+}
+
+/// The incarnation a launch created. `id` is today's incarnation text,
+/// `<daemon-pid>:<createdAt>`, kept exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Incarnation {
+    pub id: String,
+    pub runtime_id: String,
+    pub generation: String,
+    pub daemon: ProcessId,
+    pub child: Option<ProcessId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetirementPhase {
+    Requested,
+    Verified,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Retirement {
+    pub request_id: String,
+    pub phase: RetirementPhase,
+    pub evidence: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    pub request_id: String,
+    pub committed_at: String,
+    /// `true` only means the release byte was written.
+    pub released: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationRecord {
+    pub schema: String,
+    pub revision: u64,
+    pub updated_at: String,
+    pub operation_id: String,
+    pub envelope: Value,
+    pub envelope_sha256: String,
+    pub writer: Writer,
+    pub state: State,
+    pub phase: Phase,
+    pub decision: Option<Decision>,
+    pub participants: Participants,
+    pub incarnation: Option<Incarnation>,
+    pub retirement: Option<Retirement>,
+    pub transfer: Option<Transfer>,
+}
+
+impl OperationRecord {
+    /// A fresh reservation for `envelope`.
+    pub fn reserved(envelope: &super::Envelope) -> OperationRecord {
+        OperationRecord {
+            schema: RECORD_SCHEMA.to_string(),
+            revision: 1,
+            updated_at: registry::now_iso8601(),
+            operation_id: envelope.operation_id.clone(),
+            envelope: envelope.value.clone(),
+            envelope_sha256: envelope.sha256.clone(),
+            writer: Writer::none(),
+            state: State::Reserved,
+            phase: Phase::Reserved,
+            decision: None,
+            participants: Participants::default(),
+            incarnation: None,
+            retirement: None,
+            transfer: None,
+        }
+    }
+
+    /// The exact incarnation text, when the operation has launched.
+    pub fn incarnation_id(&self) -> Option<&str> {
+        self.incarnation.as_ref().map(|inc| inc.id.as_str())
+    }
+}
+
+/// The root a record lives under, as the verdicts describe it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootIdentity {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// `<root>/operations`.
+#[derive(Debug, Clone)]
+pub struct OperationStore {
+    root: PathBuf,
+}
+
+/// Why a record could not be read.
+#[derive(Debug)]
+pub enum ReadError {
+    Io(PathBuf, io::Error),
+    Malformed(PathBuf, String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Io(path, error) => write!(f, "{}: {error}", path.display()),
+            ReadError::Malformed(path, error) => write!(f, "{}: {error}", path.display()),
+        }
+    }
+}
+
+/// Why a compare-and-swap write was refused.
+#[derive(Debug)]
+pub enum WriteError {
+    /// The record changed since it was read, or the caller is not its writer.
+    Stale {
+        observed: Box<OperationRecord>,
+    },
+    Missing,
+    Read(ReadError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Stale { observed } => write!(
+                f,
+                "stale write: the record is at revision {} with writer {:?}",
+                observed.revision, observed.writer.role
+            ),
+            WriteError::Missing => write!(f, "the operation record is missing"),
+            WriteError::Read(error) => write!(f, "{error}"),
+            WriteError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Why an exclusive create did not happen.
+#[derive(Debug)]
+pub enum CreateError {
+    Exists,
+    Io(io::Error),
+}
+
+impl OperationStore {
+    /// The store under the registry root this process resolves.
+    pub fn current() -> OperationStore {
+        OperationStore::at(registry::session_dir())
+    }
+
+    pub fn at(root: impl Into<PathBuf>) -> OperationStore {
+        OperationStore { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn dir(&self) -> PathBuf {
+        self.root.join("operations")
+    }
+
+    pub fn record_path(&self, digest: &str) -> PathBuf {
+        self.dir().join(format!("{digest}.json"))
+    }
+
+    pub fn lock_path(&self, digest: &str) -> PathBuf {
+        self.dir().join(format!("{digest}.lock"))
+    }
+
+    /// The root's device and inode, so a verdict says exactly which root it
+    /// describes.
+    pub fn root_identity(&self) -> Option<RootIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&self.root).ok()?;
+        Some(RootIdentity {
+            path: self.root.to_string_lossy().into_owned(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Create `<root>/operations` (0700) when it is missing.
+    pub fn ensure_dir(&self) -> io::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.root)?;
+        match std::fs::DirBuilder::new().mode(0o700).create(self.dir()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let meta = std::fs::metadata(self.dir())?;
+        if !meta.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                self.dir().display()
+            )));
+        }
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(self.dir(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Read the record. `Ok(None)` only when the file does not exist.
+    pub fn read(&self, digest: &str) -> Result<Option<OperationRecord>, ReadError> {
+        let path = self.record_path(digest);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ReadError::Io(path, error)),
+        };
+        let record: OperationRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| ReadError::Malformed(path.clone(), error.to_string()))?;
+        if record.schema != RECORD_SCHEMA {
+            return Err(ReadError::Malformed(
+                path,
+                format!("unsupported schema {:?}", record.schema),
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Create the record exclusively: temporary file, fsync, `link`, fsync
+    /// of the directory. An existing record is never touched.
+    pub fn create_exclusive(
+        &self,
+        digest: &str,
+        record: &OperationRecord,
+    ) -> Result<(), CreateError> {
+        self.ensure_dir().map_err(CreateError::Io)?;
+        let target = self.record_path(digest);
+        let tmp = registry::atomic::tmp_path_for(&target);
+        let bytes = encode(record).map_err(CreateError::Io)?;
+        let result = (|| -> Result<(), CreateError> {
+            write_synced(&tmp, &bytes).map_err(CreateError::Io)?;
+            match std::fs::hard_link(&tmp, &target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(CreateError::Exists);
+                }
+                Err(error) => return Err(CreateError::Io(error)),
+            }
+            sync_dir(&self.dir()).map_err(CreateError::Io)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result
+    }
+
+    /// Move the record from `expected` to `next` by compare-and-swap. The
+    /// caller holds [`OperationLock::Exclusive`] and has checked that it is
+    /// the writer `expected` names (or that `expected` has no writer, for a
+    /// claim). The write is refused as stale when the record on disk is not
+    /// exactly `expected`.
+    pub fn write_cas(
+        &self,
+        _lock: &OperationLock,
+        digest: &str,
+        expected: &OperationRecord,
+        mut next: OperationRecord,
+    ) -> Result<OperationRecord, WriteError> {
+        let current = self
+            .read(digest)
+            .map_err(WriteError::Read)?
+            .ok_or(WriteError::Missing)?;
+        if current != *expected {
+            return Err(WriteError::Stale {
+                observed: Box::new(current),
+            });
+        }
+        next.revision = expected.revision + 1;
+        next.updated_at = registry::now_iso8601();
+        let target = self.record_path(digest);
+        let tmp = registry::atomic::tmp_path_for(&target);
+        let bytes = encode(&next).map_err(WriteError::Io)?;
+        let result = write_synced(&tmp, &bytes)
+            .and_then(|()| std::fs::rename(&tmp, &target))
+            .and_then(|()| sync_dir(&self.dir()));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result.map_err(WriteError::Io)?;
+        Ok(next)
+    }
+}
+
+fn encode(record: &OperationRecord) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// `flock` on `<h>.lock`. The kernel drops it when the holder dies, which is
+/// what lets a reader tell a live writer from a dead one.
+#[derive(Debug)]
+pub enum OperationLock {
+    Exclusive(File),
+    Shared(File),
+}
+
+impl OperationLock {
+    fn open(store: &OperationStore, digest: &str) -> io::Result<File> {
+        store.ensure_dir()?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(store.lock_path(digest))
+    }
+
+    /// Take `LOCK_EX`, polling for up to `wait`. `Ok(None)` means another
+    /// holder kept it for the whole wait.
+    pub fn exclusive(
+        store: &OperationStore,
+        digest: &str,
+        wait: Duration,
+    ) -> io::Result<Option<OperationLock>> {
+        let file = Self::open(store, digest)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            if try_flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+                return Ok(Some(OperationLock::Exclusive(file)));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Take `LOCK_SH` without waiting. `Ok(None)` means a writer holds
+    /// `LOCK_EX`: it is alive.
+    pub fn shared_now(store: &OperationStore, digest: &str) -> io::Result<Option<OperationLock>> {
+        let file = Self::open(store, digest)?;
+        if try_flock(&file, libc::LOCK_SH | libc::LOCK_NB)? {
+            Ok(Some(OperationLock::Shared(file)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The descriptor, for a holder that must keep it across `exec`.
+    pub fn raw_fd(&self) -> i32 {
+        match self {
+            OperationLock::Exclusive(file) | OperationLock::Shared(file) => file.as_raw_fd(),
+        }
+    }
+}
+
+fn try_flock(file: &File, operation: i32) -> io::Result<bool> {
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => return Ok(false),
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (OperationStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-oprec-{}-{}",
+            std::process::id(),
+            registry::random_hex16()
+        ));
+        (OperationStore::at(&dir), dir)
+    }
+
+    fn envelope() -> super::super::Envelope {
+        super::super::parse_envelope(
+            br#"{"type":"envelope","version":1,"operationId":"op","owner":"o","origin":"o","subject":"s","runtimeId":"rt","expectedIncarnation":null,"bindings":{}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_record_is_created_once_and_never_replaced() {
+        let (store, dir) = store();
+        let envelope = envelope();
+        let h = envelope.digest();
+        let record = OperationRecord::reserved(&envelope);
+        store.create_exclusive(&h, &record).unwrap();
+        let first = std::fs::read(store.record_path(&h)).unwrap();
+        assert!(matches!(
+            store.create_exclusive(&h, &record),
+            Err(CreateError::Exists)
+        ));
+        assert_eq!(std::fs::read(store.record_path(&h)).unwrap(), first);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store.dir()), 0o700);
+        assert_eq!(mode(&store.record_path(&h)), 0o600);
+        assert_eq!(store.read(&h).unwrap().unwrap(), record);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_revision_is_refused_and_writes_nothing() {
+        let (store, dir) = store();
+        let envelope = envelope();
+        let h = envelope.digest();
+        let record = OperationRecord::reserved(&envelope);
+        store.create_exclusive(&h, &record).unwrap();
+        let lock = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let mut next = record.clone();
+        next.state = State::Pending;
+        let written = store.write_cas(&lock, &h, &record, next.clone()).unwrap();
+        assert_eq!(written.revision, 2);
+        let before = std::fs::read(store.record_path(&h)).unwrap();
+        // The same expectation again is now stale.
+        match store.write_cas(&lock, &h, &record, next) {
+            Err(WriteError::Stale { observed }) => assert_eq!(observed.revision, 2),
+            other => panic!("expected a stale refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(store.record_path(&h)).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_exclusive_holder_excludes_shared_readers_until_it_drops() {
+        let (store, dir) = store();
+        let h = "a".repeat(64);
+        let held = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert!(OperationLock::shared_now(&store, &h).unwrap().is_none());
+        assert!(
+            OperationLock::exclusive(&store, &h, Duration::from_millis(20))
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        assert!(OperationLock::shared_now(&store, &h).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_identity_is_gone_only_on_evidence() {
+        use crate::proctable::table_from_shape;
+        let id = ProcessId {
+            pid: 10,
+            start_token: "tok:10".into(),
+            boot_id: "boot".into(),
+            uid: 1,
+        };
+        let live = table_from_shape("10 1 10 S tok:10\n");
+        assert_eq!(id.liveness(&live, Some("boot")), Liveness::Live);
+        // Same pid, another start: reused.
+        let reused = table_from_shape("10 1 10 S tok:other\n");
+        assert_eq!(id.liveness(&reused, Some("boot")), Liveness::Gone);
+        let zombie = table_from_shape("10 1 10 Z tok:10\n");
+        assert_eq!(id.liveness(&zombie, Some("boot")), Liveness::Gone);
+        let absent = table_from_shape("11 1 11 S\n");
+        assert_eq!(id.liveness(&absent, Some("boot")), Liveness::Gone);
+        assert!(matches!(
+            id.liveness(&absent.clone().marked_incomplete(), Some("boot")),
+            Liveness::Unknown(_)
+        ));
+        assert!(matches!(
+            id.liveness(&ProcTable::unreadable(), Some("boot")),
+            Liveness::Unknown(_)
+        ));
+        // Another boot: whatever has this pid now is not this process.
+        assert_eq!(id.liveness(&live, Some("other-boot")), Liveness::Gone);
+    }
+}

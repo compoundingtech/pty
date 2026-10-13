@@ -28,6 +28,8 @@ pub fn run(args: &[String]) -> CliResult {
     let mut unset_env: Vec<String> = Vec::new();
     let mut startup_timeout_ms: Option<u64> = None;
     let mut lifecycle_tag: Option<String> = None;
+    let mut operation_fd: Option<String> = None;
+    let mut launch_operation: Option<String> = None;
     let mut i = 0;
     let mut command: Vec<String> = Vec::new();
     while i < args.len() {
@@ -81,6 +83,16 @@ pub fn run(args: &[String]) -> CliResult {
                     return Ok(1);
                 };
                 lifecycle_tag = Some(value.clone());
+                i += 2;
+            }
+            // A launch operation (`pty operation`): the owner's control
+            // socket and the operation's digest, its birth marker.
+            "--operation-fd" => {
+                operation_fd = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--launch-operation" => {
+                launch_operation = Some(args.get(i + 1).cloned().unwrap_or_default());
                 i += 2;
             }
             "--tag" => {
@@ -165,6 +177,24 @@ pub fn run(args: &[String]) -> CliResult {
         );
         return Ok(1);
     }
+    let operation = if operation_fd.is_some() || launch_operation.is_some() {
+        match operation_arguments(
+            operation_fd.as_deref(),
+            launch_operation.as_deref(),
+            id.as_deref(),
+            background,
+            attach_existing,
+            lifecycle_tag.is_some(),
+        ) {
+            Ok(operation) => Some(operation),
+            Err(message) => {
+                eprintln!("pty run: {message}");
+                return Ok(64);
+            }
+        }
+    } else {
+        None
+    };
 
     // Nesting prevention: running `pty run` from inside a pty session would
     // create a session-inside-a-session. Run the command directly unless
@@ -220,11 +250,16 @@ pub fn run(args: &[String]) -> CliResult {
     let name = id.clone().unwrap_or_else(registry::generate_id);
     if let Err(e) = registry::validate_name(&name) {
         eprintln!("{e}");
-        return Ok(1);
+        return Ok(if operation.is_some() { 64 } else { 1 });
     }
     // Under `-a` a collision with an existing session is the expected path,
-    // so the uniqueness check is left to the create step below.
-    if !attach_existing && registry::session_exists(&name) && client::is_alive(&name) {
+    // so the uniqueness check is left to the create step below. A launch
+    // operation records its own occupancy decision instead.
+    if operation.is_none()
+        && !attach_existing
+        && registry::session_exists(&name)
+        && client::is_alive(&name)
+    {
         eprintln!("Session id \"{name}\" is already in use.");
         return Ok(1);
     }
@@ -267,7 +302,48 @@ pub fn run(args: &[String]) -> CliResult {
         lifecycle_tag,
     });
 
+    if let Some((fd, digest)) = operation {
+        return super::run_operation::launch(&name, params, fd, &digest);
+    }
     create_or_attach(&name, params, cwd.is_some(), background, attach_existing)
+}
+
+/// Validate the launch-operation arguments before anything is read from the
+/// owner's descriptor. Operation mode is detached, names its session
+/// explicitly, and leaves startup to the owner's transfer, so `-a` and the
+/// startup lease do not apply.
+fn operation_arguments(
+    fd: Option<&str>,
+    digest: Option<&str>,
+    id: Option<&str>,
+    detached: bool,
+    attach: bool,
+    lifecycle_tag: bool,
+) -> Result<(i32, String), String> {
+    let (Some(fd), Some(digest)) = (fd, digest) else {
+        return Err("--operation-fd and --launch-operation are required together.".into());
+    };
+    let fd = fd
+        .parse::<i32>()
+        .ok()
+        .filter(|fd| *fd >= 3)
+        .ok_or("--operation-fd requires a descriptor number of 3 or above.")?;
+    if !pty_core::operation::is_digest(digest) {
+        return Err("--launch-operation requires 64 lowercase hex characters.".into());
+    }
+    if id.is_none_or(str::is_empty) {
+        return Err("a launch operation requires --id.".into());
+    }
+    if !detached {
+        return Err("a launch operation requires -d.".into());
+    }
+    if attach {
+        return Err("a launch operation cannot take -a.".into());
+    }
+    if lifecycle_tag {
+        return Err("a launch operation cannot take --lifecycle-tag.".into());
+    }
+    Ok((fd, digest.to_string()))
 }
 
 /// A label built from the working directory and the command, the way Node

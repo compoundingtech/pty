@@ -608,7 +608,7 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false).entries
+    scan_sessions(root, options, false, None).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
@@ -619,10 +619,22 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 /// is omitted. Strict PID validation requires a complete, positive decimal i32;
 /// classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true)
+    scan_sessions(root, options, true, None)
 }
 
-fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory {
+/// [`list_sessions_strict_in`] for one session id: that id's companions are
+/// read and classified exactly as a whole-root strict scan would classify
+/// them, and no other entry is touched.
+pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
+    scan_sessions(root, options, true, Some(name))
+}
+
+fn scan_sessions(
+    root: &Path,
+    options: &ListOptions,
+    strict: bool,
+    only: Option<&str>,
+) -> Inventory {
     let mut scanner = Scanner {
         strict,
         errors: Vec::new(),
@@ -658,6 +670,14 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
             },
             Err(error) => scanner.error(root, InventoryErrorKind::EntryUnreadable, error),
         }
+    }
+    if let Some(only) = only {
+        let companions = [
+            format!("{only}.sock"),
+            format!("{only}.json"),
+            format!("{only}.pid"),
+        ];
+        entries.retain(|entry| companions.contains(entry));
     }
     entries.sort();
 
