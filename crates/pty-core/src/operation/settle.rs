@@ -337,7 +337,11 @@ pub fn settle(
         let writer = Component {
             name: "writer",
             status: Status::Pending,
-            detail: json!({"holdsLock": true, "role": record.map(|r| r.writer.role)}),
+            detail: json!({
+                "holdsLock": true,
+                "role": record.map(|r| r.writer.role),
+                "holderPid": OperationLock::holder(store, &digest),
+            }),
         };
         return snap.finish(
             "live",
@@ -635,94 +639,27 @@ pub struct RetireRefusal {
 
 /// End a recorded held child, and only it.
 ///
-/// A held child whose daemon is gone has already read end of file on its
-/// gate and exited, unless it is stopped. So the first signal is `SIGCONT`:
-/// the child resumes, reads end of file, and exits without exec by itself.
-///
-/// - **Linux** then escalates to `SIGKILL`, and every signal goes through a
-///   `pidfd`: the process is pinned first, its start identity checked, and
-///   a pid reused between the check and the signal cannot be hit.
-/// - **macOS** has no `pidfd`. The identity is checked immediately before
-///   each signal, and the only signal sent is `SIGCONT`, which an unrelated
-///   process that reused the pid in that window would merely see resumed.
-///   A child that still does not leave is left alive and reported.
-///
-/// A held child never forks, so there is no group to signal.
+/// The process is pinned first (a Linux `pidfd`, a macOS audit token) and
+/// its start identity checked after the pin, so `SIGKILL` can only reach
+/// the recorded process. Where it cannot be pinned safely nothing is sent,
+/// and the child is reported unknown. A held child never forks, so there is
+/// no group to signal.
 fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut escalated = false;
-    loop {
-        let liveness = id.liveness_now(boot);
-        if liveness != Liveness::Live {
-            return liveness;
-        }
-        let signal = if escalated && cfg!(target_os = "linux") {
-            libc::SIGKILL
-        } else {
-            libc::SIGCONT
-        };
-        if let Err(reason) = signal_exact(id, boot, signal) {
-            return Liveness::Unknown(reason);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Liveness::Live;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-        escalated = true;
-    }
-}
-
-/// Send `signal` to exactly the recorded identity.
-fn signal_exact(id: &ProcessId, boot: Option<&str>, signal: i32) -> Result<(), &'static str> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        // SAFETY: pidfd_open returns a new descriptor or -1.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, id.pid as libc::pid_t, 0) };
-        if raw >= 0 {
-            // SAFETY: a descriptor this call just received.
-            let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-            // The descriptor names one process for good: if it is the
-            // recorded one now, the signal can only reach it.
-            if id.liveness_now(boot) != Liveness::Live {
-                return Ok(());
-            }
-            // SAFETY: a signal through our own pidfd.
-            let sent = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            return if sent == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                Ok(())
-            } else {
-                Err("signal-refused")
-            };
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => return Ok(()),
-            Some(libc::ENOSYS) => {}
-            _ => return Err("pidfd-unavailable"),
-        }
-    }
-    // No pidfd: check, then signal at once.
     if id.liveness_now(boot) != Liveness::Live {
-        return Ok(());
+        return id.liveness_now(boot);
     }
-    // SAFETY: a signal to the identity the table showed this instant.
-    if unsafe { libc::kill(id.pid as i32, signal) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    {
-        Ok(())
-    } else {
-        Err("signal-refused")
+    let pinned = match super::exact::Exact::pin(id, boot) {
+        Ok(Some(pinned)) => pinned,
+        Ok(None) => return id.liveness_now(boot),
+        Err(reason) => return Liveness::Unknown(reason),
+    };
+    if let Err(reason) = pinned.signal(libc::SIGKILL) {
+        return Liveness::Unknown(reason);
     }
+    if !pinned.wait_exit(Duration::from_secs(5)) {
+        return Liveness::Live;
+    }
+    id.liveness_now(boot)
 }
 
 /// `pty operation retire`: retire an operation whose writer and every

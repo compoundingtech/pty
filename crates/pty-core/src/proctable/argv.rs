@@ -63,11 +63,6 @@ impl ArgvScan {
     }
 }
 
-/// How many times a process whose argv could not be read is looked at again
-/// within one scan, and how long apart.
-const RECHECKS: usize = 5;
-const RECHECK_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// Scan every live process of `uid`.
 pub fn scan_argv(uid: u32) -> ArgvScan {
     #[cfg(target_os = "linux")]
@@ -143,29 +138,6 @@ mod linux {
         if !saw_own {
             return ArgvScan::unreadable_listing(uid, SOURCE);
         }
-        // A process caught on its way out has already lost its argv but is
-        // not a zombie yet. Look again, briefly, before calling it
-        // unreadable: the answer is still this pass's.
-        let mut unreadable = std::mem::take(&mut scan.unreadable);
-        for _ in 0..RECHECKS {
-            if unreadable.is_empty() {
-                break;
-            }
-            std::thread::sleep(RECHECK_PAUSE);
-            unreadable.retain(|pid| match classify(*pid, uid) {
-                Class::Gone | Class::OtherUser => false,
-                Class::Zombie => {
-                    scan.zombies += 1;
-                    false
-                }
-                Class::Live(row) => {
-                    scan.rows.push(row);
-                    false
-                }
-                Class::Unreadable | Class::OwnerUnknown => true,
-            });
-        }
-        scan.unreadable = unreadable;
         scan.rows.sort_by_key(|row| row.pid);
         scan.unreadable.sort_unstable();
         scan
@@ -300,15 +272,7 @@ mod macos {
                 "darwin:{}.{:06}",
                 info.pbi_start_tvsec, info.pbi_start_tvusec
             )));
-            let mut read = procargs(pid, arg_max);
-            for _ in 0..RECHECKS {
-                if !matches!(read, Err(code) if code != libc::ESRCH) {
-                    break;
-                }
-                std::thread::sleep(RECHECK_PAUSE);
-                read = procargs(pid, arg_max);
-            }
-            match read {
+            match procargs(pid, arg_max) {
                 Ok(argv) => scan.rows.push(ArgvRow {
                     pid,
                     identity,

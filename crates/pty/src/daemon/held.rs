@@ -88,6 +88,9 @@ pub struct HeldSpec {
     /// Debug builds: stop just before acknowledging, so a test can inspect
     /// or kill a prepared child that never reached `prepared`.
     stop_before_ack: bool,
+    /// Debug builds: stop at once after the fork, still holding every
+    /// descriptor of the daemon's and still in its process group.
+    stop_after_fork: bool,
 }
 
 // SAFETY: the raw pointers point into the CStrings this struct owns, which
@@ -168,6 +171,8 @@ impl HeldSpec {
             fd_limit: descriptor_limit(),
             stop_before_ack: cfg!(debug_assertions)
                 && std::env::var("PTY_TEST_HELD_CHILD").as_deref() == Ok("stop-before-ack"),
+            stop_after_fork: cfg!(debug_assertions)
+                && std::env::var("PTY_TEST_HELD_CHILD").as_deref() == Ok("stop-after-fork"),
         })
     }
 
@@ -416,6 +421,9 @@ unsafe fn fail(gate: RawFd, step: Step) -> ! {
 /// Called only in the child of `fork_held`.
 unsafe fn held_child(spec: &HeldSpec, gate: RawFd) -> ! {
     unsafe {
+        if spec.stop_after_fork {
+            libc::kill(libc::getpid(), libc::SIGSTOP);
+        }
         // 1. Dispositions as an exec would leave them, then an empty mask.
         for &(signal, handler) in &spec.dispositions {
             let mut action: libc::sigaction = std::mem::zeroed();

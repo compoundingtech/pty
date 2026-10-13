@@ -1706,37 +1706,31 @@ impl Actor {
 }
 
 /// After the gate is shut, the child must be gone by its exact identity. A
-/// child that does not leave (it is stopped, say) is killed through the
-/// substrate, whose signals are fenced against reaping, so its pid cannot
-/// name anyone else. A held child never forks, so there is no group to
+/// held or preparing child leaves at once on end of file; one that does not
+/// (it is stopped, say) is killed through the substrate, whose signals are
+/// fenced against reaping, so its pid cannot name anyone else. Both waits
+/// end on the child's exit (a pidfd, a kqueue), not on a timer; the timer
+/// only bounds them. A held child never forks, so there is no group to
 /// signal.
 fn verify_child_gone(child: &ChildRecord) -> &'static str {
+    use pty_core::operation::exact::{Exit, wait_for_exit};
     let Some(id) = &child.id else {
         return "unrecorded";
     };
     let boot = pty_core::boot::read_boot_identity();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match id.liveness(&ProcTable::read(), boot.as_deref()) {
-            Liveness::Gone => return "gone",
-            _ if Instant::now() >= deadline => break,
-            _ => std::thread::sleep(Duration::from_millis(10)),
-        }
+    let gone = || id.liveness(&ProcTable::read(), boot.as_deref()) == Liveness::Gone;
+    let _ = wait_for_exit(child.pid, Duration::from_secs(1));
+    if gone() {
+        return "gone";
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match id.liveness(&ProcTable::read(), boot.as_deref()) {
-            Liveness::Gone => return "gone",
-            Liveness::Unknown(reason) if Instant::now() >= deadline => return reason,
-            Liveness::Live => {
-                let _ = child.session.kill();
-            }
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            return "live";
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let _ = child.session.kill();
+    let waited = wait_for_exit(child.pid, Duration::from_secs(5));
+    if gone() {
+        "gone"
+    } else if waited == Exit::Unsupported {
+        "exit-wait-unavailable"
+    } else {
+        "live"
     }
 }
 

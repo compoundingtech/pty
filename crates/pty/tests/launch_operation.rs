@@ -319,19 +319,13 @@ impl Owner {
 
     /// Settle until the verdict is `verdict` (participants take a moment to
     /// leave the process table).
+    /// Settle until the verdict is `verdict`; see [`settle_reactively`].
     fn settle_until(&self, rig: &Rig, verdict: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let v = self.settle(rig);
-            if v["verdict"] == verdict {
-                return v;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "settle never became {verdict}: {v:#}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        settle_reactively(rig, &self.operation_id, &self.sha, verdict, None)
+    }
+
+    fn settle_until_kind(&self, rig: &Rig, verdict: &str, kind: &str) -> Value {
+        settle_reactively(rig, &self.operation_id, &self.sha, verdict, Some(kind))
     }
 
     fn retire(&self, rig: &Rig, request_id: &str, incarnation: Option<&str>) -> (i32, Value) {
@@ -425,8 +419,92 @@ fn alive(pid: i32) -> bool {
     matches!(pty_core::proctable::process(pid), pty_core::proctable::Answer::Known(row) if !row.is_zombie())
 }
 
+/// Wait for `pid` to exit: on its exit (a pidfd or a kqueue), not on a
+/// timer. A zombie has exited.
 fn wait_gone(pid: i32) {
-    wait_until(&format!("pid {pid} to exit"), || !alive(pid));
+    use pty_core::operation::exact::{Exit, wait_for_exit};
+    match wait_for_exit(pid, Duration::from_secs(20)) {
+        Exit::Exited => {}
+        Exit::Running => panic!("pid {pid} did not exit"),
+        Exit::Unsupported => wait_until(&format!("pid {pid} to exit"), || !alive(pid)),
+    }
+}
+
+/// Settle until the verdict is `verdict` (and its kind `kind`), waiting in
+/// between on exactly the processes the evidence names (a live writer or
+/// participant, a marked or unreadable process) to exit. A process of this
+/// user caught exiting is honestly unreadable for that capture; the next
+/// capture follows its exit, not a timer. A verdict that names no process to
+/// wait for fails at once.
+fn settle_reactively(
+    rig: &Rig,
+    operation_id: &str,
+    sha: &str,
+    verdict: &str,
+    kind: Option<&str>,
+) -> Value {
+    for _ in 0..20 {
+        let out = rig.run(&[
+            "operation",
+            "settle",
+            operation_id,
+            "--envelope-sha256",
+            sha,
+            "--json",
+        ]);
+        assert_eq!(out.code, 0, "settle: {}", out.stderr);
+        let v = out.json();
+        if v["verdict"] == verdict && kind.is_none_or(|kind| v["kind"] == kind) {
+            return v;
+        }
+        let pids = named_processes(&v);
+        assert!(
+            !pids.is_empty(),
+            "settle is {}/{} and names no process to wait for (wanted {verdict}/{kind:?}): {v:#}",
+            v["verdict"],
+            v["kind"]
+        );
+        for pid in pids {
+            wait_gone(pid);
+        }
+    }
+    panic!("settle never became {verdict}/{kind:?}");
+}
+
+/// Every process a settle verdict names as still live or unreadable.
+fn named_processes(v: &Value) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for component in v["components"].as_array().into_iter().flatten() {
+        let detail = &component["detail"];
+        match component["name"].as_str() {
+            Some("writer") if component["status"] == "pending" => {
+                let pid = detail["pid"]
+                    .as_i64()
+                    .or_else(|| detail["holderPid"].as_i64())
+                    .or_else(|| v["record"]["writer"]["id"]["pid"].as_i64());
+                pids.extend(pid.map(|pid| pid as i32));
+            }
+            Some("participants") => {
+                for p in detail["participants"].as_array().into_iter().flatten() {
+                    if p["status"] == "live" {
+                        pids.extend(p["pid"].as_i64().map(|pid| pid as i32));
+                    }
+                }
+            }
+            Some("marker-scan") => {
+                for m in detail["matches"].as_array().into_iter().flatten() {
+                    pids.extend(m["pid"].as_i64().map(|pid| pid as i32));
+                }
+                for u in detail["unreadable"].as_array().into_iter().flatten() {
+                    pids.extend(u.as_i64().map(|pid| pid as i32));
+                }
+            }
+            _ => {}
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 fn kill(pid: i32, signal: i32) {
@@ -501,19 +579,12 @@ fn a_second_reserve_is_refused_and_the_record_is_untouched() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     // A reservation is claimable until it is withdrawn: never closure.
-    let v = rig
-        .ok(&[
-            "operation",
-            "settle",
-            "op-dup",
-            "--envelope-sha256",
-            &sha256_hex(line.as_bytes()),
-            "--json",
-        ])
-        .json();
-    assert_eq!(
-        verdict(&v),
-        ("retire-required".into(), Some("reserved".into()))
+    let v = settle_reactively(
+        &rig,
+        "op-dup",
+        &sha256_hex(line.as_bytes()),
+        "retire-required",
+        Some("reserved"),
     );
     assert_eq!(v["noFurtherEffects"], false);
 }
@@ -1579,7 +1650,7 @@ fn settle_treats_unreadable_evidence_as_unknown() {
     .unwrap();
     // SAFETY: geteuid(2) has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        let v = owner.settle(&rig);
+        let v = owner.settle_until_kind(&rig, "unknown", "registry");
         assert_eq!(verdict(&v), ("unknown".into(), Some("registry".into())));
         // Unproven evidence is never a positive closure claim.
         assert_eq!(v["noFurtherEffects"], false);
@@ -1614,8 +1685,8 @@ fn a_decoy_with_the_same_digest_keeps_the_operation_live_and_is_never_signalled(
         ])
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(owner.settle(&rig)["verdict"], "closed");
+    // `spawn` returns after the exec: the argv is in place.
+    owner.settle_until(&rig, "closed");
     let _ = unrelated.kill();
     let _ = unrelated.wait();
     // The same digest, from anywhere: conservatively live, and left alone.
@@ -1630,8 +1701,7 @@ fn a_decoy_with_the_same_digest_keeps_the_operation_live_and_is_never_signalled(
         ])
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    let v = owner.settle(&rig);
+    let v = owner.settle_until_kind(&rig, "live", "marker-scan");
     assert_eq!(verdict(&v), ("live".into(), Some("marker-scan".into())));
     let (code, v) = owner.retire(&rig, "r-decoy", Some(&inc));
     assert_eq!(code, 0, "{v:#}");
@@ -1641,7 +1711,7 @@ fn a_decoy_with_the_same_digest_keeps_the_operation_live_and_is_never_signalled(
     );
     let _ = decoy.kill();
     let _ = decoy.wait();
-    assert_eq!(owner.settle(&rig)["verdict"], "closed");
+    owner.settle_until(&rig, "closed");
 }
 
 #[test]
@@ -2766,16 +2836,7 @@ fn settle_creates_nothing() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let lock = dir.join(format!("{}.lock", sha256_hex(b"op-ro")));
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
-    let v = rig
-        .ok(&[
-            "operation",
-            "settle",
-            "op-ro",
-            "--envelope-sha256",
-            &sha,
-            "--json",
-        ])
-        .json();
+    let v = settle_reactively(&rig, "op-ro", &sha, "retire-required", Some("reserved"));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         verdict(&v),
@@ -2849,4 +2910,121 @@ fn a_death_at_every_barrier_settles_and_retires() {
         assert!(!row_exists(&rig, &owner.runtime_id), "{barrier}");
         assert!(!owner.ran(), "{barrier}");
     }
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn without_an_identity_safe_signal_recovery_sends_none() {
+    let rig = Rig::new();
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id() as i32;
+    let (sha, inc) = forge_launched(&rig, "op-nosignal", pid, None);
+    // No pidfd (or, on macOS, no audit-token call): refuse to signal.
+    let out = rig.run_env(
+        &[
+            "operation",
+            "retire",
+            "op-nosignal",
+            "--envelope-sha256",
+            &sha,
+            "--request-id",
+            "r-1",
+            "--incarnation",
+            &inc,
+            "--json",
+        ],
+        &[("PTY_TEST_EXACT_SIGNAL", "unsupported")],
+    );
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    let v = out.json();
+    assert_eq!(
+        v["record"]["retirement"]["evidence"]["child"]["status"],
+        "identity-safe-signal-unavailable"
+    );
+    assert_eq!(v["record"]["retirement"]["phase"], "incomplete");
+    assert_ne!(v["verdict"], "closed");
+    assert_eq!(v["noFurtherEffects"], false);
+    // Nothing reached the process: not killed, not stopped, not continued.
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(matches!(
+        pty_core::proctable::process(pid),
+        pty_core::proctable::Answer::Known(row) if !row.is_stopped() && !row.is_zombie()
+    ));
+    // With the mechanism, a new request ends it.
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-nosignal",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r-2",
+        "--incarnation",
+        &inc,
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    assert_eq!(out.json()["record"]["retirement"]["phase"], "verified");
+    assert!(!child.wait().unwrap().success());
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
+    let rig = Rig::new();
+    let mut owner = Owner::start(
+        &rig,
+        "fork-stop",
+        Plan {
+            env: vec![("PTY_TEST_HELD_CHILD".into(), "stop-after-fork".into())],
+            ..Plan::default()
+        },
+    );
+    owner.wait_for("decision");
+    let record = loop {
+        let record = owner.record(&rig);
+        if !record["participants"]["child"].is_null() {
+            break record;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let child = record["participants"]["child"]["pid"].as_i64().unwrap() as i32;
+    wait_until(
+        "the child to stop",
+        || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
+    );
+    // Stopped before it shed anything: it holds copies of every descriptor
+    // of the daemon's, the lock file's among them, and it is still in the
+    // daemon's process group.
+    let daemon = record["participants"]["producer"]["pid"].as_i64().unwrap() as i32;
+    kill(daemon, libc::SIGKILL);
+    owner.launcher_exit();
+    wait_gone(daemon);
+    assert!(
+        alive(child),
+        "nothing ends a stopped child that has no terminal"
+    );
+    // The lock was the daemon's alone and died with it: settle reads the
+    // record and names the live child, rather than a writer holding a lock.
+    let v = owner.settle_until_kind(&rig, "live", "participants");
+    assert_eq!(component(&v, "writer")["status"], "verified", "{v:#}");
+    let inc = owner.record(&rig)["incarnation"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, v) = owner.retire(&rig, "r-fork-stop", Some(&inc));
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(
+        v["record"]["retirement"]["evidence"]["child"]["status"],
+        "gone"
+    );
+    assert!(!alive(child));
+    owner.settle_until(&rig, "closed");
+    assert!(!owner.ran());
 }

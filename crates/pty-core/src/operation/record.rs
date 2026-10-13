@@ -647,8 +647,18 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// `flock` on `<h>.lock`. The kernel drops it when the holder dies, which is
-/// what lets a reader tell a live writer from a dead one.
+/// A POSIX record lock (`fcntl`) on `<h>.lock`. The kernel drops it when the
+/// holder dies, which is what lets a reader tell a live writer from a dead
+/// one.
+///
+/// **A record lock, not `flock`.** An `flock` belongs to the open file
+/// description, so a forked child holding a copy of the descriptor holds the
+/// lock too: a held child stopped between its fork and its descriptor
+/// cleanup would keep a dead daemon's lock for ever. A record lock belongs
+/// to the process and is never inherited by a fork. The one rule that comes
+/// with it: a process must not open and close the lock file anywhere else
+/// while it holds the lock, since closing any descriptor of the file drops
+/// it.
 #[derive(Debug)]
 pub enum OperationLock {
     Exclusive(File),
@@ -658,24 +668,25 @@ pub enum OperationLock {
 impl OperationLock {
     /// The lock `reserve` created. Nothing is created here: a reader that
     /// finds no lock finds no operation.
-    fn open(store: &OperationStore, digest: &str) -> io::Result<File> {
+    fn open(store: &OperationStore, digest: &str, write: bool) -> io::Result<File> {
         std::fs::OpenOptions::new()
             .read(true)
+            .write(write)
             .custom_flags(libc::O_CLOEXEC)
             .open(store.lock_path(digest))
     }
 
-    /// Take `LOCK_EX`, polling for up to `wait`. `Ok(None)` means another
-    /// holder kept it for the whole wait.
+    /// Take the write lock, polling for up to `wait`. `Ok(None)` means
+    /// another holder kept it for the whole wait.
     pub fn exclusive(
         store: &OperationStore,
         digest: &str,
         wait: Duration,
     ) -> io::Result<Option<OperationLock>> {
-        let file = Self::open(store, digest)?;
+        let file = Self::open(store, digest, true)?;
         let deadline = Instant::now() + wait;
         loop {
-            if try_flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+            if try_lock(&file, libc::F_WRLCK as libc::c_int)? {
                 return Ok(Some(OperationLock::Exclusive(file)));
             }
             if Instant::now() >= deadline {
@@ -685,15 +696,31 @@ impl OperationLock {
         }
     }
 
-    /// Take `LOCK_SH` without waiting. `Ok(None)` means a writer holds
-    /// `LOCK_EX`: it is alive. It reads and creates nothing.
+    /// Take the read lock without waiting. `Ok(None)` means a writer holds
+    /// the write lock: it is alive. It reads and creates nothing.
     pub fn shared_now(store: &OperationStore, digest: &str) -> io::Result<Option<OperationLock>> {
-        let file = Self::open(store, digest)?;
-        if try_flock(&file, libc::LOCK_SH | libc::LOCK_NB)? {
+        let file = Self::open(store, digest, false)?;
+        if try_lock(&file, libc::F_RDLCK as libc::c_int)? {
             Ok(Some(OperationLock::Shared(file)))
         } else {
             Ok(None)
         }
+    }
+
+    /// The pid holding the write lock, when one does. A record lock names
+    /// its holder (`F_GETLK`), so a reader can say which process is the live
+    /// writer even when the record itself no longer names one.
+    pub fn holder(store: &OperationStore, digest: &str) -> Option<i32> {
+        let file = Self::open(store, digest, false).ok()?;
+        // SAFETY: an all-zero flock is a valid value to fill in.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_RDLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        // SAFETY: `file` owns a valid descriptor; `lock` is a valid flock.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } != 0 {
+            return None;
+        }
+        (lock.l_type as libc::c_int != libc::F_UNLCK as libc::c_int).then_some(lock.l_pid as i32)
     }
 
     /// The descriptor, for a holder that must keep it across `exec`.
@@ -704,16 +731,23 @@ impl OperationLock {
     }
 }
 
-fn try_flock(file: &File, operation: i32) -> io::Result<bool> {
+/// `F_SETLK` over the whole file.
+fn try_lock(file: &File, kind: libc::c_int) -> io::Result<bool> {
     loop {
-        // SAFETY: `file` owns a valid descriptor for the duration of the call.
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        // SAFETY: an all-zero flock is a valid value to fill in.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = kind as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0;
+        lock.l_len = 0;
+        // SAFETY: `file` owns a valid descriptor; `lock` is a valid flock.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == 0 {
             return Ok(true);
         }
         let error = io::Error::last_os_error();
-        match error.kind() {
-            io::ErrorKind::Interrupted => {}
-            io::ErrorKind::WouldBlock => return Ok(false),
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) | Some(libc::EACCES) => return Ok(false),
             _ => return Err(error),
         }
     }
@@ -834,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exclusive_holder_excludes_shared_readers_until_it_drops() {
+    fn a_writer_in_another_process_excludes_readers_and_a_fork_inherits_nothing() {
         let (store, dir) = store();
         let envelope = envelope();
         let h = envelope.digest();
@@ -846,17 +880,67 @@ mod tests {
         store
             .create_exclusive(&h, &OperationRecord::reserved(&envelope))
             .unwrap();
-        let held = OperationLock::exclusive(&store, &h, Duration::ZERO)
-            .unwrap()
-            .unwrap();
+        // Another process takes the write lock. Everything it needs is made
+        // before the fork; the child only locks, reports and waits.
+        let file = OperationLock::open(&store, &h, true).unwrap();
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: the child calls only fcntl, write and pause.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as _;
+                lock.l_whence = libc::SEEK_SET as _;
+                let ok = libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0;
+                libc::write(pipe[1], [ok as u8].as_ptr().cast(), 1);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(byte[0], 1, "the other process took the lock");
         assert!(OperationLock::shared_now(&store, &h).unwrap().is_none());
         assert!(
             OperationLock::exclusive(&store, &h, Duration::from_millis(20))
                 .unwrap()
                 .is_none()
         );
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        // Its death released it.
+        let held = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .expect("free once the holder died");
+        // A fork of the holder does not hold it: the child sees it taken.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as _;
+                lock.l_whence = libc::SEEK_SET as _;
+                let busy = libc::fcntl(held.raw_fd(), libc::F_SETLK, &lock) != 0;
+                libc::_exit(if busy { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "a forked child must not inherit the parent's lock"
+        );
         drop(held);
-        assert!(OperationLock::shared_now(&store, &h).unwrap().is_some());
+        drop(file);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -21,6 +21,7 @@
 
 pub mod barrier;
 pub mod envelope;
+pub mod exact;
 pub mod frames;
 pub mod record;
 pub mod settle;

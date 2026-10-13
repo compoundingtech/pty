@@ -79,20 +79,30 @@ both. A cancel before transfer is complete when those are gone.
 
 - The daemon ends its own child only through the session substrate, which
   holds its reap lock across the signal, so the pid cannot have been reused.
-- Recovery, which is not the child's parent, sends `SIGCONT` first. A held
-  child whose daemon is gone has already read end of file on its gate unless
-  it is stopped; resumed, it reads end of file and leaves by itself.
-- On Linux recovery then escalates to `SIGKILL`, and every signal goes
-  through a `pidfd` opened before the identity is checked, so a pid reused in
-  between cannot be hit.
-- macOS has no `pidfd`. There the identity is checked immediately before
-  `SIGCONT`, and `SIGKILL` is never sent. The residual: in the microseconds
-  between that check and the signal, a pid reused by another process would
-  receive a `SIGCONT`. A child that still does not leave is reported live, and
-  the operation stays `retire-required`.
-- A stopped held child is usually ended by job control before recovery is
-  needed. Its daemon's death hangs up the terminal the child leads, and the
-  kernel sends it `SIGHUP` and `SIGCONT`; its `SIGHUP` is at its default.
+  It waits for that exit on a pidfd (Linux) or a kqueue (macOS).
+- Recovery, which is not the child's parent, pins the process first and
+  checks the pinned process is the recorded identity, then sends `SIGKILL`
+  through the pin:
+  - **Linux:** a `pidfd`; a signal through it cannot reach a later holder of
+    the pid.
+  - **macOS:** an audit token from the task name port; the kernel delivers
+    `proc_signal_with_audittoken` only while the token's pid version still
+    names the same process.
+- **Where neither exists, nothing is signalled.** That covers a Linux kernel
+  without `pidfd_open`, a macOS without the call, and a task port that is
+  refused. The child is reported unknown, the retirement incomplete, and the
+  operation stays unclosed. No raw pid is ever signalled.
+- A stopped held child that leads its own session is ended by job control
+  when its daemon dies: the terminal hangs up, and the kernel sends it
+  `SIGHUP` and `SIGCONT`. Its `SIGHUP` is at its default. A child stopped
+  before it made its own session is left stopped, and recovery ends it.
+
+**The operation lock** is a POSIX record lock (`fcntl`), not `flock`. An
+`flock` belongs to the open file description and so is shared by a forked
+child. A held child stopped before shedding its descriptors would then keep a
+dead daemon's lock for ever. A record lock belongs to the process and is never
+inherited by a fork. A reader that finds the lock held names its holder
+(`F_GETLK`).
 
 **Descriptors.** The launcher's `pre_exec` marks every descriptor from 3 up
 close-on-exec, then clears the flag on exactly the config, readiness, control
@@ -137,6 +147,10 @@ them:
   by exact bytes with the registry's own incarnation text.
 - `reserve` creates `<h>.lock` together with the record. A missing lock reads
   as a missing operation.
+- The argv scan reports a process of the operation's user whose argv cannot
+  be read, including one caught exiting, as unreadable, and the verdict as
+  unknown. It does not retry. A caller wanting a later answer settles again
+  after that process exits; the tests do exactly that.
 - The daemon handles SIGTERM and SIGINT from its start: before the transfer
   they retire the operation.
 
@@ -148,7 +162,10 @@ barriers. The daemon's actor never blocks: at `before-decision` and at the
 three transfer barriers it parks the step and keeps answering, so the tests
 see decisions, rejections and retirements arrive while the barrier holds.
 `PTY_TEST_RECORD_WRITE_FAIL=<transition>` fails one record write, and
-`PTY_TEST_BOOT_ID=unavailable` hides the boot identity. The tests cancel, close or kill a participant at every
+`PTY_TEST_BOOT_ID=unavailable` hides the boot identity, and
+`PTY_TEST_EXACT_SIGNAL=unsupported` makes identity-safe signalling
+unavailable. `PTY_TEST_HELD_CHILD=stop-after-fork|stop-before-ack` stops the
+held child at either end of its preparation. The tests cancel, close or kill a participant at every
 barrier and check the frames, the record and the exact `settle` verdict; they
 cover descriptor validation, a stopped child, a group stop, the daemon's
 handlers, a replaced binary, decoys with the same and another digest,
@@ -164,4 +181,6 @@ signal mask and dispositions to match. Each of these was reverted once to see it
 - the deferral of a transfer to `ready`;
 - the request-before-effect rule;
 - the boot-identity rule;
-- retire's tuple check.
+- retire's tuple check;
+- the refusal to signal without a pidfd;
+- the record lock.
