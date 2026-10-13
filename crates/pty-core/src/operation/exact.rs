@@ -147,7 +147,7 @@ impl Exact {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            wait_for_exit(self.pid, timeout) != Exit::Running
+            wait_for_exit(self.pid, timeout) == Exit::Exited
         }
     }
 
@@ -243,6 +243,8 @@ mod darwin {
     const RTLD_DEFAULT: *mut libc::c_void = -2isize as *mut libc::c_void;
 
     unsafe extern "C" {
+        /// What the C `mach_task_self()` macro reads.
+        static mach_task_self_: libc::mach_port_t;
         fn task_name_for_pid(
             target: libc::mach_port_t,
             pid: libc::c_int,
@@ -279,7 +281,7 @@ mod darwin {
         let mut name: libc::mach_port_t = 0;
         // SAFETY: mach calls with storage for their outputs.
         unsafe {
-            let task = libc::mach_task_self();
+            let task = mach_task_self_;
             if task_name_for_pid(task, pid, &mut name) != 0 {
                 // Refused for another user's process, or gone: tell apart.
                 return Err(match crate::proctable::process(pid) {

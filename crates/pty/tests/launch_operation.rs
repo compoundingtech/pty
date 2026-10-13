@@ -224,7 +224,9 @@ impl Owner {
             if left.is_zero() {
                 return None;
             }
-            self.socket.set_read_timeout(Some(left)).unwrap();
+            // macOS refuses a timeout on a socket whose peer has closed
+            // (EINVAL); the read below then sees the end of file anyway.
+            let _ = self.socket.set_read_timeout(Some(left));
             let mut chunk = [0u8; 65536];
             match self.socket.read(&mut chunk) {
                 Ok(0) => return None,
@@ -2921,6 +2923,13 @@ fn without_an_identity_safe_signal_recovery_sends_none() {
     let rig = Rig::new();
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     let pid = child.id() as i32;
+    // Stopped, so that any signal at all would show: SIGKILL ends it and
+    // SIGCONT resumes it.
+    kill(pid, libc::SIGSTOP);
+    wait_until(
+        "the recorded child to stop",
+        || matches!(pty_core::proctable::process(pid), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
+    );
     let (sha, inc) = forge_launched(&rig, "op-nosignal", pid, None);
     // No pidfd (or, on macOS, no audit-token call): refuse to signal.
     let out = rig.run_env(
@@ -2947,11 +2956,12 @@ fn without_an_identity_safe_signal_recovery_sends_none() {
     assert_eq!(v["record"]["retirement"]["phase"], "incomplete");
     assert_ne!(v["verdict"], "closed");
     assert_eq!(v["noFurtherEffects"], false);
-    // Nothing reached the process: not killed, not stopped, not continued.
+    // Nothing reached the process: not killed, and still stopped, so not
+    // continued either.
     assert!(child.try_wait().unwrap().is_none());
     assert!(matches!(
         pty_core::proctable::process(pid),
-        pty_core::proctable::Answer::Known(row) if !row.is_stopped() && !row.is_zombie()
+        pty_core::proctable::Answer::Known(row) if row.is_stopped() && !row.is_zombie()
     ));
     // With the mechanism, a new request ends it.
     let out = rig.run(&[

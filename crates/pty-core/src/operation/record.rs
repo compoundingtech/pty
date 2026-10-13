@@ -660,15 +660,49 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// while it holds the lock, since closing any descriptor of the file drops
 /// it.
 #[derive(Debug)]
-pub enum OperationLock {
-    Exclusive(File),
-    Shared(File),
+pub struct OperationLock {
+    file: File,
+    /// The lock file, as this process named it, while held exclusively.
+    exclusive: Option<PathBuf>,
+}
+
+/// The lock files this process holds exclusively. A record lock is dropped
+/// when its holder closes ANY descriptor of the file, and it never conflicts
+/// with the holder's own requests, so a holder that opened the same lock file
+/// to observe it would silently lose its lock (or "acquire" a second one).
+/// Every observing path refuses a lock file in this set instead.
+static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn held_here(path: &Path) -> bool {
+    HELD.lock()
+        .map(|held| held.iter().any(|p| p == path))
+        .unwrap_or(true)
+}
+
+fn held_by_this_process() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "this process holds the operation lock; observing it here would drop it",
+    )
+}
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.exclusive
+            && let Ok(mut held) = HELD.lock()
+        {
+            held.retain(|p| p != path);
+        }
+    }
 }
 
 impl OperationLock {
     /// The lock `reserve` created. Nothing is created here: a reader that
     /// finds no lock finds no operation.
     fn open(store: &OperationStore, digest: &str, write: bool) -> io::Result<File> {
+        if held_here(&store.lock_path(digest)) {
+            return Err(held_by_this_process());
+        }
         std::fs::OpenOptions::new()
             .read(true)
             .write(write)
@@ -687,7 +721,14 @@ impl OperationLock {
         let deadline = Instant::now() + wait;
         loop {
             if try_lock(&file, libc::F_WRLCK as libc::c_int)? {
-                return Ok(Some(OperationLock::Exclusive(file)));
+                let path = store.lock_path(digest);
+                if let Ok(mut held) = HELD.lock() {
+                    held.push(path.clone());
+                }
+                return Ok(Some(OperationLock {
+                    file,
+                    exclusive: Some(path),
+                }));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -701,7 +742,10 @@ impl OperationLock {
     pub fn shared_now(store: &OperationStore, digest: &str) -> io::Result<Option<OperationLock>> {
         let file = Self::open(store, digest, false)?;
         if try_lock(&file, libc::F_RDLCK as libc::c_int)? {
-            Ok(Some(OperationLock::Shared(file)))
+            Ok(Some(OperationLock {
+                file,
+                exclusive: None,
+            }))
         } else {
             Ok(None)
         }
@@ -725,9 +769,7 @@ impl OperationLock {
 
     /// The descriptor, for a holder that must keep it across `exec`.
     pub fn raw_fd(&self) -> i32 {
-        match self {
-            OperationLock::Exclusive(file) | OperationLock::Shared(file) => file.as_raw_fd(),
-        }
+        self.file.as_raw_fd()
     }
 }
 
@@ -921,6 +963,15 @@ mod tests {
         let held = OperationLock::exclusive(&store, &h, Duration::ZERO)
             .unwrap()
             .expect("free once the holder died");
+        // The holder may not open the lock file again to observe it: closing
+        // that descriptor would drop its own lock.
+        assert!(OperationLock::shared_now(&store, &h).is_err());
+        assert!(OperationLock::holder(&store, &h).is_none());
+        assert!(OperationLock::exclusive(&store, &h, Duration::ZERO).is_err());
+        assert!(
+            OperationLock::exclusive(&store, &h, Duration::ZERO).is_err(),
+            "and the refusal did not release it"
+        );
         // A fork of the holder does not hold it: the child sees it taken.
         let pid = unsafe { libc::fork() };
         if pid == 0 {

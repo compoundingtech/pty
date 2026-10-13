@@ -151,6 +151,24 @@ them:
   be read, including one caught exiting, as unreadable, and the verdict as
   unknown. It does not retry. A caller wanting a later answer settles again
   after that process exits; the tests do exactly that.
+- The argv scan's domain is processes whose real and effective uid are both
+  the operation's. No participant changes uid before its release. On macOS
+  a setuid process such as `login` refuses its argv to the user; inside the
+  domain it would make every scan unknown.
+- A process may not open the operation lock file to observe it (settle, or
+  the holder query) while it holds the write lock. Closing that descriptor
+  would drop its own record lock, so the call is refused instead.
+
+**Residuals, stated plainly.**
+
+- A held child stopped by someone else in the instant between its fork and
+  the daemon recording it, whose daemon then dies, is never recorded. It
+  stays stopped. Settle reports the operation `live` (the marker scan names
+  its pid) and never closes it. Recovery signals only recorded identities,
+  so a person must end that process.
+- Where identity-safe signalling is unavailable (see above), recovery sends
+  nothing and the operation stays unclosed with a live child, until a
+  person ends it.
 - The daemon handles SIGTERM and SIGINT from its start: before the transfer
   they retire the operation.
 

@@ -8,10 +8,12 @@
 //! that uid whose argv cannot be read is reported as unreadable, never
 //! skipped, because it might be exactly the process the caller looks for.
 //!
-//! Linux reads `/proc/<pid>/status` and `/proc/<pid>/cmdline`. macOS reads
-//! `proc_pidinfo(PROC_PIDTBSDINFO)` and `sysctl(KERN_PROCARGS2)`, which
-//! answers `EINVAL` for a zombie and for another user's process; neither is
-//! in the scan's domain.
+//! **The domain is processes whose real and effective uid are both `uid`.**
+//! No participant changes uid before its release, so a process with any other
+//! effective uid is not one. That matters on macOS, where a setuid process
+//! such as `login` (real uid the user's, effective uid root) refuses both
+//! `proc_pidinfo` and its argv to the user: inside the domain it would make
+//! every scan unknown.
 
 use super::LiveIdentity;
 
@@ -63,7 +65,7 @@ impl ArgvScan {
     }
 }
 
-/// Scan every live process of `uid`.
+/// Scan every live process whose real and effective uid are `uid`.
 pub fn scan_argv(uid: u32) -> ArgvScan {
     #[cfg(target_os = "linux")]
     {
@@ -157,30 +159,36 @@ mod linux {
     }
 
     /// `Uid:` (real uid) and `State:` from `/proc/<pid>/status`.
-    fn owner_and_state(pid: i32) -> Result<(u32, char), std::io::Error> {
+    /// Whether both the real and the effective uid are `uid`, and the
+    /// state, from `/proc/<pid>/status`.
+    fn owner_and_state(pid: i32, uid: u32) -> Result<(bool, char), std::io::Error> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
-        let mut uid = None;
+        let mut owned = None;
         let mut state = None;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
-                uid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+                let mut ids = rest.split_whitespace().map(|v| v.parse::<u32>().ok());
+                owned = match (ids.next().flatten(), ids.next().flatten()) {
+                    (Some(real), Some(effective)) => Some(real == uid && effective == uid),
+                    _ => None,
+                };
             } else if let Some(rest) = line.strip_prefix("State:") {
                 state = rest.trim_start().chars().next();
             }
         }
-        match (uid, state) {
-            (Some(uid), Some(state)) => Ok((uid, state)),
+        match (owned, state) {
+            (Some(owned), Some(state)) => Ok((owned, state)),
             _ => Err(std::io::Error::other("status without Uid or State")),
         }
     }
 
     fn classify(pid: i32, uid: u32) -> Class {
-        let (owner, state) = match owner_and_state(pid) {
+        let (owned, state) = match owner_and_state(pid, uid) {
             Ok(found) => found,
             Err(error) if gone(&error) => return Class::Gone,
             Err(_) => return Class::OwnerUnknown,
         };
-        if owner != uid {
+        if !owned {
             return Class::OtherUser;
         }
         if state == 'Z' {
@@ -199,7 +207,7 @@ mod linux {
             }),
             // An empty cmdline from a live user process is a process on its
             // way out (its memory already released). Ask again what it is.
-            Ok(_) => match owner_and_state(pid) {
+            Ok(_) => match owner_and_state(pid, uid) {
                 Err(error) if gone(&error) => Class::Gone,
                 Ok((_, 'Z')) => Class::Zombie,
                 _ => Class::Unreadable,
@@ -251,27 +259,42 @@ mod macos {
                     want,
                 )
             };
-            if got != want {
-                // `proc_pidinfo` refuses an unreaped child; the kinfo
-                // reader still answers for it.
-                match crate::proctable::process(pid) {
-                    crate::proctable::Answer::Known(row) if row.is_zombie() => {}
-                    crate::proctable::Answer::NotPresent => {}
-                    _ => scan.complete = false,
+            let identity = if got == want {
+                if info.pbi_ruid != uid || info.pbi_uid != uid {
+                    continue;
                 }
-                continue;
-            }
-            if info.pbi_ruid != uid {
-                continue;
-            }
-            if info.pbi_status == SZOMB {
-                scan.zombies += 1;
-                continue;
-            }
-            let identity = Some(LiveIdentity::new(format!(
-                "darwin:{}.{:06}",
-                info.pbi_start_tvsec, info.pbi_start_tvusec
-            )));
+                if info.pbi_status == SZOMB {
+                    scan.zombies += 1;
+                    continue;
+                }
+                Some(LiveIdentity::new(format!(
+                    "darwin:{}.{:06}",
+                    info.pbi_start_tvsec, info.pbi_start_tvusec
+                )))
+            } else {
+                // `proc_pidinfo` refuses an unreaped child and a process
+                // running with another effective uid (a setuid `login`, say);
+                // the kinfo reader still answers for both.
+                match crate::proctable::kinfo_owner(pid) {
+                    crate::proctable::Answer::NotPresent => continue,
+                    crate::proctable::Answer::Known((ruid, euid, _))
+                        if ruid != uid || euid != uid =>
+                    {
+                        continue;
+                    }
+                    crate::proctable::Answer::Known((_, _, true)) => {
+                        scan.zombies += 1;
+                        continue;
+                    }
+                    crate::proctable::Answer::Known(_) => crate::proctable::process(pid)
+                        .known()
+                        .and_then(|row| row.identity),
+                    crate::proctable::Answer::Unknown(_) => {
+                        scan.complete = false;
+                        continue;
+                    }
+                }
+            };
             match procargs(pid, arg_max) {
                 Ok(argv) => scan.rows.push(ArgvRow {
                     pid,
