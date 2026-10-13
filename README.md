@@ -81,6 +81,13 @@ cost. Publication coalesces queued updates and advances during sustained
 output at an inline 16 ms interval, not a hard realtime deadline. See
 [architecture.md](docs/architecture.md) for ownership and publication details.
 
+The daemon publishes event-log snapshots in 250 ms batches. Each batch takes
+the cross-process event lock once, reads the log once, and atomically replaces
+it once. Records keep their exact bytes and order; retention still checks
+every 100 daemon records and keeps the newest 500 at the 1000-line boundary.
+Session exit and shutdown flush pending records. One-shot writers (`pty emit`
+and metadata events) retain their existing event-lock behavior.
+
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
 the required behavior. Track the compatibility matrix, crate boundaries, and

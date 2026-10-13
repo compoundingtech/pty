@@ -13,8 +13,9 @@
 pub mod follow;
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -416,6 +417,35 @@ fn append_line(
     atomic_write(path, published)
 }
 
+/// Apply retention at each original record boundary, but publish only once.
+fn append_batch(path: &Path, events: &[Event], append_count: &mut usize) -> std::io::Result<()> {
+    let mut content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    for event in events {
+        content.extend_from_slice(event.to_json().as_bytes());
+        content.push(b'\n');
+        *append_count += 1;
+        if *append_count >= TRUNCATE_CHECK_INTERVAL {
+            if let Some(suffix) = retained_suffix(&content) {
+                let start = content.len() - suffix.len();
+                content.drain(..start);
+            }
+            *append_count = 0;
+        }
+    }
+    #[cfg(test)]
+    BATCH_WRITES.with(|count| count.set(count.get() + 1));
+    atomic_write(path, &content)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Append while the caller owns the session's event lock. Publication
 /// atomically replaces the previous snapshot and applies the one-shot
 /// size-gated retention check in the same replacement.
@@ -555,11 +585,11 @@ enum WriterMsg {
     Flush(Sender<()>),
 }
 
-/// The daemon's serialized, background event writer: one thread drains a
-/// queue, each append under the event lock (waiting up to 5 s), retention
-/// checked every [`TRUNCATE_CHECK_INTERVAL`] appends. Errors are dropped,
-/// as Node's promise chain drops them. Call [`EventWriter::flush`] before
-/// exiting; dropping the writer does not wait for queued lines.
+/// The daemon's serialized background writer publishes records in 250 ms
+/// batches, holding the cross-process event lock once per batch. Retention
+/// is checked at the same record boundaries as the one-record writer.
+/// Exit records, explicit flushes and shutdown publish pending records.
+/// Errors are dropped, as Node's promise chain drops them.
 ///
 /// node: src/events.ts:352-380
 pub struct EventWriter {
@@ -583,22 +613,56 @@ impl EventWriter {
 
     fn run(name: &str, rx: Receiver<WriterMsg>) {
         let mut append_count = 0usize;
-        while let Ok(msg) = rx.recv() {
+        let mut pending = Vec::new();
+        let mut deadline: Option<Instant> = None;
+        loop {
+            if deadline.is_some_and(|until| Instant::now() >= until) {
+                Self::publish(name, &mut pending, &mut append_count);
+                deadline = None;
+            }
+            let msg = if let Some(until) = deadline {
+                rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            } else {
+                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
             match msg {
-                WriterMsg::Append(event) => {
-                    if let Ok(_lock) = wait_for_event_lock(name, EVENT_LOCK_WAIT) {
-                        let path = events_path(name);
-                        let check_retention = append_count + 1 >= TRUNCATE_CHECK_INTERVAL;
-                        if append_line(&path, &event, |_| check_retention).is_ok() {
-                            append_count = if check_retention { 0 } else { append_count + 1 };
-                        }
+                Ok(WriterMsg::Append(event)) => {
+                    let exiting = event.r#type == event_type::SESSION_EXIT;
+                    pending.push(event);
+                    deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
+                    if exiting {
+                        Self::publish(name, &mut pending, &mut append_count);
+                        deadline = None;
                     }
                 }
-                WriterMsg::Flush(reply) => {
+                Ok(WriterMsg::Flush(reply)) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    deadline = None;
                     let _ = reply.send(());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    deadline = None;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    break;
                 }
             }
         }
+    }
+
+    fn publish(name: &str, pending: &mut Vec<Event>, append_count: &mut usize) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Ok(_lock) = wait_for_event_lock(name, EVENT_LOCK_WAIT) {
+            let mut next_count = *append_count;
+            if append_batch(&events_path(name), pending, &mut next_count).is_ok() {
+                *append_count = next_count;
+            }
+        }
+        pending.clear();
     }
 
     /// Queue an event; returns immediately.
@@ -631,7 +695,11 @@ impl EventWriter {
 
 impl Drop for EventWriter {
     fn drop(&mut self) {
+        self.flush();
         self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -779,5 +847,80 @@ pub fn format_event(event: &Event) -> String {
             };
             format!("{prefix} {other}{suffix}")
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    struct TestRoot(std::path::PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("pty-batch-{}-{label}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn batch_replaces_once_and_preserves_bytes_and_retention() {
+        let root = TestRoot::new("retention");
+        crate::registry::root::with_root(root.path(), || {
+            let events: Vec<_> = (0..2150)
+                .map(|i| Event::bell("batch").with_ts(&format!("timestamp-{i}")))
+                .collect();
+            let reference = root.path().join("reference");
+            for (index, event) in events.iter().enumerate() {
+                append_line(&reference, event, |_| {
+                    (index + 1) % TRUNCATE_CHECK_INTERVAL == 0
+                })
+                .unwrap();
+            }
+            let (tx, rx) = channel();
+            for event in events {
+                tx.send(WriterMsg::Append(event)).unwrap();
+            }
+            drop(tx);
+            BATCH_WRITES.with(|writes| writes.set(0));
+            EventWriter::run("batch", rx);
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 1));
+            assert_eq!(
+                std::fs::read(events_path("batch")).unwrap(),
+                std::fs::read(reference).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn exit_and_flush_publish_separate_batches_before_acknowledgement() {
+        let root = TestRoot::new("exit");
+        crate::registry::root::with_root(root.path(), || {
+            let (tx, rx) = channel();
+            tx.send(WriterMsg::Append(Event::bell("exit"))).unwrap();
+            tx.send(WriterMsg::Append(Event::session_exit("exit", 0, None)))
+                .unwrap();
+            tx.send(WriterMsg::Append(Event::bell("exit"))).unwrap();
+            let (reply, ack) = channel();
+            tx.send(WriterMsg::Flush(reply)).unwrap();
+            drop(tx);
+            BATCH_WRITES.with(|writes| writes.set(0));
+            EventWriter::run("exit", rx);
+            ack.recv().unwrap();
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 2));
+            assert_eq!(read_all_events("exit").len(), 3);
+        });
     }
 }
