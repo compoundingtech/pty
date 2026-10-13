@@ -1581,6 +1581,8 @@ fn settle_treats_unreadable_evidence_as_unknown() {
     if unsafe { libc::geteuid() } != 0 {
         let v = owner.settle(&rig);
         assert_eq!(verdict(&v), ("unknown".into(), Some("registry".into())));
+        // Unproven evidence is never a positive closure claim.
+        assert_eq!(v["noFurtherEffects"], false);
     }
     std::fs::set_permissions(
         rig.path("other.json"),
@@ -2668,6 +2670,7 @@ fn a_leaked_copy_of_the_owners_end_does_not_hide_its_end_of_file() {
     };
     owner.write(&line);
     let ready = owner.wait_for("ready");
+    let _ = &ready;
     assert_eq!(launcher.wait().unwrap().code(), Some(0));
     // The daemon holds no copy of the owner's end.
     #[cfg(target_os = "linux")]

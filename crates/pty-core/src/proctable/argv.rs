@@ -247,27 +247,9 @@ mod macos {
 
     pub(super) fn scan(uid: u32) -> ArgvScan {
         const SOURCE: &str = "KERN_PROCARGS2";
-        const PROC_ALL_PIDS: u32 = 1;
-        // SAFETY: a zero buffer asks for the size in bytes.
-        let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-        if bytes <= 0 {
+        let Some((pids, listed_whole)) = crate::proctable::list_all_pids() else {
             return ArgvScan::unreadable_listing(uid, SOURCE);
-        }
-        let mut pids = vec![0i32; (bytes as usize / size_of::<i32>()) + 64];
-        let cap = (pids.len() * size_of::<i32>()) as i32;
-        // SAFETY: the buffer and its length agree.
-        let written = unsafe {
-            libc::proc_listpids(
-                PROC_ALL_PIDS,
-                0,
-                pids.as_mut_ptr() as *mut libc::c_void,
-                cap,
-            )
         };
-        if written <= 0 {
-            return ArgvScan::unreadable_listing(uid, SOURCE);
-        }
-        pids.truncate(written as usize / size_of::<i32>());
         let own = std::process::id() as i32;
         if !pids.contains(&own) {
             return ArgvScan::unreadable_listing(uid, SOURCE);
@@ -276,7 +258,7 @@ mod macos {
             uid,
             source: SOURCE,
             readable: true,
-            complete: true,
+            complete: listed_whole,
             listed: 0,
             zombies: 0,
             unreadable: Vec::new(),

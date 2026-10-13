@@ -237,30 +237,18 @@ impl ProcTable {
     /// is every fact the callers ask for.
     #[cfg(target_os = "macos")]
     fn read_libproc() -> Self {
-        // <sys/proc_info.h>: PROC_ALL_PIDS. Not exported by the libc crate.
-        const PROC_ALL_PIDS: u32 = 1;
         // <sys/proc.h>: SZOMB. A zombie is a corpse that still has a row.
         const SZOMB: u32 = 5;
 
-        // SAFETY: a zero buffer asks for the size in bytes.
-        let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-        if bytes <= 0 {
+        // A listing cut short by processes that appeared since its size was
+        // asked for is not every process.
+        let Some((pids, listed_whole)) = list_all_pids() else {
             return Self::unreadable();
-        }
-        let mut pids = vec![0i32; (bytes as usize / size_of::<i32>()) + 64];
-        let cap = (pids.len() * size_of::<i32>()) as i32;
-        // SAFETY: the buffer and its length agree.
-        let written = unsafe {
-            libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr() as *mut libc::c_void, cap)
         };
-        if written <= 0 {
-            return Self::unreadable();
-        }
-        pids.truncate(written as usize / size_of::<i32>());
 
         let _ = SZOMB;
         let mut rows = Vec::with_capacity(pids.len());
-        let mut complete = true;
+        let mut complete = listed_whole;
         for pid in pids.into_iter().filter(|&p| p > 0) {
             if let Some(row) = read_bsdinfo(pid) {
                 rows.push(row);
@@ -457,6 +445,60 @@ impl ProcTable {
             std::process::id() as i32,
         )
     }
+}
+
+/// Read a pid listing whose size can grow between asking for it and reading
+/// it. A read that fills its buffer may have been cut short, so it is read
+/// again with more room; a listing still full after the retries is returned
+/// with `false`: every pid in it is real, but it is not every pid.
+///
+/// `size` returns the byte count the listing needs, `read` fills the buffer
+/// and returns the bytes written; either answers 0 or less on failure.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn list_pids_with_slack(
+    mut size: impl FnMut() -> i32,
+    mut read: impl FnMut(&mut [i32]) -> i32,
+) -> Option<(Vec<i32>, bool)> {
+    let mut slack = 64usize;
+    let mut last = Vec::new();
+    for _ in 0..4 {
+        let bytes = size();
+        if bytes <= 0 {
+            return None;
+        }
+        let mut pids = vec![0i32; bytes as usize / size_of::<i32>() + slack];
+        let written = read(&mut pids);
+        if written <= 0 {
+            return None;
+        }
+        let count = (written as usize / size_of::<i32>()).min(pids.len());
+        if count < pids.len() {
+            pids.truncate(count);
+            return Some((pids, true));
+        }
+        last = pids;
+        slack *= 8;
+    }
+    Some((last, false))
+}
+
+/// Every pid on the machine, from `proc_listpids`, and whether the listing
+/// is known to be whole.
+#[cfg(target_os = "macos")]
+pub(crate) fn list_all_pids() -> Option<(Vec<i32>, bool)> {
+    // <sys/proc_info.h>: PROC_ALL_PIDS. Not exported by the libc crate.
+    const PROC_ALL_PIDS: u32 = 1;
+    list_pids_with_slack(
+        // SAFETY: a zero buffer asks for the size in bytes.
+        || unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) },
+        |buffer| {
+            let cap = std::mem::size_of_val(buffer) as i32;
+            // SAFETY: the buffer and its length agree.
+            unsafe {
+                libc::proc_listpids(PROC_ALL_PIDS, 0, buffer.as_mut_ptr() as *mut libc::c_void, cap)
+            }
+        },
+    )
 }
 
 /// One process, without reading the whole table.
@@ -825,6 +867,71 @@ pub(crate) fn run_ps_program(program: &str, timeout: Duration) -> Option<String>
     match rx.recv_timeout(timeout) {
         Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::list_pids_with_slack;
+
+    #[test]
+    fn a_listing_with_slack_is_whole() {
+        let (pids, whole) =
+            list_pids_with_slack(|| 12, |buffer| {
+                buffer[..3].copy_from_slice(&[1, 2, 3]);
+                12
+            })
+            .unwrap();
+        assert_eq!((pids, whole), (vec![1, 2, 3], true));
+    }
+
+    /// The population grows between the size query and the read, every
+    /// time: the read always fills the buffer, so it never proves itself
+    /// whole, and it says so rather than calling the truncated list complete.
+    #[test]
+    fn a_listing_that_always_fills_its_buffer_is_not_whole() {
+        let mut reads = 0;
+        let (pids, whole) = list_pids_with_slack(
+            || 400,
+            |buffer| {
+                reads += 1;
+                for (i, slot) in buffer.iter_mut().enumerate() {
+                    *slot = i as i32 + 1;
+                }
+                std::mem::size_of_val(buffer) as i32
+            },
+        )
+        .unwrap();
+        assert!(!whole);
+        assert_eq!(reads, 4);
+        assert!(!pids.is_empty());
+    }
+
+    /// One burst of growth: the second, larger read has room and is whole.
+    #[test]
+    fn a_listing_retries_with_more_room() {
+        let mut reads = 0;
+        let (pids, whole) = list_pids_with_slack(
+            || 40,
+            |buffer| {
+                reads += 1;
+                let n = if reads == 1 { buffer.len() } else { 20 };
+                for (i, slot) in buffer[..n].iter_mut().enumerate() {
+                    *slot = i as i32 + 1;
+                }
+                (n * 4) as i32
+            },
+        )
+        .unwrap();
+        assert!(whole);
+        assert_eq!(reads, 2);
+        assert_eq!(pids.len(), 20);
+    }
+
+    #[test]
+    fn a_failed_listing_is_unreadable() {
+        assert!(list_pids_with_slack(|| 0, |_| 4).is_none());
+        assert!(list_pids_with_slack(|| 8, |_| -1).is_none());
     }
 }
 

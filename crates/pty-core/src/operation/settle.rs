@@ -387,8 +387,10 @@ pub fn settle(
             .is_some_and(|retirement| retirement.phase == RetirementPhase::Verified),
         _ => false,
     };
+    // Every source of evidence must agree, the registry included: a row that
+    // is unreadable, or live and carrying this digest, can still have effects.
     let no_further_effects = durable_end
-        && components[1..4]
+        && components[1..]
             .iter()
             .all(|component| component.status == Status::Verified);
 

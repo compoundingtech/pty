@@ -52,7 +52,12 @@ Until transfer every process involved is one of pty's own, and each carries
 settle` therefore reads the record, the process table with argv, and the
 registry once each under a shared lock, and answers `closed`, `transferred`,
 `live`, `retire-required` or `unknown`, naming the component and its evidence.
-It never signals and never creates anything. `pty operation retire` checks
+It never signals and never creates anything. `noFurtherEffects` is true only
+when every component is verified, the registry included: a row that is
+unreadable, or live and carrying this digest, can still have effects. On
+macOS a pid listing that fills its buffer is read again with more room, and
+one that stays full makes the table and the argv scan incomplete, never
+whole. `pty operation retire` checks
 the exact operation, envelope and incarnation first. It refuses while the
 writer or any recorded launcher, producer or daemon is alive or unprovable,
 and resumes its own interrupted request. It tears down only the recorded
