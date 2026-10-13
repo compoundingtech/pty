@@ -73,9 +73,11 @@ impl Step {
 pub struct HeldSpec {
     path: CString,
     /// Owns the strings `argv_ptrs` points into.
+    #[allow(dead_code)]
     argv: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     /// Owns the strings `envp_ptrs` points into.
+    #[allow(dead_code)]
     envp: Vec<CString>,
     envp_ptrs: Vec<*const libc::c_char>,
     cwd: CString,
@@ -310,8 +312,14 @@ pub fn fork_held(spec: &HeldSpec) -> io::Result<Forked> {
 /// above, so the child's end can never be 0, 1 or 2.
 fn gate_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
+    // Close-on-exec from creation where the platform allows it, so no other
+    // thread's fork and exec can inherit an end before it is re-homed.
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
     // SAFETY: socketpair fills two descriptors.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+    if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     let rehome = |fd: RawFd| -> io::Result<OwnedFd> {

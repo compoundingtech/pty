@@ -30,6 +30,47 @@ pub const BARRIERS: [&str; 14] = [
     "released-before-ack",
 ];
 
+/// Record that `name` was reached, and say whether a test armed it. A
+/// caller that must keep working while held (the daemon's actor) holds
+/// without blocking: it parks the step and waits for [`wait_released`] on
+/// another thread.
+pub fn armed(name: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        debug_assert!(BARRIERS.contains(&name), "unknown barrier {name}");
+        let Some(dir) = std::env::var_os(BARRIERS_ENV) else {
+            return false;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::write(
+            dir.join(format!("{name}.reached")),
+            std::process::id().to_string(),
+        );
+        dir.join(format!("{name}.hold")).exists()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Block until the test releases `name`.
+pub fn wait_released(name: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let Some(dir) = std::env::var_os(BARRIERS_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        while !dir.join(format!("{name}.release")).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = name;
+}
+
 /// Pass the barrier `name`, holding here if a test armed it.
 pub fn barrier(name: &str) {
     #[cfg(debug_assertions)]

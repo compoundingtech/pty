@@ -433,6 +433,15 @@ pub fn launch(name: &str, params: SpawnParams, control_fd: RawFd, digest: &str) 
                 &[("observed", observed)],
             );
         }
+        // `reserve` creates the lock with the record: no lock, no reservation.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refuse(
+                &mut channel,
+                "not-claimable",
+                None,
+                &[("observed", json!("absent"))],
+            );
+        }
         Err(error) => {
             return refuse(
                 &mut channel,

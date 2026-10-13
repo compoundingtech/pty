@@ -186,7 +186,6 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-
 /// The config object Node's spawner serializes, in its key order.
 ///
 /// node: src/spawn.ts:169-184
@@ -452,8 +451,9 @@ pub fn spawn_gated_daemon(
     operation: OperationLaunch,
 ) -> Result<GatedDaemon, SpawnError> {
     let mut gate = [0i32; 2];
-    // SAFETY: pipe(2) fills two descriptors.
-    if unsafe { libc::pipe(gate.as_mut_ptr()) } != 0 {
+    // Close-on-exec from creation, so no other thread's fork and exec can
+    // inherit an end before it is re-homed.
+    if cloexec_pipe(&mut gate) != 0 {
         return Err(SpawnError::Io(format!(
             "cannot create the daemon gate: {}",
             std::io::Error::last_os_error()
@@ -482,6 +482,78 @@ pub fn spawn_gated_daemon(
         name: params.name.clone(),
         timeout: params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT),
     })
+}
+
+/// `pipe2(O_CLOEXEC)` where there is one; elsewhere `pipe` and then the flag.
+fn cloexec_pipe(fds: &mut [i32; 2]) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: pipe2(2) fills two descriptors.
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: pipe(2) fills two descriptors; fcntl on the two it made.
+        unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0 {
+                for fd in *fds {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            rc
+        }
+    }
+}
+
+/// One past the highest descriptor this process could hold: the soft limit,
+/// or the highest descriptor open now, whichever is larger.
+fn descriptor_limit() -> RawFd {
+    const CAP: u64 = 1 << 20;
+    // SAFETY: getrlimit fills the struct passed.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        (limit.rlim_cur as u64).min(CAP)
+    } else {
+        CAP
+    };
+    let highest = ["/proc/self/fd", "/dev/fd"]
+        .iter()
+        .find_map(|dir| std::fs::read_dir(dir).ok())
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    soft.max(highest + 1) as RawFd
+}
+
+/// Mark every descriptor from 3 up close-on-exec.
+///
+/// # Safety
+///
+/// Async-signal-safe; called only between fork and exec.
+unsafe fn cloexec_from_three(limit: RawFd) {
+    #[cfg(target_os = "linux")]
+    {
+        // close_range(2) with CLOSE_RANGE_CLOEXEC (Linux 5.11).
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: a plain syscall on this process's descriptor table.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0
+        {
+            return;
+        }
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl(2) is async-signal-safe; a closed number fails.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
 }
 
 /// `F_DUPFD_CLOEXEC` at 10 or above, closing the original.
@@ -587,6 +659,7 @@ fn start_daemon_process(
     }
     let inherited: Option<[RawFd; 3]> =
         operation.map(|(operation, gate_read)| [ready_write_fd, operation.control_fd, gate_read]);
+    let limit = descriptor_limit();
     // SAFETY: the pre_exec body only calls async-signal-safe functions
     // (setsid, dup2, close, fcntl).
     unsafe {
@@ -607,7 +680,12 @@ fn start_daemon_process(
                 libc::fcntl(read_fd, libc::F_SETFD, 0);
             }
             if let Some(fds) = inherited {
-                for fd in fds {
+                // The daemon inherits exactly the protocol's descriptors:
+                // nothing else the launcher was given (another copy of the
+                // owner's socket, say, which would hide the owner's end of
+                // file from the daemon) survives the exec.
+                cloexec_from_three(limit);
+                for fd in [super::config::CONFIG_FD, fds[0], fds[1], fds[2]] {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }

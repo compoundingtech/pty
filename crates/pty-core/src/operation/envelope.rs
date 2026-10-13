@@ -189,34 +189,15 @@ fn identifying_string(value: &Value) -> Result<String, &'static str> {
     Ok(text.clone())
 }
 
-/// `<decimal pid>:<createdAt>`, the incarnation text the registry gives a
-/// daemon generation: a positive pid that fits an `i32`, then the ISO-8601
-/// millisecond UTC time the daemon publishes as `createdAt`.
+/// `<decimal pid>:<createdAt>`: decimal digits, a colon, then a non-empty
+/// `createdAt`, all inside the limits of an `S`. The value is compared by
+/// exact bytes with the registry's own incarnation text, so anything this
+/// accepts that the registry never writes simply never matches.
 pub fn is_incarnation_id(text: &str) -> bool {
     let Some((pid, created_at)) = text.split_once(':') else {
         return false;
     };
-    let pid_ok = !pid.is_empty()
-        && !pid.starts_with('0')
-        && pid.bytes().all(|b| b.is_ascii_digit())
-        && pid.parse::<i32>().is_ok_and(|pid| pid > 0);
-    pid_ok && is_created_at(created_at)
-}
-
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-fn is_created_at(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.len() != 24 {
-        return false;
-    }
-    bytes.iter().enumerate().all(|(i, b)| match i {
-        4 | 7 => *b == b'-',
-        10 => *b == b'T',
-        13 | 16 => *b == b':',
-        19 => *b == b'.',
-        23 => *b == b'Z',
-        _ => b.is_ascii_digit(),
-    })
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && !created_at.is_empty()
 }
 
 fn validate_bindings(value: &Value) -> Result<(), EnvelopeError> {
@@ -447,7 +428,7 @@ mod tests {
                 "unknown-field",
             ),
             (
-                line("").replace("null", r#""12:yesterday""#),
+                line("").replace("null", r#""twelve:yesterday""#),
                 "expectedIncarnation",
                 "not-pid-colon-created-at",
             ),
@@ -542,12 +523,15 @@ mod tests {
     }
 
     #[test]
-    fn incarnation_ids_follow_the_registry_shape() {
+    fn incarnation_ids_follow_the_written_grammar() {
         assert!(is_incarnation_id("4242:2026-10-13T17:27:07.118Z"));
-        assert!(!is_incarnation_id("0:2026-10-13T17:27:07.118Z"));
-        assert!(!is_incarnation_id("042:2026-10-13T17:27:07.118Z"));
-        assert!(!is_incarnation_id("4242:2026-10-13T17:27:07Z"));
-        assert!(!is_incarnation_id("99999999999:2026-10-13T17:27:07.118Z"));
+        // Opaque after the colon, as the contract writes it: these never
+        // match a registry row, so they only ever mismatch.
+        assert!(is_incarnation_id("042:2026-10-13T17:27:07Z"));
+        assert!(is_incarnation_id("0:x"));
         assert!(!is_incarnation_id("4242"));
+        assert!(!is_incarnation_id(":2026-10-13T17:27:07.118Z"));
+        assert!(!is_incarnation_id("42a:2026"));
+        assert!(!is_incarnation_id("4242:"));
     }
 }

@@ -9,6 +9,12 @@
 /// `darwin:{ sec = S, usec = U }` from `kern.boottime`. `None` when the host
 /// does not say.
 pub fn read_boot_identity() -> Option<String> {
+    // Debug builds: a test can make the boot identity unreadable, to prove
+    // that nothing is signalled without it.
+    #[cfg(debug_assertions)]
+    if std::env::var("PTY_TEST_BOOT_ID").as_deref() == Ok("unavailable") {
+        return None;
+    }
     #[cfg(target_os = "linux")]
     {
         let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;

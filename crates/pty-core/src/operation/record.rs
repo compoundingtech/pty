@@ -66,7 +66,12 @@ impl ProcessId {
     /// another start token or another boot is another process, a zombie has
     /// exited, and only a complete table can say a pid is absent.
     pub fn liveness(&self, table: &ProcTable, boot_id: Option<&str>) -> Liveness {
-        if boot_id.is_some_and(|boot| boot != self.boot_id) {
+        // A pid and a start token mean something only within one boot. With
+        // no current boot identity nothing here can be told apart.
+        let Some(boot_id) = boot_id else {
+            return Liveness::Unknown("boot-identity-unavailable");
+        };
+        if boot_id != self.boot_id {
             return Liveness::Gone;
         }
         match table.row(self.pid as i32) {
@@ -80,6 +85,18 @@ impl ProcessId {
             Answer::NotPresent => Liveness::Unknown("process-table-incomplete"),
             Answer::Unknown(_) => Liveness::Unknown("process-table-unreadable"),
         }
+    }
+}
+
+impl ProcessId {
+    /// [`ProcessId::liveness`] for this one pid, read now.
+    pub fn liveness_now(&self, boot_id: Option<&str>) -> Liveness {
+        let table = match crate::proctable::process(self.pid as i32) {
+            Answer::Known(row) => ProcTable::from_rows(vec![row]),
+            Answer::NotPresent => ProcTable::from_rows(Vec::new()),
+            Answer::Unknown(_) => ProcTable::unreadable(),
+        };
+        self.liveness(&table, boot_id)
     }
 }
 
@@ -273,6 +290,90 @@ impl OperationRecord {
         }
     }
 
+    /// The invariants every write of this protocol keeps. A record that
+    /// breaks one was not written by it, and nothing may act on it.
+    pub fn check(&self) -> Result<(), String> {
+        let fail = |what: &str| Err(format!("inconsistent record: {what}"));
+        if (self.writer.role == WriterRole::None) != self.writer.id.is_none() {
+            return fail("writer role and id disagree");
+        }
+        let cause = self.decision.as_ref().map(|decision| decision.cause);
+        let retirement = self.retirement.as_ref().map(|retirement| retirement.phase);
+        let requested = retirement == Some(RetirementPhase::Requested);
+        let terminal = matches!(
+            retirement,
+            Some(RetirementPhase::Verified | RetirementPhase::Incomplete)
+        );
+        match self.writer.role {
+            WriterRole::Recovery if !requested => {
+                return fail("a recovery writer without a requested retirement");
+            }
+            WriterRole::None if requested => {
+                return fail("a requested retirement without a writer");
+            }
+            _ => {}
+        }
+        if terminal && self.writer.role != WriterRole::None {
+            return fail("a finished retirement still has a writer");
+        }
+        let ok = match self.state {
+            State::Reserved => {
+                self.phase == Phase::Reserved
+                    && cause.is_none()
+                    && self.incarnation.is_none()
+                    && self.transfer.is_none()
+                    && self.participants == Participants::default()
+                    && matches!(self.writer.role, WriterRole::None | WriterRole::Recovery)
+                    && !terminal
+            }
+            State::Pending => {
+                matches!(
+                    self.phase,
+                    Phase::Claimed | Phase::DaemonForking | Phase::DaemonGated
+                ) && cause.is_none()
+                    && self.incarnation.is_none()
+                    && self.transfer.is_none()
+                    && self.participants.launcher.is_some()
+                    && self.writer.role != WriterRole::None
+                    && !terminal
+            }
+            State::Cancelled => {
+                cause.is_some_and(|cause| cause != Cause::Launch)
+                    && self.incarnation.is_none()
+                    && self.transfer.is_none()
+                    && self.writer.role == WriterRole::None
+                    && !requested
+            }
+            State::Launched => {
+                cause == Some(Cause::Launch)
+                    && self.incarnation.is_some()
+                    && self.transfer.is_none()
+                    && matches!(
+                        self.phase,
+                        Phase::DaemonGated
+                            | Phase::ChildForking
+                            | Phase::ChildPreparing
+                            | Phase::Held
+                    )
+                    && (self.writer.role != WriterRole::None || terminal)
+                    && self.writer.role != WriterRole::Launcher
+            }
+            State::Transferred => {
+                cause == Some(Cause::Launch)
+                    && self.incarnation.is_some()
+                    && self.transfer.is_some()
+                    && self.phase == Phase::Held
+                    && retirement.is_none()
+                    && matches!(self.writer.role, WriterRole::Producer | WriterRole::None)
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            fail("state, phase, writer and fields disagree")
+        }
+    }
+
     /// The exact incarnation text, when the operation has launched.
     pub fn incarnation_id(&self) -> Option<&str> {
         self.incarnation.as_ref().map(|inc| inc.id.as_str())
@@ -422,6 +523,9 @@ impl OperationStore {
                 format!("unsupported schema {:?}", record.schema),
             ));
         }
+        record
+            .check()
+            .map_err(|error| ReadError::Malformed(path, error))?;
         Ok(Some(record))
     }
 
@@ -433,6 +537,15 @@ impl OperationStore {
         record: &OperationRecord,
     ) -> Result<(), CreateError> {
         self.ensure_dir().map_err(CreateError::Io)?;
+        // The lock exists before the record does, so every later reader can
+        // open it without creating anything.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(self.lock_path(digest))
+            .map_err(CreateError::Io)?;
         let target = self.record_path(digest);
         let tmp = registry::atomic::tmp_path_for(&target);
         let bytes = encode(record).map_err(CreateError::Io)?;
@@ -458,11 +571,37 @@ impl OperationStore {
     /// exactly `expected`.
     pub fn write_cas(
         &self,
+        lock: &OperationLock,
+        digest: &str,
+        expected: &OperationRecord,
+        next: OperationRecord,
+    ) -> Result<OperationRecord, WriteError> {
+        self.write_cas_as(lock, digest, expected, next, "")
+    }
+
+    /// [`OperationStore::write_cas`] for a named transition. Debug builds
+    /// fail the write named by `PTY_TEST_RECORD_WRITE_FAIL`, so a test can
+    /// prove that no effect follows a write that did not land.
+    pub fn write_cas_as(
+        &self,
         _lock: &OperationLock,
         digest: &str,
         expected: &OperationRecord,
         mut next: OperationRecord,
+        label: &str,
     ) -> Result<OperationRecord, WriteError> {
+        #[cfg(debug_assertions)]
+        if !label.is_empty()
+            && std::env::var("PTY_TEST_RECORD_WRITE_FAIL").is_ok_and(|fail| fail == label)
+        {
+            return Err(WriteError::Io(io::Error::other(format!(
+                "injected write failure at {label}"
+            ))));
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = label;
+        next.check()
+            .map_err(|error| WriteError::Io(io::Error::other(error)))?;
         let current = self
             .read(digest)
             .map_err(WriteError::Read)?
@@ -517,13 +656,11 @@ pub enum OperationLock {
 }
 
 impl OperationLock {
+    /// The lock `reserve` created. Nothing is created here: a reader that
+    /// finds no lock finds no operation.
     fn open(store: &OperationStore, digest: &str) -> io::Result<File> {
-        store.ensure_dir()?;
         std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
             .custom_flags(libc::O_CLOEXEC)
             .open(store.lock_path(digest))
     }
@@ -549,7 +686,7 @@ impl OperationLock {
     }
 
     /// Take `LOCK_SH` without waiting. `Ok(None)` means a writer holds
-    /// `LOCK_EX`: it is alive.
+    /// `LOCK_EX`: it is alive. It reads and creates nothing.
     pub fn shared_now(store: &OperationStore, digest: &str) -> io::Result<Option<OperationLock>> {
         let file = Self::open(store, digest)?;
         if try_flock(&file, libc::LOCK_SH | libc::LOCK_NB)? {
@@ -602,6 +739,55 @@ mod tests {
         .unwrap()
     }
 
+    fn someone() -> ProcessId {
+        ProcessId {
+            pid: 10,
+            start_token: "tok:10".into(),
+            boot_id: "boot".into(),
+            uid: 1,
+        }
+    }
+
+    fn claim(record: &mut OperationRecord) {
+        record.state = State::Pending;
+        record.phase = Phase::Claimed;
+        record.writer = Writer::of(WriterRole::Launcher, someone());
+        record.participants.launcher = Some(someone());
+    }
+
+    #[test]
+    fn inconsistent_records_are_refused_on_read_and_write() {
+        let (store, dir) = store();
+        let envelope = envelope();
+        let h = envelope.digest();
+        let record = OperationRecord::reserved(&envelope);
+        store.create_exclusive(&h, &record).unwrap();
+        let lock = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        // A role with no identity would let recovery skip the liveness check.
+        let mut bad = record.clone();
+        claim(&mut bad);
+        bad.writer.id = None;
+        assert!(bad.check().is_err());
+        assert!(store.write_cas(&lock, &h, &record, bad.clone()).is_err());
+        // Written behind the store's back, it is refused on read.
+        bad.revision = 2;
+        std::fs::write(store.record_path(&h), serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(matches!(store.read(&h), Err(ReadError::Malformed(..))));
+        // A launched record must say how it launched.
+        let mut launched = record.clone();
+        claim(&mut launched);
+        launched.state = State::Launched;
+        launched.writer = Writer::none();
+        assert!(
+            launched.check().is_err(),
+            "no writer and no finished retirement"
+        );
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_record_is_created_once_and_never_replaced() {
         let (store, dir) = store();
@@ -634,7 +820,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut next = record.clone();
-        next.state = State::Pending;
+        claim(&mut next);
         let written = store.write_cas(&lock, &h, &record, next.clone()).unwrap();
         assert_eq!(written.revision, 2);
         let before = std::fs::read(store.record_path(&h)).unwrap();
@@ -650,7 +836,16 @@ mod tests {
     #[test]
     fn an_exclusive_holder_excludes_shared_readers_until_it_drops() {
         let (store, dir) = store();
-        let h = "a".repeat(64);
+        let envelope = envelope();
+        let h = envelope.digest();
+        assert!(
+            OperationLock::shared_now(&store, &h).is_err(),
+            "no lock before the reservation"
+        );
+        assert!(!store.dir().exists(), "and nothing was created looking");
+        store
+            .create_exclusive(&h, &OperationRecord::reserved(&envelope))
+            .unwrap();
         let held = OperationLock::exclusive(&store, &h, Duration::ZERO)
             .unwrap()
             .unwrap();
@@ -693,5 +888,14 @@ mod tests {
         ));
         // Another boot: whatever has this pid now is not this process.
         assert_eq!(id.liveness(&live, Some("other-boot")), Liveness::Gone);
+        // No current boot identity: a per-boot pid and token prove nothing.
+        assert_eq!(
+            id.liveness(&live, None),
+            Liveness::Unknown("boot-identity-unavailable")
+        );
+        assert_eq!(
+            id.liveness(&absent, None),
+            Liveness::Unknown("boot-identity-unavailable")
+        );
     }
 }

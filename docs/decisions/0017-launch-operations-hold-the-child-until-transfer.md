@@ -35,17 +35,30 @@ the command starts, and settle afterwards to a positive answer.
    published, prepared and held, not that the command started.
 5. `transfer` commits `transferred` to the record, then writes the release
    byte, and the child calls `execve` with today's exact argv and environment.
-   The session's metadata carries `launchOperation: {digest, phase}`, with
-   phase `startup` until the transfer and `transferred` after it.
+   A transfer accepted while the child is held but before `ready` is
+   committed right after `ready`, so the daemon is already serving. The
+   session's metadata carries `launchOperation: {digest, phase}`, with phase
+   `startup` until the transfer and `transferred` after it.
+6. A cancel, the owner's end of file, or a startup failure while launched
+   first records `retirement.requested` durably. Only then is the cause
+   acknowledged, and only once every committed ticket has completed are the
+   gate shut, the child ended and the row unwound. If any record write does
+   not land, the daemon stops: no further effect and no positive frame. The
+   held child reads end of file on its gate and leaves without exec, and the
+   operation is left to `settle` and `retire`.
 
 Until transfer every process involved is one of pty's own, and each carries
 `--launch-operation <h>` in its argv, inherited across fork. `pty operation
 settle` therefore reads the record, the process table with argv, and the
 registry once each under a shared lock, and answers `closed`, `transferred`,
 `live`, `retire-required` or `unknown`, naming the component and its evidence.
-It never signals anything. `pty operation retire` takes over from a writer
-that is verifiably gone, tears down only recorded identities and only the
-recorded generation's row, and returns the same snapshot. `pty capabilities
+It never signals and never creates anything. `pty operation retire` checks
+the exact operation, envelope and incarnation first. It refuses while the
+writer or any recorded launcher, producer or daemon is alive or unprovable,
+and resumes its own interrupted request. It tears down only the recorded
+child and only the recorded generation's row, then returns the same
+snapshot. Liveness is per boot: without a readable boot identity every
+recorded identity is unknown, and nothing is signalled. `pty capabilities
 --json` advertises `launch-operation` version 1.
 
 Without `--operation-fd` nothing changes: no record, no held child, no
@@ -57,12 +70,43 @@ that question answerable on every platform: before transfer there is no user
 code and no user descendant, only pty processes that are recorded, marked, or
 both. A cancel before transfer is complete when those are gone.
 
+**Signal authority.**
+
+- The daemon ends its own child only through the session substrate, which
+  holds its reap lock across the signal, so the pid cannot have been reused.
+- Recovery, which is not the child's parent, sends `SIGCONT` first. A held
+  child whose daemon is gone has already read end of file on its gate unless
+  it is stopped; resumed, it reads end of file and leaves by itself.
+- On Linux recovery then escalates to `SIGKILL`, and every signal goes
+  through a `pidfd` opened before the identity is checked, so a pid reused in
+  between cannot be hit.
+- macOS has no `pidfd`. There the identity is checked immediately before
+  `SIGCONT`, and `SIGKILL` is never sent. The residual: in the microseconds
+  between that check and the signal, a pid reused by another process would
+  receive a `SIGCONT`. A child that still does not leave is reported live, and
+  the operation stays `retire-required`.
+- A stopped held child is usually ended by job control before recovery is
+  needed. Its daemon's death hangs up the terminal the child leads, and the
+  kernel sends it `SIGHUP` and `SIGCONT`; its `SIGHUP` is at its default.
+
+**Descriptors.** The launcher's `pre_exec` marks every descriptor from 3 up
+close-on-exec, then clears the flag on exactly the config, readiness, control
+and gate descriptors. A launcher handed other descriptors, including a stray
+copy of the owner's own end, cannot pass them to the daemon. The gate pipe,
+the held child's gate and the control wake-up pipe are close-on-exec from
+creation on Linux.
+
 **Details the contract left open.** Recorded here so a consumer can rely on
 them:
 
-- Refusal and rejection codes beyond the contract's table: `not-held` (a
-  transfer before the child is held, or during retirement), `already-decided`
-  (a second cancel), and for the launcher `digest-mismatch`,
+- Refusal and rejection codes beyond the contract's table:
+  - `not-held`: a transfer before the child is held, during retirement, or
+    one that lost to a cancel or end of file before its commit;
+  - `already-decided`: a second cancel, or a second transfer;
+  - `already-transferred`: any frame after the commit;
+  - for retire, `live-participant`, `participant-unknown` and
+    `record-write`;
+  - for the launcher, `digest-mismatch`,
   `runtime-id-mismatch`, `session-busy`, `session-unavailable`,
   `operation-unavailable` and `identity-unavailable`. A launcher that cannot
   read a valid envelope refuses with `envelope-invalid` and null operation
@@ -79,12 +123,27 @@ them:
   a reset.
 - glibc keeps signals 32 and 33 for itself and refuses `sigaction` on them, so
   the held child keeps the C library's own handlers for those two until its
-  `execve`, as today's spawned child does.
+  `execve`, as today's spawned child does. Every other disposition is what
+  an `exec` from today's spawn leaves: caught signals at their default, and
+  ignored ones still ignored, except `SIGCHLD`, `SIGHUP`, `SIGINT`,
+  `SIGQUIT`, `SIGTERM`, `SIGALRM` and `SIGPIPE`, which are reset.
+- `expectedIncarnation` and a transfer's incarnation id are decimal digits, a
+  colon, and a non-empty rest, inside the limits of an `S`. They are compared
+  by exact bytes with the registry's own incarnation text.
+- `reserve` creates `<h>.lock` together with the record. A missing lock reads
+  as a missing operation.
+- The daemon handles SIGTERM and SIGINT from its start: before the transfer
+  they retire the operation.
 
 **Tests.** `crates/pty/tests/launch_operation.rs` plays the owner. Debug
 builds honor `PTY_TEST_OPERATION_BARRIERS=<dir>`: a barrier writes
 `<name>.reached` and, when the test created `<name>.hold`, waits for
-`<name>.release`. The tests cancel, close or kill a participant at every
+`<name>.release`. The launcher and the startup worker block at their
+barriers. The daemon's actor never blocks: at `before-decision` and at the
+three transfer barriers it parks the step and keeps answering, so the tests
+see decisions, rejections and retirements arrive while the barrier holds.
+`PTY_TEST_RECORD_WRITE_FAIL=<transition>` fails one record write, and
+`PTY_TEST_BOOT_ID=unavailable` hides the boot identity. The tests cancel, close or kill a participant at every
 barrier and check the frames, the record and the exact `settle` verdict; they
 cover descriptor validation, a stopped child, a group stop, the daemon's
 handlers, a replaced binary, decoys with the same and another digest,
@@ -92,6 +151,12 @@ unreadable evidence (`PTY_TEST_PROCESS_TABLE`, `PTY_TEST_ARGV_UNREADABLE`) and
 a same-name replacement surviving `retire`. One test runs the same probe
 through today's spawn and through a transfer and requires the environment,
 umask, working directory, session, process group, terminal, descriptors,
-signal mask and dispositions to match. Each of the queued-cancel rule,
-descriptor cleanup, disposition reset, marker match and ticket commit was
-reverted once to see its test fail.
+signal mask and dispositions to match. Each of these was reverted once to see its test fail:
+- the queued-cancel rule;
+- the held child's descriptor cleanup and its disposition reset;
+- the marker match and the ticket commit;
+- the launcher's descriptor sweep;
+- the deferral of a transfer to `ready`;
+- the request-before-effect rule;
+- the boot-identity rule;
+- retire's tuple check.

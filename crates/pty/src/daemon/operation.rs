@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use pty_core::events::EventWriter;
-use pty_core::operation::barrier::barrier;
+use pty_core::operation::barrier::{self, barrier};
 use pty_core::operation::frames::{
     FRAME_MAX_BYTES, OwnerCommand, OwnerFrame, RejectCode, TicketView, parse_owner_frame,
     producer_frame,
@@ -46,7 +46,7 @@ use super::DaemonConfig;
 use super::held::{self, Ack, HeldChild, HeldSpec};
 use super::lifecycle::{
     Daemon, DaemonParts, Msg, Publication, live_identity, new_generation, publish_session,
-    spawn_acceptor, spawn_session_bridge, spawn_signal_listener,
+    spawn_acceptor, spawn_session_bridge,
 };
 
 /// The daemon's link to its operation's actor while it serves.
@@ -104,6 +104,8 @@ enum ActorEvent {
     ReadyPoint(Sender<bool>),
     ChildExited,
     Shutdown,
+    /// A test released a barrier the actor parked a step at.
+    Released(&'static str),
 }
 
 enum OwnerInput {
@@ -113,7 +115,13 @@ enum OwnerInput {
 
 enum Completion {
     Published,
-    Forked { pid: i32, gate: Arc<OwnedFd> },
+    Forked {
+        pid: i32,
+        gate: Arc<OwnedFd>,
+        /// The substrate's handle, whose signals are fenced against reaping:
+        /// the child's pid cannot be reused while it can still be signalled.
+        session: pty_spawn::substrate::SessionClient,
+    },
 }
 
 /// What the startup worker is told to do.
@@ -293,6 +301,7 @@ pub(crate) fn main(digest: &str) -> i32 {
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let transferred = Arc::new(AtomicBool::new(false));
+    forward_kill_signals(actor_tx.clone(), msg_tx.clone());
     // SAFETY: the inherited control descriptor, owned by the I/O thread now.
     let control = unsafe { OwnedFd::from_raw_fd(control) };
     let io = match ControlHandle::start(
@@ -335,6 +344,10 @@ pub(crate) fn main(digest: &str) -> i32 {
         published: false,
         child: None,
         generation: String::new(),
+        own: actor_tx.clone(),
+        pending: None,
+        deferred_transfer: None,
+        syncing: false,
     };
     std::thread::Builder::new()
         .name("pty-operation-actor".into())
@@ -349,6 +362,25 @@ pub(crate) fn main(digest: &str) -> i32 {
         transferred,
     }
     .run(worker_rx, msg_rx, readiness)
+}
+
+/// SIGTERM and SIGINT from the start: before the transfer they retire the
+/// operation through its actor; once the actor is done they are the serving
+/// daemon's external kill, as for any session.
+fn forward_kill_signals(actor: Sender<ActorEvent>, msgs: Sender<Msg>) {
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        for _ in signals.forever() {
+            if actor.send(ActorEvent::Shutdown).is_err() && msgs.send(Msg::ExternalKill).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 // ── The startup worker ───────────────────────────────────────────────────
@@ -538,6 +570,7 @@ impl Worker {
                     spawn_session_bridge(stream, self.msgs.clone());
                     let listener_fd = listener.as_raw_fd();
                     spawn_acceptor(listener, self.msgs.clone());
+                    let fenced = client.clone();
                     serving = Some(Serving {
                         events: Some(events),
                         owner,
@@ -552,6 +585,7 @@ impl Worker {
                         Ok(Completion::Forked {
                             pid: forked.pid,
                             gate: Arc::clone(&gate),
+                            session: fenced,
                         }),
                     );
                     barrier("child-prepared-before-ack-read");
@@ -578,7 +612,6 @@ impl Worker {
                         return 1;
                     };
                     readiness.notify();
-                    spawn_signal_listener(self.msgs.clone());
                     let daemon = Daemon::assemble(DaemonParts {
                         cfg: self.cfg,
                         generation,
@@ -677,8 +710,13 @@ impl ControlHandle {
         envelope_sha256: &str,
     ) -> std::io::Result<ControlHandle> {
         let mut pipe = [0 as RawFd; 2];
-        // SAFETY: pipe(2) fills two descriptors, made close-on-exec below.
-        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        // SAFETY: pipe(2) fills two descriptors, made close-on-exec below
+        // (at creation, where the platform allows it).
+        #[cfg(target_os = "linux")]
+        let made = unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        #[cfg(not(target_os = "linux"))]
+        let made = unsafe { libc::pipe(pipe.as_mut_ptr()) };
+        if made != 0 {
             return Err(std::io::Error::last_os_error());
         }
         for end in pipe {
@@ -957,16 +995,28 @@ enum Stage {
     Done,
 }
 
-/// A retirement in progress: it waits for committed tickets to complete
-/// before it records anything.
-struct Retiring {
-    request_id: String,
+/// A step the actor parked at a held barrier, finished when the test
+/// releases it. The actor keeps processing everything else meanwhile.
+enum Pending {
+    /// The launch decision (`before-decision`).
+    Decide,
+    /// An accepted transfer before its commit (`transfer-before-commit`).
+    TransferCommit { request_id: String },
+    /// A committed transfer before its release (`transfer-committed-before-release`).
+    TransferRelease,
+    /// A released transfer before its acknowledgement (`released-before-ack`).
+    TransferAck { released: bool },
 }
+
+/// A retirement whose request is durably recorded. It waits for committed
+/// tickets before any further effect.
+struct Retiring;
 
 struct ChildRecord {
     id: Option<ProcessId>,
     pid: i32,
     gate: Arc<OwnedFd>,
+    session: pty_spawn::substrate::SessionClient,
 }
 
 struct Actor {
@@ -995,6 +1045,13 @@ struct Actor {
     published: bool,
     child: Option<ChildRecord>,
     generation: String,
+    /// The actor's own inbox, for barrier releases.
+    own: Sender<ActorEvent>,
+    pending: Option<Pending>,
+    /// A transfer accepted while held, committed once `ready` is sent.
+    deferred_transfer: Option<String>,
+    /// The decision waits for the I/O thread to read what the owner queued.
+    syncing: bool,
 }
 
 fn extra(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -1032,22 +1089,60 @@ impl Actor {
     }
 
     /// Move the record by compare-and-swap. The actor is its only writer
-    /// while the daemon lives, so a refusal here means the record was
-    /// tampered with; it is reported and the transition does not happen.
-    fn write(&mut self, next: OperationRecord) -> bool {
+    /// while the daemon lives; a refusal means the record cannot be trusted
+    /// to say what happens next, and the caller must not act as if it did.
+    fn write(&mut self, next: OperationRecord, label: &str) -> bool {
         let Some(lock) = &self.lock else {
             return false;
         };
-        match self.store.write_cas(lock, &self.digest, &self.record, next) {
+        match self
+            .store
+            .write_cas_as(lock, &self.digest, &self.record, next, label)
+        {
             Ok(written) => {
                 self.record = written;
                 true
             }
             Err(error) => {
-                super::daemon_warn!("pty daemon: operation record write refused: {error}");
+                super::daemon_warn!(
+                    "pty daemon: operation record write refused at {label}: {error}"
+                );
                 false
             }
         }
+    }
+
+    /// A record write did not land. Stop: no further effect, no positive
+    /// frame. The owner reads end of file; the held child, if any, reads end
+    /// of file on its gate when this process exits and leaves without exec;
+    /// the record is left to `settle` and `retire`.
+    fn abandon(&mut self, at: &str) {
+        super::daemon_warn!(
+            "pty daemon: stopping the launch operation without further effects after a failed record write at {at}"
+        );
+        self.io.close();
+        self.lock = None;
+        self.stage = Stage::Done;
+        if self.serving {
+            let _ = self.msgs.send(Msg::OperationEnd(1));
+        } else {
+            let _ = self.worker.send(WorkerCmd::Stop(1));
+        }
+    }
+
+    /// Park `pending` at `name` if a test armed it; the release arrives as
+    /// an event. `false` means go on now.
+    fn hold(&mut self, name: &'static str, pending: Pending) -> bool {
+        if !barrier::armed(name) {
+            return false;
+        }
+        self.pending = Some(pending);
+        let own = self.own.clone();
+        std::thread::spawn(move || {
+            barrier::wait_released(name);
+            let _ = own.send(ActorEvent::Released(name));
+        });
+        true
     }
 
     fn issue(&mut self, kind: TicketKind) -> u64 {
@@ -1070,42 +1165,15 @@ impl Actor {
             .any(|ticket| ticket.state == TicketState::Committed)
     }
 
+    fn is_transferred(&self) -> bool {
+        self.record.state == State::Transferred
+    }
+
     fn run(mut self, events: Receiver<ActorEvent>) {
         self.frame("accepted", Map::new());
-        barrier("before-decision");
-        // Everything the owner queued so far is read before deciding: a
-        // queued cancel, end of file or malformed input wins.
-        self.io.sync();
-        let mut withdrawal: Option<(Cause, Option<String>)> = None;
-        loop {
-            match events.recv() {
-                Ok(ActorEvent::Synced) => break,
-                Ok(ActorEvent::Owner(input)) => match input {
-                    OwnerInput::Eof => {
-                        withdrawal.get_or_insert((Cause::OwnerEof, None));
-                    }
-                    OwnerInput::Frame(OwnerFrame::Malformed) => {
-                        self.reject(RejectCode::Malformed, None);
-                        withdrawal.get_or_insert((Cause::Malformed, None));
-                    }
-                    OwnerInput::Frame(OwnerFrame::Command(OwnerCommand::Cancel { request_id })) => {
-                        withdrawal.get_or_insert((Cause::Cancel, Some(request_id)));
-                    }
-                    OwnerInput::Frame(OwnerFrame::Command(command)) => {
-                        self.reject(RejectCode::NotHeld, Some(command.request_id().to_string()));
-                    }
-                    OwnerInput::Frame(OwnerFrame::Rejected { code, request_id }) => {
-                        self.reject(code, request_id);
-                    }
-                },
-                Ok(ActorEvent::Shutdown) => {
-                    withdrawal.get_or_insert((Cause::Refused, None));
-                }
-                Ok(_) => {}
-                Err(_) => return,
-            }
+        if !self.hold("before-decision", Pending::Decide) {
+            self.begin_sync();
         }
-        self.decide(withdrawal);
         while self.stage != Stage::Done {
             let Ok(event) = events.recv() else {
                 return;
@@ -1114,15 +1182,19 @@ impl Actor {
         }
     }
 
-    /// The one decisive transition (contract §7.3).
-    fn decide(&mut self, withdrawal: Option<(Cause, Option<String>)>) {
+    /// Everything the owner queued is read before the decision: a queued
+    /// cancel, end of file or malformed input arrives as an event first.
+    fn begin_sync(&mut self) {
+        self.syncing = true;
+        self.io.sync();
+    }
+
+    /// The decisive transition (contract §7.3), once nothing withdrew it.
+    fn decide(&mut self) {
         let lock_path = registry::lock_path(&self.runtime_id);
         let holds_creation_lock = std::fs::read_to_string(&lock_path)
             .ok()
             .is_some_and(|owner| owner.trim() == self.me.pid.to_string());
-        if let Some((cause, request_id)) = withdrawal {
-            return self.cancel_before_launch(cause, request_id, None);
-        }
         if !holds_creation_lock {
             return self.cancel_before_launch(
                 Cause::Refused,
@@ -1150,8 +1222,8 @@ impl Actor {
             daemon: self.me.clone(),
             child: None,
         });
-        if !self.write(launched) {
-            return self.cancel_before_launch(Cause::Refused, None, Some("record-write".into()));
+        if !self.write(launched, "decision") {
+            return self.abandon("decision");
         }
         self.generation = generation.clone();
         self.stage = Stage::Starting;
@@ -1166,7 +1238,8 @@ impl Actor {
         });
     }
 
-    /// `cancelled` before anything was published: no registry effect.
+    /// `cancelled` before anything was published: no registry effect. The
+    /// decision frame is sent only once the decision is durable.
     fn cancel_before_launch(
         &mut self,
         cause: Cause,
@@ -1177,7 +1250,9 @@ impl Actor {
         cancelled.state = State::Cancelled;
         cancelled.writer = Writer::none();
         cancelled.decision = Some(Decision::now(cause, request_id, observed));
-        self.write(cancelled);
+        if !self.write(cancelled, "decision") {
+            return self.abandon("decision");
+        }
         let decision = json!(self.record.decision);
         self.frame("decision", extra(&[("decision", decision)]));
         registry::release_file_lock_owned_by(&registry::lock_path(&self.runtime_id), self.me.pid);
@@ -1199,7 +1274,13 @@ impl Actor {
 
     fn on_event(&mut self, event: ActorEvent) {
         match event {
-            ActorEvent::Synced => {}
+            ActorEvent::Synced => {
+                if self.stage == Stage::Deciding && self.syncing {
+                    self.syncing = false;
+                    self.decide();
+                }
+            }
+            ActorEvent::Released(name) => self.on_released(name),
             ActorEvent::Commit { ticket, reply } => {
                 let retiring = self.retiring.is_some();
                 let answer = match self.ticket(ticket) {
@@ -1230,25 +1311,74 @@ impl Actor {
                     self.frame("ready", Map::new());
                 }
                 let _ = reply.send(ok);
+                // A transfer accepted while held is committed now, after
+                // `ready`, so the worker is already serving when it releases.
+                if ok && let Some(request_id) = self.deferred_transfer.take() {
+                    self.start_transfer(request_id);
+                }
             }
             ActorEvent::ChildExited => {
-                if self.retiring.is_none() && self.record.state == State::Launched {
+                if self.record.state == State::Launched {
                     self.retire(None, "producer:child-exited".into());
                 }
             }
-            ActorEvent::Shutdown => {
-                if self.retiring.is_none() && self.record.state == State::Launched {
-                    self.retire(None, "producer:terminated".into());
-                }
-            }
+            ActorEvent::Shutdown => match self.record.state {
+                State::Launched => self.retire(None, "producer:terminated".into()),
+                State::Pending if self.stage == Stage::Deciding => self.cancel_before_launch(
+                    Cause::Refused,
+                    None,
+                    Some("producer:terminated".into()),
+                ),
+                _ => {}
+            },
             ActorEvent::Owner(input) => self.on_owner(input),
         }
     }
 
+    fn on_released(&mut self, name: &'static str) {
+        match (name, self.pending.take()) {
+            ("before-decision", Some(Pending::Decide)) if self.stage == Stage::Deciding => {
+                self.begin_sync();
+            }
+            ("transfer-before-commit", Some(Pending::TransferCommit { request_id })) => {
+                self.commit_transfer(request_id);
+            }
+            ("transfer-committed-before-release", Some(Pending::TransferRelease)) => {
+                self.release_transfer();
+            }
+            ("released-before-ack", Some(Pending::TransferAck { released })) => {
+                self.finish_transfer(released);
+            }
+            (_, pending) => self.pending = pending,
+        }
+    }
+
     fn on_owner(&mut self, input: OwnerInput) {
+        if self.stage == Stage::Deciding {
+            // Before the decision any withdrawal wins at once, even while
+            // the decision itself is held.
+            return match input {
+                OwnerInput::Eof => self.cancel_before_launch(Cause::OwnerEof, None, None),
+                OwnerInput::Frame(OwnerFrame::Malformed) => {
+                    self.reject(RejectCode::Malformed, None);
+                    self.cancel_before_launch(Cause::Malformed, None, None)
+                }
+                OwnerInput::Frame(OwnerFrame::Command(OwnerCommand::Cancel { request_id })) => {
+                    self.cancel_before_launch(Cause::Cancel, Some(request_id), None)
+                }
+                OwnerInput::Frame(OwnerFrame::Command(command)) => {
+                    self.reject(RejectCode::NotHeld, Some(command.request_id().to_string()))
+                }
+                OwnerInput::Frame(OwnerFrame::Rejected { code, request_id }) => {
+                    self.reject(code, request_id)
+                }
+            };
+        }
         match input {
             OwnerInput::Frame(OwnerFrame::Command(OwnerCommand::Cancel { request_id })) => {
-                if self.retiring.is_some() {
+                if self.is_transferred() {
+                    self.reject(RejectCode::AlreadyTransferred, Some(request_id));
+                } else if self.retiring.is_some() {
                     self.reject(RejectCode::AlreadyDecided, Some(request_id));
                 } else {
                     self.retire(Some(Cause::Cancel), request_id);
@@ -1259,6 +1389,14 @@ impl Actor {
                 incarnation_id,
                 generation,
             })) => {
+                if self.is_transferred() {
+                    return self.reject(RejectCode::AlreadyTransferred, Some(request_id));
+                }
+                if self.deferred_transfer.is_some()
+                    || matches!(self.pending, Some(Pending::TransferCommit { .. }))
+                {
+                    return self.reject(RejectCode::AlreadyDecided, Some(request_id));
+                }
                 let held = self.record.phase == Phase::Held && self.child.is_some();
                 if self.retiring.is_some() || !held {
                     return self.reject(RejectCode::NotHeld, Some(request_id));
@@ -1270,19 +1408,29 @@ impl Actor {
                 if !matches {
                     return self.reject(RejectCode::WrongIncarnation, Some(request_id));
                 }
-                self.transfer(request_id);
+                if self.stage == Stage::Held {
+                    self.deferred_transfer = Some(request_id);
+                } else {
+                    self.start_transfer(request_id);
+                }
             }
             OwnerInput::Frame(OwnerFrame::Rejected { code, request_id }) => {
+                let code = if self.is_transferred() && code != RejectCode::Malformed {
+                    RejectCode::AlreadyTransferred
+                } else {
+                    code
+                };
                 self.reject(code, request_id)
             }
             OwnerInput::Frame(OwnerFrame::Malformed) => {
                 self.reject(RejectCode::Malformed, None);
-                if self.retiring.is_none() {
+                if !self.is_transferred() && self.retiring.is_none() {
                     self.retire(Some(Cause::Malformed), "owner:malformed".into());
                 }
             }
+            // After the commit, end of file is never permission to retire.
             OwnerInput::Eof => {
-                if self.retiring.is_none() {
+                if !self.is_transferred() && self.retiring.is_none() {
                     self.retire(Some(Cause::OwnerEof), "owner:eof".into());
                 }
             }
@@ -1308,33 +1456,35 @@ impl Actor {
                     let ticket = self.issue(TicketKind::ForkChild);
                     let mut forking = self.record.clone();
                     forking.phase = Phase::ChildForking;
-                    if self.write(forking) {
+                    if self.write(forking, "child-forking") {
                         let _ = self.worker.send(WorkerCmd::ForkChild { ticket });
                     } else {
-                        self.retire(None, "producer:record-write".into());
+                        return self.abandon("child-forking");
                     }
                 }
             }
-            (TicketKind::ForkChild, Ok(Completion::Forked { pid, gate })) => {
+            (TicketKind::ForkChild, Ok(Completion::Forked { pid, gate, session })) => {
                 let id = ProcessId::of(pid as u32).ok();
                 self.child = Some(ChildRecord {
                     id: id.clone(),
                     pid,
                     gate,
+                    session,
                 });
-                if let Some(id) = id {
+                if self.retiring.is_none() {
+                    let Some(id) = id else {
+                        // The child is already gone: nothing was released.
+                        return self.retire(None, "producer:child-exited".into());
+                    };
                     let mut preparing = self.record.clone();
                     preparing.phase = Phase::ChildPreparing;
                     preparing.participants.child = Some(id.clone());
                     if let Some(inc) = preparing.incarnation.as_mut() {
                         inc.child = Some(id);
                     }
-                    if !self.write(preparing) && self.retiring.is_none() {
-                        self.retire(None, "producer:record-write".into());
+                    if !self.write(preparing, "child-preparing") {
+                        return self.abandon("child-preparing");
                     }
-                } else if self.retiring.is_none() {
-                    // The child is already gone: nothing was released.
-                    self.retire(None, "producer:child-exited".into());
                 }
             }
             (_, Ok(_)) => {}
@@ -1358,8 +1508,8 @@ impl Actor {
             Ack::Prepared => {
                 let mut held = self.record.clone();
                 held.phase = Phase::Held;
-                if !self.write(held) {
-                    return self.retire(None, "producer:record-write".into());
+                if !self.write(held, "held") {
+                    return self.abandon("held");
                 }
                 self.stage = Stage::Held;
                 self.frame("held", Map::new());
@@ -1378,7 +1528,35 @@ impl Actor {
 
     /// Cancel, owner end of file, or a startup failure while `launched`
     /// (contract §7.6): no user command ever ran.
+    ///
+    /// The request is recorded first. Only once it is durable is the
+    /// owner's cause acknowledged and any effect allowed; effects still wait
+    /// for every committed ticket.
     fn retire(&mut self, cause: Option<Cause>, request_id: String) {
+        if self.retiring.is_some() || self.stage == Stage::Done || self.is_transferred() {
+            return;
+        }
+        // A transfer that has not committed loses to the retirement.
+        if let Some(Pending::TransferCommit { request_id }) = self.pending.take() {
+            self.reject(RejectCode::NotHeld, Some(request_id));
+        }
+        if let Some(request_id) = self.deferred_transfer.take() {
+            self.reject(RejectCode::NotHeld, Some(request_id));
+        }
+        for ticket in &mut self.tickets {
+            if ticket.state == TicketState::Issued {
+                ticket.state = TicketState::Revoked;
+            }
+        }
+        let mut requested = self.record.clone();
+        requested.retirement = Some(Retirement {
+            request_id: request_id.clone(),
+            phase: RetirementPhase::Requested,
+            evidence: json!({}),
+        });
+        if !self.write(requested, "retirement-requested") {
+            return self.abandon("retirement-requested");
+        }
         if let Some(cause) = cause {
             let decision = Decision::now(
                 cause,
@@ -1387,12 +1565,7 @@ impl Actor {
             );
             self.frame("decision", extra(&[("decision", json!(decision))]));
         }
-        for ticket in &mut self.tickets {
-            if ticket.state == TicketState::Issued {
-                ticket.state = TicketState::Revoked;
-            }
-        }
-        self.retiring = Some(Retiring { request_id });
+        self.retiring = Some(Retiring);
         // A committed effect finishes first; its completion resumes here.
         if !self.committed_in_flight() {
             self.complete_retirement();
@@ -1400,21 +1573,9 @@ impl Actor {
     }
 
     fn complete_retirement(&mut self) {
-        let Some(retiring) = self.retiring.as_ref() else {
-            return;
-        };
-        if self.stage == Stage::Done {
+        if self.retiring.is_none() || self.stage == Stage::Done {
             return;
         }
-        let request_id = retiring.request_id.clone();
-        let mut requested = self.record.clone();
-        requested.retirement = Some(Retirement {
-            request_id: request_id.clone(),
-            phase: RetirementPhase::Requested,
-            evidence: json!({}),
-        });
-        self.write(requested);
-
         let mut evidence = Map::new();
         let mut verified = true;
         if let Some(child) = &self.child {
@@ -1429,6 +1590,12 @@ impl Actor {
             evidence.insert("row".into(), json!(row));
             verified &= matches!(row, "removed" | "absent" | "other-generation");
         }
+        let request_id = self
+            .record
+            .retirement
+            .as_ref()
+            .map(|retirement| retirement.request_id.clone())
+            .unwrap_or_default();
         let mut terminal = self.record.clone();
         terminal.writer = Writer::none();
         terminal.retirement = Some(Retirement {
@@ -1440,15 +1607,31 @@ impl Actor {
             },
             evidence: Value::Object(evidence),
         });
-        self.write(terminal);
+        if !self.write(terminal, "retirement-terminal") {
+            return self.abandon("retirement-terminal");
+        }
         let retirement = json!(self.record.retirement);
         self.frame("retirement", extra(&[("retirement", retirement)]));
         self.finish(0);
     }
 
-    /// Commit, then release (contract §7.5).
-    fn transfer(&mut self, request_id: String) {
-        barrier("transfer-before-commit");
+    /// A transfer the actor accepted at `ready` (contract §7.5).
+    fn start_transfer(&mut self, request_id: String) {
+        if !self.hold(
+            "transfer-before-commit",
+            Pending::TransferCommit {
+                request_id: request_id.clone(),
+            },
+        ) {
+            self.commit_transfer(request_id);
+        }
+    }
+
+    /// Commit, then release.
+    fn commit_transfer(&mut self, request_id: String) {
+        if self.retiring.is_some() || self.stage == Stage::Done {
+            return self.reject(RejectCode::NotHeld, Some(request_id));
+        }
         let mut committed = self.record.clone();
         committed.state = State::Transferred;
         committed.transfer = Some(Transfer {
@@ -1456,18 +1639,31 @@ impl Actor {
             committed_at: registry::now_iso8601(),
             released: None,
         });
-        if !self.write(committed) {
+        if !self.write(committed, "transfer-commit") {
             self.reject(RejectCode::NotHeld, Some(request_id));
-            return self.retire(None, "producer:record-write".into());
+            return self.abandon("transfer-commit");
         }
         self.transferred.store(true, Ordering::SeqCst);
         let _ = self.msgs.send(Msg::OperationTransferred);
-        barrier("transfer-committed-before-release");
+        if !self.hold(
+            "transfer-committed-before-release",
+            Pending::TransferRelease,
+        ) {
+            self.release_transfer();
+        }
+    }
+
+    fn release_transfer(&mut self) {
         let released = self
             .child
             .take()
             .is_some_and(|child| held::release(&child.gate));
-        barrier("released-before-ack");
+        if !self.hold("released-before-ack", Pending::TransferAck { released }) {
+            self.finish_transfer(released);
+        }
+    }
+
+    fn finish_transfer(&mut self, released: bool) {
         let generation = self.generation.clone();
         let marked = registry::mutate_metadata_under_lock_with_wait(
             &self.runtime_id,
@@ -1498,7 +1694,9 @@ impl Actor {
         if let Some(transfer) = done.transfer.as_mut() {
             transfer.released = Some(released);
         }
-        self.write(done);
+        // The commit is durable either way; if this second write fails, the
+        // frame reports the record as it stands (`released: null`).
+        self.write(done, "transfer-released");
         let transfer = json!(self.record.transfer);
         self.frame("transferred", extra(&[("transfer", transfer)]));
         self.io.close();
@@ -1508,8 +1706,10 @@ impl Actor {
 }
 
 /// After the gate is shut, the child must be gone by its exact identity. A
-/// child that does not leave (it is stopped, say) is killed by identity,
-/// with its prepared process group, and checked again.
+/// child that does not leave (it is stopped, say) is killed through the
+/// substrate, whose signals are fenced against reaping, so its pid cannot
+/// name anyone else. A held child never forks, so there is no group to
+/// signal.
 fn verify_child_gone(child: &ChildRecord) -> &'static str {
     let Some(id) = &child.id else {
         return "unrecorded";
@@ -1519,28 +1719,17 @@ fn verify_child_gone(child: &ChildRecord) -> &'static str {
     loop {
         match id.liveness(&ProcTable::read(), boot.as_deref()) {
             Liveness::Gone => return "gone",
-            Liveness::Unknown(_) if Instant::now() >= deadline => break,
             _ if Instant::now() >= deadline => break,
             _ => std::thread::sleep(Duration::from_millis(10)),
         }
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let table = ProcTable::read();
-        match id.liveness(&table, boot.as_deref()) {
+        match id.liveness(&ProcTable::read(), boot.as_deref()) {
             Liveness::Gone => return "gone",
             Liveness::Unknown(reason) if Instant::now() >= deadline => return reason,
             Liveness::Live => {
-                if let pty_core::proctable::Answer::Known(row) = table.row(child.pid) {
-                    // SAFETY: SIGKILL to the exact identity the table showed,
-                    // and to the process group it leads.
-                    unsafe {
-                        if row.pgid == child.pid {
-                            libc::kill(-child.pid, libc::SIGKILL);
-                        }
-                        libc::kill(child.pid, libc::SIGKILL);
-                    }
-                }
+                let _ = child.session.kill();
             }
             _ => {}
         }

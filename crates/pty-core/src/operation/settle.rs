@@ -277,6 +277,16 @@ pub fn settle(
     let digest = operation_digest(operation_id);
     let lock = match OperationLock::shared_now(store, &digest) {
         Ok(lock) => lock,
+        // No lock: no reservation was ever made here (reserve creates it
+        // before the record). Nothing is created by looking.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let component = Component {
+                name: "record",
+                status: Status::Unknown,
+                detail: json!({"reason": "record-missing", "path": store.record_path(&digest)}),
+            };
+            return snap.finish("unknown", Some("record-missing"), false, None, &[component]);
+        }
         Err(error) => {
             let component = Component {
                 name: "writer",
@@ -621,36 +631,101 @@ pub struct RetireRefusal {
     pub detail: String,
 }
 
-/// Tear down a recorded child by identity: the process, then its group
-/// (it is a session leader, so its pgid is its pid), each only while the
-/// table still shows that exact identity.
+/// End a recorded held child, and only it.
+///
+/// A held child whose daemon is gone has already read end of file on its
+/// gate and exited, unless it is stopped. So the first signal is `SIGCONT`:
+/// the child resumes, reads end of file, and exits without exec by itself.
+///
+/// - **Linux** then escalates to `SIGKILL`, and every signal goes through a
+///   `pidfd`: the process is pinned first, its start identity checked, and
+///   a pid reused between the check and the signal cannot be hit.
+/// - **macOS** has no `pidfd`. The identity is checked immediately before
+///   each signal, and the only signal sent is `SIGCONT`, which an unrelated
+///   process that reused the pid in that window would merely see resumed.
+///   A child that still does not leave is left alive and reported.
+///
+/// A held child never forks, so there is no group to signal.
 fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut escalated = false;
     loop {
-        let table = ProcTable::read();
-        let liveness = id.liveness(&table, boot);
+        let liveness = id.liveness_now(boot);
         if liveness != Liveness::Live {
             return liveness;
         }
-        let pid = id.pid as i32;
-        if let crate::proctable::Answer::Known(row) = table.row(pid) {
-            // SAFETY: signals to an identity the table showed this instant.
-            unsafe {
-                if row.pgid == pid {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-                libc::kill(pid, libc::SIGKILL);
-            }
+        let signal = if escalated && cfg!(target_os = "linux") {
+            libc::SIGKILL
+        } else {
+            libc::SIGCONT
+        };
+        if let Err(reason) = signal_exact(id, boot, signal) {
+            return Liveness::Unknown(reason);
         }
         if std::time::Instant::now() >= deadline {
             return Liveness::Live;
         }
         std::thread::sleep(Duration::from_millis(20));
+        escalated = true;
     }
 }
 
-/// `pty operation retire`: retire an operation whose writer is gone. Returns
-/// the post-effect snapshot (taken after the terminal write and after the
+/// Send `signal` to exactly the recorded identity.
+fn signal_exact(id: &ProcessId, boot: Option<&str>, signal: i32) -> Result<(), &'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: pidfd_open returns a new descriptor or -1.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, id.pid as libc::pid_t, 0) };
+        if raw >= 0 {
+            // SAFETY: a descriptor this call just received.
+            let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+            // The descriptor names one process for good: if it is the
+            // recorded one now, the signal can only reach it.
+            if id.liveness_now(boot) != Liveness::Live {
+                return Ok(());
+            }
+            // SAFETY: a signal through our own pidfd.
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    std::os::fd::AsRawFd::as_raw_fd(&pidfd),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            return if sent == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                Ok(())
+            } else {
+                Err("signal-refused")
+            };
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => return Ok(()),
+            Some(libc::ENOSYS) => {}
+            _ => return Err("pidfd-unavailable"),
+        }
+    }
+    // No pidfd: check, then signal at once.
+    if id.liveness_now(boot) != Liveness::Live {
+        return Ok(());
+    }
+    // SAFETY: a signal to the identity the table showed this instant.
+    if unsafe { libc::kill(id.pid as i32, signal) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        Ok(())
+    } else {
+        Err("signal-refused")
+    }
+}
+
+/// `pty operation retire`: retire an operation whose writer and every
+/// recorded participant but the held child are gone. Returns the
+/// post-effect snapshot (taken after the terminal write and after the
 /// exclusive lock is released), or why nothing was done.
 pub fn retire(
     store: &OperationStore,
@@ -664,6 +739,12 @@ pub fn retire(
     let lock = match OperationLock::exclusive(store, &digest, Duration::from_millis(250)) {
         Ok(Some(lock)) => lock,
         Ok(None) => return refuse("live-writer", "a writer holds the operation lock".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refuse(
+                "record-missing",
+                store.record_path(&digest).display().to_string(),
+            );
+        }
         Err(error) => return refuse("lock-unavailable", error.to_string()),
     };
     let record = match store.read(&digest) {
@@ -676,11 +757,31 @@ pub fn retire(
         }
         Err(error) => return refuse("record-unreadable", error.to_string()),
     };
+    // The exact tuple first, before any replay can answer.
     if record.operation_id != operation_id {
         return refuse("record-mismatch", "operationId".into());
     }
     if record.envelope_sha256 != envelope_sha256 {
         return refuse("wrong-envelope", "envelopeSha256".into());
+    }
+    if record.state == State::Transferred {
+        return refuse(
+            "transferred",
+            "a transferred operation is steady state".into(),
+        );
+    }
+    if record.state == State::Launched {
+        let recorded = record.incarnation_id().unwrap_or_default().to_string();
+        match incarnation {
+            None => return refuse("incarnation-required", recorded),
+            Some(given) if given != recorded => return refuse("wrong-incarnation", recorded),
+            Some(_) => {}
+        }
+    } else if let Some(given) = incarnation {
+        return refuse(
+            "wrong-incarnation",
+            format!("{given}: nothing was launched"),
+        );
     }
     let snapshot_after = |lock: OperationLock| {
         drop(lock);
@@ -691,48 +792,55 @@ pub fn retire(
             (RequestKind::Retire, Some(request_id)),
         ))
     };
-    // The same request again returns what it recorded, with no new effect.
-    if record
+    let phase = record
         .retirement
         .as_ref()
-        .is_some_and(|retirement| retirement.request_id == request_id)
-    {
+        .map(|retirement| retirement.phase);
+    let same_request = record
+        .retirement
+        .as_ref()
+        .is_some_and(|retirement| retirement.request_id == request_id);
+    // A finished retirement, or a decision already made, is the answer.
+    if phase.is_some_and(|phase| phase != RetirementPhase::Requested) && same_request {
         return snapshot_after(lock);
     }
-    match record.state {
-        State::Transferred => {
-            return refuse(
-                "transferred",
-                "a transferred operation is steady state".into(),
-            );
-        }
-        State::Cancelled => return snapshot_after(lock),
-        State::Launched => {
-            let recorded = record.incarnation_id().unwrap_or_default().to_string();
-            match incarnation {
-                None => return refuse("incarnation-required", recorded),
-                Some(given) if given != recorded => return refuse("wrong-incarnation", recorded),
-                Some(_) => {}
-            }
-            if record
-                .retirement
-                .as_ref()
-                .is_some_and(|retirement| retirement.phase == RetirementPhase::Verified)
-            {
-                return snapshot_after(lock);
-            }
-        }
-        State::Reserved | State::Pending => {}
+    if record.state == State::Cancelled || phase == Some(RetirementPhase::Verified) {
+        return snapshot_after(lock);
     }
+    // Every recorded participant that could still act must be gone: the
+    // writer, the launcher, the producer and the daemon. Only the held child
+    // is ours to end.
     let boot = crate::boot::read_boot_identity();
-    if record.writer.role != WriterRole::None
-        && let Some(writer) = &record.writer.id
-    {
-        let table = ProcTable::read();
-        match writer.liveness(&table, boot.as_deref()) {
+    let table = ProcTable::read();
+    let mut actors: Vec<(&str, &ProcessId)> = Vec::new();
+    if let Some(writer) = &record.writer.id {
+        actors.push(("writer", writer));
+    }
+    for (role, id) in [
+        ("launcher", record.participants.launcher.as_ref()),
+        ("producer", record.participants.producer.as_ref()),
+        ("daemon", record.incarnation.as_ref().map(|inc| &inc.daemon)),
+    ] {
+        if let Some(id) = id {
+            actors.push((role, id));
+        }
+    }
+    for (role, id) in actors {
+        match id.liveness(&table, boot.as_deref()) {
             Liveness::Gone => {}
-            Liveness::Live => return refuse("live-writer", format!("pid {}", writer.pid)),
-            Liveness::Unknown(reason) => return refuse("writer-unknown", reason.to_string()),
+            Liveness::Live => {
+                return refuse(
+                    if role == "writer" {
+                        "live-writer"
+                    } else {
+                        "live-participant"
+                    },
+                    format!("{role} pid {}", id.pid),
+                );
+            }
+            Liveness::Unknown(reason) => {
+                return refuse("participant-unknown", format!("{role}: {reason}"));
+            }
         }
     }
     let me = match ProcessId::current() {
@@ -740,7 +848,8 @@ pub fn retire(
         Err(error) => return refuse("identity-unavailable", error),
     };
 
-    // Take authority and record the request before any effect.
+    // Take authority and record the request before any effect. An
+    // interrupted request with this same id is resumed, not repeated.
     let mut requested = record.clone();
     requested.writer = Writer::of(WriterRole::Recovery, me);
     requested.retirement = Some(Retirement {
@@ -748,10 +857,11 @@ pub fn retire(
         phase: RetirementPhase::Requested,
         evidence: json!({}),
     });
-    let requested = match store.write_cas(&lock, &digest, &record, requested) {
-        Ok(written) => written,
-        Err(error) => return refuse("stale", error.to_string()),
-    };
+    let requested =
+        match store.write_cas_as(&lock, &digest, &record, requested, "recovery-requested") {
+            Ok(written) => written,
+            Err(error) => return refuse("record-write", error.to_string()),
+        };
 
     let mut terminal = requested.clone();
     let mut evidence = Map::new();
@@ -805,8 +915,10 @@ pub fn retire(
         },
         evidence: Value::Object(evidence),
     });
-    if let Err(error) = store.write_cas(&lock, &digest, &requested, terminal) {
-        return refuse("stale", error.to_string());
+    if let Err(error) =
+        store.write_cas_as(&lock, &digest, &requested, terminal, "recovery-terminal")
+    {
+        return refuse("record-write", error.to_string());
     }
     snapshot_after(lock)
 }

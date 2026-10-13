@@ -403,6 +403,24 @@ fn marked(digest: &str) -> Vec<i32> {
         .collect()
 }
 
+/// The held child has not exec'd: its argv is still the daemon's, birth
+/// marker and all. Positive evidence, not the absence of a side effect.
+fn still_held(child: i32, digest: &str) -> bool {
+    // SAFETY: getuid(2) has no preconditions.
+    let scan = pty_core::proctable::argv::scan_argv(unsafe { libc::getuid() });
+    scan.rows.iter().any(|row| {
+        row.pid == child && pty_core::operation::settle::argv_carries_marker(&row.argv, digest)
+    })
+}
+
+fn child_of(frame: &Value) -> i32 {
+    frame["incarnation"]["child"]["pid"].as_i64().unwrap() as i32
+}
+
+fn daemon_of(frame: &Value) -> i32 {
+    frame["incarnation"]["daemon"]["pid"].as_i64().unwrap() as i32
+}
+
 fn alive(pid: i32) -> bool {
     matches!(pty_core::proctable::process(pid), pty_core::proctable::Answer::Known(row) if !row.is_zombie())
 }
@@ -579,8 +597,9 @@ fn the_command_runs_only_after_transfer() {
         ))
     );
     assert_eq!(incarnation["generation"], meta["generation"]);
-    // Held: published and prepared, and the command has not run.
-    std::thread::sleep(Duration::from_millis(300));
+    // Held: published and prepared, and the command has not run: the child
+    // still carries the daemon's argv.
+    assert!(still_held(child_of(&ready), &owner.digest));
     assert!(!owner.ran());
 
     owner.transfer("t1", &incarnation);
@@ -757,7 +776,9 @@ fn a_cancel_before_the_fork_cancels_without_any_daemon() {
 
 #[test]
 fn a_cancel_before_the_decision_wins_and_publishes_nothing() {
-    for barrier in ["launcher-before-fork", "daemon-gated", "before-decision"] {
+    // No actor exists yet at these barriers: the cancel is delivered (it sits
+    // in the socket) while held, and decided once released.
+    for barrier in ["launcher-before-fork", "daemon-gated"] {
         let rig = Rig::new();
         let (mut owner, frames) = cancel_at(&rig, "decide", barrier);
         let decision = frames
@@ -821,12 +842,16 @@ fn a_cancel_while_a_ticket_is_issued_revokes_it() {
             .iter()
             .any(|t| t["state"] == "revoked");
         assert!(revoked, "{barrier}: {retirement:#}");
+        let daemon = daemon_of(&retirement);
         owner.release(barrier);
         owner.drain();
         owner.launcher_exit();
-        // No effect happens after a revoked ticket: no child, and the row
-        // is either never published or unwound.
-        std::thread::sleep(Duration::from_millis(300));
+        // No effect happens after a revoked ticket: the worker, released,
+        // asks to commit, is refused, and the daemon ends without publishing
+        // or forking.
+        wait_until("the daemon to end", || {
+            !pty_core::registry::pid_alive(daemon)
+        });
         assert!(!row_exists(&rig, &owner.runtime_id), "{barrier}");
         assert!(!owner.ran());
         let v = owner.settle_until(&rig, "closed");
@@ -859,8 +884,12 @@ fn a_cancel_while_a_ticket_is_committed_waits_for_its_effect() {
         while cause != "cancel" {
             cause = owner.wait_for("decision")["decision"]["cause"].clone();
         }
-        // The committed effect is in flight: retirement is not recorded
-        // until it completes.
+        // The request is durable before it is acknowledged, and the
+        // committed effect is still in flight: the retirement is requested,
+        // not finished.
+        let record = owner.record(&rig);
+        assert_eq!(record["retirement"]["phase"], "requested", "{barrier}");
+        assert_eq!(record["retirement"]["requestId"], "c-commit", "{barrier}");
         assert!(
             owner.next(Duration::from_millis(500)).is_none(),
             "{barrier}: {:#?}",
@@ -1102,6 +1131,7 @@ fn the_launcher_dying_after_its_claim_leaves_a_retirable_operation() {
     let (code, v) = owner.retire(&rig, "r-lost", None);
     assert_eq!(code, 0, "{v:#}");
     assert_eq!(v["record"]["decision"]["cause"], "producer-lost");
+    let v = owner.settle_until(&rig, "closed");
     assert_eq!(
         verdict(&v),
         ("closed".into(), Some("never-launched".into()))
@@ -1136,7 +1166,8 @@ fn a_gated_daemon_exits_when_its_launcher_dies() {
     let v = owner.settle_until(&rig, "retire-required");
     assert_eq!(v["kind"], "pending");
     let (code, v) = owner.retire(&rig, "r-gate", None);
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{v:#}");
+    let v = owner.settle_until(&rig, "closed");
     assert_eq!(
         verdict(&v),
         ("closed".into(), Some("never-launched".into()))
@@ -1159,7 +1190,12 @@ fn the_daemon_dying_before_its_decision_is_producer_lost() {
     owner.launcher_exit();
     let v = owner.settle_until(&rig, "retire-required");
     assert_eq!(v["kind"], "pending");
-    let (_, v) = owner.retire(&rig, "r-dd", None);
+    let (code, v) = owner.retire(&rig, "r-dd", None);
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["record"]["state"], "cancelled");
+    // A process of this user caught exiting reads as unknown for a moment;
+    // closure is what settle reaches, never what it assumes.
+    let v = owner.settle_until(&rig, "closed");
     assert_eq!(
         verdict(&v),
         ("closed".into(), Some("never-launched".into()))
@@ -1177,9 +1213,10 @@ fn the_daemon_dying_while_the_child_is_held_never_runs_the_command() {
     let child = inc["child"]["pid"].as_i64().unwrap() as i32;
     assert!(alive(child));
     kill(daemon, libc::SIGKILL);
-    // End of file on its gate: the child exits without exec.
+    // End of file on its gate: the child exits without exec. The launcher,
+    // which may not have seen readiness yet, is a participant until it ends.
     wait_gone(child);
-    std::thread::sleep(Duration::from_millis(300));
+    owner.launcher_exit();
     assert!(!owner.ran());
     assert!(marked(&owner.digest).is_empty());
     let v = owner.settle_until(&rig, "retire-required");
@@ -1191,6 +1228,8 @@ fn the_daemon_dying_while_the_child_is_held_never_runs_the_command() {
     );
     let (code, v) = owner.retire(&rig, "r-held", inc["id"].as_str());
     assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["record"]["retirement"]["phase"], "verified");
+    let v = owner.settle_until(&rig, "closed");
     assert_eq!(verdict(&v), ("closed".into(), Some("retired".into())));
     assert!(!row_exists(&rig, &owner.runtime_id));
 }
@@ -1627,6 +1666,7 @@ fn retire_leaves_a_same_name_replacement_alone() {
         v["record"]["retirement"]["evidence"]["row"],
         "other-generation"
     );
+    let v = owner.settle_until(&rig, "closed");
     assert_eq!(verdict(&v), ("closed".into(), Some("retired".into())));
     assert_eq!(
         rig.read_meta(&owner.runtime_id).unwrap()["generation"],
@@ -1767,8 +1807,10 @@ fn operation_mode_requires_its_arguments() {
 fn probe_script(out: &Path) -> String {
     let linux = if cfg!(target_os = "linux") {
         // Signal mask and dispositions, and session, group and terminal,
-        // straight from the kernel.
-        "grep -E '^Sig(Blk|Ign|Cgt):' /proc/$$/status; \
+        // straight from the kernel. The mask is read with builtins only: a
+        // shell waiting on a child blocks every signal while it waits, so
+        // reading it from a child would race that wait.
+        "while IFS= read -r l; do case $l in SigBlk:*|SigIgn:*|SigCgt:*) echo \"$l\";; esac; done < /proc/$$/status; \
          awk '{ sub(/.*\\) /, \"\"); print \"pgid-is-pid\", ($3 == pid); print \"sid-is-pid\", ($4 == pid); print \"tty\", ($5 != 0) }' pid=$$ /proc/$$/stat; \
          ls /proc/$$/fd | sort -n | tr '\\n' ' '; echo;"
     } else {
@@ -1921,4 +1963,887 @@ fn the_released_command_starts_exactly_as_todays_spawn_does() {
     }
     rig.ok(&["kill", "parity-today"]);
     rig.ok(&["kill", "parity-held"]);
+}
+
+// ── The actor keeps answering while a step is held ───────────────────────
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn a_withdrawal_held_at_the_decision_is_decided_while_held() {
+    for (tag, withdraw, cause) in [
+        ("held-cancel", "cancel", "cancel"),
+        ("held-eof", "eof", "owner-eof"),
+        ("held-malformed", "malformed", "malformed"),
+    ] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(
+            &rig,
+            tag,
+            Plan {
+                hold: vec!["before-decision"],
+                ..Plan::default()
+            },
+        );
+        owner.wait_for("accepted");
+        owner.wait_reached("before-decision");
+        match withdraw {
+            "cancel" => owner.cancel("c-decision"),
+            "eof" => owner.socket.shutdown(std::net::Shutdown::Write).unwrap(),
+            _ => owner.write("{not json"),
+        }
+        // The decision is made while the barrier still holds.
+        let decision = owner.wait_for("decision");
+        assert_eq!(decision["decision"]["cause"], cause, "{tag}");
+        assert_eq!(decision["state"], "cancelled", "{tag}");
+        assert!(!owner.barriers.join("before-decision.release").exists());
+        owner.release("before-decision");
+        let rest = owner.drain();
+        assert!(
+            !kinds(&rest).contains(&"decision".to_string()),
+            "{tag}: one decision only: {rest:#?}"
+        );
+        owner.launcher_exit();
+        assert!(!row_exists(&rig, &owner.runtime_id), "{tag}");
+        let v = owner.settle_until(&rig, "closed");
+        assert_eq!(
+            verdict(&v),
+            ("closed".into(), Some("never-launched".into())),
+            "{tag}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn a_transfer_between_held_and_ready_waits_for_ready_and_is_served() {
+    let rig = Rig::new();
+    let mut owner = Owner::start(
+        &rig,
+        "held-transfer",
+        Plan {
+            hold: vec!["before-ready"],
+            ..Plan::default()
+        },
+    );
+    let held = owner.wait_for("held");
+    owner.wait_reached("before-ready");
+    // A transfer is valid at phase held. It is accepted, and committed once
+    // `ready` has gone out, so the daemon is serving when it releases.
+    owner.transfer("t-early", &held["incarnation"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(owner.record(&rig)["state"], "launched");
+    assert!(still_held(child_of(&held), &owner.digest));
+    owner.release("before-ready");
+    owner.wait_for("ready");
+    let transferred = owner.wait_for("transferred");
+    assert_eq!(transferred["transfer"]["requestId"], "t-early");
+    assert_eq!(transferred["transfer"]["released"], true);
+    wait_until("the command to run", || owner.ran());
+    assert_eq!(owner.launcher_exit(), 0);
+    // The daemon serves the transferred session.
+    let daemon = daemon_of(&transferred);
+    assert!(alive(daemon));
+    let listed = rig.ok(&["list", "--json"]).json();
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == owner.runtime_id)
+        .cloned()
+        .expect("the session is listed");
+    assert_eq!(row["status"], "running");
+    std::os::unix::net::UnixStream::connect(rig.path(&format!("{}.sock", owner.runtime_id)))
+        .expect("the daemon accepts clients");
+    assert_eq!(owner.settle(&rig)["verdict"], "transferred");
+    rig.ok(&["kill", &owner.runtime_id]);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn a_withdrawal_before_the_transfer_commits_wins() {
+    for (tag, withdraw, cause) in [
+        ("tbc-cancel", "cancel", "cancel"),
+        ("tbc-eof", "eof", "owner-eof"),
+    ] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(
+            &rig,
+            tag,
+            Plan {
+                hold: vec!["transfer-before-commit"],
+                ..Plan::default()
+            },
+        );
+        let ready = owner.wait_for("ready");
+        owner.transfer("t-pending", &ready["incarnation"]);
+        owner.wait_reached("transfer-before-commit");
+        match withdraw {
+            "cancel" => owner.cancel("c-pending"),
+            _ => owner.socket.shutdown(std::net::Shutdown::Write).unwrap(),
+        }
+        // All while the transfer is held before its commit: the transfer
+        // is refused, the cause acknowledged, and the retirement done.
+        let rejected = owner.wait_for("command-rejected");
+        assert_eq!(rejected["code"], "not-held", "{tag}");
+        assert_eq!(rejected["requestId"], "t-pending", "{tag}");
+        let decision = owner.wait_for("decision");
+        assert_eq!(decision["decision"]["cause"], cause, "{tag}");
+        let retirement = owner.wait_for("retirement");
+        assert_eq!(retirement["retirement"]["phase"], "verified", "{tag}");
+        assert!(
+            !owner
+                .barriers
+                .join("transfer-before-commit.release")
+                .exists()
+        );
+        owner.release("transfer-before-commit");
+        let rest = owner.drain();
+        assert!(!kinds(&rest).contains(&"transferred".to_string()), "{tag}");
+        assert!(!owner.ran(), "{tag}");
+        let v = owner.settle_until(&rig, "closed");
+        assert_eq!(
+            verdict(&v),
+            ("closed".into(), Some("retired".into())),
+            "{tag}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn after_the_transfer_commits_a_cancel_or_end_of_file_changes_nothing() {
+    for barrier in ["transfer-committed-before-release", "released-before-ack"] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(
+            &rig,
+            "after-commit",
+            Plan {
+                hold: vec![barrier],
+                ..Plan::default()
+            },
+        );
+        let ready = owner.wait_for("ready");
+        owner.transfer("t-commit", &ready["incarnation"]);
+        owner.wait_reached(barrier);
+        assert_eq!(owner.record(&rig)["state"], "transferred", "{barrier}");
+        // Frames after the commit are refused while the barrier holds.
+        owner.cancel("c-late");
+        let rejected = owner.wait_for("command-rejected");
+        assert_eq!(rejected["code"], "already-transferred", "{barrier}");
+        assert_eq!(rejected["requestId"], "c-late");
+        owner.write(&json!({"type":"resume","version":1,"operationId":owner.operation_id,"envelopeSha256":owner.sha,"requestId":"r-late"}).to_string());
+        assert_eq!(
+            owner.wait_for("command-rejected")["code"],
+            "already-transferred",
+            "{barrier}"
+        );
+        // End of file after the commit is never permission to kill.
+        owner.socket.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(!owner.barriers.join(format!("{barrier}.release")).exists());
+        owner.release(barrier);
+        let transferred = owner.wait_for("transferred");
+        assert_eq!(transferred["transfer"]["released"], true, "{barrier}");
+        wait_until("the command to run", || owner.ran());
+        assert_eq!(owner.settle(&rig)["verdict"], "transferred");
+        rig.ok(&["kill", &owner.runtime_id]);
+    }
+}
+
+// ── A record write that does not land ────────────────────────────────────
+
+/// Launch with the daemon's record write `label` made to fail.
+fn faulted(rig: &Rig, tag: &str, label: &str, hold: Vec<&'static str>) -> Owner {
+    Owner::start(
+        rig,
+        tag,
+        Plan {
+            hold,
+            env: vec![("PTY_TEST_RECORD_WRITE_FAIL".into(), label.into())],
+            ..Plan::default()
+        },
+    )
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "write faults exist only in debug builds"
+)]
+fn a_retirement_whose_request_did_not_land_has_no_effect_and_no_acknowledgement() {
+    let rig = Rig::new();
+    let mut owner = faulted(&rig, "fault-request", "retirement-requested", vec![]);
+    let ready = owner.wait_for("ready");
+    let child = child_of(&ready);
+    let daemon = daemon_of(&ready);
+    owner.cancel("c-fault");
+    // No acknowledgement and no retirement: the owner reads end of file.
+    let rest = owner.drain();
+    assert!(
+        !kinds(&rest).contains(&"decision".to_string())
+            && !kinds(&rest).contains(&"retirement".to_string()),
+        "{rest:#?}"
+    );
+    wait_until("the daemon to stop", || {
+        !pty_core::registry::pid_alive(daemon)
+    });
+    // Nothing was unwound: the row is still there, and nothing was signalled
+    // (the child left on its own, at end of file on its gate).
+    assert!(row_exists(&rig, &owner.runtime_id));
+    wait_gone(child);
+    assert!(!owner.ran());
+    let record = owner.record(&rig);
+    assert!(record["retirement"].is_null(), "{record:#}");
+    let v = owner.settle_until(&rig, "retire-required");
+    assert_eq!(v["kind"], "launched");
+    let (code, v) = owner.retire(&rig, "r-after-fault", ready["incarnation"]["id"].as_str());
+    assert_eq!(code, 0, "{v:#}");
+    assert!(!row_exists(&rig, &owner.runtime_id));
+    let v = owner.settle_until(&rig, "closed");
+    assert_eq!(verdict(&v), ("closed".into(), Some("retired".into())));
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "write faults exist only in debug builds"
+)]
+fn a_retirement_whose_terminal_write_did_not_land_claims_nothing() {
+    let rig = Rig::new();
+    let mut owner = faulted(&rig, "fault-terminal", "retirement-terminal", vec![]);
+    let ready = owner.wait_for("ready");
+    owner.cancel("c-terminal");
+    let decision = owner.wait_for("decision");
+    assert_eq!(decision["decision"]["cause"], "cancel");
+    let rest = owner.drain();
+    assert!(
+        !kinds(&rest).contains(&"retirement".to_string()),
+        "{rest:#?}"
+    );
+    let record = owner.record(&rig);
+    assert_eq!(record["retirement"]["phase"], "requested");
+    assert_eq!(record["retirement"]["requestId"], "c-terminal");
+    // The writer is gone with a request it never finished: recovery resumes
+    // that same request.
+    let v = owner.settle_until(&rig, "retire-required");
+    assert_eq!(v["kind"], "launched");
+    let inc = ready["incarnation"]["id"].as_str().unwrap();
+    let (code, v) = owner.retire(&rig, "c-terminal", Some(inc));
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["record"]["retirement"]["requestId"], "c-terminal");
+    assert_eq!(v["record"]["retirement"]["phase"], "verified");
+    let v = owner.settle_until(&rig, "closed");
+    assert_eq!(verdict(&v), ("closed".into(), Some("retired".into())));
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "write faults exist only in debug builds"
+)]
+fn a_decision_that_did_not_land_is_never_acknowledged() {
+    let rig = Rig::new();
+    let mut owner = faulted(&rig, "fault-decision", "decision", vec!["before-decision"]);
+    owner.wait_reached("before-decision");
+    owner.cancel("c-decision");
+    let rest = owner.drain();
+    assert!(!kinds(&rest).contains(&"decision".to_string()), "{rest:#?}");
+    owner.release("before-decision");
+    owner.launcher_exit();
+    let v = owner.settle_until(&rig, "retire-required");
+    assert_eq!(v["kind"], "pending");
+    let (code, v) = owner.retire(&rig, "r-decision", None);
+    assert_eq!(code, 0, "{v:#}");
+    let v = owner.settle_until(&rig, "closed");
+    assert_eq!(
+        verdict(&v),
+        ("closed".into(), Some("never-launched".into()))
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "write faults exist only in debug builds"
+)]
+fn a_transfer_whose_commit_did_not_land_never_releases_the_child() {
+    let rig = Rig::new();
+    let mut owner = faulted(&rig, "fault-transfer", "transfer-commit", vec![]);
+    let ready = owner.wait_for("ready");
+    owner.transfer("t-fault", &ready["incarnation"]);
+    let rejected = owner.wait_for("command-rejected");
+    assert_eq!(rejected["code"], "not-held");
+    let rest = owner.drain();
+    assert!(
+        !kinds(&rest).contains(&"transferred".to_string()),
+        "{rest:#?}"
+    );
+    wait_gone(child_of(&ready));
+    assert!(!owner.ran());
+    assert_eq!(owner.record(&rig)["state"], "launched");
+    let v = owner.settle_until(&rig, "retire-required");
+    assert_eq!(v["kind"], "launched");
+    let (code, v) = owner.retire(&rig, "r-transfer", ready["incarnation"]["id"].as_str());
+    assert_eq!(code, 0, "{v:#}");
+    owner.settle_until(&rig, "closed");
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "write faults exist only in debug builds"
+)]
+fn retire_checks_the_exact_tuple_before_replaying_and_resumes_its_own_request() {
+    let rig = Rig::new();
+    let mut owner = Owner::start(&rig, "replay", Plan::default());
+    let ready = owner.wait_for("ready");
+    let inc = ready["incarnation"]["id"].as_str().unwrap().to_string();
+    kill(daemon_of(&ready), libc::SIGKILL);
+    wait_gone(child_of(&ready));
+    owner.settle_until(&rig, "retire-required");
+    // Recovery's own terminal write fails: the request stays requested.
+    let out = rig.run_env(
+        &[
+            "operation",
+            "retire",
+            &owner.operation_id,
+            "--envelope-sha256",
+            &owner.sha,
+            "--request-id",
+            "r-replay",
+            "--incarnation",
+            &inc,
+            "--json",
+        ],
+        &[("PTY_TEST_RECORD_WRITE_FAIL", "recovery-terminal")],
+    );
+    assert_eq!(out.code, 1);
+    assert_eq!(out.json()["code"], "record-write");
+    let record = owner.record(&rig);
+    assert_eq!(record["retirement"]["phase"], "requested");
+    assert_eq!(record["writer"]["role"], "recovery");
+    let before = owner.record(&rig);
+    // The same request id with a missing or a wrong incarnation is refused
+    // before any replay, and changes nothing.
+    let (code, refusal) = owner.retire(&rig, "r-replay", None);
+    assert_eq!(
+        (code, refusal["code"].clone()),
+        (1, json!("incarnation-required"))
+    );
+    let (code, refusal) = owner.retire(&rig, "r-replay", Some("1:2026-10-13T10:00:00.000Z"));
+    assert_eq!(
+        (code, refusal["code"].clone()),
+        (1, json!("wrong-incarnation"))
+    );
+    assert_eq!(owner.record(&rig), before);
+    // The exact tuple resumes the interrupted request.
+    let (code, v) = owner.retire(&rig, "r-replay", Some(&inc));
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["record"]["retirement"]["requestId"], "r-replay");
+    assert_eq!(v["record"]["retirement"]["phase"], "verified");
+    owner.settle_until(&rig, "closed");
+    // And replays of the finished request still check the tuple first.
+    let (code, refusal) = owner.retire(&rig, "r-replay", None);
+    assert_eq!(
+        (code, refusal["code"].clone()),
+        (1, json!("incarnation-required"))
+    );
+}
+
+// ── Recovery's signal authority ──────────────────────────────────────────
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn a_stopped_child_orphaned_by_its_daemon_is_ended_by_job_control() {
+    let rig = Rig::new();
+    let mut owner = Owner::start(
+        &rig,
+        "orphan",
+        Plan {
+            env: vec![("PTY_TEST_HELD_CHILD".into(), "stop-before-ack".into())],
+            ..Plan::default()
+        },
+    );
+    owner.wait_for("decision");
+    let record = loop {
+        let record = owner.record(&rig);
+        if !record["participants"]["child"].is_null() {
+            break record;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let child = record["participants"]["child"]["pid"].as_i64().unwrap() as i32;
+    wait_until(
+        "the child to stop",
+        || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
+    );
+    // A stopped child cannot read the end of file on its gate. But it leads
+    // its session with the terminal the daemon's master serves: the daemon's
+    // death hangs that terminal up, and the kernel sends the session leader
+    // SIGHUP and SIGCONT. Its SIGHUP is at its default, so it ends.
+    kill(
+        record["participants"]["producer"]["pid"].as_i64().unwrap() as i32,
+        libc::SIGKILL,
+    );
+    owner.launcher_exit();
+    wait_gone(child);
+    assert!(!owner.ran());
+    let v = owner.settle_until(&rig, "retire-required");
+    assert_eq!(v["kind"], "launched");
+    let inc = owner.record(&rig)["incarnation"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, v) = owner.retire(&rig, "r-orphan", Some(&inc));
+    assert_eq!(code, 0, "{v:#}");
+    owner.settle_until(&rig, "closed");
+}
+
+/// A launched record, forged as a dead daemon would leave it, whose child is
+/// `child` (or a process that only shares its pid when `token` differs).
+fn forge_launched(
+    rig: &Rig,
+    operation_id: &str,
+    child: i32,
+    token: Option<&str>,
+) -> (String, String) {
+    let line = envelope(operation_id, &format!("rt-{operation_id}"), None);
+    rig.run_stdin(&["operation", "reserve", "--json"], &format!("{line}\n"));
+    let sha = sha256_hex(line.as_bytes());
+    let path = rig
+        .path("operations")
+        .join(format!("{}.json", sha256_hex(operation_id.as_bytes())));
+    let live_token = match pty_core::proctable::process(child) {
+        pty_core::proctable::Answer::Known(row) => row.identity.unwrap().as_str().to_string(),
+        other => panic!("{other:?}"),
+    };
+    let boot = pty_core::boot::read_boot_identity().unwrap();
+    // SAFETY: getuid(2) has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let dead = json!({"pid": 2147483646, "startToken": "linux:1", "bootId": boot, "uid": uid});
+    let child_id = json!({"pid": child, "startToken": token.unwrap_or(&live_token), "bootId": boot, "uid": uid});
+    let inc = "2147483646:2026-10-13T10:00:00.000Z".to_string();
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["state"] = json!("launched");
+    record["phase"] = json!("held");
+    record["revision"] = json!(9);
+    record["writer"] = json!({"role": "producer", "id": dead});
+    record["decision"] = json!({"cause": "launch", "at": "2026-10-13T10:00:00.000Z", "requestId": null, "observed": null});
+    record["participants"] = json!({"launcher": dead, "producer": dead, "child": child_id});
+    record["incarnation"] = json!({"id": inc, "runtimeId": format!("rt-{operation_id}"), "generation": "g-forged", "daemon": dead, "child": child_id});
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    (sha, inc)
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn recovery_signals_only_a_proven_identity() {
+    let rig = Rig::new();
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id() as i32;
+    let (sha, inc) = forge_launched(&rig, "op-proof", pid, None);
+    let retire = |env: &[(&str, &str)]| {
+        rig.run_env(
+            &[
+                "operation",
+                "retire",
+                "op-proof",
+                "--envelope-sha256",
+                &sha,
+                "--request-id",
+                "r-proof",
+                "--incarnation",
+                &inc,
+                "--json",
+            ],
+            env,
+        )
+    };
+    // No boot identity: nothing can be proven, so nothing is signalled.
+    let v = rig
+        .run_env(
+            &[
+                "operation",
+                "settle",
+                "op-proof",
+                "--envelope-sha256",
+                &sha,
+                "--json",
+            ],
+            &[("PTY_TEST_BOOT_ID", "unavailable")],
+        )
+        .json();
+    assert_eq!(v["verdict"], "unknown", "{v:#}");
+    let out = retire(&[("PTY_TEST_BOOT_ID", "unavailable")]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert_eq!(out.json()["code"], "participant-unknown");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "signalled without a proven identity"
+    );
+    // Proven: the recorded child is ended by its exact identity.
+    let out = retire(&[]);
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    let v = out.json();
+    assert_eq!(
+        v["record"]["retirement"]["evidence"]["child"]["status"],
+        "gone"
+    );
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "the recorded child was killed");
+
+    // The same pid with another start token is another process: it is never
+    // signalled, and the recorded one is simply gone.
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    let (sha, inc) = forge_launched(&rig, "op-reuse", other.id() as i32, Some("linux:1"));
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-reuse",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r-reuse",
+        "--incarnation",
+        &inc,
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    assert_eq!(
+        out.json()["record"]["retirement"]["evidence"]["child"]["status"],
+        "gone"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        other.try_wait().unwrap().is_none(),
+        "a reused pid was signalled"
+    );
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+#[test]
+fn retire_refuses_while_a_recorded_participant_lives() {
+    let rig = Rig::new();
+    let line = envelope("op-participant", "rt-participant", None);
+    rig.run_stdin(&["operation", "reserve", "--json"], &format!("{line}\n"));
+    let sha = sha256_hex(line.as_bytes());
+    let path = rig
+        .path("operations")
+        .join(format!("{}.json", sha256_hex(b"op-participant")));
+    // A recorded launcher that is still alive, behind a writer that is gone:
+    // what a recovery that died part-way leaves when the launcher outlived it.
+    let mut launcher = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = launcher.id() as i32;
+    let token = match pty_core::proctable::process(pid) {
+        pty_core::proctable::Answer::Known(row) => row.identity.unwrap().as_str().to_string(),
+        other => panic!("{other:?}"),
+    };
+    let boot = pty_core::boot::read_boot_identity().unwrap();
+    // SAFETY: getuid(2) has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["state"] = json!("pending");
+    record["phase"] = json!("claimed");
+    record["revision"] = json!(5);
+    record["participants"]["launcher"] =
+        json!({"pid": pid, "startToken": token, "bootId": boot, "uid": uid});
+    record["writer"] = json!({"role": "recovery", "id": {"pid": 2147483646, "startToken": "linux:1", "bootId": boot, "uid": uid}});
+    record["retirement"] = json!({"requestId": "r-old", "phase": "requested", "evidence": {}});
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-participant",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r-new",
+        "--json",
+    ]);
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert_eq!(out.json()["code"], "live-participant");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refusal writes nothing"
+    );
+    let _ = launcher.kill();
+    let _ = launcher.wait();
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-participant",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r-new",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    assert_eq!(out.json()["record"]["decision"]["cause"], "producer-lost");
+
+    // An inconsistent record (a writer role with no identity) is refused
+    // outright: nothing may act on it.
+    let mut broken = record.clone();
+    broken["writer"] = json!({"role": "launcher", "id": null});
+    broken["retirement"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-participant",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r-3",
+        "--json",
+    ]);
+    assert_eq!(out.json()["code"], "record-unreadable");
+    let v = rig
+        .ok(&[
+            "operation",
+            "settle",
+            "op-participant",
+            "--envelope-sha256",
+            &sha,
+            "--json",
+        ])
+        .json();
+    assert_eq!(v["verdict"], "unknown");
+}
+
+// ── Descriptors and frames ───────────────────────────────────────────────
+
+#[test]
+fn a_leaked_copy_of_the_owners_end_does_not_hide_its_end_of_file() {
+    let rig = Rig::new();
+    let line = envelope("op-leak", "rt-leak", None);
+    assert_eq!(
+        rig.run_stdin(&["operation", "reserve", "--json"], &format!("{line}\n"))
+            .code,
+        0
+    );
+    let (owner_end, launcher_end) = UnixStream::pair().unwrap();
+    let digest = sha256_hex(b"op-leak");
+    let mut cmd = rig.cmd(&[
+        "run",
+        "-d",
+        "--operation-fd",
+        &FD.to_string(),
+        "--launch-operation",
+        &digest,
+        "--id",
+        "rt-leak",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec sleep 60",
+    ]);
+    // The launcher is handed the protocol end AND an inheritable copy of the
+    // owner's own end, as a careless spawner might.
+    inherit_as(&mut cmd, launcher_end.as_raw_fd(), FD);
+    inherit_as(&mut cmd, owner_end.as_raw_fd(), 8);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut launcher = cmd.spawn().unwrap();
+    drop(launcher_end);
+    let mut owner = Owner {
+        socket: owner_end,
+        buf: Vec::new(),
+        sha: sha256_hex(line.as_bytes()),
+        envelope: line.clone(),
+        operation_id: "op-leak".into(),
+        runtime_id: "rt-leak".into(),
+        digest,
+        launcher: None,
+        barriers: rig.scratch.clone(),
+        frames: Vec::new(),
+        marker: rig.scratch.join("never"),
+    };
+    owner.write(&line);
+    let ready = owner.wait_for("ready");
+    assert_eq!(launcher.wait().unwrap().code(), Some(0));
+    // The daemon holds no copy of the owner's end.
+    #[cfg(target_os = "linux")]
+    {
+        let daemon = daemon_of(&ready);
+        let mine =
+            std::fs::read_link(format!("/proc/self/fd/{}", owner.socket.as_raw_fd())).unwrap();
+        let theirs: Vec<std::path::PathBuf> = std::fs::read_dir(format!("/proc/{daemon}/fd"))
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .collect();
+        assert!(
+            !theirs.contains(&mine),
+            "the daemon inherited the owner's own end {mine:?}"
+        );
+    }
+    // The real owner goes away: the daemon must see end of file and retire.
+    drop(std::mem::replace(
+        &mut owner.socket,
+        UnixStream::pair().unwrap().0,
+    ));
+    let v = owner.settle_until(&rig, "closed");
+    assert_eq!(verdict(&v), ("closed".into(), Some("retired".into())));
+    assert_eq!(v["record"]["retirement"]["requestId"], "owner:eof");
+}
+
+#[test]
+fn unsupported_and_oversize_live_frames_are_malformed_and_retire() {
+    for (tag, frame) in [
+        (
+            "version-two",
+            Some(r#"{"type":"cancel","version":2,"operationId":"x","envelopeSha256":"y","requestId":"r"}"#.to_string()),
+        ),
+        ("oversize", None),
+    ] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(&rig, tag, Plan::default());
+        owner.wait_for("ready");
+        match frame {
+            Some(frame) => owner.write(&frame),
+            None => {
+                let huge = vec![b'x'; 129 * 1024];
+                owner.socket.write_all(&huge).unwrap();
+            }
+        }
+        let rejected = owner.wait_for("command-rejected");
+        assert_eq!(rejected["code"], "malformed", "{tag}");
+        let decision = owner.wait_for("decision");
+        assert_eq!(decision["decision"]["cause"], "malformed", "{tag}");
+        assert_eq!(
+            owner.wait_for("retirement")["retirement"]["phase"],
+            "verified",
+            "{tag}"
+        );
+        assert!(!owner.ran());
+    }
+}
+
+#[test]
+fn settle_creates_nothing() {
+    let rig = Rig::new();
+    let sha = "0".repeat(64);
+    let out = rig.run(&[
+        "operation",
+        "settle",
+        "op-none",
+        "--envelope-sha256",
+        &sha,
+        "--json",
+    ]);
+    assert_eq!(out.code, 0);
+    assert_eq!(out.json()["kind"], "record-missing");
+    assert!(!rig.path("operations").exists(), "settle created the store");
+    let out = rig.run(&[
+        "operation",
+        "retire",
+        "op-none",
+        "--envelope-sha256",
+        &sha,
+        "--request-id",
+        "r",
+        "--json",
+    ]);
+    assert_eq!(out.json()["code"], "record-missing");
+    assert!(!rig.path("operations").exists(), "retire created the store");
+
+    // A readable store that may not be written: settle still answers.
+    let line = envelope("op-ro", "rt-ro", None);
+    rig.run_stdin(&["operation", "reserve", "--json"], &format!("{line}\n"));
+    let sha = sha256_hex(line.as_bytes());
+    use std::os::unix::fs::PermissionsExt;
+    let dir = rig.path("operations");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let lock = dir.join(format!("{}.lock", sha256_hex(b"op-ro")));
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let v = rig
+        .ok(&[
+            "operation",
+            "settle",
+            "op-ro",
+            "--envelope-sha256",
+            &sha,
+            "--json",
+        ])
+        .json();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        verdict(&v),
+        ("retire-required".into(), Some("reserved".into()))
+    );
+}
+
+// ── A death at every barrier ─────────────────────────────────────────────
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn a_death_at_every_barrier_settles_and_retires() {
+    for barrier in [
+        "launcher-before-claim",
+        "launcher-before-peek",
+        "launcher-before-fork",
+        "daemon-gated",
+        "before-decision",
+        "publish-issued-before-commit",
+        "publish-committed-before-effect",
+        "published-before-child-fork",
+        "child-forked-before-record",
+        "child-prepared-before-ack-read",
+        "before-ready",
+    ] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(
+            &rig,
+            "death",
+            Plan {
+                hold: vec![barrier],
+                ..Plan::default()
+            },
+        );
+        owner.wait_reached(barrier);
+        let holder = owner.holder(barrier);
+        kill(holder, libc::SIGKILL);
+        owner.launcher_exit();
+        wait_until(&format!("{barrier}: the holder to be reaped"), || {
+            !pty_core::registry::pid_alive(holder)
+        });
+        // Settle never calls it closed on its own: a reservation stays
+        // claimable, and a claimed or launched operation needs retiring.
+        let v = owner.settle_until(&rig, "retire-required");
+        let kind = v["kind"].as_str().unwrap().to_string();
+        let expected = match barrier {
+            "launcher-before-claim" => "reserved",
+            "launcher-before-peek"
+            | "launcher-before-fork"
+            | "daemon-gated"
+            | "before-decision" => "pending",
+            _ => "launched",
+        };
+        assert_eq!(kind, expected, "{barrier}");
+        let inc = owner.record(&rig)["incarnation"]["id"]
+            .as_str()
+            .map(str::to_string);
+        let (code, v) = owner.retire(&rig, "r-death", inc.as_deref());
+        assert_eq!(code, 0, "{barrier}: {v:#}");
+        let v = owner.settle_until(&rig, "closed");
+        let closed = if expected == "launched" {
+            "retired"
+        } else {
+            "never-launched"
+        };
+        assert_eq!(
+            verdict(&v),
+            ("closed".into(), Some(closed.into())),
+            "{barrier}"
+        );
+        assert!(!row_exists(&rig, &owner.runtime_id), "{barrier}");
+        assert!(!owner.ran(), "{barrier}");
+    }
 }
