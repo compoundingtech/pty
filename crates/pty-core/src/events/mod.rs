@@ -417,28 +417,48 @@ fn append_line(
     atomic_write(path, published)
 }
 
-/// Apply retention at each original record boundary, but publish only once.
+/// Apply retention at each original record boundary. Publish each shrink
+/// separately so offset-based followers can recognize a retention rewrite.
 fn append_batch(path: &Path, events: &[Event], append_count: &mut usize) -> std::io::Result<()> {
     let mut content = match std::fs::read(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
+    let mut published_len = content.len();
+    let mut dirty = false;
     for event in events {
         content.extend_from_slice(event.to_json().as_bytes());
         content.push(b'\n');
+        dirty = true;
         *append_count += 1;
         if *append_count >= TRUNCATE_CHECK_INTERVAL {
             if let Some(suffix) = retained_suffix(&content) {
                 let start = content.len() - suffix.len();
+                let retained_len = content.len() - start;
+                if retained_len >= published_len {
+                    // Large records can make even the retained suffix larger
+                    // than the old log. Establish a full snapshot to shrink.
+                    publish_batch_snapshot(path, &content)?;
+                }
                 content.drain(..start);
+                publish_batch_snapshot(path, &content)?;
+                published_len = content.len();
+                dirty = false;
             }
             *append_count = 0;
         }
     }
+    if dirty {
+        publish_batch_snapshot(path, &content)?;
+    }
+    Ok(())
+}
+
+fn publish_batch_snapshot(path: &Path, content: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     BATCH_WRITES.with(|count| count.set(count.get() + 1));
-    atomic_write(path, &content)
+    atomic_write(path, content)
 }
 
 #[cfg(test)]
@@ -876,7 +896,7 @@ mod batch_tests {
     }
 
     #[test]
-    fn batch_replaces_once_and_preserves_bytes_and_retention() {
+    fn batch_reduces_replacements_and_preserves_bytes_and_retention() {
         let root = TestRoot::new("retention");
         crate::registry::root::with_root(root.path(), || {
             let events: Vec<_> = (0..2150)
@@ -889,18 +909,22 @@ mod batch_tests {
                 })
                 .unwrap();
             }
-            let (tx, rx) = channel();
-            for event in events {
-                tx.send(WriterMsg::Append(event)).unwrap();
-            }
-            drop(tx);
             BATCH_WRITES.with(|writes| writes.set(0));
-            EventWriter::run("batch", rx);
-            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 1));
+            append_batch(&events_path("batch"), &events, &mut 0).unwrap();
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 7));
             assert_eq!(
                 std::fs::read(events_path("batch")).unwrap(),
                 std::fs::read(reference).unwrap()
             );
+            let (tx, rx) = channel();
+            for _ in 0..80 {
+                tx.send(WriterMsg::Append(Event::bell("short"))).unwrap();
+            }
+            drop(tx);
+            BATCH_WRITES.with(|writes| writes.set(0));
+            EventWriter::run("short", rx);
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 1));
+            assert_eq!(read_all_events("short").len(), 80);
         });
     }
 
