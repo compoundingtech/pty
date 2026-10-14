@@ -117,8 +117,9 @@ authorize legacy records. Linux also requires `/proc/<pid>/status` to identify
 the PID as its own thread-group leader. Missing boot identity or start token
 is Unknown, never Match, and grants no signal authority. A reachable socket
 cannot rescue a mismatched or absent identity. Unknown identity is not running
-and makes strict inventory incomplete. Run, up, down, restart and attach
-recheck identity before cleanup or replacement; Unknown preserves the record.
+and makes strict inventory incomplete. Run, up, down, restart, attach and the
+interactive picker recheck identity before cleanup or replacement; Unknown
+preserves the record.
 Manifest stop and restart use the same pinned stop path as `pty kill`.
 `registry::daemon_identity_counters()` exposes process-local match, mismatch,
 gone and unknown observations without logging every scan.

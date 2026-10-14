@@ -307,7 +307,8 @@ fn restart_yes_preserves_missing_boot_live_child() {
 #[test]
 fn run_same_name_preserves_conflicting_live_sidecar() {
     let rig = Rig::new();
-    let mut fixture = cli_common::MissingBootSession::new(&rig, "conflicting-owner", json!({}));
+    let mut fixture =
+        cli_common::MissingBootSession::new(&rig, "conflicting-owner", serde_json::json!({}));
     fixture.retain_departed_metadata(&rig);
     let out = rig.run(&["run", "-d", "--id", "conflicting-owner", "--", "true"]);
     assert_eq!(out.code, 1, "{out:?}");
