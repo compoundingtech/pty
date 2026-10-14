@@ -284,7 +284,7 @@ fn down_bound_manifest_preserves_missing_boot_live_child() {
     let rig = Rig::new();
     let (dir, mut fixture) = missing_boot_manifest_fixture(&rig);
     let out = rig.run(&["down", dir.to_str().unwrap()]);
-    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.code, 1, "{out:?}");
     assert!(out.stderr.contains("identity is unknown"), "{out:?}");
     assert!(
         !out.stdout.contains("(cleaned up)") && !out.stdout.contains("(stopped)"),
@@ -301,5 +301,19 @@ fn restart_yes_preserves_missing_boot_live_child() {
     assert_eq!(out.code, 1, "{out:?}");
     assert!(out.stderr.contains("identity is unknown"), "{out:?}");
     assert!(!out.stdout.contains("restarted"), "{out:?}");
+    fixture.assert_preserved(&rig);
+}
+
+#[test]
+fn run_same_name_preserves_conflicting_live_sidecar() {
+    let rig = Rig::new();
+    let mut fixture = cli_common::MissingBootSession::new(&rig, "conflicting-owner", json!({}));
+    fixture.retain_departed_metadata(&rig);
+    let out = rig.run(&["run", "-d", "--id", "conflicting-owner", "--", "true"]);
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(
+        out.stderr.contains("identity") && out.stderr.contains("unknown"),
+        "{out:?}"
+    );
     fixture.assert_preserved(&rig);
 }

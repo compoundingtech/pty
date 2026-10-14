@@ -470,7 +470,7 @@ fn create_or_attach(
     // lack boot evidence. Recheck under the lifecycle locks before either
     // replacing the name or deleting its companions.
     let identity = session.as_ref().map(|record| {
-        registry::check_record_identity(registry::read_pid(name), record.metadata.as_ref())
+        registry::check_record_identity(registry::read_session_pid(name), record.metadata.as_ref())
     });
     if identity == Some(registry::DaemonIdentityCheck::Unknown) {
         eprintln!("Refusing to replace session \"{name}\": daemon identity is unknown.");

@@ -442,7 +442,11 @@ fn require_daemon_identity(
 
 /// Reuse the exact-owner capability used by launch-operation recovery.
 /// Unsupported or refused pinning never downgrades to numeric signalling.
-struct DaemonHandle(pty_core::operation::exact::Exact);
+struct DaemonHandle {
+    handle: pty_core::operation::exact::Exact,
+    #[cfg(not(target_os = "linux"))]
+    start_token: String,
+}
 
 impl DaemonHandle {
     fn open(name: &str, pid: i32, metadata: &SessionMetadata) -> Result<Self, StopError> {
@@ -462,26 +466,86 @@ impl DaemonHandle {
                 })?;
         // If the numeric PID changed before pinning, refuse the new owner.
         require_daemon_identity(name, pid, metadata)?;
-        Ok(Self(handle))
+        Ok(Self {
+            handle,
+            #[cfg(not(target_os = "linux"))]
+            start_token: owner.start_token,
+        })
     }
 
     fn signal(&self, name: &str, pid: i32, metadata: &SessionMetadata) -> Result<(), StopError> {
         require_daemon_identity(name, pid, metadata)?;
-        self.0
+        self.handle
             .signal(libc::SIGTERM)
             .map_err(|_| StopError::SignalFailed {
                 name: name.to_string(),
             })
     }
 
-    fn wait_for_exit(&self, _: i32, _: &SessionMetadata, timeout: Duration) -> bool {
-        self.0.wait_exit(timeout)
+    fn wait_for_exit(&self, _pid: i32, _metadata: &SessionMetadata, timeout: Duration) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.handle.wait_exit(timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Do not install a numeric-PID exit watch after signalling.
+            // A new incarnation is proof that the recorded owner exited,
+            // not a process whose exit this operation may wait for.
+            let start = std::time::Instant::now();
+            loop {
+                if original_owner_exited(&self.start_token, &pty_core::proctable::process(_pid)) {
+                    return true;
+                }
+                if start.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn original_owner_exited(expected: &str, observation: &Answer<pty_core::proctable::Row>) -> bool {
+    match observation {
+        Answer::NotPresent => true,
+        Answer::Known(row) => {
+            row.is_zombie()
+                || row
+                    .identity
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() != expected)
+        }
+        Answer::Unknown(_) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_wait_never_waits_for_a_reused_owner_or_infers_exit_from_unknown() {
+        for (shape, exited) in [
+            ("10 1 10 S original", false),
+            ("10 1 10 S replacement", true),
+            ("10 1 10 Z original", true),
+            ("10 1 10 S -", false),
+        ] {
+            let table = pty_core::proctable::table_from_shape(shape);
+            let row = table.rows().next().unwrap().clone();
+            assert_eq!(
+                original_owner_exited("original", &Answer::Known(row)),
+                exited
+            );
+        }
+        assert!(original_owner_exited("original", &Answer::NotPresent));
+        assert!(!original_owner_exited(
+            "original",
+            &Answer::Unknown(pty_core::proctable::Unknown::TableUnreadable)
+        ));
+    }
 
     #[test]
     fn group_sweep_requires_exact_original_members_and_fresh_proof() {

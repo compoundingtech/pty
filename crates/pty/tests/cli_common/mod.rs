@@ -340,6 +340,29 @@ impl MissingBootSession {
         fixture
     }
 
+    /// Keep a live sidecar while metadata names a departed incarnation.
+    /// This can be an in-flight replacement, not proof of registry loss.
+    pub fn retain_departed_metadata(&mut self, rig: &Rig) {
+        let mut metadata = rig.read_meta(&self.name).unwrap();
+        metadata["daemonPid"] = json!(2_147_483_646_i32);
+        metadata["daemonStartToken"] = json!("departed:token");
+        metadata["daemonBootId"] = json!(pty_core::registry::read_boot_id().unwrap());
+        std::fs::write(
+            rig.path(&format!("{}.json", self.name)),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        self.metadata = std::fs::read(rig.path(&format!("{}.json", self.name))).unwrap();
+        let parsed = serde_json::from_value(metadata).unwrap();
+        assert_eq!(
+            pty_core::registry::check_record_identity(
+                Some(self.child.0.id() as i32),
+                Some(&parsed)
+            ),
+            pty_core::registry::DaemonIdentityCheck::Unknown,
+        );
+    }
+
     pub fn assert_preserved(&mut self, rig: &Rig) {
         use std::os::unix::fs::MetadataExt;
 
