@@ -192,8 +192,7 @@ pub struct Row {
 
 impl Row {
     /// A zombie is a dead process that still has a row, still has a process
-    /// group, and still answers `kill(pid, 0)`. On macOS a process whose exit
-    /// is under way reads as one too (see `kinfo_exited`).
+    /// group, and still answers `kill(pid, 0)`.
     pub fn is_zombie(&self) -> bool {
         self.state.starts_with('Z')
     }
@@ -667,11 +666,12 @@ fn page_size_kb() -> u64 {
 ///
 /// ```text
 /// kp_eproc.e_pcred.p_ruid = 392   kp_eproc.e_ucred.cr_uid = 420 (4 bytes)
-/// kp_proc.p_flag = 32 (4 bytes)
 /// ```
 #[cfg(target_os = "macos")]
 mod kinfo {
     pub const SIZE: usize = super::KINFO_SIZE;
+    /// `SZOMB` from `<sys/proc.h>`.
+    pub const SZOMB: u8 = 5;
     /// `SSTOP` from `<sys/proc.h>`.
     pub const SSTOP: u8 = 4;
 }
@@ -685,7 +685,6 @@ struct KinfoLayout {
     start_sec: usize,
     start_usec: usize,
     p_stat: usize,
-    p_flag: usize,
     p_pid: usize,
     e_ppid: usize,
     e_pgid: usize,
@@ -701,7 +700,6 @@ const KINFO: KinfoLayout = KinfoLayout {
     start_sec: 0,
     start_usec: 8,
     p_stat: 36,
-    p_flag: 32,
     p_pid: P_PID_OFFSET,
     e_ppid: 560,
     e_pgid: 564,
@@ -713,32 +711,6 @@ const KINFO: KinfoLayout = KinfoLayout {
 /// stopped nor a zombie, which a process reading its own row always is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SRUN: u8 = 2;
-
-/// `SZOMB` from `<sys/proc.h>`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const SZOMB: u8 = 5;
-
-/// `<sys/proc.h>` `p_flag` bits: a 64-bit process, which every process
-/// reading its own row is, and one whose exit is under way.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const P_LP64: u32 = 0x4;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const P_WEXIT: u32 = 0x2000;
-
-/// Has the process a `kinfo_proc` row describes exited?
-///
-/// **A process whose exit is under way has, though its state still says
-/// running.** Between the start of its exit and `SZOMB`, `p_stat` reads
-/// `SRUN`, while `proc_pidinfo` already refuses the process as it refuses a
-/// zombie, so this row is the one read. Measured on macOS 27 (2026-10-14, a
-/// loaded host), reading right after a `NOTE_EXIT` filter fired or was
-/// refused: `p_stat` was still `SRUN` in 1,265 of 2,400 rounds, and
-/// `P_WEXIT` was set in every one of the 2,400; it was set in none of 2,400
-/// running children. Its exit has begun, and it runs no user code again.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn kinfo_exited(buf: &[u8], layout: &KinfoLayout) -> bool {
-    buf[layout.p_stat] == SZOMB || read_i32(buf, layout.p_flag) as u32 & P_WEXIT != 0
-}
 
 /// What a process knows about itself without `kinfo_proc`: its own system
 /// calls and its own `proc_pidinfo` row.
@@ -764,8 +736,8 @@ struct OwnFacts {
 /// argv scan's domain, and the scan would report no marker while one was
 /// live. So before any field is believed, each must read back this
 /// process's own value: the uids from `getuid`/`geteuid`, the parent and
-/// group from `getppid`/`getpgrp`, the start time from `proc_pidinfo`, the
-/// state as running, and the flags as a 64-bit process not exiting.
+/// group from `getppid`/`getpgrp`, the start time from `proc_pidinfo`, and
+/// the state as running.
 ///
 /// Its limit: a field that reads a neighbour holding the same value for
 /// this process passes. That is the real and saved uid, say, which the
@@ -777,7 +749,6 @@ fn layout_reads_itself(buf: &[u8], layout: &KinfoLayout, own: &OwnFacts) -> bool
         && fits(layout.start_usec, 4)
         && fits(layout.p_stat, 1)
         && [
-            layout.p_flag,
             layout.p_pid,
             layout.e_ppid,
             layout.e_pgid,
@@ -807,7 +778,6 @@ fn layout_reads_itself(buf: &[u8], layout: &KinfoLayout, own: &OwnFacts) -> bool
         && sec == own.start_sec
         && usec == own.start_usec
         && buf[layout.p_stat] == SRUN
-        && read_i32(buf, layout.p_flag) as u32 & (P_LP64 | P_WEXIT) == P_LP64
 }
 
 /// One `KERN_PROC_PID` read: the raw row, refused when it does not contain
@@ -937,13 +907,10 @@ fn sysctl_proc(pid: i32) -> Answer<Row> {
         pid,
         ppid: read_i32(&buf, KINFO.e_ppid),
         pgid: read_i32(&buf, KINFO.e_pgid),
-        // An exiting process reads as the zombie it is about to be.
-        state: if kinfo_exited(&buf, &KINFO) {
-            "Z".into()
-        } else if buf[KINFO.p_stat] == kinfo::SSTOP {
-            "T".into()
-        } else {
-            "S".into()
+        state: match buf[KINFO.p_stat] {
+            kinfo::SZOMB => "Z".into(),
+            kinfo::SSTOP => "T".into(),
+            _ => "S".into(),
         },
         rss_kb: None,
         cpu_percent: None,
@@ -951,7 +918,7 @@ fn sysctl_proc(pid: i32) -> Answer<Row> {
     })
 }
 
-/// A process's real and effective uid, and whether it has exited, from
+/// A process's real and effective uid, and whether it is a zombie, from
 /// `KERN_PROC_PID`: the call that still answers when `proc_pidinfo` refuses,
 /// as it does for a setuid process such as `login` (measured on macOS 27:
 /// 236 of 800 processes, none of them with both uids those of the caller).
@@ -970,7 +937,7 @@ fn kinfo_owner_checked(pid: i32, verified: bool) -> Answer<(u32, u32, bool)> {
         Answer::Known(buf) => Answer::Known((
             read_i32(&buf, KINFO.ruid) as u32,
             read_i32(&buf, KINFO.euid) as u32,
-            kinfo_exited(&buf, &KINFO),
+            buf[KINFO.p_stat] == kinfo::SZOMB,
         )),
         Answer::NotPresent => Answer::NotPresent,
         Answer::Unknown(why) => Answer::Unknown(why),
@@ -1416,8 +1383,6 @@ mod tests {
         buf[layout.start_usec..layout.start_usec + 4]
             .copy_from_slice(&own.start_usec.to_ne_bytes());
         buf[layout.p_stat] = SRUN;
-        // A 64-bit process that has exec'd (`P_EXEC`), as a reader is.
-        buf[layout.p_flag..layout.p_flag + 4].copy_from_slice(&(P_LP64 | 0x4000).to_ne_bytes());
         for (at, value) in [
             (layout.p_pid, own.pid),
             (layout.e_ppid, own.ppid),
@@ -1451,11 +1416,10 @@ mod tests {
             "the control: the right layout passes"
         );
 
-        let wrong: [(&str, fn(&mut KinfoLayout)); 9] = [
+        let wrong: [(&str, fn(&mut KinfoLayout)); 8] = [
             ("start_sec", |l| l.start_sec += 4),
             ("start_usec", |l| l.start_usec += 4),
             ("p_stat", |l| l.p_stat += 1),
-            ("p_flag", |l| l.p_flag -= 4),
             ("p_pid", |l| l.p_pid += 4),
             ("e_ppid", |l| l.e_ppid += 4),
             ("e_pgid", |l| l.e_pgid -= 4),
@@ -1477,10 +1441,6 @@ mod tests {
             !layout_reads_itself(&zombie, &KINFO, &own),
             "a reader is running, never a zombie"
         );
-        let mut exiting = row.clone();
-        let flags = read_i32(&row, KINFO.p_flag) as u32 | P_WEXIT;
-        exiting[KINFO.p_flag..KINFO.p_flag + 4].copy_from_slice(&flags.to_ne_bytes());
-        assert!(!layout_reads_itself(&exiting, &KINFO, &own), "nor exiting");
 
         let mut beyond = KINFO;
         beyond.euid = KINFO_SIZE - 2;
@@ -1491,40 +1451,6 @@ mod tests {
         assert!(
             !layout_reads_itself(&row[..400], &KINFO, &own),
             "so is a short row"
-        );
-    }
-
-    /// **A process whose exit is under way has exited, whatever its state
-    /// says.** Its `p_stat` still reads `SRUN` until it is a zombie; its
-    /// `P_WEXIT` flag is the kernel's word that it will not run again.
-    #[test]
-    fn an_exiting_process_reads_as_exited() {
-        let own = OwnFacts {
-            pid: 4242,
-            ppid: 4141,
-            pgid: 4040,
-            ruid: 501,
-            euid: 501,
-            start_sec: 1_790_000_000,
-            start_usec: 123_456,
-        };
-        let row = |stat: u8, flags: u32| {
-            let mut buf = own_row(&KINFO, &own);
-            buf[KINFO.p_stat] = stat;
-            buf[KINFO.p_flag..KINFO.p_flag + 4].copy_from_slice(&flags.to_ne_bytes());
-            buf
-        };
-        const SSTOP: u8 = 4;
-        assert!(!kinfo_exited(&row(SRUN, P_LP64), &KINFO), "running");
-        assert!(!kinfo_exited(&row(SSTOP, P_LP64), &KINFO), "stopped");
-        assert!(kinfo_exited(&row(SZOMB, P_LP64), &KINFO), "a zombie");
-        assert!(
-            kinfo_exited(&row(SRUN, P_LP64 | P_WEXIT), &KINFO),
-            "exiting, while its state still says running"
-        );
-        assert!(
-            kinfo_exited(&row(SSTOP, P_LP64 | P_WEXIT), &KINFO),
-            "killed while stopped"
         );
     }
 

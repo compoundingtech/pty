@@ -151,7 +151,8 @@ impl Exact {
     }
 
     /// Wait until the pinned process exits, for at most `timeout`. `true`
-    /// when it did.
+    /// only when the exit itself was observed, on the pidfd or on the watch
+    /// armed with the pin (see [`ExitWatch`]).
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -213,23 +214,34 @@ pub enum Exit {
 ///
 /// The watch is armed by this call, on whatever process holds `pid` then,
 /// and a process that began to exit before it reads as exited at once. A
-/// caller about to end a process arms an [`ExitWatch`] first.
+/// caller about to end a process arms an [`ExitWatch`] first, and takes its
+/// [`ExitWatch::observed`] as the exit.
 pub fn wait_for_exit(pid: i32, timeout: Duration) -> Exit {
     ExitWatch::arm(pid).wait(timeout)
 }
 
 /// A watch on one process's exit, armed while the process still runs.
 ///
-/// **Arm it before the action that can end the process.** A watch armed
-/// on the running process is bound to that process: its exit is the event,
-/// whichever process holds the pid by the time anyone waits. One attached
-/// afterwards is attached to whatever the pid names then. On macOS a
-/// `NOTE_EXIT` filter attached once the process has begun to exit is
-/// refused with `ESRCH`, which reads as exited; measured on macOS 27
-/// (2026-10-14), that was most rounds once 20 µs separated a `SIGKILL` from
-/// the attach. The process table can still say `SRUN` at that moment, and
-/// even when an armed filter has fired; [`crate::proctable`] reads such a
-/// process as exited by its `P_WEXIT` flag.
+/// **Arm it before the action that can end the process, and take what it
+/// observes as the exit.** The event is the kernel's own: a Linux `pidfd`
+/// becomes readable, and a macOS `NOTE_EXIT` is posted, only once every
+/// thread of the process has terminated (in XNU, from `proc_exit`, which the
+/// last thread runs). A watch armed on the running process is bound to it,
+/// whichever process holds the pid by the time anyone waits.
+///
+/// Two weaker answers are not an observed exit, and [`ExitWatch::observed`]
+/// keeps them apart:
+///
+/// - **A watch armed too late.** On macOS a filter attached to a process
+///   that has begun to exit is refused with `ESRCH` from the moment its exit
+///   is prepared, while its other threads may still be finishing system
+///   calls. Measured on macOS 27 (2026-10-14), that refusal came in most
+///   rounds once 20 µs separated a `SIGKILL` from the attach.
+/// - **The process table.** On macOS it says `SRUN` from the start of an
+///   exit until `SZOMB`, which is set a moment after `NOTE_EXIT`: right after
+///   an exit was seen, `p_stat` still read `SRUN` in 1,265 of 2,400 rounds,
+///   and in 1 of 300 even after the filter had fired. Re-reading it after
+///   the event can call an exited process live.
 pub struct ExitWatch {
     state: WatchState,
 }
@@ -281,8 +293,16 @@ impl ExitWatch {
         WatchState::Unsupported
     }
 
+    /// Has this watch observed the exit itself? Only a watch armed on the
+    /// running process can: one armed too late answers `false` here, though
+    /// [`ExitWatch::wait`] reads it as exited.
+    pub fn observed(&self) -> bool {
+        !matches!(self.state, WatchState::Ended | WatchState::Unsupported)
+            && self.wait(Duration::ZERO) == Exit::Exited
+    }
+
     /// Wait at most `timeout` for the exit. A watch that has seen it says so
-    /// again at once.
+    /// again at once, and so does one armed too late.
     pub fn wait(&self, timeout: Duration) -> Exit {
         match &self.state {
             #[cfg(target_os = "linux")]
@@ -551,43 +571,15 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// **A process seen to exit through its pin reads as gone at once.**
-    /// Recovery's own sequence: pin, `SIGKILL`, wait, read. On macOS the
-    /// read used to land between the start of the exit and `SZOMB` and call
-    /// the process live (measured: about a third of rounds on a loaded host).
+    /// **A watch armed before the gate shuts observes the child's exit**:
+    /// the daemon's order. The child is `cat`, which leaves at once on end of
+    /// file, as a held child does. Armed after the gate shuts instead, the
+    /// watch is often refused because the exit has begun, and observes
+    /// nothing.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn a_process_seen_to_exit_through_its_pin_reads_as_gone() {
-        let boot = crate::boot::read_boot_identity();
-        for round in 0..200 {
-            let mut child = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .unwrap();
-            let id = ProcessId::of(child.id()).unwrap();
-            let pinned = Exact::pin(&id, boot.as_deref()).unwrap().expect("live");
-            pinned.signal(libc::SIGKILL).unwrap();
-            assert!(pinned.wait_exit(Duration::from_secs(5)), "round {round}");
-            assert_eq!(
-                id.liveness_now(boot.as_deref()),
-                Liveness::Gone,
-                "round {round}"
-            );
-            let _ = child.wait();
-        }
-    }
-
-    /// **A child that leaves on end of file reads as gone once the wait for
-    /// it ends**, in the order the daemon first used: the gate shuts, then
-    /// the wait starts, then the table is read. That order is the widest
-    /// window, since the child may be mid-exit when the wait starts. The
-    /// child is `cat`, which leaves at once on end of file, as a held child
-    /// does.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_child_leaving_on_end_of_file_reads_as_gone_after_the_wait() {
+    fn a_watch_armed_before_the_gate_shuts_observes_the_exit() {
         use std::io::BufRead;
-        let boot = crate::boot::read_boot_identity();
         for round in 0..300 {
             let mut child = std::process::Command::new("sh")
                 .args(["-c", "echo held; exec cat"])
@@ -599,38 +591,34 @@ mod tests {
             std::io::BufReader::new(child.stdout.take().unwrap())
                 .read_line(&mut prepared)
                 .unwrap();
-            let id = ProcessId::of(child.id()).unwrap();
+            let watch = ExitWatch::arm(child.id() as i32);
             drop(child.stdin.take());
             assert_eq!(
-                wait_for_exit(child.id() as i32, Duration::from_secs(5)),
+                watch.wait(Duration::from_secs(5)),
                 Exit::Exited,
                 "round {round}"
             );
-            assert_eq!(
-                id.liveness_now(boot.as_deref()),
-                Liveness::Gone,
-                "round {round}"
-            );
+            assert!(watch.observed(), "round {round}");
             let _ = child.wait();
         }
     }
 
-    /// A watch armed on the running process sees its exit, and says so
-    /// again at once when asked a second time.
+    /// A watch armed on the running process observes its exit, and says so
+    /// again at once. One armed on a pid already reaped reads as exited but
+    /// observed nothing.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn a_watch_armed_before_the_end_sees_it() {
-        let boot = crate::boot::read_boot_identity();
+    fn a_watch_armed_before_the_end_observes_it() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        let id = ProcessId::of(child.id()).unwrap();
         let watch = ExitWatch::arm(child.id() as i32);
         assert_eq!(watch.wait(Duration::from_millis(50)), Exit::Running);
+        assert!(!watch.observed());
         child.kill().unwrap();
         assert_eq!(watch.wait(Duration::from_secs(5)), Exit::Exited);
-        assert_eq!(id.liveness_now(boot.as_deref()), Liveness::Gone);
+        assert!(watch.observed());
         let started = std::time::Instant::now();
         assert_eq!(watch.wait(Duration::from_secs(5)), Exit::Exited);
         assert!(
@@ -638,10 +626,8 @@ mod tests {
             "seen once is seen"
         );
         let _ = child.wait();
-        assert_eq!(
-            ExitWatch::arm(child.id() as i32).wait(Duration::from_secs(1)),
-            Exit::Exited,
-            "a reaped pid is an exit already seen"
-        );
+        let late = ExitWatch::arm(child.id() as i32);
+        assert_eq!(late.wait(Duration::from_secs(1)), Exit::Exited);
+        assert!(!late.observed(), "a reaped pid is no observed exit");
     }
 }

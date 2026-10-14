@@ -80,7 +80,7 @@ both. A cancel before transfer is complete when those are gone.
 - The daemon ends its own child only through the session substrate, which
   holds its reap lock across the signal, so the pid cannot have been reused.
   It waits for that exit on a pidfd (Linux) or a kqueue (macOS), armed
-  before the gate shuts, so the wait is on this child's exit.
+  before the gate shuts.
 - Recovery, which is not the child's parent, pins the process first and
   checks the pinned process is the recorded identity, then sends `SIGKILL`
   through the pin. Its exit watch is armed with the pin, before the signal:
@@ -89,6 +89,22 @@ both. A cancel before transfer is complete when those are gone.
   - **macOS:** an audit token from the task name port; the kernel delivers
     `proc_signal_with_audittoken` only while the token's pid version still
     names the same process.
+- **A child is gone when its exit is observed.** That means the kernel's
+  exit event arrived on a watch armed while the child still ran. A Linux
+  pidfd becomes readable, and a macOS `NOTE_EXIT` is posted, only once
+  every thread of the process has ended; in the published XNU source
+  (xnu-12377.121.6), `NOTE_EXIT` comes from `proc_exit`, which the last
+  thread runs. The process table is not read again after the event: on
+  macOS `p_stat` says `SRUN` until `SZOMB`, which is set a moment later.
+  Measured on macOS 27, right after an exit was seen, it said `SRUN` in
+  1,265 of 2,400 rounds. Two weaker signs are not taken as an exit:
+  - **a watch refused with `ESRCH`**, which in that source starts when the
+    exit is prepared, before the threads have ended;
+  - **the `P_WEXIT` flag**, set once the other threads are held but while
+    a system call already under way may still finish.
+
+  The running kernel's source (xnu-13432) is not published, so this rests on
+  the published one and on the measurements.
 - **Where neither exists, nothing is signalled.** That covers a Linux kernel
   without `pidfd_open`, a macOS without the call, and a task port that is
   refused. The child is reported unknown, the retirement incomplete, and the
@@ -175,18 +191,9 @@ them:
   whose `kinfo_proc` offsets were measured on one Mac. Before any of them is
   believed, each process reads its own row once and every field must say
   back what it knows of itself: its pid, parent, group, real and effective
-  uid, start time, running state, and flags as a 64-bit process not
-  exiting. A layout that fails makes every such read unknown, and so the
-  scan incomplete. Its limit: a field that reads a neighbour holding the
-  same value for the reading process passes.
-- On macOS a process whose exit is under way reads as exited. From the
-  start of its exit until it is a zombie, `p_stat` still says `SRUN`, and
-  `proc_pidinfo` already refuses it, so `KERN_PROC_PID` is the row read; its
-  `P_WEXIT` flag decides. Measured on macOS 27, reading right after an exit
-  was seen: `SRUN` in 1,265 of 2,400 rounds, `P_WEXIT` in all 2,400, and in
-  none of 2,400 running children. Before this, recovery's read after the
-  exit could call the killed child live and record the retirement
-  incomplete.
+  uid, start time and running state. A layout that fails makes every such
+  read unknown, and so the scan incomplete. Its limit: a field that reads a
+  neighbour holding the same value for the reading process passes.
 - A process may not open an operation lock file it already has open
   (settle, or the holder query, while it holds the write lock, say). The
   call is refused instead.
@@ -241,7 +248,8 @@ signal mask and dispositions to match. Each of these was reverted once to see it
   by inode;
 - the kernel-thread rule, and the layout check of every `kinfo_proc` field;
 - the hand-over of a kill after the commit;
-- the macOS exiting-process rule. With it reverted, the row decoding fails
-  every time, and the gate-shaped exit fails now and then. With it and the
-  pin's early watch both reverted, recovery's own sequence fails too. Either
-  one alone kept that sequence passing.
+- the observed-exit rule on macOS, in two places:
+  - **recovery's kill.** With the table re-read after the event and the
+    watch armed after the signal (the code as it was), the kill test fails;
+  - **the watch armed before the gate shuts.** Armed after it instead, the
+    gate-shaped test fails.

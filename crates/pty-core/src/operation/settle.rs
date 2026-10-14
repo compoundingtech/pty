@@ -645,6 +645,10 @@ pub struct RetireRefusal {
 /// the recorded process. Where it cannot be pinned safely nothing is sent,
 /// and the child is reported unknown. A held child never forks, so there is
 /// no group to signal.
+///
+/// It is gone when its exit is observed on the pin, and only then. The
+/// process table is not read again: on macOS it says running until the
+/// zombie is marked, a moment after the exit (see `ExitWatch`).
 fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if id.liveness_now(boot) != Liveness::Live {
         return id.liveness_now(boot);
@@ -657,10 +661,11 @@ fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if let Err(reason) = pinned.signal(libc::SIGKILL) {
         return Liveness::Unknown(reason);
     }
-    if !pinned.wait_exit(Duration::from_secs(5)) {
-        return Liveness::Live;
+    if pinned.wait_exit(Duration::from_secs(5)) {
+        Liveness::Gone
+    } else {
+        Liveness::Live
     }
-    id.liveness_now(boot)
 }
 
 /// `pty operation retire`: retire an operation whose writer and every
@@ -908,6 +913,29 @@ fn unwind_row(root: &Path, record: &OperationRecord) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A recorded child killed through its pin is gone once its exit is
+    /// observed**, whatever the process table says a moment later. On macOS
+    /// the table said running for a while after the exit, and recovery used
+    /// to read it again and record the child live.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_recorded_child_killed_through_its_pin_is_gone() {
+        let boot = crate::boot::read_boot_identity();
+        for round in 0..200 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let id = ProcessId::of(child.id()).unwrap();
+            assert_eq!(
+                kill_recorded(&id, boot.as_deref()),
+                Liveness::Gone,
+                "round {round}"
+            );
+            assert!(!child.wait().unwrap().success(), "round {round}: killed");
+        }
+    }
 
     fn argv(text: &str) -> Vec<String> {
         text.split(' ').map(str::to_string).collect()

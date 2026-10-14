@@ -1721,14 +1721,17 @@ impl Actor {
 /// (it is stopped, say) is killed through the substrate, whose signals are
 /// fenced against reaping, so its pid cannot name anyone else. Both waits
 /// end on the child's exit (a pidfd, a kqueue), not on a timer; the timer
-/// only bounds them. `watch` was armed before the gate shut (see
-/// [`ExitWatch`]). A held child never forks, so there is no group to signal.
+/// only bounds them. `watch` was armed before the gate shut, and the exit
+/// it observes is the child's (see [`ExitWatch`]); the table answers only
+/// for a watch that could not be armed. A held child never forks, so there
+/// is no group to signal.
 fn verify_child_gone(child: &ChildRecord, watch: &ExitWatch) -> &'static str {
     let Some(id) = &child.id else {
         return "unrecorded";
     };
     let boot = pty_core::boot::read_boot_identity();
-    let gone = || id.liveness(&ProcTable::read(), boot.as_deref()) == Liveness::Gone;
+    let gone =
+        || watch.observed() || id.liveness(&ProcTable::read(), boot.as_deref()) == Liveness::Gone;
     let _ = watch.wait(Duration::from_secs(1));
     if gone() {
         return "gone";
