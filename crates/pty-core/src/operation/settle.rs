@@ -15,8 +15,8 @@ use serde_json::{Map, Value, json};
 
 use super::envelope::operation_digest;
 use super::record::{
-    Cause, Decision, Liveness, OperationLock, OperationRecord, OperationStore, ProcessId,
-    Retirement, RetirementPhase, State, Writer, WriterRole,
+    AFTER_EXIT_CAP, Cause, Decision, Liveness, OperationLock, OperationRecord, OperationStore,
+    ProcessId, Retirement, RetirementPhase, State, Writer, WriterRole,
 };
 use crate::proctable::ProcTable;
 use crate::proctable::argv::{ArgvRow, ArgvScan, scan_argv};
@@ -646,9 +646,10 @@ pub struct RetireRefusal {
 /// and the child is reported unknown. A held child never forks, so there is
 /// no group to signal.
 ///
-/// It is gone when its exit is observed on the pin, and only then. The
-/// process table is not read again: on macOS it says running until the
-/// zombie is marked, a moment after the exit (see `ExitWatch`).
+/// Its exit must be observed on the pin, and then the zombie seen: the table
+/// is read again for at most [`AFTER_EXIT_CAP`] until it shows one, since on
+/// macOS it says the process is still exiting for a moment after the event.
+/// A process still exiting after that is unknown, never gone.
 fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if id.liveness_now(boot) != Liveness::Live {
         return id.liveness_now(boot);
@@ -661,11 +662,10 @@ fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if let Err(reason) = pinned.signal(libc::SIGKILL) {
         return Liveness::Unknown(reason);
     }
-    if pinned.wait_exit(Duration::from_secs(5)) {
-        Liveness::Gone
-    } else {
-        Liveness::Live
+    if !pinned.wait_exit(Duration::from_secs(5)) {
+        return Liveness::Live;
     }
+    id.liveness_after_exit(boot, AFTER_EXIT_CAP)
 }
 
 /// `pty operation retire`: retire an operation whose writer and every

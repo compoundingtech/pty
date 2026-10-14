@@ -89,19 +89,27 @@ both. A cancel before transfer is complete when those are gone.
   - **macOS:** an audit token from the task name port; the kernel delivers
     `proc_signal_with_audittoken` only while the token's pid version still
     names the same process.
-- **A child is gone when its exit is observed.** That means the kernel's
-  exit event arrived on a watch armed while the child still ran. A Linux
-  pidfd becomes readable, and a macOS `NOTE_EXIT` is posted, only once
-  every thread of the process has ended; in the published XNU source
-  (xnu-12377.121.6), `NOTE_EXIT` comes from `proc_exit`, which the last
-  thread runs. The process table is not read again after the event: on
-  macOS `p_stat` says `SRUN` until `SZOMB`, which is set a moment later.
-  Measured on macOS 27, right after an exit was seen, it said `SRUN` in
-  1,265 of 2,400 rounds. Two weaker signs are not taken as an exit:
-  - **a watch refused with `ESRCH`**, which in that source starts when the
-    exit is prepared, before the threads have ended;
-  - **the `P_WEXIT` flag**, set once the other threads are held but while
-    a system call already under way may still finish.
+- **A child is gone when its exit is observed and its zombie seen.**
+  - **The fence is the observed exit:** the kernel's exit event, arriving on
+    a watch armed while the child still ran. A Linux pidfd becomes
+    readable, and a macOS `NOTE_EXIT` is posted, once every thread of the
+    process has ended. In the published XNU source (xnu-12377.121.6),
+    `NOTE_EXIT` comes from `proc_exit`, which the last thread runs.
+  - **The proof is the zombie, or no process,** in the table. On macOS,
+    `p_stat` says `SRUN` until `SZOMB`, which is set a moment after the
+    event. Measured on macOS 27, right after an exit was seen, it said
+    `SRUN` in 1,265 of 2,400 rounds. So after the event the table is read
+    again, for at most 10 ms, until it shows one. A child still exiting
+    after that is unknown, and the retirement is incomplete.
+  - **Two weaker signs are never an exit:**
+    - **a watch refused with `ESRCH`.** In that source this starts when the
+      exit is prepared, before the threads have ended.
+    - **`P_WEXIT`.** It is set once the other threads are held, while a
+      system call already under way in one of them may still finish.
+
+    macOS reads a `P_WEXIT` row as *exiting*. Liveness calls it unknown.
+    Group membership, peer credentials and the ownership root check count
+    it as no longer there; no closure rests on those.
 
   The running kernel's source (xnu-13432) is not published, so this rests on
   the published one and on the measurements.
@@ -191,7 +199,8 @@ them:
   whose `kinfo_proc` offsets were measured on one Mac. Before any of them is
   believed, each process reads its own row once and every field must say
   back what it knows of itself: its pid, parent, group, real and effective
-  uid, start time and running state. A layout that fails makes every such
+  uid, start time, running state, and flags as a 64-bit process not
+  exiting. A layout that fails makes every such
   read unknown, and so the scan incomplete. Its limit: a field that reads a
   neighbour holding the same value for the reading process passes.
 - A process may not open an operation lock file it already has open
@@ -248,8 +257,7 @@ signal mask and dispositions to match. Each of these was reverted once to see it
   by inode;
 - the kernel-thread rule, and the layout check of every `kinfo_proc` field;
 - the hand-over of a kill after the commit;
-- the observed-exit rule on macOS, in two places:
-  - **recovery's kill.** With the table re-read after the event and the
-    watch armed after the signal (the code as it was), the kill test fails;
-  - **the watch armed before the gate shuts.** Armed after it instead, the
-    gate-shaped test fails.
+- the exiting state, the read after an observed exit, and the `P_WEXIT`
+  read. Each one reverted fails its own test, every time. With recovery's
+  kill as it was (watch armed after the signal, table read once), the macOS
+  kill test failed in 4 of 5 runs.

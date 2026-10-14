@@ -100,6 +100,12 @@ impl Exact {
         };
         // A process that cannot be watched is not signalled: its exit could
         // never be seen, only guessed at.
+        //
+        // The token is taken before the watch is armed, and the order does
+        // not matter. Each names whichever process holds the pid when it is
+        // taken, and `pin` checks the recorded identity after both: that
+        // process was alive at the check, and a pid is not reused while its
+        // process lives, so it held the pid for both.
         let watch = ExitWatch::arm(pid);
         match watch.state {
             WatchState::Armed(_) => Ok(Some(Exact { token, watch, pid })),
