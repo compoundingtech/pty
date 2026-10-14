@@ -2,7 +2,7 @@
 
 ## Context
 
-This node defines how pty-core reads the session registry and the session daemons behind it for a caller in the same process. It covers the socket liveness probe inside a listing (`list_sessions_in`, `list_sessions_with`, `socket_reachable`) and STATUS reads, single (`query_stats_in_with_timeout`) and batched (`query_stats_batch_in`). Which sessions a listing reports and how it classifies them (`running`, `exited`, `vanished`) is the Node contract tracked in [docs/parity.md](../../parity.md) section 5.2. This node only constrains how the reads are performed. The rationale is in [decision 0014](../../decisions/0014-registry-reads-run-on-the-callers-thread.md).
+This node defines how pty-core reads the session registry and the session daemons behind it for a caller in the same process. It covers bounded socket transport diagnostics inside a strict listing (`list_sessions_in`, `list_sessions_with`, `socket_reachable`) and STATUS reads, single (`query_stats_in_with_timeout`) and batched (`query_stats_batch_in`). A running classification requires a live daemon identity: a thread-group leader with a matching recorded start token and, when recorded, boot identity; socket reachability is not liveness authority. Classification is tracked in [docs/parity.md](../../parity.md) section 5.2. This node constrains how the reads are performed. The rationale is in [decision 0014](../../decisions/0014-registry-reads-run-on-the-callers-thread.md).
 
 ## Assumptions
 
@@ -32,7 +32,7 @@ This node defines how pty-core reads the session registry and the session daemon
 ### Must answer within its budget
 
 - **PTY.REG-R04 Probe budget:** A listing probes every socket that needs a probe under one shared budget, 500 ms by default, and does not wait past it.
-- **PTY.REG-R05 Unanswered is absent:** A socket that has neither connected nor failed when the budget ends is absent from the probe result, and the listing reads it as unreachable. A Linux listener with a full accept queue is such a socket.
+- **PTY.REG-R05 Unanswered is absent:** A socket that has neither connected nor failed when the budget ends is absent from the probe result and its transport is unconfirmed. Strict listings report incomplete transport diagnostics; neither a reachable nor an unanswered socket proves daemon liveness. A Linux listener with a full accept queue is such a socket.
 - **PTY.REG-R06 One deadline per batch:** A batch STATUS read serves any number of sessions under one shared deadline. Silent daemons and full accept queues cost the deadline once, not once each, and cannot hold the caller past it. Neither can a daemon that sends packets without pause, and it cannot keep the other sessions from being answered.
 
 ### Must answer what a single read answers
