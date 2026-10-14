@@ -4,8 +4,6 @@
 //! node: src/cli.ts:1358-1382 (dispatch), 3850-3857 (`statefulAgentReason`),
 //! 3886-3963 (`cmdRestart`)
 
-use std::time::Duration;
-
 use pty_core::registry::{self, SessionMetadata, SessionStatus};
 
 use super::{
@@ -20,7 +18,13 @@ const USAGE: &str = "Usage: pty restart [-y] [--force] <name>";
 ///
 /// node: src/cli.ts:3850-3857
 fn stateful_agent_reason(meta: &SessionMetadata) -> Option<&'static str> {
-    if meta.tags.as_ref().and_then(|t| t.get("role")).map(String::as_str) == Some("agent") {
+    if meta
+        .tags
+        .as_ref()
+        .and_then(|t| t.get("role"))
+        .map(String::as_str)
+        == Some("agent")
+    {
         return Some("role=agent tag");
     }
     let argv = std::iter::once(meta.command.clone())
@@ -83,7 +87,6 @@ pub fn run(args: &[String]) -> CliResult {
     };
     let Some(meta) = session.metadata.clone() else {
         eprintln!("Session \"{name}\" has no metadata — cannot restart.");
-        let _ = registry::cleanup_all(&name);
         return Ok(1);
     };
 
@@ -98,22 +101,33 @@ pub fn run(args: &[String]) -> CliResult {
         return Ok(1);
     }
 
-    if session.status == SessionStatus::Running
-        && let Some(pid) = session.pid
-    {
-        if !yes && ask::declined(&ask::ask(&format!(
-            "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        ))) {
+    if session.status == SessionStatus::Running {
+        if !yes
+            && ask::declined(&ask::ask(&format!(
+                "Session \"{name}\" is running. Kill and restart? [Y/n] "
+            )))
+        {
             return Ok(0);
         }
-        // SAFETY: kill(2) with a pid read from the registry; an error only
-        // means the process is already gone, which is the wanted state.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        registry::cleanup_socket(&name);
-        std::thread::sleep(Duration::from_millis(200));
+        let stopped = match pty_client::stop(&name, meta.generation.as_deref()) {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                eprintln!("pty restart: {error}");
+                return Ok(1);
+            }
+        };
+        if !stopped.verified_empty() {
+            eprintln!(
+                "pty restart: Session \"{name}\" daemon stopped, but process tree could not be verified empty; not restarted."
+            );
+            return Ok(1);
+        }
     }
 
-    let _ = registry::cleanup_all(&name);
+    if let Err(error) = pty_client::remove(&name) {
+        eprintln!("pty restart: {error}");
+        return Ok(1);
+    }
 
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();

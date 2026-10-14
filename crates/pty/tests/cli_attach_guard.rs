@@ -14,6 +14,23 @@ fn delayed_status_does_not_allow_unforced_attach() {
     let started = Instant::now();
     let out = rig.run(&["attach", "slow"]);
     assert_eq!(out.code, 1, "{out:?}");
-    assert!(out.stderr.contains("cannot verify the current session"), "{out:?}");
+    assert!(
+        out.stderr.contains("cannot verify the current session"),
+        "{out:?}"
+    );
     assert!(started.elapsed() >= Duration::from_millis(500));
+}
+
+#[test]
+fn auto_restart_preserves_missing_boot_live_child() {
+    let rig = Rig::new();
+    let mut fixture = cli_common::MissingBootSession::new(&rig, "unknown", serde_json::json!({}));
+    // --auto-restart is this CLI's noninteractive restart policy (-r).
+    // Unknown projects as vanished, so this reaches the destructive restart
+    // guard without needing a terminal or a daemon answering STATUS.
+    let out = rig.run(&["attach", "--auto-restart", "unknown"]);
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(out.stderr.contains("identity is unknown"), "{out:?}");
+    assert!(!out.stdout.contains("Restarting"), "{out:?}");
+    fixture.assert_preserved(&rig);
 }

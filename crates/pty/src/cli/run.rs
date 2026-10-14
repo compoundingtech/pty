@@ -466,10 +466,17 @@ fn create_or_attach(
         session = registry::get_session_by_name(name);
     }
 
-    if session
-        .as_ref()
-        .is_some_and(|s| s.status == registry::SessionStatus::Running)
-    {
+    // A vanished projection is not proof of loss: a legacy live owner may
+    // lack boot evidence. Recheck under the lifecycle locks before either
+    // replacing the name or deleting its companions.
+    let identity = session.as_ref().map(|record| {
+        registry::check_record_identity(registry::read_pid(name), record.metadata.as_ref())
+    });
+    if identity == Some(registry::DaemonIdentityCheck::Unknown) {
+        eprintln!("Refusing to replace session \"{name}\": daemon identity is unknown.");
+        return Ok(1);
+    }
+    if identity == Some(registry::DaemonIdentityCheck::Match) {
         drop(creation_lock);
         event_lock.take().map(registry::LockGuard::release);
         if attach_existing {

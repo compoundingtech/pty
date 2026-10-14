@@ -97,7 +97,9 @@ impl Rig {
     pub fn run_stdin(&self, args: &[&str], input: &str) -> Out {
         use std::io::Write;
         let mut c = self.cmd(args);
-        c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = c.spawn().expect("spawn pty");
         // A command that rejects its arguments exits without reading stdin,
         // and a write that loses that race gets EPIPE. The test checks the
@@ -113,7 +115,13 @@ impl Rig {
 
     pub fn ok(&self, args: &[&str]) -> Out {
         let out = self.run(args);
-        assert_eq!(out.code, 0, "`pty {}` failed: {}", args.join(" "), out.stderr);
+        assert_eq!(
+            out.code,
+            0,
+            "`pty {}` failed: {}",
+            args.join(" "),
+            out.stderr
+        );
         out
     }
 
@@ -256,4 +264,136 @@ pub fn file_names(dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     v.sort();
     v
+}
+
+/// A disposable process with a matching start token but no recorded boot
+/// identity. Its socket is real, but no daemon serves it.
+pub struct MissingBootSession {
+    child: DisposableChild,
+    _listener: std::os::unix::net::UnixListener,
+    name: String,
+    metadata: Vec<u8>,
+    pid: Vec<u8>,
+    socket_identity: (u64, u64),
+    signal_marker: PathBuf,
+    pub replacement_marker: PathBuf,
+}
+
+impl MissingBootSession {
+    pub fn new(rig: &Rig, name: &str, tags: Value) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+
+        let signal_marker = rig.scratch.join(format!("{name}-signalled"));
+        let ready = rig.scratch.join(format!("{name}-ready"));
+        let replacement_marker = rig.scratch.join(format!("{name}-replacement"));
+        let child = DisposableChild(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "trap 'echo signalled > \"$1\"; exit 73' TERM HUP INT USR1 USR2; \
+                 touch \"$2\"; while :; do read -r line || exit 74; done",
+                    "missing-boot-child",
+                ])
+                .arg(&signal_marker)
+                .arg(&ready)
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn disposable identity fixture"),
+        );
+        let listener = std::os::unix::net::UnixListener::bind(rig.path(&format!("{name}.sock")))
+            .expect("bind disposable session socket");
+        let token = pty_core::registry::read_process_start_token(child.0.id() as i32)
+            .expect("disposable child start token");
+        let metadata = rig.write_meta(
+            name,
+            json!({
+                "generation": "missing-boot-generation",
+                "daemonPid": child.0.id(),
+                "daemonStartToken": token,
+                "command": "sh",
+                "args": ["-c", "touch \"$1\"", "replacement", replacement_marker],
+                "tags": tags
+            }),
+        );
+        let parsed: pty_core::registry::SessionMetadata = serde_json::from_value(metadata).unwrap();
+        assert_eq!(
+            pty_core::registry::check_daemon_identity(child.0.id() as i32, &parsed),
+            pty_core::registry::DaemonIdentityCheck::Unknown,
+        );
+        std::fs::write(rig.path(&format!("{name}.pid")), child.0.id().to_string()).unwrap();
+        let socket = std::fs::metadata(rig.path(&format!("{name}.sock"))).unwrap();
+        let fixture = Self {
+            child,
+            _listener: listener,
+            name: name.to_string(),
+            metadata: std::fs::read(rig.path(&format!("{name}.json"))).unwrap(),
+            pid: std::fs::read(rig.path(&format!("{name}.pid"))).unwrap(),
+            socket_identity: (socket.dev(), socket.ino()),
+            signal_marker,
+            replacement_marker,
+        };
+        wait_until("disposable signal traps installed", || ready.exists());
+        fixture
+    }
+
+    pub fn assert_preserved(&mut self, rig: &Rig) {
+        use std::os::unix::fs::MetadataExt;
+
+        assert!(
+            self.child.0.try_wait().unwrap().is_none(),
+            "disposable child was terminated"
+        );
+        assert!(
+            !self.signal_marker.exists(),
+            "disposable child received a signal"
+        );
+        assert!(
+            !self.replacement_marker.exists(),
+            "stored replacement command was launched"
+        );
+        assert_eq!(
+            std::fs::read(rig.path(&format!("{}.json", self.name))).unwrap(),
+            self.metadata,
+            "unknown identity metadata was changed or replaced",
+        );
+        assert_eq!(
+            std::fs::read(rig.path(&format!("{}.pid", self.name))).unwrap(),
+            self.pid,
+            "unknown identity pid evidence was changed",
+        );
+        let socket = std::fs::metadata(rig.path(&format!("{}.sock", self.name))).unwrap();
+        assert_eq!(
+            (socket.dev(), socket.ino()),
+            self.socket_identity,
+            "socket was replaced"
+        );
+        let metadata_files: Vec<_> = file_names(&rig.root)
+            .into_iter()
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        assert_eq!(
+            metadata_files,
+            [format!("{}.json", self.name)],
+            "replacement session appeared"
+        );
+    }
+}
+
+struct DisposableChild(std::process::Child);
+
+impl Drop for DisposableChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            // SAFETY: this child was spawned into its own process group;
+            // teardown signals only the fixture's disposable process group.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.0.wait();
+    }
 }

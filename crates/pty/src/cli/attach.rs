@@ -154,7 +154,9 @@ fn attach_session(
                 }
                 None => {
                     eprintln!("pty attach: cannot verify the current session for \"{name}\".");
-                    eprintln!("  Retry when the session responds, or pass --force to attach anyway.");
+                    eprintln!(
+                        "  Retry when the session responds, or pass --force to attach anyway."
+                    );
                     return Ok(1);
                 }
                 Some(false) => {}
@@ -179,14 +181,9 @@ fn attach_session(
 /// Show what the session last printed, then offer to start it again.
 ///
 /// node: src/cli.ts:1808-1853
-fn handle_dead_session(
-    name: &str,
-    meta: Option<SessionMetadata>,
-    auto_restart: bool,
-) -> CliResult {
+fn handle_dead_session(name: &str, meta: Option<SessionMetadata>, auto_restart: bool) -> CliResult {
     let Some(meta) = meta else {
         eprintln!("Session \"{name}\" exited (no metadata available).");
-        let _ = registry::cleanup_all(name);
         return Ok(1);
     };
 
@@ -220,7 +217,10 @@ fn handle_dead_session(
         return Ok(0);
     }
 
-    let _ = registry::cleanup_all(name);
+    if let Err(error) = client::remove(name) {
+        eprintln!("pty attach: {error}");
+        return Ok(1);
+    }
     let mut params = SpawnParams::new(name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();

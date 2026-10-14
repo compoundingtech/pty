@@ -9,8 +9,8 @@ use std::path::Path;
 
 use pty_core::ptyfile::{self, PtyFile, PtySessionDef};
 use pty_core::registry::{
-    self, GC_BOOKKEEPING_KEYS, SessionInfo, TagMap, all_session_names, cleanup_all,
-    random_session_name, update_tags, validate_display_name, validate_name,
+    self, GC_BOOKKEEPING_KEYS, SessionInfo, TagMap, all_session_names, random_session_name,
+    update_tags, validate_display_name, validate_name,
 };
 
 use super::{CliError, CliResult, SpawnParams};
@@ -214,8 +214,8 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
             && bound.is_gone()
         {
             let label = label_of(bound);
-            if let Err(busy) = cleanup_all(&bound.name) {
-                eprintln!("  \u{2717} {label}: {}", busy.message(&bound.name));
+            if let Err(error) = pty_client::remove(&bound.name) {
+                eprintln!("  \u{2717} {label}: {error}");
                 skipped += 1;
                 continue;
             }
@@ -264,11 +264,8 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
             continue;
         }
 
-        let mut params = SpawnParams::new(
-            &name,
-            "/bin/sh",
-            &["-c".to_string(), sess.command.clone()],
-        );
+        let mut params =
+            SpawnParams::new(&name, "/bin/sh", &["-c".to_string(), sess.command.clone()]);
         params.display_command = sess.command.clone();
         params.cwd = sess
             .cwd
