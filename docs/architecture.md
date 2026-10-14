@@ -112,6 +112,8 @@ never both win. See `crates/pty-core/src/registry/lock.rs` and
 
 **Registry liveness is process identity, not a numeric PID or a socket.**
 Native records publish `daemonStartToken` and `daemonBootId` on Linux and macOS.
+If either kernel identity cannot be read, startup fails before publication
+or child launch; it does not create an unmanageable Unknown-owned session.
 Both recorded identities must match; a recovery start token alone does not
 authorize legacy records. Linux also requires `/proc/<pid>/status` to identify
 the PID as its own thread-group leader. Missing boot identity or start token

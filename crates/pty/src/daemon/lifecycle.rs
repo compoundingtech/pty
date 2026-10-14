@@ -453,6 +453,12 @@ pub(crate) fn publish_session(
 ) -> Result<(UnixListener, SessionMetadata), String> {
     let cfg = p.cfg;
     let name = &cfg.name;
+    // A daemon without complete birth evidence cannot be safely managed.
+    // Refuse before publishing companions or starting its terminal child.
+    let daemon_start_token = registry::read_process_start_token(std::process::id() as i32)
+        .ok_or_else(|| "daemon start identity is unavailable".to_string())?;
+    let daemon_boot_id = registry::read_boot_id()
+        .ok_or_else(|| "daemon boot identity is unavailable".to_string())?;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
     // Do not inspect this name: its pid/metadata publication is still in flight.
     registry::retire_stale_daemon_records(name);
@@ -475,8 +481,8 @@ pub(crate) fn publish_session(
     let mut metadata = SessionMetadata {
         generation: Some(p.generation.to_string()),
         daemon_pid: Some(std::process::id() as i32),
-        daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
-        daemon_boot_id: registry::read_boot_id(),
+        daemon_start_token: Some(daemon_start_token),
+        daemon_boot_id: Some(daemon_boot_id),
         recovery: None,
         command: cfg.command.clone(),
         args: cfg.args.clone(),
