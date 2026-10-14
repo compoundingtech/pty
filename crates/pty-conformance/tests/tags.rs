@@ -214,7 +214,7 @@ fn run_a_preserves_tags_of_an_exited_session() {
     let rig = Rig::new();
     let name = unique_id("tag");
     rig.daemon(&name, &["true"], tagged(&[("owner", "ci"), ("keep", "true")]));
-    rig.wait_for_daemon_exit(&name);
+    rig.wait_for_exit(&name);
     let out = rig.pty(&["run", "-a", "-d", "--id", &name, "--", "cat"]);
     expect_status(&out, 0);
     let meta = rig.meta(&name).unwrap();
@@ -227,7 +227,7 @@ fn run_a_with_new_tags_replaces_the_old_ones() {
     let rig = Rig::new();
     let name = unique_id("tag");
     rig.daemon(&name, &["true"], tagged(&[("owner", "old"), ("keep", "true")]));
-    rig.wait_for_daemon_exit(&name);
+    rig.wait_for_exit(&name);
     let out = rig.pty(&["run", "-a", "-d", "--id", &name, "--tag", "owner=new", "--", "cat"]);
     expect_status(&out, 0);
     let meta = rig.meta(&name).unwrap();

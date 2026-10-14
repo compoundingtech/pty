@@ -173,8 +173,11 @@ Registry fixtures that represent a live daemon must record its real PID,
 start token, and boot identity. `FakeMeta::identity(pid)` provides these fields;
 use a known absent PID for an exited fixture. A socket or PID sidecar alone
 does not prove a live Rust session or authorize deletion of unknown runtime
-debris. Replacement tests must wait for the daemon process to leave, not just
-for exit metadata: a matching daemon can still serve an attach during shutdown.
+debris. Recipe-replacement tests wait for published exit metadata, not PID
+absence: an exited session must be recreated even while its matching daemon
+finishes shutdown or remains an adopted zombie. Production zombie identity
+behavior is unchanged; a birth-identity Match alone does not imply that the
+session's child is still running.
 Typed publication fixtures must also reflect publication defaults, including
 `ephemeral: Some(false)`, when comparing records read back from disk.
 

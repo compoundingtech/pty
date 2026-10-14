@@ -476,7 +476,11 @@ fn create_or_attach(
         eprintln!("Refusing to replace session \"{name}\": daemon identity is unknown.");
         return Ok(1);
     }
-    if identity == Some(registry::DaemonIdentityCheck::Match) {
+    // Matching birth evidence does not undo a published child exit. Such a
+    // retained recipe is replaced, even while its daemon finishes shutdown.
+    if session.as_ref().is_some_and(|record| record.is_running())
+        && identity == Some(registry::DaemonIdentityCheck::Match)
+    {
         drop(creation_lock);
         event_lock.take().map(registry::LockGuard::release);
         if attach_existing {

@@ -849,17 +849,6 @@ impl Rig {
         });
     }
 
-    /// Exit metadata is published before the daemon process leaves. Wait for
-    /// that process too before exercising replacement rather than attachment.
-    pub fn wait_for_daemon_exit(&self, id: &str) {
-        self.wait_for_exit(id);
-        let pid =
-            self.pid(id).or_else(|| self.meta(id)?.get("daemonPid")?.as_i64()?.try_into().ok());
-        if let Some(pid) = pid {
-            wait_until(&format!("{id} daemon to exit"), || !pid_alive(pid));
-        }
-    }
-
     /// Wait until the session's registry files are gone.
     pub fn wait_for_gone(&self, id: &str) {
         wait_until(&format!("{id} to be removed"), || {

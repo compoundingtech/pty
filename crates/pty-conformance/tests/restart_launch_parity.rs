@@ -57,7 +57,9 @@ fn run_a_preserves_env_removals_when_recreating_an_exited_session() {
         &[("NO_COLOR", "ambient-create")],
     );
     expect_status(&created, 0);
-    rig.wait_for_daemon_exit(name);
+    wait_until_for("exit metadata", Duration::from_secs(5), &mut || {
+        rig.meta(name).map(|m| m["exitedAt"].is_string()).unwrap_or(false)
+    });
 
     let script = format!(
         "if [ \"${{NO_COLOR+x}}\" = x ]; then printf set; else printf unset; fi > '{}'; exec sleep 300",
