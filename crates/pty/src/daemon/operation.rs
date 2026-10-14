@@ -29,14 +29,16 @@ use serde_json::{Map, Value, json};
 
 use pty_core::events::EventWriter;
 use pty_core::operation::barrier::{self, barrier};
+use pty_core::operation::exact::{Exit, ExitWatch};
 use pty_core::operation::frames::{
     FRAME_MAX_BYTES, OwnerCommand, OwnerFrame, RejectCode, TicketView, parse_owner_frame,
     producer_frame,
 };
 use pty_core::operation::settle::{MARKER_FIELD, observe_occupancy, occupancy_rule};
 use pty_core::operation::{
-    Cause, Decision, Incarnation, Liveness, OperationLock, OperationRecord, OperationStore, Phase,
-    ProcessId, Retirement, RetirementPhase, State, Transfer, Writer, WriterRole, operation_digest,
+    AFTER_EXIT_CAP, Cause, Decision, Incarnation, Liveness, OperationLock, OperationRecord,
+    OperationStore, Phase, ProcessId, Retirement, RetirementPhase, State, Transfer, Writer,
+    WriterRole, operation_digest,
 };
 use pty_core::proctable::ProcTable;
 use pty_core::registry::{self, MutateOptions, MutateStatus};
@@ -1586,8 +1588,11 @@ impl Actor {
         let mut evidence = Map::new();
         let mut verified = true;
         if let Some(child) = &self.child {
+            // Armed while the held child still runs, so the wait is on this
+            // child's exit, however soon the shut gate brings it.
+            let watch = ExitWatch::arm(child.pid);
             held::shut(&child.gate);
-            let outcome = verify_child_gone(child);
+            let outcome = verify_child_gone(child, &watch);
             evidence.insert("child".into(), json!({"pid": child.pid, "status": outcome}));
             verified &= outcome == "gone";
         }
@@ -1717,22 +1722,34 @@ impl Actor {
 /// (it is stopped, say) is killed through the substrate, whose signals are
 /// fenced against reaping, so its pid cannot name anyone else. Both waits
 /// end on the child's exit (a pidfd, a kqueue), not on a timer; the timer
-/// only bounds them. A held child never forks, so there is no group to
-/// signal.
-fn verify_child_gone(child: &ChildRecord) -> &'static str {
-    use pty_core::operation::exact::{Exit, wait_for_exit};
+/// only bounds them. `watch` was armed before the gate shut, so the exit it
+/// observes is the child's (see [`ExitWatch`]); then the zombie must show,
+/// read again for at most [`AFTER_EXIT_CAP`]. A child still exiting after
+/// that is reported as such, never gone. A held child never forks, so there
+/// is no group to signal.
+fn verify_child_gone(child: &ChildRecord, watch: &ExitWatch) -> &'static str {
     let Some(id) = &child.id else {
         return "unrecorded";
     };
     let boot = pty_core::boot::read_boot_identity();
+    let after_exit = || match id.liveness_after_exit(boot.as_deref(), AFTER_EXIT_CAP) {
+        Liveness::Gone => "gone",
+        Liveness::Live => "live",
+        Liveness::Unknown(reason) => reason,
+    };
     let gone = || id.liveness(&ProcTable::read(), boot.as_deref()) == Liveness::Gone;
-    let _ = wait_for_exit(child.pid, Duration::from_secs(1));
+    let _ = watch.wait(Duration::from_secs(1));
+    if watch.observed() {
+        return after_exit();
+    }
     if gone() {
         return "gone";
     }
     let _ = child.session.kill();
-    let waited = wait_for_exit(child.pid, Duration::from_secs(5));
-    if gone() {
+    let waited = watch.wait(Duration::from_secs(5));
+    if watch.observed() {
+        after_exit()
+    } else if gone() {
         "gone"
     } else if waited == Exit::Unsupported {
         "exit-wait-unavailable"

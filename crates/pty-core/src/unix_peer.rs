@@ -41,7 +41,7 @@ pub fn credentials(stream: &UnixStream) -> Option<PeerCredentials> {
         return None;
     }
     let row = crate::proctable::process(peer.pid).known()?;
-    if row.is_zombie() {
+    if row.is_zombie() || row.is_exiting() {
         return None;
     }
     Some(PeerCredentials {
@@ -80,7 +80,7 @@ pub fn credentials(stream: &UnixStream) -> Option<PeerCredentials> {
         return None;
     }
     let row = crate::proctable::process(pid).known()?;
-    if row.is_zombie() {
+    if row.is_zombie() || row.is_exiting() {
         return None;
     }
     Some(PeerCredentials {

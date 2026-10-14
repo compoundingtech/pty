@@ -31,8 +31,9 @@ pub use envelope::{
     sha256_hex,
 };
 pub use record::{
-    Cause, Decision, Incarnation, Liveness, OperationLock, OperationRecord, OperationStore, Phase,
-    ProcessId, RECORD_SCHEMA, Retirement, RetirementPhase, State, Transfer, Writer, WriterRole,
+    AFTER_EXIT_CAP, Cause, Decision, Incarnation, Liveness, OperationLock, OperationRecord,
+    OperationStore, Phase, ProcessId, RECORD_SCHEMA, Retirement, RetirementPhase, State, Transfer,
+    Writer, WriterRole,
 };
 
 /// The capability `pty capabilities --json` advertises.
