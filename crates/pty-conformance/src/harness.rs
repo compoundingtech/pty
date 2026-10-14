@@ -84,10 +84,8 @@ pub fn pty_bin() -> &'static Path {
             return p;
         }
         let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(profile)
-            .join("pty");
+        let p =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(profile).join("pty");
         let p = p.canonicalize().unwrap_or(p);
         assert!(
             p.exists(),
@@ -124,11 +122,7 @@ pub fn is_node() -> bool {
 /// Default deadline for polls: 10 s, doubled by `PC_SLOW=1`.
 pub fn deadline() -> Duration {
     let base = Duration::from_secs(10);
-    if std::env::var("PC_SLOW").map(|v| v == "1").unwrap_or(false) {
-        base * 2
-    } else {
-        base
-    }
+    if std::env::var("PC_SLOW").map(|v| v == "1").unwrap_or(false) { base * 2 } else { base }
 }
 
 /// Is the binary under test the workspace's own unoptimized build?
@@ -155,11 +149,7 @@ pub fn unoptimized_binary_under_test() -> bool {
 /// most of a 10 s budget for one megabyte, so eight times leaves room without
 /// letting a real starvation sit undetected for minutes.
 pub fn throughput_budget(base: Duration) -> Duration {
-    if unoptimized_binary_under_test() {
-        base * 8
-    } else {
-        base
-    }
+    if unoptimized_binary_under_test() { base * 8 } else { base }
 }
 
 /// Poll `cond` every 10 ms until it returns true or the default deadline
@@ -313,18 +303,11 @@ pub struct DaemonOpts {
 
 impl DaemonOpts {
     pub fn no_display_name() -> Self {
-        Self {
-            no_display_name: true,
-            ..Default::default()
-        }
+        Self { no_display_name: true, ..Default::default() }
     }
 
     pub fn keep() -> Self {
-        Self {
-            no_display_name: true,
-            keep: true,
-            ..Default::default()
-        }
+        Self { no_display_name: true, keep: true, ..Default::default() }
     }
 
     pub fn tag(mut self, k: &str, v: &str) -> Self {
@@ -473,7 +456,8 @@ impl Rig {
         if prefix.is_empty() {
             return ambient;
         }
-        let mut parts: Vec<String> = prefix.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let mut parts: Vec<String> =
+            prefix.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         parts.push(ambient);
         parts.join(":")
     }
@@ -602,7 +586,12 @@ impl Rig {
 
     /// [`Rig::run`] with a custom timeout, for commands that are expected
     /// to block (an attach without a tty) and are killed on purpose.
-    pub fn run_with_timeout(&self, mut cmd: Command, stdin: Option<Vec<u8>>, timeout: Duration) -> Out {
+    pub fn run_with_timeout(
+        &self,
+        mut cmd: Command,
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Out {
         cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -648,12 +637,7 @@ impl Rig {
         let grace = Duration::from_secs(2);
         let stdout = rx_out.recv_timeout(grace).unwrap_or_default();
         let stderr = rx_err.recv_timeout(grace).unwrap_or_default();
-        Out {
-            status,
-            stdout,
-            stderr,
-            timed_out,
-        }
+        Out { status, stdout, stderr, timed_out }
     }
 
     /// Run the CLI inside a real terminal (for `attach`, `peek -f`, prompts).
@@ -663,7 +647,13 @@ impl Rig {
     }
 
     /// [`Rig::pty_tty`] with extra environment.
-    pub fn pty_tty_env(&self, extra: &[(&str, &str)], args: &[&str], rows: u16, cols: u16) -> Session {
+    pub fn pty_tty_env(
+        &self,
+        extra: &[(&str, &str)],
+        args: &[&str],
+        rows: u16,
+        cols: u16,
+    ) -> Session {
         // `env -u` scrubs the ambient variables the testkit would otherwise
         // pass through; the rig's fixed variables are set on the same line.
         let mut env_args: Vec<String> = Vec::new();
@@ -705,7 +695,14 @@ impl Rig {
     /// (no terminal emulation), for tests about exact escape sequences
     /// (`attach` sanitize/exit trailers, `peek -f`). Environment as
     /// [`Rig::pty_tty_env`]; `unset` removes variables.
-    pub fn pty_tty_raw(&self, extra: &[(&str, &str)], unset: &[&str], args: &[&str], rows: u16, cols: u16) -> TtyProc {
+    pub fn pty_tty_raw(
+        &self,
+        extra: &[(&str, &str)],
+        unset: &[&str],
+        args: &[&str],
+        rows: u16,
+        cols: u16,
+    ) -> TtyProc {
         let mut env = self.base_env();
         for (k, v) in extra {
             env.insert((*k).into(), (*v).into());
@@ -775,11 +772,7 @@ impl Rig {
             command.env(k, v);
         }
         let launch = self.run(command, None);
-        Daemon {
-            root: self.root.clone(),
-            id: id.to_string(),
-            launch,
-        }
+        Daemon { root: self.root.clone(), id: id.to_string(), launch }
     }
 
     /// Wait (≤ 30 s) for `<id>.sock` and `<id>.json`. A command that exits
@@ -849,6 +842,17 @@ impl Rig {
         });
     }
 
+    /// Exit metadata is published before the daemon process leaves. Wait for
+    /// that process too before exercising replacement rather than attachment.
+    pub fn wait_for_daemon_exit(&self, id: &str) {
+        self.wait_for_exit(id);
+        let pid =
+            self.pid(id).or_else(|| self.meta(id)?.get("daemonPid")?.as_i64()?.try_into().ok());
+        if let Some(pid) = pid {
+            wait_until(&format!("{id} daemon to exit"), || !pid_alive(pid));
+        }
+    }
+
     /// Wait until the session's registry files are gone.
     pub fn wait_for_gone(&self, id: &str) {
         wait_until(&format!("{id} to be removed"), || {
@@ -876,7 +880,9 @@ impl Rig {
         let mut pids = Vec::new();
         let mut stack = dirs;
         while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -896,11 +902,8 @@ impl Rig {
     /// Stop every recorded daemon PID except PID 1 and the test process.
     pub fn teardown_daemons(&self) {
         let me = std::process::id() as i32;
-        let pids: Vec<i32> = self
-            .recorded_pids()
-            .into_iter()
-            .filter(|&p| p > 1 && p != me)
-            .collect();
+        let pids: Vec<i32> =
+            self.recorded_pids().into_iter().filter(|&p| p > 1 && p != me).collect();
         for &pid in &pids {
             kill_pid(pid, libc::SIGTERM);
         }
@@ -940,8 +943,8 @@ pub struct Conn {
 impl Conn {
     /// Connect to a daemon socket.
     pub fn open(path: &Path) -> Conn {
-        let stream = UnixStream::connect(path)
-            .unwrap_or_else(|e| panic!("connect {}: {e}", path.display()));
+        let stream =
+            UnixStream::connect(path).unwrap_or_else(|e| panic!("connect {}: {e}", path.display()));
         Conn {
             stream,
             reader: PacketReader::new(),
@@ -1044,9 +1047,7 @@ impl Conn {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            self.stream
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .ok();
+            self.stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1)))).ok();
             let mut buf = [0u8; 65536];
             match self.stream.read(&mut buf) {
                 Ok(0) => {
@@ -1121,9 +1122,7 @@ impl Conn {
     /// Send STATUS and return the parsed JSON response.
     pub fn status_json(&mut self, timeout: Duration) -> Value {
         self.status();
-        let p = self
-            .wait_for(MessageType::Status, timeout)
-            .expect("STATUS response");
+        let p = self.wait_for(MessageType::Status, timeout).expect("STATUS response");
         serde_json::from_slice(&p.payload).expect("STATUS payload is JSON")
     }
 }
@@ -1199,14 +1198,16 @@ pub fn count_regex(hay: &str, re: &str) -> usize {
 pub fn expect_json(out: &Out) -> Value {
     assert_eq!(out.status, 0, "expected success: {}", out.summary());
     let s = out.stdout();
-    serde_json::from_str(&s).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", out.summary()))
+    serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", out.summary()))
 }
 
 /// Parse stdout as JSON without checking the status.
 #[track_caller]
 pub fn parse_json(out: &Out) -> Value {
     let s = out.stdout();
-    serde_json::from_str(&s).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", out.summary()))
+    serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", out.summary()))
 }
 
 /// stdout split into lines (a trailing newline does not add an empty line).
@@ -1219,11 +1220,9 @@ pub fn unique_id(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos()
-        % 100_000;
+    let t =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+            % 100_000;
     format!("{prefix}{t}{n}")
 }
 
@@ -1245,9 +1244,7 @@ pub fn fixtures_dir() -> PathBuf {
 /// An ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.mmmZ`, like
 /// `Date#toISOString`) for now plus `offset_secs` (negative = the past).
 pub fn iso_timestamp(offset_secs: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
     let millis = (now.as_millis() as i64) + offset_secs * 1000;
     let secs = millis.div_euclid(1000);
     let ms = millis.rem_euclid(1000);
@@ -1286,10 +1283,7 @@ pub struct FakeMeta {
 
 impl FakeMeta {
     pub fn created(offset_secs: i64) -> Self {
-        Self {
-            created_at: Some(iso_timestamp(offset_secs)),
-            ..Default::default()
-        }
+        Self { created_at: Some(iso_timestamp(offset_secs)), ..Default::default() }
     }
 
     pub fn exited(mut self, offset_secs: i64, code: i64) -> Self {
@@ -1311,6 +1305,22 @@ impl FakeMeta {
     pub fn extra(mut self, k: &str, v: Value) -> Self {
         self.extra.push((k.into(), v));
         self
+    }
+
+    /// Bind a fixture to a real process, or to a known absent daemon PID.
+    pub fn identity(self, pid: i32) -> Self {
+        let token = pty_core::registry::read_process_start_token(pid).unwrap_or_else(|| {
+            assert!(!pid_alive(pid), "a live fixture needs a readable identity");
+            "fixture:dead".to_string()
+        });
+        self.extra("daemonPid", serde_json::json!(pid))
+            .extra("daemonStartToken", serde_json::json!(token))
+            .extra(
+                "daemonBootId",
+                serde_json::json!(
+                    pty_core::registry::read_boot_id().expect("fixture boot identity")
+                ),
+            )
     }
 }
 
@@ -1436,14 +1446,7 @@ impl TtyProc {
                 }
             }
         });
-        TtyProc {
-            master: pair.master,
-            writer,
-            rx,
-            child,
-            output: Vec::new(),
-            exit: None,
-        }
+        TtyProc { master: pair.master, writer, rx, child, output: Vec::new(), exit: None }
     }
 
     fn pump(&mut self) {
@@ -1492,12 +1495,7 @@ impl TtyProc {
     /// Resize the pty (the process gets SIGWINCH).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         use portable_pty::PtySize;
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
     }
 
     /// The child's pid.

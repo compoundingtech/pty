@@ -12,10 +12,7 @@ use serde_json::json;
 #[test]
 fn strict_requires_json_and_rejects_other_inventory_views() {
     let rig = Rig::new();
-    for args in [
-        vec!["list", "--strict"],
-        vec!["ls", "--strict", "--clients"],
-    ] {
+    for args in [vec!["list", "--strict"], vec!["ls", "--strict", "--clients"]] {
         let out = rig.run(&args);
         assert_eq!(out.code, 1);
         assert_eq!(out.stderr, "--strict requires --json\n");
@@ -24,10 +21,7 @@ fn strict_requires_json_and_rejects_other_inventory_views() {
     for flag in ["--summary", "--remote"] {
         let out = rig.run(&["list", "--json", "--strict", flag]);
         assert_eq!(out.code, 1);
-        assert_eq!(
-            out.stderr,
-            "--strict is incompatible with --summary and --remote\n"
-        );
+        assert_eq!(out.stderr, "--strict is incompatible with --summary and --remote\n");
         assert!(out.stdout.is_empty());
     }
     let out = rig.run(&["list", "--json", "--strict", "--remote", "peer"]);
@@ -40,17 +34,10 @@ fn strict_preserves_entry_serialization_and_filters() {
     let rig = Rig::new();
     rig.write_meta(
         "old",
-        json!({"createdAt": iso_now(-7_200_000), "tags": {"env": "prod"}}),
+        json!({"daemonPid": DEAD_PID, "createdAt": iso_now(-7_200_000), "tags": {"env": "prod"}}),
     );
-    rig.write_meta("recent", json!({"exitCode": 0, "exitedAt": iso_now(0)}));
-    let filters = [
-        "--status",
-        "vanished",
-        "--older-than",
-        "1h",
-        "--filter-tag",
-        "env=prod",
-    ];
+    rig.write_meta("recent", json!({"daemonPid": DEAD_PID, "exitCode": 0, "exitedAt": iso_now(0)}));
+    let filters = ["--status", "vanished", "--older-than", "1h", "--filter-tag", "env=prod"];
     let mut ordinary = vec!["list", "--json"];
     ordinary.extend(filters);
     let expected = rig.ok(&ordinary).json();
@@ -83,6 +70,7 @@ fn strict_retains_lifecycle_tags_and_projects_recorded_identity_only() {
         });
         let mut fields = json!({
             "generation": generation,
+            "daemonPid": DEAD_PID,
             "displayName": name,
             "tags": tags,
         });
@@ -111,10 +99,7 @@ fn strict_retains_lifecycle_tags_and_projects_recorded_identity_only() {
         }));
     }
     let ordinary = rig.ok(&["list", "--json"]);
-    assert_eq!(
-        ordinary.stdout,
-        format!("{}\n", serde_json::to_string(&expected).unwrap())
-    );
+    assert_eq!(ordinary.stdout, format!("{}\n", serde_json::to_string(&expected).unwrap()));
     let inventory = rig.ok(&["list", "--json", "--strict"]).json();
     assert_eq!(inventory["complete"], true);
     assert_eq!(inventory["errors"], json!([]));
@@ -123,7 +108,10 @@ fn strict_retains_lifecycle_tags_and_projects_recorded_identity_only() {
         let entry = entry.as_object_mut().unwrap();
         assert_eq!(entry.shift_remove("generation"), Some(json!(format!("generation-{name}"))));
         assert_eq!(entry.shift_remove("daemonStartToken"), daemon_token.map(|token| json!(token)));
-        assert_eq!(entry.shift_remove("processStartToken"), recovery_token.map(|token| json!(token)));
+        assert_eq!(
+            entry.shift_remove("processStartToken"),
+            recovery_token.map(|token| json!(token))
+        );
     }
     assert_eq!(entries, expected);
     assert_eq!(rig.ok(&["list", "--json"]).stdout, ordinary.stdout);
@@ -144,23 +132,14 @@ fn strict_reports_full_scan_errors_even_when_entries_are_filtered_out() {
     assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
         error["path"] == json!(rig.path("bad.json")) && error["kind"] == "metadata-malformed"
     }));
-    assert_eq!(
-        rig.ok(&["list", "--json", "--status", "exited"]).json()[0]["name"],
-        "good"
-    );
+    assert_eq!(rig.ok(&["list", "--json", "--status", "exited"]).json()[0]["name"], "good");
 }
 
 #[test]
 fn strict_missing_root_uses_global_root_and_returns_an_envelope() {
     let rig = Rig::new();
     let missing = rig.scratch.join("missing");
-    let out = rig.run(&[
-        "list",
-        "--json",
-        "--strict",
-        "--root",
-        missing.to_str().unwrap(),
-    ]);
+    let out = rig.run(&["list", "--json", "--strict", "--root", missing.to_str().unwrap()]);
     assert_eq!(out.code, 3);
     assert!(out.stderr.is_empty());
     assert!(!missing.exists());
@@ -180,9 +159,9 @@ fn strict_refused_socket_requires_dead_pid_before_cleanup_is_allowed() {
     assert_eq!(out.code, 3);
     let inventory = out.json();
     assert_eq!(inventory["complete"], false);
-    assert_eq!(inventory["errors"][0]["kind"], "entry-unreadable");
-    assert_eq!(inventory["entries"][0]["status"], "running");
-    assert_eq!(rig.ok(&["list", "--json"]).json()[0]["status"], "running");
+    assert_eq!(inventory["errors"][0]["kind"], "identity-unknown");
+    assert_eq!(inventory["entries"][0]["status"], "vanished");
+    assert_eq!(rig.ok(&["list", "--json"]).json()[0]["status"], "vanished");
     std::fs::write(rig.path("unknown.pid"), DEAD_PID.to_string()).unwrap();
     let inventory = rig.ok(&["list", "--json", "--strict"]).json();
     assert_eq!(inventory["complete"], true);
@@ -214,10 +193,12 @@ fn strict_fifo_companions_return_an_incomplete_envelope_without_blocking() {
         // SAFETY: the path is a valid NUL-terminated string.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
-    let mut child = rig.cmd(&["list", "--json", "--strict"])
+    let mut child = rig
+        .cmd(&["list", "--json", "--strict"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn().unwrap();
+        .spawn()
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
@@ -234,9 +215,13 @@ fn strict_fifo_companions_return_an_incomplete_envelope_without_blocking() {
     assert_eq!(inventory["complete"], false);
     assert_eq!(inventory["entries"], json!([]));
     for (name, kind) in [("orphan.pid", "pid-unreadable"), ("record.json", "metadata-unreadable")] {
-        assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
-            error["path"] == json!(rig.path(name)) && error["kind"] == kind
-        }));
+        assert!(
+            inventory["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| { error["path"] == json!(rig.path(name)) && error["kind"] == kind })
+        );
     }
 }
 
@@ -259,10 +244,8 @@ fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
     // SAFETY: the path is a valid NUL-terminated string.
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     for args in [vec!["list"], vec!["list", "--json"]] {
-        let mut child = rig.cmd(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn().unwrap();
+        let mut child =
+            rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
@@ -276,7 +259,10 @@ fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
         assert_eq!(out.status.code(), Some(0));
         assert!(out.stderr.is_empty());
         if args.contains(&"--json") {
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(), json!([]));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                json!([])
+            );
         }
     }
 }
@@ -286,10 +272,7 @@ fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
 fn json_status_and_key_order() {
     let rig = Rig::new();
     rig.write_meta("van", json!({"displayCommand": "sleep 1", "tags": {"a": "1"}}));
-    rig.write_meta(
-        "ex",
-        json!({"exitCode": 0, "exitedAt": iso_now(0), "displayName": "friendly"}),
-    );
+    rig.write_meta("ex", json!({"exitCode": 0, "exitedAt": iso_now(0), "displayName": "friendly"}));
     // A dead pid without a socket is vanished; its files are kept.
     rig.write_meta("deadpid", json!({}));
     std::fs::write(rig.path("deadpid.pid"), DEAD_PID.to_string()).unwrap();
@@ -315,12 +298,19 @@ fn json_status_and_key_order() {
     let keys: Vec<&String> = ex.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["name", "status", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "displayName"]
+        [
+            "name",
+            "status",
+            "pid",
+            "command",
+            "cwd",
+            "createdAt",
+            "exitCode",
+            "exitedAt",
+            "displayName"
+        ]
     );
-    assert_eq!(
-        arr.iter().find(|s| s["name"] == "deadpid").unwrap()["status"],
-        "vanished"
-    );
+    assert_eq!(arr.iter().find(|s| s["name"] == "deadpid").unwrap()["status"], "vanished");
     assert!(rig.exists("deadpid.pid"));
     assert!(rig.exists("deadpid.json"));
     // Single line, no pretty print.
@@ -416,7 +406,10 @@ fn summary_text_and_json() {
         rig2.ok(&["list", "--summary"]).stdout,
         "1 session — 1 vanished\noldest: only (vanished, 1m5s)\n"
     );
-    assert_eq!(rig2.ok(&["list", "--json", "--summary", "--status", "exited"]).json(), json!({"total": 0, "byStatus": {"running": 0, "exited": 0, "vanished": 0}, "oldest": null, "newest": null}));
+    assert_eq!(
+        rig2.ok(&["list", "--json", "--summary", "--status", "exited"]).json(),
+        json!({"total": 0, "byStatus": {"running": 0, "exited": 0, "vanished": 0}, "oldest": null, "newest": null})
+    );
 }
 
 /// node: tests/list-filters.test.ts:386-437
@@ -529,8 +522,5 @@ fn a_named_peer_that_cannot_be_dialed_is_a_host_group_with_an_error() {
     let v = out.json();
     assert!(v["local"].is_array(), "{v}");
     assert_eq!(v["remote"][0]["label"], "somepeer", "{v}");
-    assert!(
-        !v["remote"][0]["error"].as_str().unwrap_or_default().is_empty(),
-        "{v}"
-    );
+    assert!(!v["remote"][0]["error"].as_str().unwrap_or_default().is_empty(), "{v}");
 }

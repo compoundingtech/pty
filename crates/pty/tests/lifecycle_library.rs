@@ -93,10 +93,7 @@ fn gc_dry_run_reports_without_mutating_then_applies_the_same_cleanup() {
     std::fs::write(registry::events_path(name), b"existing evidence\n").unwrap();
     let before = artifact_snapshot(name);
 
-    let preview: GcResult = gc(GcOptions {
-        dry_run: true,
-        ..Default::default()
-    });
+    let preview: GcResult = gc(GcOptions { dry_run: true, ..Default::default() });
     assert_eq!(preview.removed, [name]);
     assert!(preview.killed_orphan_children.is_empty());
     assert!(preview.abandoned.is_empty());
@@ -107,11 +104,7 @@ fn gc_dry_run_reports_without_mutating_then_applies_the_same_cleanup() {
     assert!(preview.kept.is_empty());
     assert!(preview.keep_expired.is_empty());
     assert!(preview.reap_skipped.is_empty());
-    assert_eq!(
-        artifact_snapshot(name),
-        before,
-        "dry-run GC changed the registry"
-    );
+    assert_eq!(artifact_snapshot(name), before, "dry-run GC changed the registry");
 
     let applied: GcResult = gc(GcOptions::default());
     assert_eq!(applied.removed, [name]);
@@ -124,10 +117,7 @@ fn stop_daemon(name: &str, started: &SpawnedDaemon) {
     let _ = wait_for_process_exit(started.pid as i32, Duration::from_secs(8));
     let _ = cleanup_owned_all(
         name,
-        &SessionGenerationOwner {
-            generation: started.generation.clone(),
-            pid: started.pid as i32,
-        },
+        &SessionGenerationOwner { generation: started.generation.clone(), pid: started.pid as i32 },
     );
 }
 
@@ -154,10 +144,7 @@ fn spawn_params_new_supplies_a_usable_cwd_to_a_real_daemon() {
         registry::check_daemon_identity(started.pid as i32, &published),
         registry::DaemonIdentityCheck::Match,
     );
-    assert_eq!(
-        published.generation.as_deref(),
-        Some(started.generation.as_str())
-    );
+    assert_eq!(published.generation.as_deref(), Some(started.generation.as_str()));
 
     stop_daemon(&name, &started);
 }
@@ -170,10 +157,7 @@ fn library_reaps_its_daemon_child_after_the_daemon_exits() {
     let name = unique_name("library-reaper");
     let mut params = SpawnParams::new(&name, "/bin/sh", &["-c".into(), "sleep 1".into()]);
     // Keep this test independent of the constructor-default finding above.
-    params.cwd = std::env::current_dir()
-        .expect("current directory")
-        .to_string_lossy()
-        .into_owned();
+    params.cwd = std::env::current_dir().expect("current directory").to_string_lossy().into_owned();
     params.tags.insert("keep".into(), "true".into());
     let started =
         spawn_daemon(Path::new(pty_bin()), params).expect("start short-lived real daemon");
@@ -195,10 +179,7 @@ fn library_reaps_its_daemon_child_after_the_daemon_exits() {
     // the child, and process-table absence proves that it did.
     let _ = cleanup_owned_all(
         &name,
-        &SessionGenerationOwner {
-            generation: started.generation,
-            pid: started.pid as i32,
-        },
+        &SessionGenerationOwner { generation: started.generation, pid: started.pid as i32 },
     );
 }
 
@@ -332,14 +313,14 @@ fn real_daemon_startup_retires_stale_exited_records_without_touching_live_or_unk
         daemon_pid: Some(pid),
         daemon_start_token: Some(token.clone()),
         daemon_boot_id: registry::read_boot_id(),
+        ephemeral: Some(false),
         ..Default::default()
     };
     registry::write_metadata_publication(&live_name, &live).unwrap();
-    let unknown = SessionMetadata {
-        daemon_start_token: None,
-        ..live.clone()
-    };
+    let unknown = SessionMetadata { daemon_start_token: None, ..live.clone() };
     registry::write_metadata_publication(&unknown_name, &unknown).unwrap();
+    let live_bytes = std::fs::read(registry::metadata_path(&live_name)).unwrap();
+    let unknown_bytes = std::fs::read(registry::metadata_path(&unknown_name)).unwrap();
 
     let params = SpawnParams::new(&name, "/bin/sh", &["-c".into(), "exec sleep 30".into()]);
     let started =
@@ -349,10 +330,9 @@ fn real_daemon_startup_retires_stale_exited_records_without_touching_live_or_unk
     assert!(companions.iter().all(|path| !path.exists()));
     assert_eq!(registry::read_metadata(&live_name), Some(live));
     assert_eq!(registry::read_metadata(&unknown_name), Some(unknown));
-    assert_eq!(
-        registry::read_process_start_token(pid).as_deref(),
-        Some(token.as_str())
-    );
+    assert_eq!(std::fs::read(registry::metadata_path(&live_name)).unwrap(), live_bytes);
+    assert_eq!(std::fs::read(registry::metadata_path(&unknown_name)).unwrap(), unknown_bytes);
+    assert_eq!(registry::read_process_start_token(pid).as_deref(), Some(token.as_str()));
     assert_eq!(
         registry::check_daemon_identity(
             started.pid as i32,

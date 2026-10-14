@@ -43,7 +43,8 @@ fn filter_tag_filters_json_output() {
     rig.daemon(&m, &["cat"], tagged(&[("layout", "work"), ("role", "srv")]));
     rig.daemon(&o, &["cat"], tagged(&[("layout", "play")]));
     let out = expect_json(&rig.pty(&["list", "--json", "--filter-tag", "layout=work"]));
-    let names: Vec<&str> = out.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> =
+        out.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec![m.as_str()]);
 }
 
@@ -56,9 +57,15 @@ fn filter_tag_requires_all_tags_to_match() {
     rig.daemon(&both, &["cat"], tagged(&[("layout", "work"), ("role", "srv")]));
     rig.daemon(&one, &["cat"], tagged(&[("layout", "work")]));
     let out = expect_json(&rig.pty(&[
-        "list", "--json", "--filter-tag", "layout=work", "--filter-tag", "role=srv",
+        "list",
+        "--json",
+        "--filter-tag",
+        "layout=work",
+        "--filter-tag",
+        "role=srv",
     ]));
-    let names: Vec<&str> = out.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> =
+        out.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec![both.as_str()]);
 }
 
@@ -175,7 +182,16 @@ fn run_tag_flag_sets_tags() {
     let rig = Rig::new();
     let name = unique_id("tag");
     let out = rig.pty(&[
-        "run", "-d", "--id", &name, "--tag", "owner=forge", "--tag", "env=staging", "--", "cat",
+        "run",
+        "-d",
+        "--id",
+        &name,
+        "--tag",
+        "owner=forge",
+        "--tag",
+        "env=staging",
+        "--",
+        "cat",
     ]);
     expect_status(&out, 0);
     let meta = rig.meta(&name).expect("metadata");
@@ -214,7 +230,7 @@ fn run_a_preserves_tags_of_an_exited_session() {
     let rig = Rig::new();
     let name = unique_id("tag");
     rig.daemon(&name, &["true"], tagged(&[("owner", "ci"), ("keep", "true")]));
-    rig.wait_for_exit(&name);
+    rig.wait_for_daemon_exit(&name);
     let out = rig.pty(&["run", "-a", "-d", "--id", &name, "--", "cat"]);
     expect_status(&out, 0);
     let meta = rig.meta(&name).unwrap();
@@ -227,7 +243,7 @@ fn run_a_with_new_tags_replaces_the_old_ones() {
     let rig = Rig::new();
     let name = unique_id("tag");
     rig.daemon(&name, &["true"], tagged(&[("owner", "old"), ("keep", "true")]));
-    rig.wait_for_exit(&name);
+    rig.wait_for_daemon_exit(&name);
     let out = rig.pty(&["run", "-a", "-d", "--id", &name, "--tag", "owner=new", "--", "cat"]);
     expect_status(&out, 0);
     let meta = rig.meta(&name).unwrap();

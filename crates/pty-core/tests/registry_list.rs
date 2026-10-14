@@ -11,11 +11,8 @@ use registry_support::{DEAD_PID, node_pty, root, run_node_pty, stale_socket, uni
 use serde_json::{Value, json};
 
 fn write_json(name: &str, value: Value) {
-    std::fs::write(
-        registry::metadata_path(name),
-        serde_json::to_string_pretty(&value).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(registry::metadata_path(name), serde_json::to_string_pretty(&value).unwrap())
+        .unwrap();
 }
 
 fn find(name: &str) -> registry::SessionInfo {
@@ -82,10 +79,7 @@ fn json_with_live_pid_and_no_socket_is_running_and_untouched() {
     let s = find(&name);
     assert_eq!(s.status, SessionStatus::Running);
     assert_eq!(s.pid, Some(std::process::id() as i32));
-    assert!(
-        registry::metadata_path(&name).exists(),
-        "listing never unlinks"
-    );
+    assert!(registry::metadata_path(&name).exists(), "listing never unlinks");
     assert!(registry::pid_path(&name).exists());
 }
 
@@ -114,10 +108,7 @@ fn reachable_socket_never_overrides_a_dead_pid() {
     let s = find(&name);
     assert_eq!(s.status, SessionStatus::Vanished);
     assert_eq!(s.pid, None);
-    assert!(
-        registry::socket_path(&name).exists(),
-        "listing never unlinks a socket"
-    );
+    assert!(registry::socket_path(&name).exists(), "listing never unlinks a socket");
 }
 
 /// A stale socket with a dead pid and an exit record is exited; without
@@ -225,11 +216,7 @@ fn daemon_pid_needs_a_matching_start_token() {
 
     v.as_object_mut().unwrap().remove("recovery");
     write_json(&name, v);
-    assert_eq!(
-        registry::read_pid(&name),
-        None,
-        "daemonPid alone is never trusted"
-    );
+    assert_eq!(registry::read_pid(&name), None, "daemonPid alone is never trusted");
 
     // The raw sidecar remains inspectable, but never overrides identity.
     std::fs::write(registry::pid_path(&name), "12abc").unwrap();
@@ -253,15 +240,9 @@ fn signal_target_binds_the_live_os_start_token() {
         daemon_boot_id: registry::read_boot_id(),
         ..Default::default()
     };
-    assert_eq!(
-        registry::read_signal_target_with(&name, Some(&live)),
-        Some(me)
-    );
+    assert_eq!(registry::read_signal_target_with(&name, Some(&live)), Some(me));
 
-    let stale = SessionMetadata {
-        daemon_start_token: Some("linux:0".to_string()),
-        ..live
-    };
+    let stale = SessionMetadata { daemon_start_token: Some("linux:0".to_string()), ..live };
     assert_eq!(registry::read_signal_target_with(&name, Some(&stale)), None);
 }
 
@@ -270,16 +251,8 @@ fn signal_target_binds_the_live_os_start_token() {
 fn tmp_files_are_skipped() {
     let root = root();
     let name = unique_name("tmp");
-    std::fs::write(
-        root.join(format!("{name}.json.tmp.1.abcdef0123456789")),
-        "{}",
-    )
-    .unwrap();
-    assert!(
-        registry::list_sessions()
-            .iter()
-            .all(|s| !s.name.starts_with(&name))
-    );
+    std::fs::write(root.join(format!("{name}.json.tmp.1.abcdef0123456789")), "{}").unwrap();
+    assert!(registry::list_sessions().iter().all(|s| !s.name.starts_with(&name)));
 }
 
 /// Sorted by name; `get_session` resolves ids first, unique display names
@@ -304,10 +277,7 @@ fn get_session_resolution_and_ambiguity() {
     write_json(&c, vc);
     write_json(&d, base(&d));
 
-    let names: Vec<String> = registry::list_sessions()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+    let names: Vec<String> = registry::list_sessions().into_iter().map(|s| s.name).collect();
     let mut sorted = names.clone();
     sorted.sort();
     assert_eq!(names, sorted);
@@ -318,10 +288,7 @@ fn get_session_resolution_and_ambiguity() {
         "exact id wins over c's display name"
     );
     assert_eq!(
-        registry::get_session(&format!("label-{d}"))
-            .unwrap()
-            .unwrap()
-            .name,
+        registry::get_session(&format!("label-{d}")).unwrap().unwrap().name,
         d,
         "a unique display name resolves"
     );
@@ -350,21 +317,13 @@ fn process_helpers() {
     assert!(!registry::pid_alive(DEAD_PID));
     assert!(!registry::pid_alive(0));
     assert!(!registry::pid_alive(-1));
-    assert!(
-        registry::pid_alive(1),
-        "pid 1 exists; EPERM counts as alive"
-    );
+    assert!(registry::pid_alive(1), "pid 1 exists; EPERM counts as alive");
     if !registry_support::skip_without_ps("stat=") {
-        assert!(!registry::has_process_exited_for_reap(
-            std::process::id() as i32
-        ));
+        assert!(!registry::has_process_exited_for_reap(std::process::id() as i32));
     }
     assert!(registry::has_process_exited_for_reap(DEAD_PID));
     let start = std::time::Instant::now();
-    assert!(registry::wait_for_process_exit(
-        DEAD_PID,
-        Duration::from_secs(1)
-    ));
+    assert!(registry::wait_for_process_exit(DEAD_PID, Duration::from_secs(1)));
     assert!(start.elapsed() < Duration::from_millis(500));
     assert!(!registry::wait_for_process_exit(
         std::process::id() as i32,
@@ -387,16 +346,10 @@ fn process_helpers() {
 #[test]
 fn socket_probe_budget_is_shared() {
     let root = root();
-    let paths: Vec<_> = (0..100)
-        .map(|i| root.join(format!("probe-{i}.sock")))
-        .collect();
+    let paths: Vec<_> = (0..100).map(|i| root.join(format!("probe-{i}.sock"))).collect();
     let start = std::time::Instant::now();
     let results = registry::probe_sockets_within_budget(&paths, Duration::from_millis(25));
-    assert!(
-        start.elapsed() < Duration::from_millis(250),
-        "{:?}",
-        start.elapsed()
-    );
+    assert!(start.elapsed() < Duration::from_millis(250), "{:?}", start.elapsed());
     assert!(results.values().all(|r| !r));
     assert!(!registry::socket_reachable(&root.join("probe-none.sock")));
 }
@@ -418,11 +371,7 @@ fn matches_node_list_json_on_a_mixed_directory() {
     exited["exitCode"] = json!(3);
     exited["exitedAt"] = json!("2026-04-05T10:16:03.000Z");
     write_json("m-exited", exited);
-    std::fs::write(
-        registry::pid_path("m-running"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    std::fs::write(registry::pid_path("m-running"), std::process::id().to_string()).unwrap();
     let mut running = base("m-running");
     bind_live(&mut running);
     write_json("m-running", running);
@@ -432,18 +381,10 @@ fn matches_node_list_json_on_a_mixed_directory() {
     let mut sockonly = base("m-sockonly");
     bind_live(&mut sockonly);
     write_json("m-sockonly", sockonly);
-    std::fs::write(
-        registry::pid_path("m-sockonly"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    std::fs::write(registry::pid_path("m-sockonly"), std::process::id().to_string()).unwrap();
 
     let out = run_node_pty(&bin, &root, &["list", "--json"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let node: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
     let node: Vec<(String, String, Option<i32>)> = node
         .into_iter()
@@ -467,10 +408,7 @@ fn matches_node_list_json_on_a_mixed_directory() {
         .collect();
     assert_eq!(rust, node);
     let statuses: Vec<&str> = rust.iter().map(|(_, s, _)| s.as_str()).collect();
-    assert_eq!(
-        statuses,
-        ["vanished", "exited", "running", "running", "vanished"]
-    );
+    assert_eq!(statuses, ["vanished", "exited", "running", "running", "vanished"]);
 }
 
 #[test]
@@ -511,20 +449,10 @@ fn strict_clean_inventory_matches_default_and_preserves_root() {
     assert!(inventory.complete);
     assert!(inventory.errors.is_empty());
     assert_eq!(inventory.root, dir);
+    assert_eq!(inventory.entries, registry::list_sessions_in(&dir, &options));
     assert_eq!(
-        inventory.entries,
-        registry::list_sessions_in(&dir, &options)
-    );
-    assert_eq!(
-        inventory
-            .entries
-            .iter()
-            .map(|s| (s.name.as_str(), s.status))
-            .collect::<Vec<_>>(),
-        vec![
-            ("retained", SessionStatus::Exited),
-            ("socket", SessionStatus::Running)
-        ]
+        inventory.entries.iter().map(|s| (s.name.as_str(), s.status)).collect::<Vec<_>>(),
+        vec![("retained", SessionStatus::Exited), ("socket", SessionStatus::Running)]
     );
     drop(listener);
     std::fs::remove_dir_all(dir).unwrap();
@@ -558,23 +486,13 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
             .collect::<Vec<_>>(),
         vec![
             ("dead-pid", SessionStatus::Vanished, None),
-            (
-                "live",
-                SessionStatus::Running,
-                Some(std::process::id() as i32)
-            ),
+            ("live", SessionStatus::Running, Some(std::process::id() as i32)),
             ("recorded-exit", SessionStatus::Exited, None),
         ]
     );
-    assert_eq!(
-        inventory.entries[2].metadata.as_ref().unwrap().exit_code,
-        Some(7)
-    );
+    assert_eq!(inventory.entries[2].metadata.as_ref().unwrap().exit_code, Some(7));
     // Tolerant and strict listings use the same identity boundary.
-    assert_eq!(
-        registry::list_sessions_in(&dir, &options),
-        inventory.entries
-    );
+    assert_eq!(registry::list_sessions_in(&dir, &options), inventory.entries);
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -587,10 +505,7 @@ fn strict_refused_socket_without_dead_pid_is_incomplete() {
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
-    assert_eq!(
-        inventory.errors[0].kind,
-        registry::InventoryErrorKind::IdentityUnknown
-    );
+    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::IdentityUnknown);
     assert_eq!(inventory.errors[0].path, dir.join("unknown.json"));
     assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
     // Recorded exit evidence does not prove an unknown process is gone.
@@ -611,10 +526,7 @@ fn strict_missing_root_is_incomplete_without_creating_it() {
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
     assert!(inventory.entries.is_empty());
-    assert_eq!(
-        inventory.errors[0].kind,
-        registry::InventoryErrorKind::RootMissing
-    );
+    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::RootMissing);
     assert_eq!(inventory.errors[0].path, dir);
     assert!(!dir.exists());
     assert!(registry::list_sessions_in(&dir, &options).is_empty());
@@ -624,16 +536,8 @@ fn strict_missing_root_is_incomplete_without_creating_it() {
 fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records() {
     use registry::InventoryErrorKind::{MetadataMalformed, PidMalformed};
     let dir = strict_root();
-    std::fs::write(
-        dir.join("good.json"),
-        format!(r#"{{"daemonPid":{DEAD_PID}}}"#),
-    )
-    .unwrap();
-    for (name, content) in [
-        ("broken", "{"),
-        ("array", "[]"),
-        ("wrongtype", r#"{"command":42}"#),
-    ] {
+    std::fs::write(dir.join("good.json"), format!(r#"{{"daemonPid":{DEAD_PID}}}"#)).unwrap();
+    for (name, content) in [("broken", "{"), ("array", "[]"), ("wrongtype", r#"{"command":42}"#)] {
         std::fs::write(dir.join(format!("{name}.json")), content).unwrap();
     }
     for (name, content) in [
@@ -649,36 +553,20 @@ fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records(
     let mut legacy = base("legacy");
     bind_live(&mut legacy);
     std::fs::write(dir.join("legacy.json"), legacy.to_string()).unwrap();
-    std::fs::write(
-        dir.join("legacy.pid"),
-        format!("{}junk", std::process::id()),
-    )
-    .unwrap();
+    std::fs::write(dir.join("legacy.pid"), format!("{}junk", std::process::id())).unwrap();
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
+    assert_eq!(inventory.entries, registry::list_sessions_in(&dir, &options));
     assert_eq!(
-        inventory.entries,
-        registry::list_sessions_in(&dir, &options)
-    );
-    assert_eq!(
-        inventory
-            .entries
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>(),
+        inventory.entries.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
         vec!["good", "legacy"]
     );
     assert_eq!(inventory.entries[1].status, SessionStatus::Running);
     let actual: Vec<_> = inventory
         .errors
         .iter()
-        .map(|error| {
-            (
-                error.path.file_name().unwrap().to_str().unwrap(),
-                error.kind,
-            )
-        })
+        .map(|error| (error.path.file_name().unwrap().to_str().unwrap(), error.kind))
         .collect();
     assert_eq!(
         actual,
@@ -719,21 +607,10 @@ fn strict_reports_unreadable_companions_and_non_utf8_entries() {
     assert!(!inventory.complete);
     assert!(inventory.entries.is_empty());
     for (path, kind) in [
-        (
-            dir.join("bad.json"),
-            registry::InventoryErrorKind::MetadataUnreadable,
-        ),
-        (
-            dir.join("orphan.pid"),
-            registry::InventoryErrorKind::PidUnreadable,
-        ),
+        (dir.join("bad.json"), registry::InventoryErrorKind::MetadataUnreadable),
+        (dir.join("orphan.pid"), registry::InventoryErrorKind::PidUnreadable),
     ] {
-        assert!(
-            inventory
-                .errors
-                .iter()
-                .any(|error| error.path == path && error.kind == kind)
-        );
+        assert!(inventory.errors.iter().any(|error| error.path == path && error.kind == kind));
     }
     if has_non_utf8_entry {
         assert!(inventory.errors.iter().any(|error| {
@@ -741,11 +618,7 @@ fn strict_reports_unreadable_companions_and_non_utf8_entries() {
         }));
         let encoded = serde_json::to_value(&inventory.errors).unwrap();
         assert!(
-            encoded
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|error| error["kind"] == "entry-unreadable")
+            encoded.as_array().unwrap().iter().any(|error| error["kind"] == "entry-unreadable")
         );
     }
     std::fs::remove_dir_all(dir).unwrap();
@@ -764,10 +637,7 @@ fn strict_reports_permission_denied_root_and_sidecars() {
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!inventory.complete);
-    assert_eq!(
-        inventory.errors[0].kind,
-        registry::InventoryErrorKind::RootUnreadable
-    );
+    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::RootUnreadable);
     for file in ["bad.json", "orphan.pid"] {
         let path = dir.join(file);
         std::fs::write(&path, b"{}").unwrap();
@@ -776,11 +646,7 @@ fn strict_reports_permission_denied_root_and_sidecars() {
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
     assert_eq!(
-        inventory
-            .errors
-            .iter()
-            .map(|error| error.kind)
-            .collect::<Vec<_>>(),
+        inventory.errors.iter().map(|error| error.kind).collect::<Vec<_>>(),
         vec![
             registry::InventoryErrorKind::MetadataUnreadable,
             registry::InventoryErrorKind::PidUnreadable
@@ -796,12 +662,7 @@ fn strict_reports_permission_denied_root_and_sidecars() {
             && error.kind == registry::InventoryErrorKind::IdentityUnknown
     }));
     assert_eq!(
-        inventory
-            .entries
-            .iter()
-            .find(|session| session.name == "denied")
-            .unwrap()
-            .status,
+        inventory.entries.iter().find(|session| session.name == "denied").unwrap().status,
         SessionStatus::Vanished
     );
     drop(listener);
@@ -821,9 +682,7 @@ fn saturated_or_refused_socket_cannot_rescue_a_gone_identity() {
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
     let queued = UnixStream::connect(&busy).unwrap();
     std::fs::write(dir.join("busy.pid"), DEAD_PID.to_string()).unwrap();
-    let options = registry::ListOptions {
-        socket_probe_budget: Duration::ZERO,
-    };
+    let options = registry::ListOptions { socket_probe_budget: Duration::ZERO };
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(inventory.complete);
     assert!(inventory.errors.is_empty());
@@ -841,10 +700,7 @@ fn saturated_or_refused_socket_cannot_rescue_a_gone_identity() {
             .any(|error| error.kind == registry::InventoryErrorKind::IdentityUnknown)
     );
     assert!(
-        unknown
-            .errors
-            .iter()
-            .any(|error| error.kind == registry::InventoryErrorKind::ProbeTimeout)
+        unknown.errors.iter().any(|error| error.kind == registry::InventoryErrorKind::ProbeTimeout)
     );
     std::fs::write(dir.join("busy.pid"), DEAD_PID.to_string()).unwrap();
     drop(queued);
@@ -888,10 +744,7 @@ fn sidecar_reuse_is_vanished_even_with_a_reachable_socket() {
         assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
         assert_eq!(inventory.entries[0].pid, None);
         assert_eq!(registry::read_pid("reused"), None);
-        assert_eq!(
-            registry::read_signal_target_with("reused", Some(&metadata)),
-            None
-        );
+        assert_eq!(registry::read_signal_target_with("reused", Some(&metadata)), None);
         assert!(registry::daemon_identity_counters().mismatched > before.mismatched);
         metadata.exited_at = Some("2026-10-01T00:00:00.000Z".into());
         registry::write_metadata_publication("reused", &metadata).unwrap();
@@ -905,10 +758,7 @@ fn unknown_identity_is_not_live_and_makes_strict_inventory_incomplete() {
     let dir = strict_root();
     registry::with_root(&dir, || {
         let pid = std::process::id() as i32;
-        let metadata = SessionMetadata {
-            daemon_pid: Some(pid),
-            ..Default::default()
-        };
+        let metadata = SessionMetadata { daemon_pid: Some(pid), ..Default::default() };
         registry::write_metadata_publication("unknown", &metadata).unwrap();
         registry::write_pid("unknown", pid as u32).unwrap();
         let _listener = UnixListener::bind(registry::socket_path("unknown")).unwrap();
@@ -919,14 +769,8 @@ fn unknown_identity_is_not_live_and_makes_strict_inventory_incomplete() {
         let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
         assert!(!inventory.complete);
         assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
-        assert_eq!(
-            inventory.errors[0].kind,
-            registry::InventoryErrorKind::IdentityUnknown
-        );
-        assert_eq!(
-            registry::read_signal_target_with("unknown", Some(&metadata)),
-            None
-        );
+        assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::IdentityUnknown);
+        assert_eq!(registry::read_signal_target_with("unknown", Some(&metadata)), None);
         assert!(!registry::retire_stale_daemon_record("unknown", &metadata));
         assert!(registry::metadata_path("unknown").exists());
     });
@@ -941,6 +785,7 @@ fn boot_identity_and_leader_identity_are_required() {
     let mut metadata = SessionMetadata {
         daemon_pid: Some(pid),
         daemon_start_token: Some(token),
+        ephemeral: Some(false),
         ..Default::default()
     };
     // A token-only record cannot prove which boot owns this PID.
@@ -948,14 +793,8 @@ fn boot_identity_and_leader_identity_are_required() {
         registry::check_daemon_identity(pid, &metadata),
         registry::DaemonIdentityCheck::Unknown
     );
-    assert_eq!(
-        registry::read_signal_target_with("token-only", Some(&metadata)),
-        None
-    );
-    assert!(!registry::retire_stale_daemon_record(
-        "token-only",
-        &metadata
-    ));
+    assert_eq!(registry::read_signal_target_with("token-only", Some(&metadata)), None);
+    assert!(!registry::retire_stale_daemon_record("token-only", &metadata));
     metadata.daemon_boot_id = registry::read_boot_id();
     assert!(metadata.daemon_boot_id.is_some());
     assert_eq!(
@@ -973,10 +812,7 @@ fn boot_identity_and_leader_identity_are_required() {
         let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
         assert!(inventory.complete);
         assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
-        assert_eq!(
-            registry::read_signal_target_with("old-boot", Some(&metadata)),
-            None
-        );
+        assert_eq!(registry::read_signal_target_with("old-boot", Some(&metadata)), None);
         assert!(registry::retire_stale_daemon_record("old-boot", &metadata));
     });
     std::fs::remove_dir_all(dir).unwrap();
@@ -1005,10 +841,7 @@ fn boot_identity_and_leader_identity_are_required() {
         let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
         assert!(inventory.complete);
         assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
-        assert_eq!(
-            registry::read_signal_target_with("thread", Some(&metadata)),
-            None
-        );
+        assert_eq!(registry::read_signal_target_with("thread", Some(&metadata)), None);
     });
     std::fs::remove_dir_all(dir).unwrap();
     release_tx.send(()).unwrap();
@@ -1073,10 +906,7 @@ fn startup_retirement_removes_stale_exited_history_but_not_live_unknown_or_own_n
             ..Default::default()
         };
         seed_retirement_record("live", &live);
-        let unknown = SessionMetadata {
-            daemon_start_token: None,
-            ..live.clone()
-        };
+        let unknown = SessionMetadata { daemon_start_token: None, ..live.clone() };
         seed_retirement_record("unknown", &unknown);
         assert_eq!(registry::retire_stale_daemon_records("starting"), 4);
         for name in ["stale-a", "stale-b", "gone-a", "gone-b"] {
@@ -1104,13 +934,12 @@ fn retirement_revalidates_generation_sidecar_and_both_locks() {
             daemon_pid: Some(pid),
             daemon_start_token: Some("stale:token".into()),
             daemon_boot_id: registry::read_boot_id(),
+            ephemeral: Some(false),
             ..Default::default()
         };
         seed_retirement_record("fenced", &observed);
-        let replacement = SessionMetadata {
-            generation: Some("new-generation".into()),
-            ..observed.clone()
-        };
+        let replacement =
+            SessionMetadata { generation: Some("new-generation".into()), ..observed.clone() };
         registry::write_metadata_publication("fenced", &replacement).unwrap();
         assert!(!registry::retire_stale_daemon_record("fenced", &observed));
         assert_eq!(registry::read_metadata("fenced"), Some(replacement));
@@ -1125,10 +954,7 @@ fn retirement_revalidates_generation_sidecar_and_both_locks() {
                 .iter()
                 .any(|error| error.kind == registry::InventoryErrorKind::IdentityUnknown)
         );
-        assert_eq!(
-            registry::read_signal_target_with("fenced", Some(&observed)),
-            None
-        );
+        assert_eq!(registry::read_signal_target_with("fenced", Some(&observed)), None);
         registry::write_pid("fenced", pid as u32).unwrap();
         {
             let _lock = registry::acquire_event_lock("fenced").unwrap();
@@ -1138,17 +964,9 @@ fn retirement_revalidates_generation_sidecar_and_both_locks() {
             let _lock = registry::acquire_lock("fenced").unwrap();
             assert!(!registry::retire_stale_daemon_record("fenced", &observed));
         }
-        assert!(
-            retirement_artifacts("fenced")
-                .iter()
-                .all(|path| path.exists())
-        );
+        assert!(retirement_artifacts("fenced").iter().all(|path| path.exists()));
         assert!(registry::retire_stale_daemon_record("fenced", &observed));
-        assert!(
-            retirement_artifacts("fenced")
-                .iter()
-                .all(|path| !path.exists())
-        );
+        assert!(retirement_artifacts("fenced").iter().all(|path| !path.exists()));
     });
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1160,10 +978,7 @@ fn a_live_orphan_pid_is_incomplete_not_replacement_authority() {
     let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
     assert!(!inventory.complete);
     assert!(inventory.entries.is_empty());
-    assert_eq!(
-        inventory.errors[0].kind,
-        registry::InventoryErrorKind::IdentityUnknown
-    );
+    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::IdentityUnknown);
     assert_eq!(inventory.errors[0].path, dir.join("orphan.pid"));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1183,11 +998,7 @@ fn retirement_preserves_malformed_and_nonregular_identity_companions() {
         seed_retirement_record("invalid", &stale);
         std::fs::write(registry::pid_path("invalid"), b"not-a-pid").unwrap();
         assert!(!registry::retire_stale_daemon_record("invalid", &stale));
-        assert!(
-            retirement_artifacts("invalid")
-                .iter()
-                .all(|path| path.exists())
-        );
+        assert!(retirement_artifacts("invalid").iter().all(|path| path.exists()));
         let fifo_path = registry::metadata_path("fifo");
         let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
         // SAFETY: fifo is a valid NUL-terminated path to a missing fixture.
@@ -1211,6 +1022,7 @@ fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
             created_at: registry::now_iso8601(),
             exited_at: Some(registry::now_iso8601()),
             exit_code: Some(0),
+            ephemeral: Some(false),
             ..Default::default()
         };
         seed_retirement_record("current-gone", &current_gone);
@@ -1220,10 +1032,7 @@ fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
             ..current_gone.clone()
         };
         seed_retirement_record("legacy-old", &legacy_old);
-        let unknown_age = SessionMetadata {
-            created_at: String::new(),
-            ..legacy_old.clone()
-        };
+        let unknown_age = SessionMetadata { created_at: String::new(), ..legacy_old.clone() };
         seed_retirement_record("unknown-age", &unknown_age);
         for (name, base, key, value) in [
             ("keep-current", &current_gone, "keep", "true"),
@@ -1235,10 +1044,9 @@ fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
             retained.tags = Some(registry::TagMap::from([(key.into(), value.into())]));
             seed_retirement_record(name, &retained);
         }
-        for (name, key, value) in [
-            ("keep-mismatch", "keep", "true"),
-            ("permanent-mismatch", "strategy", "permanent"),
-        ] {
+        for (name, key, value) in
+            [("keep-mismatch", "keep", "true"), ("permanent-mismatch", "strategy", "permanent")]
+        {
             let mut retained = legacy_old.clone();
             retained.daemon_pid = Some(std::process::id() as i32);
             retained.daemon_boot_id = registry::read_boot_id();
@@ -1246,11 +1054,7 @@ fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
             seed_retirement_record(name, &retained);
         }
         assert_eq!(registry::retire_stale_daemon_records("starting"), 1);
-        assert!(
-            retirement_artifacts("legacy-old")
-                .iter()
-                .all(|path| !path.exists())
-        );
+        assert!(retirement_artifacts("legacy-old").iter().all(|path| !path.exists()));
         for name in [
             "current-gone",
             "unknown-age",
@@ -1261,25 +1065,15 @@ fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
             "keep-mismatch",
             "permanent-mismatch",
         ] {
-            assert!(
-                retirement_artifacts(name).iter().all(|path| path.exists()),
-                "{name}"
-            );
+            assert!(retirement_artifacts(name).iter().all(|path| path.exists()), "{name}");
         }
         #[cfg(target_os = "linux")]
         {
             let mut old_boot = current_gone.clone();
             old_boot.daemon_boot_id = Some("previous-boot".into());
             seed_retirement_record("old-boot-gone", &old_boot);
-            assert!(registry::retire_stale_daemon_record(
-                "old-boot-gone",
-                &old_boot
-            ));
-            assert!(
-                retirement_artifacts("old-boot-gone")
-                    .iter()
-                    .all(|path| !path.exists())
-            );
+            assert!(registry::retire_stale_daemon_record("old-boot-gone", &old_boot));
+            assert!(retirement_artifacts("old-boot-gone").iter().all(|path| !path.exists()));
         }
     });
     std::fs::remove_dir_all(dir).unwrap();
