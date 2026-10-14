@@ -240,4 +240,8 @@ signal mask and dispositions to match. Each of these was reverted once to see it
   closed and unregistered as one step, read locks registered, files named
   by inode;
 - the kernel-thread rule, and the layout check of every `kinfo_proc` field;
-- the hand-over of a kill after the commit.
+- the hand-over of a kill after the commit;
+- the macOS exiting-process rule. With it reverted, the row decoding fails
+  every time, and the gate-shaped exit fails now and then. With it and the
+  pin's early watch both reverted, recovery's own sequence fails too. Either
+  one alone kept that sequence passing.
