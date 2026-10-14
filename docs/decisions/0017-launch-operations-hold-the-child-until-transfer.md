@@ -79,10 +79,11 @@ both. A cancel before transfer is complete when those are gone.
 
 - The daemon ends its own child only through the session substrate, which
   holds its reap lock across the signal, so the pid cannot have been reused.
-  It waits for that exit on a pidfd (Linux) or a kqueue (macOS).
+  It waits for that exit on a pidfd (Linux) or a kqueue (macOS), armed
+  before the gate shuts, so the wait is on this child's exit.
 - Recovery, which is not the child's parent, pins the process first and
   checks the pinned process is the recorded identity, then sends `SIGKILL`
-  through the pin:
+  through the pin. Its exit watch is armed with the pin, before the signal:
   - **Linux:** a `pidfd`; a signal through it cannot reach a later holder of
     the pid.
   - **macOS:** an audit token from the task name port; the kernel delivers
@@ -174,9 +175,18 @@ them:
   whose `kinfo_proc` offsets were measured on one Mac. Before any of them is
   believed, each process reads its own row once and every field must say
   back what it knows of itself: its pid, parent, group, real and effective
-  uid, start time and running state. A layout that fails makes every such
-  read unknown, and so the scan incomplete. Its limit: a field that reads a
-  neighbour holding the same value for the reading process passes.
+  uid, start time, running state, and flags as a 64-bit process not
+  exiting. A layout that fails makes every such read unknown, and so the
+  scan incomplete. Its limit: a field that reads a neighbour holding the
+  same value for the reading process passes.
+- On macOS a process whose exit is under way reads as exited. From the
+  start of its exit until it is a zombie, `p_stat` still says `SRUN`, and
+  `proc_pidinfo` already refuses it, so `KERN_PROC_PID` is the row read; its
+  `P_WEXIT` flag decides. Measured on macOS 27, reading right after an exit
+  was seen: `SRUN` in 1,265 of 2,400 rounds, `P_WEXIT` in all 2,400, and in
+  none of 2,400 running children. Before this, recovery's read after the
+  exit could call the killed child live and record the retirement
+  incomplete.
 - A process may not open an operation lock file it already has open
   (settle, or the holder query, while it holds the write lock, say). The
   call is refused instead.

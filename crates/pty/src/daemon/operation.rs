@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 
 use pty_core::events::EventWriter;
 use pty_core::operation::barrier::{self, barrier};
+use pty_core::operation::exact::{Exit, ExitWatch};
 use pty_core::operation::frames::{
     FRAME_MAX_BYTES, OwnerCommand, OwnerFrame, RejectCode, TicketView, parse_owner_frame,
     producer_frame,
@@ -1586,8 +1587,11 @@ impl Actor {
         let mut evidence = Map::new();
         let mut verified = true;
         if let Some(child) = &self.child {
+            // Armed while the held child still runs, so the wait is on this
+            // child's exit, however soon the shut gate brings it.
+            let watch = ExitWatch::arm(child.pid);
             held::shut(&child.gate);
-            let outcome = verify_child_gone(child);
+            let outcome = verify_child_gone(child, &watch);
             evidence.insert("child".into(), json!({"pid": child.pid, "status": outcome}));
             verified &= outcome == "gone";
         }
@@ -1717,21 +1721,20 @@ impl Actor {
 /// (it is stopped, say) is killed through the substrate, whose signals are
 /// fenced against reaping, so its pid cannot name anyone else. Both waits
 /// end on the child's exit (a pidfd, a kqueue), not on a timer; the timer
-/// only bounds them. A held child never forks, so there is no group to
-/// signal.
-fn verify_child_gone(child: &ChildRecord) -> &'static str {
-    use pty_core::operation::exact::{Exit, wait_for_exit};
+/// only bounds them. `watch` was armed before the gate shut (see
+/// [`ExitWatch`]). A held child never forks, so there is no group to signal.
+fn verify_child_gone(child: &ChildRecord, watch: &ExitWatch) -> &'static str {
     let Some(id) = &child.id else {
         return "unrecorded";
     };
     let boot = pty_core::boot::read_boot_identity();
     let gone = || id.liveness(&ProcTable::read(), boot.as_deref()) == Liveness::Gone;
-    let _ = wait_for_exit(child.pid, Duration::from_secs(1));
+    let _ = watch.wait(Duration::from_secs(1));
     if gone() {
         return "gone";
     }
     let _ = child.session.kill();
-    let waited = wait_for_exit(child.pid, Duration::from_secs(5));
+    let waited = watch.wait(Duration::from_secs(5));
     if gone() {
         "gone"
     } else if waited == Exit::Unsupported {

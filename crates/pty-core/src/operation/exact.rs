@@ -16,7 +16,9 @@
 //! caller reports the process as unknown and leaves it to a person.
 //!
 //! Waiting is reactive: a `pidfd` becomes readable, and a kqueue
-//! `EVFILT_PROC`/`NOTE_EXIT` filter fires, when the process exits.
+//! `EVFILT_PROC`/`NOTE_EXIT` filter fires, when the process exits. Both are
+//! armed while the process still runs, before anything that can end it (see
+//! [`ExitWatch`]).
 
 use std::time::Duration;
 
@@ -31,6 +33,9 @@ pub struct Exact {
     pidfd: std::os::fd::OwnedFd,
     #[cfg(target_os = "macos")]
     token: darwin::AuditToken,
+    /// Armed at the pin, before any signal can end the process.
+    #[cfg(target_os = "macos")]
+    watch: ExitWatch,
     pid: i32,
 }
 
@@ -88,10 +93,18 @@ impl Exact {
         if unsupported_for_test() || !darwin::available() {
             return Err(UNSUPPORTED);
         }
-        match darwin::token_of(pid) {
-            Ok(token) => Ok(Some(Exact { token, pid })),
-            Err(darwin::TokenError::Gone) => Ok(None),
-            Err(darwin::TokenError::Refused) => Err("task-port-refused"),
+        let token = match darwin::token_of(pid) {
+            Ok(token) => token,
+            Err(darwin::TokenError::Gone) => return Ok(None),
+            Err(darwin::TokenError::Refused) => return Err("task-port-refused"),
+        };
+        // A process that cannot be watched is not signalled: its exit could
+        // never be seen, only guessed at.
+        let watch = ExitWatch::arm(pid);
+        match watch.state {
+            WatchState::Armed(_) => Ok(Some(Exact { token, watch, pid })),
+            WatchState::Ended => Ok(None),
+            WatchState::Unsupported => Err("exit-watch-unavailable"),
         }
     }
 
@@ -145,7 +158,11 @@ impl Exact {
             use std::os::fd::AsRawFd;
             poll_readable(self.pidfd.as_raw_fd(), timeout)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.watch.wait(timeout) == Exit::Exited
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             wait_for_exit(self.pid, timeout) == Exit::Exited
         }
@@ -193,34 +210,98 @@ pub enum Exit {
 }
 
 /// Wait, reactively, for `pid` to exit. A zombie has exited.
+///
+/// The watch is armed by this call, on whatever process holds `pid` then,
+/// and a process that began to exit before it reads as exited at once. A
+/// caller about to end a process arms an [`ExitWatch`] first.
 pub fn wait_for_exit(pid: i32, timeout: Duration) -> Exit {
+    ExitWatch::arm(pid).wait(timeout)
+}
+
+/// A watch on one process's exit, armed while the process still runs.
+///
+/// **Arm it before the action that can end the process.** A watch armed
+/// on the running process is bound to that process: its exit is the event,
+/// whichever process holds the pid by the time anyone waits. One attached
+/// afterwards is attached to whatever the pid names then. On macOS a
+/// `NOTE_EXIT` filter attached once the process has begun to exit is
+/// refused with `ESRCH`, which reads as exited; measured on macOS 27
+/// (2026-10-14), that was most rounds once 20 µs separated a `SIGKILL` from
+/// the attach. The process table can still say `SRUN` at that moment, and
+/// even when an armed filter has fired; [`crate::proctable`] reads such a
+/// process as exited by its `P_WEXIT` flag.
+pub struct ExitWatch {
+    state: WatchState,
+}
+
+enum WatchState {
     #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::{AsRawFd, FromRawFd};
+    Armed(std::os::fd::OwnedFd),
+    #[cfg(target_os = "macos")]
+    Armed(darwin::Watch),
+    /// It had exited, or begun to, before the watch was armed.
+    Ended,
+    /// This platform cannot watch a process it did not start.
+    Unsupported,
+}
+
+impl ExitWatch {
+    /// Arm a watch on `pid`'s exit.
+    pub fn arm(pid: i32) -> ExitWatch {
+        let state = Self::arm_state(pid);
+        ExitWatch { state }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm_state(pid: i32) -> WatchState {
+        use std::os::fd::FromRawFd;
         // SAFETY: pidfd_open returns a new descriptor or -1.
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             return match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ESRCH) => Exit::Exited,
-                _ => Exit::Unsupported,
+                Some(libc::ESRCH) => WatchState::Ended,
+                _ => WatchState::Unsupported,
             };
         }
         // SAFETY: a descriptor this call just received.
-        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
-        if poll_readable(pidfd.as_raw_fd(), timeout) {
-            Exit::Exited
-        } else {
-            Exit::Running
+        WatchState::Armed(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn arm_state(pid: i32) -> WatchState {
+        match darwin::Watch::arm(pid) {
+            Ok(watch) => WatchState::Armed(watch),
+            Err(Exit::Exited) => WatchState::Ended,
+            Err(_) => WatchState::Unsupported,
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        darwin::wait_exit(pid, timeout)
-    }
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (pid, timeout);
-        Exit::Unsupported
+    fn arm_state(_pid: i32) -> WatchState {
+        WatchState::Unsupported
+    }
+
+    /// Wait at most `timeout` for the exit. A watch that has seen it says so
+    /// again at once.
+    pub fn wait(&self, timeout: Duration) -> Exit {
+        match &self.state {
+            #[cfg(target_os = "linux")]
+            WatchState::Armed(pidfd) => {
+                use std::os::fd::AsRawFd;
+                if poll_readable(pidfd.as_raw_fd(), timeout) {
+                    Exit::Exited
+                } else {
+                    Exit::Running
+                }
+            }
+            #[cfg(target_os = "macos")]
+            WatchState::Armed(watch) => watch.wait(timeout),
+            WatchState::Ended => Exit::Exited,
+            WatchState::Unsupported => {
+                let _ = timeout;
+                Exit::Unsupported
+            }
+        }
     }
 }
 
@@ -322,13 +403,24 @@ mod darwin {
         }
     }
 
-    pub fn wait_exit(pid: i32, timeout: Duration) -> Exit {
-        // SAFETY: kqueue and kevent on storage owned here.
-        unsafe {
-            let kq = libc::kqueue();
-            if kq < 0 {
-                return Exit::Unsupported;
+    /// A kqueue with a `NOTE_EXIT` filter attached to one process.
+    pub struct Watch {
+        kq: std::os::fd::OwnedFd,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl Watch {
+        /// Attach the filter now. `Err(Exit::Exited)` when the process has
+        /// exited or begun to: the kernel refuses the filter with `ESRCH`.
+        pub fn arm(pid: i32) -> Result<Watch, Exit> {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            // SAFETY: kqueue returns a new descriptor or -1.
+            let raw = unsafe { libc::kqueue() };
+            if raw < 0 {
+                return Err(Exit::Unsupported);
             }
+            // SAFETY: a descriptor this call just received.
+            let kq = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
             let change = libc::kevent {
                 ident: pid as libc::uintptr_t,
                 filter: libc::EVFILT_PROC,
@@ -337,32 +429,68 @@ mod darwin {
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
-            let mut event: libc::kevent = std::mem::zeroed();
-            let span = libc::timespec {
-                tv_sec: timeout.as_secs() as libc::time_t,
-                tv_nsec: timeout.subsec_nanos() as libc::c_long,
+            // With no room for events, a change that fails is returned as
+            // -1 and errno.
+            // SAFETY: one change on our own kqueue, no events read.
+            let n = unsafe {
+                libc::kevent(
+                    kq.as_raw_fd(),
+                    &change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
             };
-            let n = libc::kevent(kq, &change, 1, &mut event, 1, &span);
-            let error = std::io::Error::last_os_error().raw_os_error();
-            libc::close(kq);
             if n < 0 {
-                return if error == Some(libc::ESRCH) {
-                    Exit::Exited
-                } else {
-                    Exit::Unsupported
+                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ESRCH) => Exit::Exited,
+                    _ => Exit::Unsupported,
+                });
+            }
+            Ok(Watch {
+                kq,
+                fired: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        pub fn wait(&self, timeout: Duration) -> Exit {
+            use std::os::fd::AsRawFd;
+            use std::sync::atomic::Ordering;
+            if self.fired.load(Ordering::SeqCst) {
+                return Exit::Exited;
+            }
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let span = libc::timespec {
+                    tv_sec: left.as_secs() as libc::time_t,
+                    tv_nsec: left.subsec_nanos() as libc::c_long,
                 };
-            }
-            if n == 0 {
-                return Exit::Running;
-            }
-            if event.flags & libc::EV_ERROR != 0 {
-                return if event.data as i32 == libc::ESRCH {
-                    Exit::Exited
-                } else {
-                    Exit::Unsupported
+                // SAFETY: an all-zero kevent is a valid value to overwrite.
+                let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+                // SAFETY: reads at most one event from our own kqueue.
+                let n = unsafe {
+                    libc::kevent(
+                        self.kq.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        &mut event,
+                        1,
+                        &span,
+                    )
                 };
+                if n > 0 {
+                    self.fired.store(true, Ordering::SeqCst);
+                    return Exit::Exited;
+                }
+                if n == 0 {
+                    return Exit::Running;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return Exit::Unsupported;
+                }
             }
-            Exit::Exited
         }
     }
 }
@@ -421,5 +549,97 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         let _ = child.wait();
+    }
+
+    /// **A process seen to exit through its pin reads as gone at once.**
+    /// Recovery's own sequence: pin, `SIGKILL`, wait, read. On macOS the
+    /// read used to land between the start of the exit and `SZOMB` and call
+    /// the process live (measured: about a third of rounds on a loaded host).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_seen_to_exit_through_its_pin_reads_as_gone() {
+        let boot = crate::boot::read_boot_identity();
+        for round in 0..200 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let id = ProcessId::of(child.id()).unwrap();
+            let pinned = Exact::pin(&id, boot.as_deref()).unwrap().expect("live");
+            pinned.signal(libc::SIGKILL).unwrap();
+            assert!(pinned.wait_exit(Duration::from_secs(5)), "round {round}");
+            assert_eq!(
+                id.liveness_now(boot.as_deref()),
+                Liveness::Gone,
+                "round {round}"
+            );
+            let _ = child.wait();
+        }
+    }
+
+    /// **A child that leaves on end of file reads as gone once the wait for
+    /// it ends**, in the order the daemon first used: the gate shuts, then
+    /// the wait starts, then the table is read. That order is the widest
+    /// window, since the child may be mid-exit when the wait starts.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_child_leaving_on_end_of_file_reads_as_gone_after_the_wait() {
+        use std::io::BufRead;
+        let boot = crate::boot::read_boot_identity();
+        for round in 0..300 {
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "echo held; read gate"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut prepared = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut prepared)
+                .unwrap();
+            let id = ProcessId::of(child.id()).unwrap();
+            drop(child.stdin.take());
+            assert_eq!(
+                wait_for_exit(child.id() as i32, Duration::from_secs(5)),
+                Exit::Exited,
+                "round {round}"
+            );
+            assert_eq!(
+                id.liveness_now(boot.as_deref()),
+                Liveness::Gone,
+                "round {round}"
+            );
+            let _ = child.wait();
+        }
+    }
+
+    /// A watch armed on the running process sees its exit, and says so
+    /// again at once when asked a second time.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_watch_armed_before_the_end_sees_it() {
+        let boot = crate::boot::read_boot_identity();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let id = ProcessId::of(child.id()).unwrap();
+        let watch = ExitWatch::arm(child.id() as i32);
+        assert_eq!(watch.wait(Duration::from_millis(50)), Exit::Running);
+        child.kill().unwrap();
+        assert_eq!(watch.wait(Duration::from_secs(5)), Exit::Exited);
+        assert_eq!(id.liveness_now(boot.as_deref()), Liveness::Gone);
+        let started = std::time::Instant::now();
+        assert_eq!(watch.wait(Duration::from_secs(5)), Exit::Exited);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "seen once is seen"
+        );
+        let _ = child.wait();
+        assert_eq!(
+            ExitWatch::arm(child.id() as i32).wait(Duration::from_secs(1)),
+            Exit::Exited,
+            "a reaped pid is an exit already seen"
+        );
     }
 }
