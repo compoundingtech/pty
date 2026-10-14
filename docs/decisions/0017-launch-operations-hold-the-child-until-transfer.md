@@ -260,4 +260,5 @@ signal mask and dispositions to match. Each of these was reverted once to see it
 - the exiting state, the read after an observed exit, and the `P_WEXIT`
   read. Each one reverted fails its own test, every time. With recovery's
   kill as it was (watch armed after the signal, table read once), the macOS
-  kill test failed in 4 of 5 runs.
+  kill test failed in all 5 runs, and `recovery_signals_only_a_proven_identity`
+  in 3 of 30.
