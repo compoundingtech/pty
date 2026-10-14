@@ -212,7 +212,7 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
 
     daemon.signal(name, pid, metadata)?;
 
-    if !daemon.wait_for_exit(pid, metadata, SHUTDOWN_WAIT) {
+    if !daemon.wait_for_exit(SHUTDOWN_WAIT) {
         return Err(StopError::DaemonStillRunning {
             name: name.to_string(),
             pid,
@@ -393,14 +393,12 @@ fn verified_empty(after: &Aftermath, escalated: Option<&[i32]>) -> bool {
 /// tags or resolving the numeric PID again.
 pub struct SignalledDaemon {
     handle: DaemonHandle,
-    pid: i32,
-    identity: SessionMetadata,
 }
 
 impl SignalledDaemon {
     /// Wait only for the process bound when it was signalled.
     pub fn wait_for_exit(&self, timeout: Duration) -> bool {
-        self.handle.wait_for_exit(self.pid, &self.identity, timeout)
+        self.handle.wait_for_exit(timeout)
     }
 }
 
@@ -413,16 +411,7 @@ pub fn signal_daemon(
 ) -> Result<SignalledDaemon, StopError> {
     let handle = DaemonHandle::open(name, pid, metadata)?;
     handle.signal(name, pid, metadata)?;
-    Ok(SignalledDaemon {
-        handle,
-        pid,
-        identity: SessionMetadata {
-            daemon_pid: Some(pid),
-            daemon_start_token: metadata.daemon_start_token().map(str::to_owned),
-            daemon_boot_id: metadata.daemon_boot_id.clone(),
-            ..SessionMetadata::default()
-        },
-    })
+    Ok(SignalledDaemon { handle })
 }
 
 fn require_daemon_identity(
@@ -482,7 +471,7 @@ impl DaemonHandle {
             })
     }
 
-    fn wait_for_exit(&self, _pid: i32, _metadata: &SessionMetadata, timeout: Duration) -> bool {
+    fn wait_for_exit(&self, timeout: Duration) -> bool {
         #[cfg(target_os = "linux")]
         {
             self.handle.wait_exit(timeout)
@@ -494,7 +483,10 @@ impl DaemonHandle {
             // not a process whose exit this operation may wait for.
             let start = std::time::Instant::now();
             loop {
-                if original_owner_exited(&self.start_token, &pty_core::proctable::process(_pid)) {
+                if original_owner_exited(
+                    &self.start_token,
+                    &pty_core::proctable::process(self.handle.pid()),
+                ) {
                     return true;
                 }
                 if start.elapsed() >= timeout {
