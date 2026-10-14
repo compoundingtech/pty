@@ -144,42 +144,9 @@ pub fn monotonic_now_ns() -> Option<u128> {
     Some(seconds * 1_000_000_000 + nanos)
 }
 
+/// The host's current boot, shared with the launch-operation record.
 pub fn read_boot_identity() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let value = value.trim();
-        return (!value.is_empty()).then(|| format!("linux:{value}"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let name = c"kern.boottime";
-        let mut value: libc::timeval = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::timeval>();
-        // SAFETY: the name is NUL-terminated; `value` and `len` describe a
-        // writable `timeval`, and no replacement value is supplied.
-        if unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&mut value as *mut libc::timeval).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        } != 0
-            || len != std::mem::size_of::<libc::timeval>()
-        {
-            return None;
-        }
-        return Some(format!(
-            "darwin:{{ sec = {}, usec = {} }}",
-            value.tv_sec, value.tv_usec
-        ));
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
+    pty_core::boot::read_boot_identity()
 }
 
 #[cfg(test)]

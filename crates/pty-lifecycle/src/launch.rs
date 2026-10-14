@@ -186,7 +186,6 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-
 /// The config object Node's spawner serializes, in its key order.
 ///
 /// node: src/spawn.ts:169-184
@@ -354,14 +353,231 @@ pub fn spawn_daemon(
     daemon_executable: &std::path::Path,
     params: SpawnParams,
 ) -> Result<SpawnedDaemon, SpawnError> {
+    let name = params.name.clone();
+    let timeout = params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT);
+    let (mut watch, pid) = start_daemon_process(daemon_executable, &params, None)?;
+    let outcome = wait_for_publication(&name, pid, timeout, &mut watch);
+    if let Err(err) = &outcome
+        && !matches!(err, SpawnError::DaemonExited { .. })
+    {
+        // SAFETY: SIGTERM to the pid we spawned.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    // Keep a waiter alive for this direct child. Detaching changes its session,
+    // not its parent; without waitpid an embedding process accumulates zombies.
+    std::thread::spawn(move || {
+        let _ = watch.child.wait();
+    });
+    outcome
+}
+
+/// The variable naming a launch-operation daemon's control socket.
+pub const OPERATION_FD_ENV: &str = "PTY_DAEMON_OPERATION_FD";
+/// The variable naming a launch-operation daemon's gate.
+pub const GATE_FD_ENV: &str = "PTY_DAEMON_GATE_FD";
+
+/// What a launch-operation daemon inherits besides today's config and
+/// readiness descriptors.
+#[derive(Debug, Clone)]
+pub struct OperationLaunch {
+    /// The owner's control socket, already re-homed at 10 or above.
+    pub control_fd: RawFd,
+    /// `<h>`, carried in the daemon's argv as its birth marker.
+    pub digest: String,
+}
+
+/// A launch-operation daemon, forked and blocked at its gate.
+///
+/// Nothing it does is visible until [`GatedDaemon::release`]: its first act
+/// is to read the gate, and end of file there makes it `_exit(70)` with no
+/// other action. The gate's write end exists only in this process.
+pub struct GatedDaemon {
+    pid: u32,
+    gate: Option<File>,
+    watch: ChildWatch,
+    name: String,
+    timeout: Duration,
+}
+
+impl GatedDaemon {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Open the gate, then wait for publication and readiness the way
+    /// [`spawn_daemon`] does. The daemon is never signalled: in operation
+    /// mode it alone decides, and this wait is informational.
+    pub fn release(mut self) -> Result<SpawnedDaemon, SpawnError> {
+        let opened = self
+            .gate
+            .take()
+            .map(|mut gate| gate.write_all(&[1]).and_then(|()| gate.flush()));
+        let outcome = match opened {
+            Some(Ok(())) => {
+                wait_for_publication(&self.name, self.pid, self.timeout, &mut self.watch)
+            }
+            Some(Err(error)) => Err(SpawnError::Io(format!(
+                "cannot open the daemon gate: {error}"
+            ))),
+            None => Err(SpawnError::Io("the daemon gate is already closed".into())),
+        };
+        let mut watch = self.watch;
+        std::thread::spawn(move || {
+            let _ = watch.child.wait();
+        });
+        outcome
+    }
+
+    /// Close the gate without opening it: the daemon exits without acting.
+    pub fn abandon(mut self) {
+        drop(self.gate.take());
+        let mut watch = self.watch;
+        let _ = watch.child.wait();
+    }
+}
+
+/// Fork `<daemon_executable> __daemon --launch-operation <h>` held at a gate.
+///
+/// Unlike [`spawn_daemon`] there is no `setsid` here: the daemon makes its
+/// own session only after the gate opens, so until then it stays in the
+/// launcher's session and process group. It inherits exactly four
+/// descriptors: the config on fd 3, the readiness write end, the control
+/// socket and the gate's read end.
+pub fn spawn_gated_daemon(
+    daemon_executable: &std::path::Path,
+    params: SpawnParams,
+    operation: OperationLaunch,
+) -> Result<GatedDaemon, SpawnError> {
+    let mut gate = [0i32; 2];
+    // Close-on-exec from creation, so no other thread's fork and exec can
+    // inherit an end before it is re-homed.
+    if cloexec_pipe(&mut gate) != 0 {
+        return Err(SpawnError::Io(format!(
+            "cannot create the daemon gate: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let (gate_read, gate_write) = match (rehome_cloexec(gate[0]), rehome_cloexec(gate[1])) {
+        (Ok(read), Ok(write)) => (read, write),
+        (read, write) => {
+            for fd in [read, write].into_iter().flatten() {
+                // SAFETY: a descriptor this call created.
+                unsafe { libc::close(fd) };
+            }
+            return Err(SpawnError::Io("cannot re-home the daemon gate".into()));
+        }
+    };
+    // SAFETY: freshly re-homed descriptor owned here.
+    let gate_write = unsafe { File::from_raw_fd(gate_write) };
+    let started = start_daemon_process(daemon_executable, &params, Some((&operation, gate_read)));
+    // SAFETY: the parent's copy of the gate read end; the daemon has its own.
+    unsafe { libc::close(gate_read) };
+    let (watch, pid) = started?;
+    Ok(GatedDaemon {
+        pid,
+        gate: Some(gate_write),
+        watch,
+        name: params.name.clone(),
+        timeout: params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT),
+    })
+}
+
+/// `pipe2(O_CLOEXEC)` where there is one; elsewhere `pipe` and then the flag.
+fn cloexec_pipe(fds: &mut [i32; 2]) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: pipe2(2) fills two descriptors.
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: pipe(2) fills two descriptors; fcntl on the two it made.
+        unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0 {
+                for fd in *fds {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            rc
+        }
+    }
+}
+
+/// One past the highest descriptor this process could hold: the soft limit,
+/// or the highest descriptor open now, whichever is larger.
+fn descriptor_limit() -> RawFd {
+    const CAP: u64 = 1 << 20;
+    // SAFETY: getrlimit fills the struct passed.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        (limit.rlim_cur as u64).min(CAP)
+    } else {
+        CAP
+    };
+    let highest = ["/proc/self/fd", "/dev/fd"]
+        .iter()
+        .find_map(|dir| std::fs::read_dir(dir).ok())
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    soft.max(highest + 1) as RawFd
+}
+
+/// Mark every descriptor from 3 up close-on-exec.
+///
+/// # Safety
+///
+/// Async-signal-safe; called only between fork and exec.
+unsafe fn cloexec_from_three(limit: RawFd) {
+    #[cfg(target_os = "linux")]
+    {
+        // close_range(2) with CLOSE_RANGE_CLOEXEC (Linux 5.11).
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: a plain syscall on this process's descriptor table.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0
+        {
+            return;
+        }
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl(2) is async-signal-safe; a closed number fails.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// `F_DUPFD_CLOEXEC` at 10 or above, closing the original.
+fn rehome_cloexec(fd: RawFd) -> Result<RawFd, ()> {
+    // SAFETY: fcntl on a descriptor this module created.
+    let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    // SAFETY: the original is no longer needed either way.
+    unsafe { libc::close(fd) };
+    if moved < 0 { Err(()) } else { Ok(moved) }
+}
+
+/// Start the daemon process with the config on fd 3 and the readiness pipe,
+/// plus the operation descriptors when there are any.
+fn start_daemon_process(
+    daemon_executable: &std::path::Path,
+    params: &SpawnParams,
+    operation: Option<(&OperationLaunch, RawFd)>,
+) -> Result<(ChildWatch, u32), SpawnError> {
     if params.env.is_some()
         && (params.isolate_env || !params.extra_env.is_empty() || !params.unset_env.is_empty())
     {
         return Err(SpawnError::EnvExclusive);
     }
-    let name = params.name.clone();
-    let timeout = params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT);
-    let config = serde_json::to_string(&config_for(&params))
+    let config = serde_json::to_string(&config_for(params))
         .map_err(|e| SpawnError::Io(format!("cannot encode daemon config: {e}")))?;
 
     // The config travels on a pipe the child inherits as fd 3.
@@ -402,21 +618,34 @@ pub fn spawn_daemon(
     let (ready_read_fd, ready_write_fd) = (ready_fds[0], ready_fds[1]);
     // SAFETY: both descriptors are freshly created and owned here.
     let ready_read = unsafe { File::from_raw_fd(ready_read_fd) };
-    // The daemon needs only the write end.
+    // The daemon needs only the write end. In operation mode the write end is
+    // close-on-exec too, and only the daemon's own copy is made inheritable.
     unsafe {
         libc::fcntl(ready_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        if operation.is_some() {
+            libc::fcntl(ready_write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
     }
 
     let mut cmd = Command::new(daemon_executable);
-    cmd.arg("__daemon")
-        .stdin(Stdio::null())
+    cmd.arg("__daemon");
+    if let Some((operation, _)) = operation {
+        cmd.arg("--launch-operation").arg(&operation.digest);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .env_remove("PTY_SERVER_CONFIG");
+        .env_remove("PTY_SERVER_CONFIG")
+        .env_remove(OPERATION_FD_ENV)
+        .env_remove(GATE_FD_ENV);
     for key in &params.scrub_env {
         cmd.env_remove(key);
     }
     cmd.env(READY_FD_ENV, ready_write_fd.to_string());
+    if let Some((operation, gate_read)) = operation {
+        cmd.env(OPERATION_FD_ENV, operation.control_fd.to_string());
+        cmd.env(GATE_FD_ENV, gate_read.to_string());
+    }
     if params.bind_to_spawner_lifetime {
         cmd.env("PTY_SPAWNER_PID", std::process::id().to_string());
     }
@@ -428,12 +657,19 @@ pub fn spawn_daemon(
             cmd.env_remove("PTY_CREATION_LOCK_OWNER_PID");
         }
     }
+    let inherited: Option<[RawFd; 3]> =
+        operation.map(|(operation, gate_read)| [ready_write_fd, operation.control_fd, gate_read]);
+    let limit = descriptor_limit();
     // SAFETY: the pre_exec body only calls async-signal-safe functions
-    // (setsid, dup2, close).
+    // (setsid, dup2, close, fcntl).
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
-            libc::setsid();
+            // A launch-operation daemon stays in the launcher's session until
+            // its gate opens; it calls setsid itself after that.
+            if inherited.is_none() {
+                libc::setsid();
+            }
             if read_fd != super::config::CONFIG_FD {
                 if libc::dup2(read_fd, super::config::CONFIG_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -442,6 +678,18 @@ pub fn spawn_daemon(
             } else {
                 // Already fd 3: clear CLOEXEC so it survives the exec.
                 libc::fcntl(read_fd, libc::F_SETFD, 0);
+            }
+            if let Some(fds) = inherited {
+                // The daemon inherits exactly the protocol's descriptors:
+                // nothing else the launcher was given (another copy of the
+                // owner's socket, say, which would hide the owner's end of
+                // file from the daemon) survives the exec.
+                cloexec_from_three(limit);
+                for fd in [super::config::CONFIG_FD, fds[0], fds[1], fds[2]] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
             }
             Ok(())
         });
@@ -493,27 +741,15 @@ pub fn spawn_daemon(
         });
     }
     let pid = child.id();
-    let mut watch = ChildWatch {
-        child,
-        stderr: stderr_buf,
-        exit_code: None,
-        readiness: ready_rx,
-    };
-    let outcome = wait_for_publication(&name, pid, timeout, &mut watch);
-    if let Err(err) = &outcome
-        && !matches!(err, SpawnError::DaemonExited { .. })
-    {
-        // SAFETY: SIGTERM to the pid we spawned.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
-    // Keep a waiter alive for this direct child. Detaching changes its session,
-    // not its parent; without waitpid an embedding process accumulates zombies.
-    std::thread::spawn(move || {
-        let _ = watch.child.wait();
-    });
-    outcome
+    Ok((
+        ChildWatch {
+            child,
+            stderr: stderr_buf,
+            exit_code: None,
+            readiness: ready_rx,
+        },
+        pid,
+    ))
 }
 
 fn wait_for_publication(

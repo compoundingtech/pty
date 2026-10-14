@@ -19,10 +19,12 @@
 //! lock, but a delayed Node stale contender can unlink a newer Rust or Node
 //! claim. [`registry::lock`] describes the mixed-registry boundary.
 
+pub mod boot;
 pub mod duration;
 pub mod events;
 pub mod input;
 pub mod keys;
+pub mod operation;
 pub mod paste;
 pub mod process_tree;
 pub mod proctable;

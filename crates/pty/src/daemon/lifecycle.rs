@@ -67,6 +67,12 @@ pub(crate) enum Msg {
     },
     /// SIGTERM, SIGINT, or the spawner watchdog.
     ExternalKill,
+    /// The launch operation's transfer committed: from here this loop owns
+    /// the child's exit, as for any session.
+    OperationTransferred,
+    /// The launch operation retired the session before transfer: the child
+    /// is gone and the row unwound, so exit without recording anything.
+    OperationEnd(i32),
 }
 
 /// Pull pending client/control work ahead of terminal output without changing
@@ -179,6 +185,9 @@ pub(crate) struct Daemon {
     /// process acts on nothing but SIGKILL, so the teardown skips the
     /// graceful signals.
     teardown_frozen: bool,
+    /// A launch operation not yet transferred: until then the operation's
+    /// actor, not this loop, decides what a child exit or a kill means.
+    operation: Option<super::operation::OperationLink>,
 }
 
 /// How long the activity write waits after the first chunk of a burst.
@@ -191,7 +200,7 @@ const ACTIVITY_PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
 const ACTIVITY_PERSIST_BUSY_RETRY: Duration = Duration::from_millis(50);
 
 /// 32 hex characters, Node's `randomBytes(16).toString("hex")`.
-fn new_generation() -> String {
+pub(crate) fn new_generation() -> String {
     registry::atomic::random_bytes(16)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -332,64 +341,16 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     let pair = pty_spawn::open(rows, cols)
         .map_err(|e| format!("Failed to open a PTY for session \"{name}\": {e}"))?;
 
-    // Publication before the child spawns: dir → clear events → stale
-    // socket → listen (umask 077, chmod 600) → pid → metadata →
-    // session_start. An attached child's first action runs after this block,
-    // so its session record — the `<name>.pid` owner sidecar, the metadata,
-    // and the `session_start` line `pty run` waits for — is already on disk
-    // when the child starts (compoundingtech/pty#180). Spawning first left
-    // the child racing publication: its immediate `metadata patch` met the
-    // creation lock its own `pty run` parent still held, and the sidecar
-    // could be unpublished when it first ran.
-    registry::ensure_session_dir().map_err(|e| e.to_string())?;
-    pty_core::events::clear_events(&name)?;
+    let (listener, metadata) = publish_session(&Publication {
+        cfg: &cfg,
+        generation: &generation,
+        created_at: registry::now_iso8601(),
+        published_tags: &published_tags,
+        child_env: &child_env,
+        events: &events,
+        marker: None,
+    })?;
     let socket_path = registry::socket_path(&name);
-    let _ = std::fs::remove_file(&socket_path);
-    // SAFETY: umask(2) has no preconditions.
-    let prev_umask = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(&socket_path);
-    // SAFETY: restoring the mask we read above.
-    unsafe {
-        libc::umask(prev_umask);
-    }
-    let listener = listener.map_err(|e| format!("Socket server error: {e}"))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
-    }
-    registry::write_pid(&name, std::process::id()).map_err(|e| e.to_string())?;
-    let created_at = registry::now_iso8601();
-    let metadata = SessionMetadata {
-        generation: Some(generation.clone()),
-        daemon_pid: Some(std::process::id() as i32),
-        daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
-        recovery: None,
-        command: cfg.command.clone(),
-        args: cfg.args.clone(),
-        display_command: cfg.display_command.clone(),
-        cwd: cwd.clone(),
-        rows: Some(rows),
-        cols: Some(cols),
-        ephemeral: Some(cfg.ephemeral),
-        created_at,
-        display_name: cfg.display_name().map(str::to_string),
-        tags: (!published_tags.is_empty()).then(|| published_tags.clone()),
-        isolate_env: cfg.isolate_env().then_some(true),
-        extra_env: cfg.extra_env().cloned(),
-        session_env: permanent_respawn_env(&cfg, &published_tags, &child_env),
-        unset_env: (!cfg.unset_env().is_empty()).then(|| cfg.unset_env().to_vec()),
-        env: cfg.env.clone(),
-        ..Default::default()
-    };
-    registry::write_metadata_publication(&name, &metadata).map_err(|e| e.to_string())?;
-    events.append(Event::session_start(
-        &name,
-        (!published_tags.is_empty()).then_some(&published_tags),
-    ));
-    if cfg.respawn {
-        events.append(Event::session_respawn(&name));
-    }
-    events.flush();
 
     // The child: `/bin/sh -c 'exec "$@"' sh <command> <args...>`, so PATH
     // lookups, shebangs and symlinks behave like a shell's.
@@ -422,14 +383,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         }
     };
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
-    let child_identity = pty_core::proctable::process(child_pid)
-        .known()
-        .and_then(|row| row.identity)
-        .map(|identity| ProcessIdentity {
-            pid: child_pid,
-            identity,
-            depth: 0,
-        });
+    let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
     let (owner, session_client, session_stream) =
         pty_spawn::external_owned_pair_attached(session, pair, child).map_err(|e| {
@@ -443,53 +397,132 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     spawn_signal_listener(tx.clone());
     install_spawner_watchdog(tx);
 
-    let daemon = Daemon {
-        name,
-        generation,
+    let daemon = Daemon::assemble(DaemonParts {
         cfg,
-        actor: terminal_actor(rows, cols),
-        _owner: owner,
+        generation,
+        owner,
         session: session_client,
         child_pid,
         child_identity,
-        clients: BTreeMap::new(),
-        attach_counter: 0,
-        last_resize: None,
-        settle: settle_duration(),
-        exited: false,
-        exit_code: 0,
         events,
-        child_status: None,
-        pty_eof: false,
         rx,
-        deferred_bridge: VecDeque::new(),
-        external_kill: false,
-        shutdown_code: None,
-        exit_drain_deadline: None,
-        exit_shutdown_at: None,
-        exit_meta_retry: None,
-        last_output_at_ms: None,
-        activity_persist_at: None,
-        client_generation: 0,
-        published_client_facts: ClientFacts::unattached(rows, cols),
-        pending_attach_at: None,
-        client_meta_retry: None,
         listener_fd,
-        startup_lease_timer: startup_lease
-            .as_ref()
-            .and_then(|lease| lease.deadline_monotonic_ns)
-            .filter(|_| !startup_timer_disabled_for_test())
-            .map(|deadline| Instant::now() + remaining_lease_delay(deadline)),
         startup_lease,
-        startup_lease_disarmed: false,
-        startup_deadline_pending_shutdown: false,
-        startup_lease_terminal_value: None,
-        teardown_tree: None,
-        teardown_frozen: false,
-    };
+        operation: None,
+    });
 
     readiness.notify();
     Ok(daemon.serve())
+}
+
+/// The exact identity of a child the daemon just started.
+pub(crate) fn live_identity(child_pid: i32) -> Option<ProcessIdentity> {
+    pty_core::proctable::process(child_pid)
+        .known()
+        .and_then(|row| row.identity)
+        .map(|identity| ProcessIdentity {
+            pid: child_pid,
+            identity,
+            depth: 0,
+        })
+}
+
+/// What a publication writes.
+pub(crate) struct Publication<'a> {
+    pub(crate) cfg: &'a DaemonConfig,
+    pub(crate) generation: &'a str,
+    pub(crate) created_at: String,
+    pub(crate) published_tags: &'a TagMap,
+    pub(crate) child_env: &'a std::collections::BTreeMap<String, String>,
+    pub(crate) events: &'a EventWriter,
+    /// The launch-operation marker, `{"digest":<h>,"phase":"startup"}`.
+    pub(crate) marker: Option<serde_json::Value>,
+}
+
+/// Publication before the child spawns: dir → clear events → stale socket →
+/// listen (umask 077, chmod 600) → pid → metadata → session_start. An
+/// attached child's first action runs after this, so its session record —
+/// the `<name>.pid` owner sidecar, the metadata, and the `session_start` line
+/// `pty run` waits for — is already on disk when the child starts
+/// (compoundingtech/pty#180). Spawning first left the child racing
+/// publication: its immediate `metadata patch` met the creation lock its own
+/// `pty run` parent still held, and the sidecar could be unpublished when it
+/// first ran.
+pub(crate) fn publish_session(
+    p: &Publication<'_>,
+) -> Result<(UnixListener, SessionMetadata), String> {
+    let cfg = p.cfg;
+    let name = &cfg.name;
+    registry::ensure_session_dir().map_err(|e| e.to_string())?;
+    pty_core::events::clear_events(name)?;
+    let socket_path = registry::socket_path(name);
+    let _ = std::fs::remove_file(&socket_path);
+    // SAFETY: umask(2) has no preconditions.
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(&socket_path);
+    // SAFETY: restoring the mask we read above.
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    let listener = listener.map_err(|e| format!("Socket server error: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+    }
+    registry::write_pid(name, std::process::id()).map_err(|e| e.to_string())?;
+    let mut metadata = SessionMetadata {
+        generation: Some(p.generation.to_string()),
+        daemon_pid: Some(std::process::id() as i32),
+        daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
+        recovery: None,
+        command: cfg.command.clone(),
+        args: cfg.args.clone(),
+        display_command: cfg.display_command.clone(),
+        cwd: cfg.cwd(),
+        rows: Some(cfg.rows()),
+        cols: Some(cfg.cols()),
+        ephemeral: Some(cfg.ephemeral),
+        created_at: p.created_at.clone(),
+        display_name: cfg.display_name().map(str::to_string),
+        tags: (!p.published_tags.is_empty()).then(|| p.published_tags.clone()),
+        isolate_env: cfg.isolate_env().then_some(true),
+        extra_env: cfg.extra_env().cloned(),
+        session_env: permanent_respawn_env(cfg, p.published_tags, p.child_env),
+        unset_env: (!cfg.unset_env().is_empty()).then(|| cfg.unset_env().to_vec()),
+        env: cfg.env.clone(),
+        ..Default::default()
+    };
+    if let Some(marker) = &p.marker {
+        metadata.extra.insert(
+            pty_core::operation::settle::MARKER_FIELD.to_string(),
+            marker.clone(),
+        );
+    }
+    registry::write_metadata_publication(name, &metadata).map_err(|e| e.to_string())?;
+    p.events.append(Event::session_start(
+        name,
+        (!p.published_tags.is_empty()).then_some(p.published_tags),
+    ));
+    if cfg.respawn {
+        p.events.append(Event::session_respawn(name));
+    }
+    p.events.flush();
+    Ok((listener, metadata))
+}
+
+/// Everything a serving daemon is built from.
+pub(crate) struct DaemonParts {
+    pub(crate) cfg: DaemonConfig,
+    pub(crate) generation: String,
+    pub(crate) owner: SessionOwner,
+    pub(crate) session: pty_spawn::substrate::SessionClient,
+    pub(crate) child_pid: i32,
+    pub(crate) child_identity: Option<ProcessIdentity>,
+    pub(crate) events: EventWriter,
+    pub(crate) rx: Receiver<Msg>,
+    pub(crate) listener_fd: i32,
+    pub(crate) startup_lease: Option<ArmedStartupLease>,
+    pub(crate) operation: Option<super::operation::OperationLink>,
 }
 
 /// The session's terminal, with kitty graphics on.
@@ -512,7 +545,7 @@ fn terminal_actor(rows: u16, cols: u16) -> TerminalActor {
     actor
 }
 
-fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, tx: Sender<Msg>) {
+pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let mut exited = false;
         let mut output_closed = false;
@@ -570,7 +603,7 @@ pub(crate) fn accept_failure_passes(e: &std::io::Error) -> bool {
 /// descriptor shortage would do it, and a descriptor shortage ends. So a
 /// failure that can pass is reported and retried, and only a listener that
 /// cannot work at all shuts the session down, where somebody can see it.
-fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
+pub(crate) fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let ids = Arc::new(AtomicU64::new(1));
         let mut consecutive = 0u32;
@@ -680,7 +713,7 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
 /// SIGTERM and SIGINT are external kills.
 ///
 /// node: src/server.ts:1598-1603
-fn spawn_signal_listener(tx: Sender<Msg>) {
+pub(crate) fn spawn_signal_listener(tx: Sender<Msg>) {
     let Ok(mut signals) = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
@@ -738,6 +771,68 @@ fn clipboard_client_available(clients: &BTreeMap<u64, Client>) -> bool {
 }
 
 impl Daemon {
+    pub(crate) fn assemble(parts: DaemonParts) -> Daemon {
+        let DaemonParts {
+            cfg,
+            generation,
+            owner,
+            session,
+            child_pid,
+            child_identity,
+            events,
+            rx,
+            listener_fd,
+            startup_lease,
+            operation,
+        } = parts;
+        let (rows, cols) = (cfg.rows(), cfg.cols());
+        Daemon {
+            name: cfg.name.clone(),
+            generation,
+            cfg,
+            actor: terminal_actor(rows, cols),
+            _owner: owner,
+            session,
+            child_pid,
+            child_identity,
+            clients: BTreeMap::new(),
+            attach_counter: 0,
+            last_resize: None,
+            settle: settle_duration(),
+            exited: false,
+            exit_code: 0,
+            events,
+            child_status: None,
+            pty_eof: false,
+            rx,
+            deferred_bridge: VecDeque::new(),
+            external_kill: false,
+            shutdown_code: None,
+            exit_drain_deadline: None,
+            exit_shutdown_at: None,
+            exit_meta_retry: None,
+            last_output_at_ms: None,
+            activity_persist_at: None,
+            client_generation: 0,
+            published_client_facts: ClientFacts::unattached(rows, cols),
+            pending_attach_at: None,
+            client_meta_retry: None,
+            listener_fd,
+            startup_lease_timer: startup_lease
+                .as_ref()
+                .and_then(|lease| lease.deadline_monotonic_ns)
+                .filter(|_| !startup_timer_disabled_for_test())
+                .map(|deadline| Instant::now() + remaining_lease_delay(deadline)),
+            startup_lease,
+            startup_lease_disarmed: false,
+            startup_deadline_pending_shutdown: false,
+            startup_lease_terminal_value: None,
+            teardown_tree: None,
+            teardown_frozen: false,
+            operation,
+        }
+    }
+
     fn owner(&self) -> SessionGenerationOwner {
         SessionGenerationOwner {
             generation: self.generation.clone(),
@@ -753,7 +848,7 @@ impl Daemon {
     }
 
     /// The serving loop, then the shutdown. Returns the process exit status.
-    fn serve(mut self) -> i32 {
+    pub(crate) fn serve(mut self) -> i32 {
         loop {
             let now = Instant::now();
             let deadline = [
@@ -805,6 +900,11 @@ impl Daemon {
                 }
             }
             Msg::ChildExited(status) => {
+                if let Some(operation) = self.operation.as_mut()
+                    && operation.holds(status)
+                {
+                    return;
+                }
                 if self.child_status.is_some() {
                     return;
                 }
@@ -826,9 +926,31 @@ impl Daemon {
             Msg::Packet { id, packet } => self.on_packet(id, packet),
             Msg::Closed { id } => self.on_closed(id),
             Msg::ExternalKill => {
+                if let Some(operation) = &self.operation
+                    && operation.intercepts_kill()
+                {
+                    return;
+                }
                 if self.shutdown_code.is_none() {
                     self.external_kill = true;
                     self.shutdown_code = Some(0);
+                }
+            }
+            Msg::OperationTransferred => {
+                if let Some(status) = self
+                    .operation
+                    .as_mut()
+                    .and_then(super::operation::OperationLink::take_deferred_exit)
+                {
+                    self.handle(Msg::ChildExited(status));
+                }
+            }
+            Msg::OperationEnd(code) => {
+                if let Some(operation) = self.operation.as_mut() {
+                    operation.ended = true;
+                }
+                if self.shutdown_code.is_none() {
+                    self.shutdown_code = Some(code);
                 }
             }
         }
@@ -1434,6 +1556,23 @@ impl Daemon {
     ///
     /// node: src/server.ts:1340-1408, 1559-1568
     fn close(mut self, code: i32) -> i32 {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.ended)
+        {
+            // Retired before transfer: the operation already verified the
+            // child gone and unwound this generation's row. Recording an
+            // exit now would publish a row for a session that never ran.
+            for (_, c) in std::mem::take(&mut self.clients) {
+                c.send_out(Out::Destroy);
+            }
+            // SAFETY: shutdown on the listening socket unblocks accept(2).
+            unsafe {
+                libc::shutdown(self.listener_fd, libc::SHUT_RDWR);
+            }
+            return code;
+        }
         self.settle_startup_lifecycle_before_close();
         let tree = self.external_kill.then(|| {
             self.teardown_tree.take().unwrap_or_else(|| {
@@ -1545,9 +1684,9 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use pty_core::protocol::AttachedClient;
     use pty_spawn::{external_owned_pair, open, shell_exec};
+    use std::time::Duration;
 
     #[test]
     fn command_socket_does_not_suppress_clipboard_fallback() {

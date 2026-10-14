@@ -109,6 +109,9 @@ pub fn build_child_env_from(
         let mut env: BTreeMap<String, String> = source.iter().cloned().collect();
         env.remove("PTY_SERVER_CONFIG");
         env.remove(READY_FD_ENV);
+        // A launch operation's daemon descriptors are the daemon's alone.
+        env.remove(pty_lifecycle::OPERATION_FD_ENV);
+        env.remove(pty_lifecycle::GATE_FD_ENV);
         env
     } else {
         source

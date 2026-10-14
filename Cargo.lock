@@ -1185,6 +1185,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
 ]
 
@@ -1224,6 +1225,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
