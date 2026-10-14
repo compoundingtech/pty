@@ -1325,6 +1325,8 @@ fn a_lifecycle_cas_after_the_deadline_chooses_its_cause_from_the_observation() {
     }
 }
 
+// The unreadable-boot injection is a debug-build facility only.
+#[cfg(debug_assertions)]
 #[test]
 fn unavailable_birth_identity_prevents_daemon_publication_and_child_launch() {
     skip_without_a_real_machine!();

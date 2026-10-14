@@ -5,7 +5,9 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(debug_assertions)]
+use std::time::Instant;
 
 struct Fixture {
     child: Child,
@@ -163,6 +165,8 @@ fn reused_pid_is_nonleader_thread_refuses_stop() {
     fixture.refused();
 }
 
+// PTY_TEST_BOOT_ID is deliberately unavailable in release builds.
+#[cfg(debug_assertions)]
 #[test]
 fn unreadable_identity_child() {
     if std::env::var_os("PTY_IDENTITY_UNREADABLE_CHILD").is_none() {
@@ -174,6 +178,7 @@ fn unreadable_identity_child() {
     fixture.refused();
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn unreadable_boot_identity_refuses_stop() {
     let mut process = Command::new(std::env::current_exe().unwrap())

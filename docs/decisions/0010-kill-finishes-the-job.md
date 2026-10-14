@@ -98,6 +98,10 @@ regression owns a sacrificial sleep child, binds a stale socket, and records
 the child's PID with an old start token: inventory must not call it running,
 and stop must refuse without signalling it. Direct handle tests independently
 prove refusal of mismatched and missing identity even without inventory.
+The base-compatible stop suite covers token reuse, a nonleader thread, boot
+mismatch, missing identity and a matching owner. Unreadable-boot injection
+tests run only in debug builds, where `PTY_TEST_BOOT_ID` exists; release tests
+use real kernel evidence and do not treat a disabled injection as unreadable.
 The sweep is also pinned against a **real process group that ignores SIGTERM**,
 which is checked against the process table afterwards rather than against the
 signals sent. **The path from
