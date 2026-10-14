@@ -580,7 +580,9 @@ mod tests {
     /// **A child that leaves on end of file reads as gone once the wait for
     /// it ends**, in the order the daemon first used: the gate shuts, then
     /// the wait starts, then the table is read. That order is the widest
-    /// window, since the child may be mid-exit when the wait starts.
+    /// window, since the child may be mid-exit when the wait starts. The
+    /// child is `cat`, which leaves at once on end of file, as a held child
+    /// does.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_child_leaving_on_end_of_file_reads_as_gone_after_the_wait() {
@@ -588,7 +590,7 @@ mod tests {
         let boot = crate::boot::read_boot_identity();
         for round in 0..300 {
             let mut child = std::process::Command::new("sh")
-                .args(["-c", "echo held; read gate"])
+                .args(["-c", "echo held; exec cat"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
