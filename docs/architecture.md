@@ -128,6 +128,17 @@ macOS, with identity rechecked after pinning. Signals cannot reach a later
 holder of the numeric PID. Unavailable or refused pinning fails closed; there
 is no raw-PID or raw-process-group fallback.
 
+Before publishing a daemon, startup retires stale records for other names,
+including exited history and its companions. Retirement takes event then
+creation locks, revalidates the observed metadata and sidecar, and removes only
+proven mismatched bindings, or absent identities proved to predate this boot
+by a recorded boot ID or a legacy creation timestamp before the cached boot
+start. Current-boot exited history, keep-tagged history and permanent launch
+recipes are not startup garbage: retention and respawn policy remain GC's job.
+Matching live, unknown, busy and newer generations are preserved; no process is
+signalled. The starting name is excluded while its own publication is incomplete.
+Each retirement logs the generation, identity result and liveness decision.
+
 **Terminal query answers are fixed in Rust, not recorded.** DA1, DA2,
 XTVERSION and the OSC 10, 11 and 4 color queries answer with Node's constants
 through libghostty callbacks (`crates/pty-terminal/src/queries.rs`). A

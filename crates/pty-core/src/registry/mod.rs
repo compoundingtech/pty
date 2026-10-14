@@ -35,7 +35,8 @@ pub use activity::{
 pub use atomic::{atomic_write, is_tmp_name, random_hex16};
 pub use cleanup::{
     SessionGenerationOwner, cleanup, cleanup_all, cleanup_all_while_locked, cleanup_owned_all,
-    cleanup_owned_socket, cleanup_socket, is_current_generation_owner,
+    cleanup_owned_socket, cleanup_socket, is_current_generation_owner, retire_stale_daemon_record,
+    retire_stale_daemon_records,
 };
 pub use evidence::{
     EvidenceStream, EvidenceUnavailableReason, RemoveSessionGenerationResult, SessionExitEvidence,

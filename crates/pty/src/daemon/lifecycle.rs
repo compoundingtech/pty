@@ -454,6 +454,8 @@ pub(crate) fn publish_session(
     let cfg = p.cfg;
     let name = &cfg.name;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
+    // Do not inspect this name: its pid/metadata publication is still in flight.
+    registry::retire_stale_daemon_records(name);
     pty_core::events::clear_events(name)?;
     let socket_path = registry::socket_path(name);
     let _ = std::fs::remove_file(&socket_path);

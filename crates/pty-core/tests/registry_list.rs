@@ -927,6 +927,7 @@ fn unknown_identity_is_not_live_and_makes_strict_inventory_incomplete() {
             registry::read_signal_target_with("unknown", Some(&metadata)),
             None
         );
+        assert!(!registry::retire_stale_daemon_record("unknown", &metadata));
         assert!(registry::metadata_path("unknown").exists());
     });
     std::fs::remove_dir_all(dir).unwrap();
@@ -951,6 +952,10 @@ fn boot_identity_and_leader_identity_are_required() {
         registry::read_signal_target_with("token-only", Some(&metadata)),
         None
     );
+    assert!(!registry::retire_stale_daemon_record(
+        "token-only",
+        &metadata
+    ));
     metadata.daemon_boot_id = registry::read_boot_id();
     assert!(metadata.daemon_boot_id.is_some());
     assert_eq!(
@@ -972,6 +977,7 @@ fn boot_identity_and_leader_identity_are_required() {
             registry::read_signal_target_with("old-boot", Some(&metadata)),
             None
         );
+        assert!(registry::retire_stale_daemon_record("old-boot", &metadata));
     });
     std::fs::remove_dir_all(dir).unwrap();
 
@@ -1007,4 +1013,274 @@ fn boot_identity_and_leader_identity_are_required() {
     std::fs::remove_dir_all(dir).unwrap();
     release_tx.send(()).unwrap();
     thread.join().unwrap();
+}
+
+fn seed_retirement_record(name: &str, metadata: &SessionMetadata) {
+    registry::write_metadata_publication(name, metadata).unwrap();
+    registry::write_pid(name, metadata.daemon_pid.unwrap() as u32).unwrap();
+    for path in [
+        registry::socket_path(name),
+        registry::events_path(name),
+        registry::recovery_revision_path(name),
+        registry::output_activity_path(name),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"retained companion").unwrap();
+    }
+}
+
+fn retirement_artifacts(name: &str) -> Vec<std::path::PathBuf> {
+    vec![
+        registry::metadata_path(name),
+        registry::pid_path(name),
+        registry::socket_path(name),
+        registry::events_path(name),
+        registry::recovery_revision_path(name),
+        registry::output_activity_path(name),
+    ]
+}
+
+#[test]
+fn startup_retirement_removes_stale_exited_history_but_not_live_unknown_or_own_name() {
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let pid = std::process::id() as i32;
+        let stale = SessionMetadata {
+            generation: Some("stale-generation".into()),
+            daemon_pid: Some(pid),
+            daemon_start_token: Some("stale:token".into()),
+            daemon_boot_id: registry::read_boot_id(),
+            created_at: "1970-01-01T00:00:00.000Z".into(),
+            exited_at: Some("2026-10-01T00:00:00.000Z".into()),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        // All four exited records must be retired, not skipped as historical.
+        for name in ["stale-a", "stale-b", "gone-a", "gone-b"] {
+            let mut record = stale.clone();
+            if name.starts_with("gone") {
+                record.daemon_pid = Some(DEAD_PID);
+                record.daemon_boot_id = None;
+            }
+            seed_retirement_record(name, &record);
+        }
+        seed_retirement_record("starting", &stale);
+        let live = SessionMetadata {
+            generation: Some("live-generation".into()),
+            daemon_pid: Some(pid),
+            daemon_start_token: registry::read_process_start_token(pid),
+            daemon_boot_id: registry::read_boot_id(),
+            ..Default::default()
+        };
+        seed_retirement_record("live", &live);
+        let unknown = SessionMetadata {
+            daemon_start_token: None,
+            ..live.clone()
+        };
+        seed_retirement_record("unknown", &unknown);
+        assert_eq!(registry::retire_stale_daemon_records("starting"), 4);
+        for name in ["stale-a", "stale-b", "gone-a", "gone-b"] {
+            assert!(retirement_artifacts(name).iter().all(|path| !path.exists()));
+        }
+        for name in ["starting", "live", "unknown"] {
+            assert!(retirement_artifacts(name).iter().all(|path| path.exists()));
+        }
+        assert_eq!(
+            registry::check_daemon_identity(pid, &live),
+            registry::DaemonIdentityCheck::Match
+        );
+        assert_eq!(registry::retire_stale_daemon_records("starting"), 0);
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn retirement_revalidates_generation_sidecar_and_both_locks() {
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let pid = std::process::id() as i32;
+        let observed = SessionMetadata {
+            generation: Some("observed-generation".into()),
+            daemon_pid: Some(pid),
+            daemon_start_token: Some("stale:token".into()),
+            daemon_boot_id: registry::read_boot_id(),
+            ..Default::default()
+        };
+        seed_retirement_record("fenced", &observed);
+        let replacement = SessionMetadata {
+            generation: Some("new-generation".into()),
+            ..observed.clone()
+        };
+        registry::write_metadata_publication("fenced", &replacement).unwrap();
+        assert!(!registry::retire_stale_daemon_record("fenced", &observed));
+        assert_eq!(registry::read_metadata("fenced"), Some(replacement));
+        registry::write_metadata_publication("fenced", &observed).unwrap();
+        registry::write_pid("fenced", DEAD_PID as u32).unwrap();
+        assert!(!registry::retire_stale_daemon_record("fenced", &observed));
+        let conflict = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+        assert!(!conflict.complete);
+        assert!(
+            conflict
+                .errors
+                .iter()
+                .any(|error| error.kind == registry::InventoryErrorKind::IdentityUnknown)
+        );
+        assert_eq!(
+            registry::read_signal_target_with("fenced", Some(&observed)),
+            None
+        );
+        registry::write_pid("fenced", pid as u32).unwrap();
+        {
+            let _lock = registry::acquire_event_lock("fenced").unwrap();
+            assert!(!registry::retire_stale_daemon_record("fenced", &observed));
+        }
+        {
+            let _lock = registry::acquire_lock("fenced").unwrap();
+            assert!(!registry::retire_stale_daemon_record("fenced", &observed));
+        }
+        assert!(
+            retirement_artifacts("fenced")
+                .iter()
+                .all(|path| path.exists())
+        );
+        assert!(registry::retire_stale_daemon_record("fenced", &observed));
+        assert!(
+            retirement_artifacts("fenced")
+                .iter()
+                .all(|path| !path.exists())
+        );
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_live_orphan_pid_is_incomplete_not_replacement_authority() {
+    let dir = strict_root();
+    std::fs::write(dir.join("orphan.pid"), std::process::id().to_string()).unwrap();
+    let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+    assert!(!inventory.complete);
+    assert!(inventory.entries.is_empty());
+    assert_eq!(
+        inventory.errors[0].kind,
+        registry::InventoryErrorKind::IdentityUnknown
+    );
+    assert_eq!(inventory.errors[0].path, dir.join("orphan.pid"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn retirement_preserves_malformed_and_nonregular_identity_companions() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let stale = SessionMetadata {
+            generation: Some("stale-generation".into()),
+            daemon_pid: Some(std::process::id() as i32),
+            daemon_start_token: Some("stale:token".into()),
+            daemon_boot_id: registry::read_boot_id(),
+            ..Default::default()
+        };
+        seed_retirement_record("invalid", &stale);
+        std::fs::write(registry::pid_path("invalid"), b"not-a-pid").unwrap();
+        assert!(!registry::retire_stale_daemon_record("invalid", &stale));
+        assert!(
+            retirement_artifacts("invalid")
+                .iter()
+                .all(|path| path.exists())
+        );
+        let fifo_path = registry::metadata_path("fifo");
+        let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a valid NUL-terminated path to a missing fixture.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(!registry::retire_stale_daemon_record("fifo", &stale));
+        assert_eq!(registry::retire_stale_daemon_records("starting"), 0);
+        assert!(fifo_path.exists());
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn startup_retirement_preserves_current_boot_history_and_retention_policy() {
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let current_gone = SessionMetadata {
+            generation: Some("current-boot-history".into()),
+            daemon_pid: Some(DEAD_PID),
+            daemon_start_token: Some("departed:token".into()),
+            daemon_boot_id: registry::read_boot_id(),
+            created_at: registry::now_iso8601(),
+            exited_at: Some(registry::now_iso8601()),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        seed_retirement_record("current-gone", &current_gone);
+        let legacy_old = SessionMetadata {
+            daemon_boot_id: None,
+            created_at: "1970-01-01T00:00:00.000Z".into(),
+            ..current_gone.clone()
+        };
+        seed_retirement_record("legacy-old", &legacy_old);
+        let unknown_age = SessionMetadata {
+            created_at: String::new(),
+            ..legacy_old.clone()
+        };
+        seed_retirement_record("unknown-age", &unknown_age);
+        for (name, base, key, value) in [
+            ("keep-current", &current_gone, "keep", "true"),
+            ("permanent-current", &current_gone, "strategy", "permanent"),
+            ("keep-old", &legacy_old, "keep", "true"),
+            ("permanent-old", &legacy_old, "strategy", "permanent"),
+        ] {
+            let mut retained = (*base).clone();
+            retained.tags = Some(registry::TagMap::from([(key.into(), value.into())]));
+            seed_retirement_record(name, &retained);
+        }
+        for (name, key, value) in [
+            ("keep-mismatch", "keep", "true"),
+            ("permanent-mismatch", "strategy", "permanent"),
+        ] {
+            let mut retained = legacy_old.clone();
+            retained.daemon_pid = Some(std::process::id() as i32);
+            retained.daemon_boot_id = registry::read_boot_id();
+            retained.tags = Some(registry::TagMap::from([(key.into(), value.into())]));
+            seed_retirement_record(name, &retained);
+        }
+        assert_eq!(registry::retire_stale_daemon_records("starting"), 1);
+        assert!(
+            retirement_artifacts("legacy-old")
+                .iter()
+                .all(|path| !path.exists())
+        );
+        for name in [
+            "current-gone",
+            "unknown-age",
+            "keep-current",
+            "permanent-current",
+            "keep-old",
+            "permanent-old",
+            "keep-mismatch",
+            "permanent-mismatch",
+        ] {
+            assert!(
+                retirement_artifacts(name).iter().all(|path| path.exists()),
+                "{name}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut old_boot = current_gone.clone();
+            old_boot.daemon_boot_id = Some("previous-boot".into());
+            seed_retirement_record("old-boot-gone", &old_boot);
+            assert!(registry::retire_stale_daemon_record(
+                "old-boot-gone",
+                &old_boot
+            ));
+            assert!(
+                retirement_artifacts("old-boot-gone")
+                    .iter()
+                    .all(|path| !path.exists())
+            );
+        }
+    });
+    std::fs::remove_dir_all(dir).unwrap();
 }
