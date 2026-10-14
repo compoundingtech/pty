@@ -107,7 +107,15 @@ impl StreamCli {
             *stream_fd.lock().unwrap() = Some(read_fd);
             None
         };
-        StreamCli { child, stdin, stdout_rx, stderr_rx, stream_rx, stream_fd, stream: Vec::new() }
+        StreamCli {
+            child,
+            stdin,
+            stdout_rx,
+            stderr_rx,
+            stream_rx,
+            stream_fd,
+            stream: Vec::new(),
+        }
     }
 
     fn pump(&mut self) {
@@ -171,7 +179,12 @@ impl StreamCli {
                 }
             }
         }
-        StreamRun { status, stdout, stderr, stream: self.stream }
+        StreamRun {
+            status,
+            stdout,
+            stderr,
+            stream: self.stream,
+        }
     }
 }
 
@@ -289,11 +302,7 @@ fn missing_descriptor_value_is_rejected() {
 fn frames_events_through_fd_3_from_a_real_daemon() {
     let rig = Rig::new();
     let id = "launcher";
-    rig.daemon(
-        id,
-        &["sh", "-c", "printf LAUNCHER_READY; read value"],
-        DaemonOpts::no_display_name(),
-    );
+    rig.daemon(id, &["sh", "-c", "printf LAUNCHER_READY; read value"], DaemonOpts::no_display_name());
     // The SCREEN below must already carry the child's output.
     rig.wait_for_screen(id, "LAUNCHER_READY");
     let mut cli = StreamCli::spawn(&rig, &[id], true);
@@ -465,10 +474,7 @@ fn stdout_stays_the_controlling_tty_for_the_attach_geometry() {
     assert!(output.is_empty(), "painted on the tty: {:?}", String::from_utf8_lossy(&output));
     assert_eq!(size_rx.recv_timeout(Duration::from_secs(5)).unwrap(), (27, 91));
     let packets = PacketReader::new().feed(&std::fs::read(&stream_path).unwrap()).unwrap();
-    assert_eq!(
-        sequence_names(&packets.iter().map(|p| p.type_).collect::<Vec<_>>()),
-        vec!["GEOMETRY", "SCREEN", "EXIT"]
-    );
+    assert_eq!(sequence_names(&packets.iter().map(|p| p.type_).collect::<Vec<_>>()), vec!["GEOMETRY", "SCREEN", "EXIT"]);
 }
 
 /// node: tests/attach-stream.test.ts:404

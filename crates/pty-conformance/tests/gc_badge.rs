@@ -82,7 +82,11 @@ fn restart_drops_all_four_gc_bookkeeping_tags() {
 #[test]
 fn running_flapping_session_shows_flapping_badge() {
     let rig = Rig::new();
-    write_running(&rig, "fc2", json!({"strategy": "permanent", "strategy.status": "flapping"}));
+    write_running(
+        &rig,
+        "fc2",
+        json!({"strategy": "permanent", "strategy.status": "flapping"}),
+    );
     let out = rig.pty(&["list"]);
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "[flapping]");

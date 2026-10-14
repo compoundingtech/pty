@@ -23,7 +23,10 @@ fn delayed_status_does_not_allow_unforced_attach() {
     let started = Instant::now();
     let out = rig.run(&["attach", "slow"]);
     assert_eq!(out.code, 1, "{out:?}");
-    assert!(out.stderr.contains("cannot verify the current session"), "{out:?}");
+    assert!(
+        out.stderr.contains("cannot verify the current session"),
+        "{out:?}"
+    );
     assert!(started.elapsed() >= Duration::from_millis(500));
 }
 

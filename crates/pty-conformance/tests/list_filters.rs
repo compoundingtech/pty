@@ -6,7 +6,11 @@
 use pty_conformance::*;
 
 fn names(v: &serde_json::Value) -> Vec<String> {
-    v.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect()
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// node: tests/list-filters.test.ts:124
@@ -154,12 +158,7 @@ fn age_filters_compose_with_filter_tag() {
     write_fake_metadata(rig.root(), &old_match, FakeMeta::created(-2 * 3600).tag("env", "prod"));
     write_fake_metadata(rig.root(), &old_skip, FakeMeta::created(-2 * 3600).tag("env", "dev"));
     let out = expect_json(&rig.pty(&[
-        "list",
-        "--json",
-        "--older-than",
-        "1h",
-        "--filter-tag",
-        "env=prod",
+        "list", "--json", "--older-than", "1h", "--filter-tag", "env=prod",
     ]));
     assert_eq!(names(&out), vec![old_match]);
 }

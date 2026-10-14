@@ -51,17 +51,8 @@ fn run_a_preserves_env_removals_when_recreating_an_exited_session() {
     let created = cli(
         &rig,
         &[
-            "run",
-            "-d",
-            "--id",
-            name,
-            "--no-display-name",
-            "--tag",
-            "keep=true",
-            "--unset-env",
-            "NO_COLOR",
-            "--",
-            "true",
+            "run", "-d", "--id", name, "--no-display-name", "--tag", "keep=true", "--unset-env",
+            "NO_COLOR", "--", "true",
         ],
         &[("NO_COLOR", "ambient-create")],
     );
@@ -95,23 +86,9 @@ fn restart_preserves_inherited_env_removals() {
     let created = cli(
         &rig,
         &[
-            "run",
-            "-d",
-            "--id",
-            name,
-            "--no-display-name",
-            "--tag",
-            "keep=true",
-            "--unset-env",
-            "NO_COLOR",
-            "--env",
-            "ASSIGNMENT_WINS=explicit",
-            "--unset-env",
-            "ASSIGNMENT_WINS",
-            "--",
-            "sh",
-            "-c",
-            &recorder,
+            "run", "-d", "--id", name, "--no-display-name", "--tag", "keep=true", "--unset-env",
+            "NO_COLOR", "--env", "ASSIGNMENT_WINS=explicit", "--unset-env", "ASSIGNMENT_WINS", "--",
+            "sh", "-c", &recorder,
         ],
         &[("NO_COLOR", "1"), ("ASSIGNMENT_WINS", "ambient-create")],
     );
@@ -149,37 +126,18 @@ fn persists_repeatable_env_and_every_restart_relevant_setting() {
     let created = cli(
         &rig,
         &[
-            "run",
-            "-d",
-            "-e",
-            "--id",
-            name,
-            "--name",
-            "Launch Parity",
-            "--tag",
-            "keep=true",
-            "--tag",
-            "role=service",
-            "--cwd",
-            &cwd_s,
-            "--isolate-env",
-            "--env",
-            "ST_AGENT=managed-first",
-            "--env",
-            "CATALOG=/managed/catalog",
-            "--env",
-            "PTY_SESSION=must-not-win",
-            "--env",
-            "ST_AGENT=managed-final",
-            "--",
-            "sh",
-            "-c",
-            &recorder,
+            "run", "-d", "-e", "--id", name, "--name", "Launch Parity", "--tag", "keep=true", "--tag",
+            "role=service", "--cwd", &cwd_s, "--isolate-env", "--env", "ST_AGENT=managed-first",
+            "--env", "CATALOG=/managed/catalog", "--env", "PTY_SESSION=must-not-win", "--env",
+            "ST_AGENT=managed-final", "--", "sh", "-c", &recorder,
         ],
         &[("ST_AGENT", "ambient-create"), ("CATALOG", "/ambient/create")],
     );
     expect_status(&created, 0);
-    assert_eq!(wait_for_content(&output), format!("managed-final|/managed/catalog|{name}|{cwd_s}"));
+    assert_eq!(
+        wait_for_content(&output),
+        format!("managed-final|/managed/catalog|{name}|{cwd_s}")
+    );
 
     let before = rig.meta(name).unwrap();
     assert_eq!(before["ephemeral"], true, "{before}");
@@ -203,7 +161,10 @@ fn persists_repeatable_env_and_every_restart_relevant_setting() {
     );
     expect_status(&restarted, 0);
     expect_contains(&restarted.stdout(), "restarted");
-    assert_eq!(wait_for_content(&output), format!("managed-final|/managed/catalog|{name}|{cwd_s}"));
+    assert_eq!(
+        wait_for_content(&output),
+        format!("managed-final|/managed/catalog|{name}|{cwd_s}")
+    );
     let after = rig.meta(name).unwrap();
     assert_eq!(restart_shape(&after), restart_shape(&before));
 }
