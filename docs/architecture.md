@@ -110,6 +110,24 @@ confirming the path still names the inode it inspected, so Rust contenders
 never both win. See `crates/pty-core/src/registry/lock.rs` and
 [hardening.md](hardening.md).
 
+**Registry liveness is process identity, not a numeric PID or a socket.**
+Native records publish `daemonStartToken` and `daemonBootId` on Linux and macOS.
+Both recorded identities must match; a recovery start token alone does not
+authorize legacy records. Linux also requires `/proc/<pid>/status` to identify
+the PID as its own thread-group leader. Missing boot identity or start token
+is Unknown, never Match, and grants no signal authority. A reachable socket
+cannot rescue a mismatched or absent identity. Unknown identity is not running
+and makes strict inventory incomplete, so launch occupancy checks refuse
+replacement rather than infer absence.
+`registry::daemon_identity_counters()` exposes process-local match, mismatch,
+gone and unknown observations without logging every scan.
+
+**Signals pin the exact owner.** Registry teardown uses the existing
+`operation::exact::Exact` abstraction: a pidfd on Linux and an audit token on
+macOS, with identity rechecked after pinning. Signals cannot reach a later
+holder of the numeric PID. Unavailable or refused pinning fails closed; there
+is no raw-PID or raw-process-group fallback.
+
 **Terminal query answers are fixed in Rust, not recorded.** DA1, DA2,
 XTVERSION and the OSC 10, 11 and 4 color queries answer with Node's constants
 through libghostty callbacks (`crates/pty-terminal/src/queries.rs`). A

@@ -474,6 +474,7 @@ pub(crate) fn publish_session(
         generation: Some(p.generation.to_string()),
         daemon_pid: Some(std::process::id() as i32),
         daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
+        daemon_boot_id: registry::read_boot_id(),
         recovery: None,
         command: cfg.command.clone(),
         args: cfg.args.clone(),
@@ -651,7 +652,9 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(packet) => {
-                    let _guard = writer_lock.lock().unwrap_or_else(|error| error.into_inner());
+                    let _guard = writer_lock
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
@@ -917,10 +920,21 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx, disconnect, write_lock } => {
+            Msg::Connect {
+                id,
+                tx,
+                disconnect,
+                write_lock,
+            } => {
                 self.clients.insert(
                     id,
-                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols(), write_lock),
+                    Client::new(
+                        tx,
+                        disconnect,
+                        self.actor.rows(),
+                        self.actor.cols(),
+                        write_lock,
+                    ),
                 );
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
@@ -962,7 +976,8 @@ impl Daemon {
     /// node: src/server.ts:559-569
     fn on_pty_data(&mut self, bytes: &[u8]) {
         self.stamp_output_activity();
-        self.actor.set_clipboard_client_available(clipboard_client_available(&self.clients));
+        self.actor
+            .set_clipboard_client_available(clipboard_client_available(&self.clients));
         let cleaned = self.actor.write(bytes);
         let replies = self.actor.take_pty_replies();
         self.write_pty(&replies);
@@ -1693,7 +1708,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))));
+        clients.insert(
+            1,
+            Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))),
+        );
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(clipboard_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");

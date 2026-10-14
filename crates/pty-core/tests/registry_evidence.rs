@@ -11,6 +11,7 @@ use registry_support::{root, unique_name};
 fn terminal_metadata(generation: &str) -> SessionMetadata {
     SessionMetadata {
         generation: Some(generation.to_string()),
+        daemon_pid: Some(registry_support::DEAD_PID),
         command: "/bin/sh".to_string(),
         display_command: "sh".to_string(),
         cwd: "/tmp".to_string(),
@@ -52,6 +53,7 @@ fn snapshot_ignores_a_live_pid_from_another_daemon_generation() {
     let mut metadata = terminal_metadata("generation-a");
     metadata.daemon_pid = Some(std::process::id() as i32);
     metadata.daemon_start_token = Some("stale-generation-token".to_string());
+    metadata.daemon_boot_id = registry::read_boot_id();
     registry::write_metadata_publication(&name, &metadata).unwrap();
 
     assert!(matches!(
@@ -99,7 +101,10 @@ fn strict_snapshot_rejects_partial_terminal_metadata() {
 fn evidence_library_boundary_rejects_path_traversal() {
     let registry_root = root();
     let victim = unique_name("evidence-outside");
-    let outside = registry_root.parent().unwrap().join(format!("{victim}.json"));
+    let outside = registry_root
+        .parent()
+        .unwrap()
+        .join(format!("{victim}.json"));
     std::fs::write(&outside, b"must remain").unwrap();
     let traversal = format!("../{victim}");
 
@@ -162,4 +167,25 @@ fn lifecycle_compare_and_set_is_fenced_by_generation_and_exact_value() {
             value: "ready-a".to_string()
         }
     );
+}
+
+#[test]
+fn unknown_identity_refuses_snapshot_and_generation_removal() {
+    root();
+    let name = unique_name("evidence-unknown");
+    let mut metadata = terminal_metadata("unknown-generation");
+    metadata.daemon_pid = Some(std::process::id() as i32);
+    metadata.daemon_start_token = None;
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    assert_eq!(
+        registry::get_session_exit_evidence(&name),
+        SessionExitEvidenceResult::Unavailable {
+            reason: EvidenceUnavailableReason::InvalidMetadata
+        },
+    );
+    assert_eq!(
+        registry::remove_session_generation(&name, "unknown-generation").unwrap(),
+        RemoveSessionGenerationResult::NotTerminal,
+    );
+    assert!(registry::metadata_path(&name).exists());
 }

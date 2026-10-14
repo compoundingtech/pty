@@ -207,8 +207,8 @@ gap is in what the daemon does with the frames.
 
 | Behavior | Rust status |
 |---|---|
-| `listSessions` never mutates; scans `.sock` then orphan `.json`; pid alive or socket reachable → running; probe budget 500 ms | partial |
-| `daemonPid` accepted only with a matching start token | missing |
+| `listSessions` never mutates; scans `.sock` then orphan `.json`; 500 ms transport probe budget | have; probes are diagnostics, never daemon liveness authority |
+| `daemonPid` accepted only with matching recorded boot identity and start token | have; required on Linux and macOS, with thread-group leadership also required on Linux. Missing boot or token is Unknown, grants no signal authority, and makes strict inventory incomplete; mismatch is vanished. Teardown pins exact owners through `Exact` (Linux pidfd / macOS audit token), never raw PID or group fallback |
 | Status `running` / `exited` / `vanished` | have |
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |

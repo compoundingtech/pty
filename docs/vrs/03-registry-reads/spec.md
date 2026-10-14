@@ -17,7 +17,7 @@ Not defined here: which sessions a listing probes and how it classifies them (`c
 ```
 caller thread
   │
-  ├─ list_sessions_with ──► probe_sockets_within_budget(paths, budget) ──┐
+  ├─ list_sessions_strict_in ──► probe_sockets_within_budget(paths, budget) ──┐
   │                                                                      ├─► unix_connect::connect  (per socket, per round)
   └─ query_stats_batch_in(root, names, deadline) ────────────────────────┘   unix_connect::poll_until (one poll(2) per round)
 ```
@@ -64,7 +64,14 @@ Each round:
 | `Failed`, or `InProgress` then an error | `false` |
 | `Busy` or `InProgress` at the deadline | absent (`PTY.REG-R05`) |
 
-The listing reads `false` and absent the same way: unreachable. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`.
+Daemon identity requires matching recorded boot identity and start token on
+Linux and macOS, plus thread-group leadership on Linux. Missing boot identity
+or start token yields Unknown, not a legacy Match, and grants no signal
+authority. Teardown uses the existing `operation::exact::Exact` pinned-owner
+abstraction (Linux pidfd / macOS audit token); socket probes cannot authorize
+signals or substitute for these identity requirements.
+
+Strict inventory probes transport only when daemon identity is unconfirmed; a probe cannot change that identity result or promote the session to running. Failed or unanswered probes make transport diagnostics incomplete. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`. Ordinary listings classify identity without probing sockets.
 
 ## Batch STATUS
 

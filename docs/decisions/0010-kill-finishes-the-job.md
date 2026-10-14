@@ -8,34 +8,73 @@ and then returns. Whatever the daemon did not manage is nobody's work after
 that.
 
 **Rust behavior.** After the daemon has gone, `pty kill` re-reads the process
-table. If anything from its pre-kill snapshot is still alive, it signals the
-process groups the session left behind, waits, escalates to SIGKILL, then reads
-the table again and reports what is still there. It exits non-zero unless it
-verified the tree is empty.
+table. If anything from its pre-kill snapshot is still alive, it pins and signals
+those exact processes, waits, escalates to SIGKILL, then reads the table again
+and reports what is still there. It exits non-zero unless it verified the tree
+is empty.
 
 **Why the command and not the daemon.** The daemon does its teardown inside a
 process that is trying to die, so the teardown races its own exit. The command
 outlives the daemon, which puts it in the only position from which the job can
 be finished.
 
-**Why process groups.** A group signal needs no per-process identity.
-`snapshot_from_listing` drops a descendant whose start token cannot be read, and
-that process is then never signalled — see [decision 0009]. Collecting groups
-from the raw `ps` listing reaches it anyway. **The blind spot is not solved; it
-is made irrelevant.** The sweep is also cheaper: reading start tokens costs one
-`ps` per descendant on macOS, and a sweep costs one `ps` in total.
+**Identity is required before teardown.** A retained PID and socket do not
+prove ownership: reboot or PID reuse can bind that number to an unrelated
+process (or, on Linux, another process's thread). Before taking the tree
+snapshot or signalling, `kill` independently checks matching recorded boot
+identity and start token on Linux and macOS, plus thread-group leadership on
+Linux. The registry generation alone is not proof. Missing boot identity or
+start token is Unknown, never a legacy Match, and grants no signal authority.
+Unreadable identity also refuses teardown.
+
+**The existing `Exact` abstraction pins the owner.** The client uses
+`operation::exact::Exact` rather than a separate daemon pinning implementation.
+It pins with a pidfd on Linux or an audit token on macOS, rechecks recorded
+identity after pinning, sends SIGTERM through that exact-owner capability, and
+waits for that process's exit. A reused numeric PID cannot redirect the signal
+or hold the wait open. Unavailable or refused pinning fails closed, including
+Linux kernels without pidfds and macOS without the audit-token signalling
+capability; there is no raw-PID compatibility fallback.
+
+**Process groups are not signal authority.** The pre-signal tree snapshot
+records exact process identities. TERM and KILL escalation target individually
+pinned snapshot owners through `Exact`, not raw group signals whose numeric
+PGID can be reused between an ownership check and delivery. Unknown identities,
+newly joined processes, or reused PIDs cannot broaden the kill. Processes that
+cannot be pinned remain in the report and cannot count as verified cleanup.
+
+**Socket cleanup is generation-owned.** After waiting, the client removes
+socket/PID sidecars only under the creation lock and with the original
+generation and PID owner. A busy lock or a same-name replacement refuses
+cleanup and returns an error without unlinking the replacement's socket.
+
+**GC uses the same authority.** Parent-orphan decisions and permanent
+reconciliation require proven loss of the old owner, not a failed PID read.
+Gone and Mismatch authorize generation-fenced, signal-free retirement or
+permanent respawn; only Match authorizes signalling. Unknown refuses both.
+GC's lock-held reap shares the client's identity-proven daemon signal
+capability and waits on its pinned process after releasing locks. Reachable
+sockets never supply independent signal authority. Runtime debris without
+recorded identity is retained; malformed metadata can be reclaimed only when
+no socket or PID sidecars accompany it.
+
+**Removal does not wait on reused PIDs.** `pty rm` skips daemon waiting when
+Gone or Mismatch already proves the old incarnation is lost. For a matching
+exited record it waits by repeatedly checking that recorded identity, not raw
+PID existence. Unknown refuses removal; cleanup retains its existing
+generation/PID ownership fence.
 
 **The daemon's own group is not a target.** Measured on Linux for both tools on
 2026-09-03: the pty child calls `setsid`, so it starts a new session and a new
 group, and the daemon sits alone in its own group. Signalling the daemon's group
 would reach the daemon and nothing else. The child's group held exactly the
-child and its descendants, and nothing else on the machine was in it, so the
-sweep is as precise here as a pid list.
+child and its descendants in that observation, but that snapshot does not
+authorize a later raw group signal; the sweep pins each exact owner.
 
-**A zombie is not a member.** `ps` lists a zombie with its process group, so
-counting it makes the sweep report a group it has already emptied and signal it
-again. The state column is read for this reason. Found by a test against a real
-process group, not by inspection.
+**A zombie is not a survivor.** `ps` lists a zombie with its process group, so
+counting it makes the sweep report a process that has already exited. The state
+column is read for this reason. Found by a test against a real process group,
+not by inspection.
 
 **One TERM and hope is known not to work.** A coding agent was measured ignoring
 SIGTERM for ten seconds on 2026-09-02. The sweep therefore escalates, and the
@@ -53,11 +92,15 @@ session and the group. Neither the tree walk nor the group sweep can see it,
 and this record does not change that. A process group created after the
 snapshot, by a process that had already left the tree, is likewise unreachable.
 
-**What is tested and what is not.** The group selection, the TERM-then-KILL
-ordering, the refusal to signal the running process's own group, and the zombie
-exclusion are pinned by unit tests. The sweep is pinned end to end against a
-**real process group that ignores SIGTERM**, which is checked against the
-process table afterwards rather than against the signals sent. **The path from
+**What is tested and what is not.** Client unit regressions fence reused,
+unknown, newly joined, and incompletely observed group membership. A Linux
+regression owns a sacrificial sleep child, binds a stale socket, and records
+the child's PID with an old start token: inventory must not call it running,
+and stop must refuse without signalling it. Direct handle tests independently
+prove refusal of mismatched and missing identity even without inventory.
+The sweep is also pinned against a **real process group that ignores SIGTERM**,
+which is checked against the process table afterwards rather than against the
+signals sent. **The path from
 `pty kill` to a survivor is not pinned end to end**, because a survivor that
 `pty kill` alone produces cannot be manufactured on Linux: the daemon's exact
 teardown succeeds when start tokens are readable, and the terminal hangup clears

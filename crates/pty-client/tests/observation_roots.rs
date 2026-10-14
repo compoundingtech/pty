@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use pty_client::query_stats_batch_in;
 use pty_client::{
     ClientError, PeekScreenOptions, peek_screen_bytes_in, peek_screen_in, query_stats_in,
     query_stats_in_with_timeout,
 };
+use pty_core::busy_connects_on_this_thread;
 use pty_core::events::{read_all_events_in, read_recent_events_in};
 use pty_core::protocol::{
     MessageType, Packet, PacketReader, decode_peek, encode_data, encode_screen,
@@ -23,8 +25,6 @@ use pty_core::registry::{
     ListOptions, SessionMetadata, SessionStatus, last_output_at_ms_in, list_sessions_in,
     probe_sockets_within_budget,
 };
-use pty_client::query_stats_batch_in;
-use pty_core::busy_connects_on_this_thread;
 use serde_json::json;
 
 const T: Duration = Duration::from_secs(5);
@@ -653,9 +653,8 @@ fn socket_probe_never_retries_a_busy_connect_at_the_deadline() {
     }
 }
 
-/// The multiplexed probe answers what a blocking connect answers, and leaves a
-/// listener that cannot accept unanswered (Linux) instead of waiting on it;
-/// the listing classifies each accordingly.
+/// Explicit transport probes still report connection reachability, but listing
+/// never uses that reachability to override an absent daemon identity.
 #[test]
 fn socket_probe_matches_a_blocking_connect() {
     let root = TestRoot::new();
@@ -694,7 +693,7 @@ fn socket_probe_matches_a_blocking_connect() {
     };
     assert_eq!(results.get(&backlog), wedged);
 
-    // A dead pid sends every listed session through the probe.
+    // Every numeric PID is absent; reachable transport cannot rescue any row.
     for name in ["live", "stale", "backlog"] {
         std::fs::write(root.session_file(name, "json"), metadata(name)).unwrap();
         std::fs::write(root.session_file(name, "pid"), "2147483646").unwrap();
@@ -712,7 +711,7 @@ fn socket_probe_matches_a_blocking_connect() {
         listed,
         [
             ("backlog".to_string(), SessionStatus::Vanished),
-            ("live".to_string(), SessionStatus::Running),
+            ("live".to_string(), SessionStatus::Vanished),
             ("stale".to_string(), SessionStatus::Vanished),
         ]
     );

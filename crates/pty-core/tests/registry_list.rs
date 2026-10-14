@@ -1,6 +1,5 @@
-//! `list_sessions` liveness exactly as Node classifies it, from fabricated
-//! registry files; reference resolution with the ambiguity text; the
-//! process helpers; and a cross-check against the Node `pty list --json`.
+//! Identity-bound registry listing, historical records, reference resolution,
+//! process helpers, and compatibility with identity-proven Node records.
 
 mod registry_support;
 
@@ -31,6 +30,13 @@ fn base(name: &str) -> Value {
         "command": "cat", "args": [], "displayCommand": "cat", "cwd": "/tmp",
         "createdAt": "2026-04-05T10:15:03.000Z", "displayName": format!("label-{name}")
     })
+}
+
+fn bind_live(value: &mut Value) {
+    let pid = std::process::id() as i32;
+    value["daemonPid"] = json!(pid);
+    value["daemonStartToken"] = json!(registry::read_process_start_token(pid).unwrap());
+    value["daemonBootId"] = json!(registry::read_boot_id().unwrap());
 }
 
 /// node: tests/list-filters.test.ts:119-131 (vanished: metadata only)
@@ -71,6 +77,7 @@ fn json_with_live_pid_and_no_socket_is_running_and_untouched() {
     std::fs::write(registry::pid_path(&name), std::process::id().to_string()).unwrap();
     let mut v = base(&name);
     v["createdAt"] = json!("2020-01-01T00:00:00.000Z");
+    bind_live(&mut v);
     write_json(&name, v);
     let s = find(&name);
     assert_eq!(s.status, SessionStatus::Running);
@@ -96,23 +103,17 @@ fn json_with_dead_pid_is_vanished_and_kept() {
     assert!(registry::metadata_path(&name).exists());
 }
 
-/// A socket whose pid is dead but which answers a connect is alive.
-///
-/// node: src/sessions.ts:934-947; tests/list-live-session-race.test.ts
+/// A reachable socket cannot rescue an absent daemon identity.
 #[test]
-fn reachable_socket_overrides_a_dead_pid() {
+fn reachable_socket_never_overrides_a_dead_pid() {
     let _ = root();
     let name = unique_name("sockok");
     write_json(&name, base(&name));
     std::fs::write(registry::pid_path(&name), DEAD_PID.to_string()).unwrap();
     let _listener = UnixListener::bind(registry::socket_path(&name)).unwrap();
     let s = find(&name);
-    assert_eq!(s.status, SessionStatus::Running);
-    assert_eq!(
-        s.pid,
-        Some(DEAD_PID),
-        "Node reports the pid it read even when the socket rescued it"
-    );
+    assert_eq!(s.status, SessionStatus::Vanished);
+    assert_eq!(s.pid, None);
     assert!(
         registry::socket_path(&name).exists(),
         "listing never unlinks a socket"
@@ -141,29 +142,24 @@ fn stale_socket_with_dead_pid_reports_the_retained_record() {
     assert!(registry::socket_path(&name).exists());
 }
 
-/// A stale socket, a dead pid and no metadata is not listed at all.
-///
-/// node: src/sessions.ts:948-961
+/// A stale socket with a dead PID is listed as vanished without metadata.
 #[test]
-fn stale_socket_with_dead_pid_and_no_metadata_is_omitted() {
+fn stale_socket_with_dead_pid_and_no_metadata_is_vanished() {
     let _ = root();
     let name = unique_name("nometa");
     stale_socket(&registry::socket_path(&name));
     std::fs::write(registry::pid_path(&name), DEAD_PID.to_string()).unwrap();
-    assert!(registry::list_sessions().iter().all(|s| s.name != name));
+    assert_eq!(find(&name).status, SessionStatus::Vanished);
 }
 
-/// A socket with an unreadable pid is reported running defensively, with
-/// `metadata: None` when there is no record.
-///
-/// node: src/sessions.ts:962-971
+/// An unknown socket identity is never live, even with an unreadable sidecar.
 #[test]
-fn socket_with_unreadable_pid_is_running_defensively() {
+fn socket_with_unreadable_pid_is_not_live() {
     let _ = root();
     let name = unique_name("nopid");
     stale_socket(&registry::socket_path(&name));
     let s = find(&name);
-    assert_eq!(s.status, SessionStatus::Running);
+    assert_eq!(s.status, SessionStatus::Vanished);
     assert_eq!(s.pid, None);
     assert!(s.metadata.is_none());
     assert_eq!(s.socket_path, registry::socket_path(&name));
@@ -172,7 +168,7 @@ fn socket_with_unreadable_pid_is_running_defensively() {
     std::fs::write(registry::pid_path(&name), "not a pid").unwrap();
     write_json(&name, base(&name));
     let s = find(&name);
-    assert_eq!(s.status, SessionStatus::Running);
+    assert_eq!(s.status, SessionStatus::Vanished);
     assert!(s.metadata.is_some());
 }
 
@@ -187,6 +183,7 @@ fn live_socket_with_exit_record_is_exited() {
     let _listener = UnixListener::bind(registry::socket_path(&name)).unwrap();
     std::fs::write(registry::pid_path(&name), std::process::id().to_string()).unwrap();
     let mut v = base(&name);
+    bind_live(&mut v);
     v["exitCode"] = json!(7);
     v["exitedAt"] = json!("2026-04-05T10:16:03.000Z");
     write_json(&name, v);
@@ -213,6 +210,7 @@ fn daemon_pid_needs_a_matching_start_token() {
     let name = unique_name("token");
     let mut v = base(&name);
     v["daemonPid"] = json!(me);
+    v["daemonBootId"] = json!(registry::read_boot_id().unwrap());
     v["recovery"] = json!({"protocol": 1, "processStartToken": token});
     write_json(&name, v.clone());
     assert_eq!(registry::read_pid(&name), Some(me));
@@ -233,10 +231,10 @@ fn daemon_pid_needs_a_matching_start_token() {
         "daemonPid alone is never trusted"
     );
 
-    // The sidecar pid always wins.
+    // The raw sidecar remains inspectable, but never overrides identity.
     std::fs::write(registry::pid_path(&name), "12abc").unwrap();
     assert_eq!(registry::read_session_pid(&name), Some(12));
-    assert_eq!(registry::read_pid(&name), Some(12));
+    assert_eq!(registry::read_pid(&name), None);
 }
 
 /// A destructive signal target binds to the real OS start token of the live
@@ -252,6 +250,7 @@ fn signal_target_binds_the_live_os_start_token() {
     let live = SessionMetadata {
         daemon_pid: Some(me),
         daemon_start_token: registry::read_process_start_token(me),
+        daemon_boot_id: registry::read_boot_id(),
         ..Default::default()
     };
     assert_eq!(
@@ -424,10 +423,20 @@ fn matches_node_list_json_on_a_mixed_directory() {
         std::process::id().to_string(),
     )
     .unwrap();
-    write_json("m-running", base("m-running"));
+    let mut running = base("m-running");
+    bind_live(&mut running);
+    write_json("m-running", running);
     std::fs::write(registry::pid_path("m-dead"), DEAD_PID.to_string()).unwrap();
     write_json("m-dead", base("m-dead"));
     let _listener = UnixListener::bind(registry::socket_path("m-sockonly")).unwrap();
+    let mut sockonly = base("m-sockonly");
+    bind_live(&mut sockonly);
+    write_json("m-sockonly", sockonly);
+    std::fs::write(
+        registry::pid_path("m-sockonly"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
 
     let out = run_node_pty(&bin, &root, &["list", "--json"]);
     assert!(
@@ -485,11 +494,18 @@ fn strict_root() -> std::path::PathBuf {
 #[test]
 fn strict_clean_inventory_matches_default_and_preserves_root() {
     let dir = strict_root();
-    std::fs::write(dir.join("retained.json"), br#"{"exitCode":0}"#).unwrap();
+    std::fs::write(
+        dir.join("retained.json"),
+        format!(r#"{{"exitCode":0,"daemonPid":{DEAD_PID}}}"#),
+    )
+    .unwrap();
     std::fs::write(dir.join("orphan.pid"), DEAD_PID.to_string()).unwrap();
     std::fs::write(dir.join("ignored.tmp.bad.json"), b"not json").unwrap();
     let socket = dir.join("socket.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let mut socket_record = base("socket");
+    bind_live(&mut socket_record);
+    std::fs::write(dir.join("socket.json"), socket_record.to_string()).unwrap();
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(inventory.complete);
@@ -518,6 +534,9 @@ fn strict_clean_inventory_matches_default_and_preserves_root() {
 fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
     let dir = strict_root();
     let live = UnixListener::bind(dir.join("live.sock")).unwrap();
+    let mut live_record = base("live");
+    bind_live(&mut live_record);
+    std::fs::write(dir.join("live.json"), live_record.to_string()).unwrap();
     for name in ["dead-pid", "recorded-exit"] {
         stale_socket(&dir.join(format!("{name}.sock")));
     }
@@ -525,7 +544,8 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
     std::fs::write(
         dir.join("recorded-exit.json"),
         format!(r#"{{"exitCode":7,"daemonPid":{DEAD_PID}}}"#),
-    ).unwrap();
+    )
+    .unwrap();
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(inventory.complete);
@@ -538,7 +558,11 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
             .collect::<Vec<_>>(),
         vec![
             ("dead-pid", SessionStatus::Vanished, None),
-            ("live", SessionStatus::Running, None),
+            (
+                "live",
+                SessionStatus::Running,
+                Some(std::process::id() as i32)
+            ),
             ("recorded-exit", SessionStatus::Exited, None),
         ]
     );
@@ -546,17 +570,10 @@ fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
         inventory.entries[2].metadata.as_ref().unwrap().exit_code,
         Some(7)
     );
-    // The legacy scanner still omits dead pid-only sockets and defensively
-    // reports a socket without a PID as running.
+    // Tolerant and strict listings use the same identity boundary.
     assert_eq!(
-        registry::list_sessions_in(&dir, &options)
-            .iter()
-            .map(|session| (session.name.as_str(), session.status))
-            .collect::<Vec<_>>(),
-        vec![
-            ("live", SessionStatus::Running),
-            ("recorded-exit", SessionStatus::Running),
-        ]
+        registry::list_sessions_in(&dir, &options),
+        inventory.entries
     );
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
@@ -570,11 +587,13 @@ fn strict_refused_socket_without_dead_pid_is_incomplete() {
     let options = registry::ListOptions::default();
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
-    assert_eq!(inventory.errors[0].kind, registry::InventoryErrorKind::EntryUnreadable);
-    assert_eq!(inventory.errors[0].path, socket);
-    assert_eq!(inventory.entries[0].status, SessionStatus::Running);
-    // Recorded exit evidence without a known non-live process is still
-    // insufficient to disambiguate a refused listener.
+    assert_eq!(
+        inventory.errors[0].kind,
+        registry::InventoryErrorKind::IdentityUnknown
+    );
+    assert_eq!(inventory.errors[0].path, dir.join("unknown.json"));
+    assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+    // Recorded exit evidence does not prove an unknown process is gone.
     std::fs::write(dir.join("unknown.json"), br#"{"exitCode":0}"#).unwrap();
     assert!(!registry::list_sessions_strict_in(&dir, &options).complete);
     std::fs::write(dir.join("unknown.pid"), DEAD_PID.to_string()).unwrap();
@@ -605,7 +624,11 @@ fn strict_missing_root_is_incomplete_without_creating_it() {
 fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records() {
     use registry::InventoryErrorKind::{MetadataMalformed, PidMalformed};
     let dir = strict_root();
-    std::fs::write(dir.join("good.json"), b"{}").unwrap();
+    std::fs::write(
+        dir.join("good.json"),
+        format!(r#"{{"daemonPid":{DEAD_PID}}}"#),
+    )
+    .unwrap();
     for (name, content) in [
         ("broken", "{"),
         ("array", "[]"),
@@ -623,7 +646,9 @@ fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records(
         std::fs::write(dir.join(format!("{name}.pid")), content).unwrap();
     }
     // A legacy suffix remains valid for classification, but not strict evidence.
-    std::fs::write(dir.join("legacy.json"), b"{}").unwrap();
+    let mut legacy = base("legacy");
+    bind_live(&mut legacy);
+    std::fs::write(dir.join("legacy.json"), legacy.to_string()).unwrap();
     std::fs::write(
         dir.join("legacy.pid"),
         format!("{}junk", std::process::id()),
@@ -767,11 +792,17 @@ fn strict_reports_permission_denied_root_and_sidecars() {
     let inventory = registry::list_sessions_strict_in(&dir, &options);
     assert!(!inventory.complete);
     assert!(inventory.errors.iter().any(|error| {
-        error.path == socket && error.kind == registry::InventoryErrorKind::EntryUnreadable
+        error.path == dir.join("denied.json")
+            && error.kind == registry::InventoryErrorKind::IdentityUnknown
     }));
     assert_eq!(
-        inventory.entries.iter().find(|session| session.name == "denied").unwrap().status,
-        SessionStatus::Running
+        inventory
+            .entries
+            .iter()
+            .find(|session| session.name == "denied")
+            .unwrap()
+            .status,
+        SessionStatus::Vanished
     );
     drop(listener);
     std::fs::remove_dir_all(dir).unwrap();
@@ -779,7 +810,7 @@ fn strict_reports_permission_denied_root_and_sidecars() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn strict_timeout_is_incomplete_but_refused_socket_is_complete() {
+fn saturated_or_refused_socket_cannot_rescue_a_gone_identity() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     let dir = strict_root();
@@ -794,13 +825,28 @@ fn strict_timeout_is_incomplete_but_refused_socket_is_complete() {
         socket_probe_budget: Duration::ZERO,
     };
     let inventory = registry::list_sessions_strict_in(&dir, &options);
-    assert!(!inventory.complete);
-    assert_eq!(
-        inventory.errors[0].kind,
-        registry::InventoryErrorKind::ProbeTimeout
+    assert!(inventory.complete);
+    assert!(inventory.errors.is_empty());
+    assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+    // Unknown identity remains non-live, but its transport diagnostics honor
+    // the shared budget rather than converting a timeout into absence.
+    std::fs::write(dir.join("busy.pid"), std::process::id().to_string()).unwrap();
+    let unknown = registry::list_sessions_strict_in(&dir, &options);
+    assert!(!unknown.complete);
+    assert_eq!(unknown.entries[0].status, SessionStatus::Vanished);
+    assert!(
+        unknown
+            .errors
+            .iter()
+            .any(|error| error.kind == registry::InventoryErrorKind::IdentityUnknown)
     );
-    assert_eq!(inventory.errors[0].path, busy);
-    assert!(inventory.entries.is_empty());
+    assert!(
+        unknown
+            .errors
+            .iter()
+            .any(|error| error.kind == registry::InventoryErrorKind::ProbeTimeout)
+    );
+    std::fs::write(dir.join("busy.pid"), DEAD_PID.to_string()).unwrap();
     drop(queued);
     drop(listener);
     let inventory = registry::list_sessions_strict_in(&dir, &options);
@@ -815,4 +861,150 @@ fn strict_timeout_is_incomplete_but_refused_socket_is_complete() {
         vec![("busy", SessionStatus::Vanished, None)]
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn sidecar_reuse_is_vanished_even_with_a_reachable_socket() {
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let pid = std::process::id() as i32;
+        let mut metadata = SessionMetadata {
+            generation: Some("old-generation".into()),
+            daemon_pid: Some(pid),
+            daemon_start_token: Some("stale:start-token".into()),
+            daemon_boot_id: registry::read_boot_id(),
+            ..Default::default()
+        };
+        registry::write_metadata_publication("reused", &metadata).unwrap();
+        registry::write_pid("reused", pid as u32).unwrap();
+        let _listener = UnixListener::bind(registry::socket_path("reused")).unwrap();
+        let before = registry::daemon_identity_counters();
+        assert_eq!(
+            registry::check_daemon_identity(pid, &metadata),
+            registry::DaemonIdentityCheck::Mismatch
+        );
+        let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+        assert!(inventory.complete);
+        assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+        assert_eq!(inventory.entries[0].pid, None);
+        assert_eq!(registry::read_pid("reused"), None);
+        assert_eq!(
+            registry::read_signal_target_with("reused", Some(&metadata)),
+            None
+        );
+        assert!(registry::daemon_identity_counters().mismatched > before.mismatched);
+        metadata.exited_at = Some("2026-10-01T00:00:00.000Z".into());
+        registry::write_metadata_publication("reused", &metadata).unwrap();
+        assert_eq!(registry::list_sessions()[0].status, SessionStatus::Exited);
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unknown_identity_is_not_live_and_makes_strict_inventory_incomplete() {
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        let pid = std::process::id() as i32;
+        let metadata = SessionMetadata {
+            daemon_pid: Some(pid),
+            ..Default::default()
+        };
+        registry::write_metadata_publication("unknown", &metadata).unwrap();
+        registry::write_pid("unknown", pid as u32).unwrap();
+        let _listener = UnixListener::bind(registry::socket_path("unknown")).unwrap();
+        assert_eq!(
+            registry::check_daemon_identity(pid, &metadata),
+            registry::DaemonIdentityCheck::Unknown
+        );
+        let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+        assert!(!inventory.complete);
+        assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+        assert_eq!(
+            inventory.errors[0].kind,
+            registry::InventoryErrorKind::IdentityUnknown
+        );
+        assert_eq!(
+            registry::read_signal_target_with("unknown", Some(&metadata)),
+            None
+        );
+        assert!(registry::metadata_path("unknown").exists());
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn boot_identity_and_leader_identity_are_required() {
+    let pid = std::process::id() as i32;
+    let token = registry::read_process_start_token(pid).unwrap();
+    let mut metadata = SessionMetadata {
+        daemon_pid: Some(pid),
+        daemon_start_token: Some(token),
+        ..Default::default()
+    };
+    // A token-only record cannot prove which boot owns this PID.
+    assert_eq!(
+        registry::check_daemon_identity(pid, &metadata),
+        registry::DaemonIdentityCheck::Unknown
+    );
+    assert_eq!(
+        registry::read_signal_target_with("token-only", Some(&metadata)),
+        None
+    );
+    metadata.daemon_boot_id = registry::read_boot_id();
+    assert!(metadata.daemon_boot_id.is_some());
+    assert_eq!(
+        registry::check_daemon_identity(pid, &metadata),
+        registry::DaemonIdentityCheck::Match
+    );
+    metadata.daemon_boot_id = Some("another-boot".into());
+    assert_eq!(
+        registry::check_daemon_identity(pid, &metadata),
+        registry::DaemonIdentityCheck::Mismatch
+    );
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        registry::write_metadata_publication("old-boot", &metadata).unwrap();
+        let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+        assert!(inventory.complete);
+        assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+        assert_eq!(
+            registry::read_signal_target_with("old-boot", Some(&metadata)),
+            None
+        );
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: gettid has no arguments or side effects.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        tid_tx.send(tid).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let tid = tid_rx.recv().unwrap();
+    assert_ne!(tid, pid);
+    assert_eq!(registry::read_process_start_token(tid), None);
+    metadata.daemon_pid = Some(tid);
+    metadata.daemon_boot_id = registry::read_boot_id();
+    assert_eq!(
+        registry::check_daemon_identity(tid, &metadata),
+        registry::DaemonIdentityCheck::Mismatch
+    );
+    let dir = strict_root();
+    registry::with_root(&dir, || {
+        registry::write_metadata_publication("thread", &metadata).unwrap();
+        registry::write_pid("thread", tid as u32).unwrap();
+        let inventory = registry::list_sessions_strict_in(&dir, &registry::ListOptions::default());
+        assert!(inventory.complete);
+        assert_eq!(inventory.entries[0].status, SessionStatus::Vanished);
+        assert_eq!(
+            registry::read_signal_target_with("thread", Some(&metadata)),
+            None
+        );
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+    release_tx.send(()).unwrap();
+    thread.join().unwrap();
 }

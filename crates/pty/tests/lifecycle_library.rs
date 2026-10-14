@@ -75,6 +75,8 @@ fn gc_dry_run_reports_without_mutating_then_applies_the_same_cleanup() {
     let metadata = SessionMetadata {
         generation: Some("gone-generation".into()),
         daemon_pid: Some(DEAD_PID),
+        daemon_start_token: Some("fixture:dead".into()),
+        daemon_boot_id: registry::read_boot_id(),
         command: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 0".into()],
         display_command: "exit 0".into(),
@@ -147,6 +149,11 @@ fn spawn_params_new_supplies_a_usable_cwd_to_a_real_daemon() {
         .expect("SpawnParams::new should be spawnable without overwriting cwd");
     let published = registry::read_metadata(&name).expect("daemon published metadata");
     assert_eq!(published.daemon_pid, Some(started.pid as i32));
+    assert_eq!(published.daemon_boot_id, registry::read_boot_id());
+    assert_eq!(
+        registry::check_daemon_identity(started.pid as i32, &published),
+        registry::DaemonIdentityCheck::Match,
+    );
     assert_eq!(
         published.generation.as_deref(),
         Some(started.generation.as_str())
