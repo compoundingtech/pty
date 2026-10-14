@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sha2::{Digest, Sha256};
+
 /// Largest pathname, excluding its trailing NUL, that the supported platform
 /// can represent in `sockaddr_un.sun_path`.
 pub const SUN_PATH_MAX: usize = if cfg!(target_os = "macos") { 103 } else { 104 };
@@ -156,9 +158,27 @@ pub fn ensure_session_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to a session's unix socket, `<root>/<name>.sock`.
+/// Path to a session's unix socket within the effective registry.
 pub fn socket_path(name: &str) -> PathBuf {
-    session_dir().join(format!("{name}.sock"))
+    socket_path_in(&session_dir(), name)
+}
+
+/// Preserve a readable address when it fits; otherwise bound the transport
+/// filename independently of the logical id. `@` cannot occur in an id, so
+/// the digest namespace cannot alias a readable session's socket.
+pub fn socket_path_in(root: &Path, name: &str) -> PathBuf {
+    let readable = root.join(format!("{name}.sock"));
+    if readable.as_os_str().len() <= SUN_PATH_MAX {
+        return readable;
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    let mut filename = String::from("@");
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        write!(filename, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    filename.push_str(".sock");
+    root.join(filename)
 }
 
 /// Path to a session's pid file, `<root>/<name>.pid`.
@@ -237,6 +257,27 @@ mod tests {
         assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
         assert_eq!(root, default_session_dir_for_host(home, host));
         assert_ne!(root, default_session_dir_for_host(home, b"other-host"));
+    }
+
+    #[test]
+    fn bounded_socket_preserves_readable_paths_and_session_identity() {
+        let root = PathBuf::from(format!("/tmp/{}", "r".repeat(58)));
+        let id = "n".repeat(63);
+        let socket = socket_path_in(&root, &id);
+        assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
+        assert_eq!(socket, socket_path_in(&root, &id));
+        assert_ne!(socket, socket_path_in(&root, &format!("{id}.replacement")));
+        assert!(
+            socket.file_name().unwrap().to_string_lossy().starts_with('@')
+        );
+        assert_eq!(socket_path_in(&root, "short"), root.join("short.sock"));
+        with_root(&root, || {
+            assert!(super::super::names::validate_name(&id).is_ok());
+            assert!(
+                super::super::names::validate_name(socket.file_stem().unwrap().to_str().unwrap())
+                    .is_err()
+            );
+        });
     }
 
     #[test]

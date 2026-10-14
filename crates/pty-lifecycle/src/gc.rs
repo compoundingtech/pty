@@ -805,7 +805,8 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
             .strip_suffix(".events.jsonl")
             .or_else(|| entry.strip_suffix(".sock"))
             .or_else(|| entry.strip_suffix(".pid"))
-            .or_else(|| entry.strip_suffix(".json"));
+            .or_else(|| entry.strip_suffix(".json"))
+            .filter(|name| !name.starts_with('@'));
         if let Some(name) = name
             && only.is_none_or(|o| o == name)
         {
@@ -823,7 +824,9 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
     let candidates: Vec<Candidate> = names
         .into_iter()
         .filter_map(|name| {
-            let has_socket = entries.contains(&format!("{name}.sock"));
+            let has_socket = socket_path(&name).file_name().is_some_and(|filename| {
+                entries.contains(filename.to_string_lossy().as_ref())
+            });
             let has_pid = entries.contains(&format!("{name}.pid"));
             let has_metadata = entries.contains(&format!("{name}.json"));
             if has_metadata && !metadata_is_malformed(&name) {

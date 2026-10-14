@@ -31,6 +31,14 @@ PTY.TRL-R08: a lost attachment is not a child-exit observation.
 and a Rust client talks to a Node daemon, on the same `$PTY_ROOT`. Section 11
 lists what this costs beyond drop-in.
 
+**Socket pathname extension.** For a logical id whose `<root>/<id>.sock`
+address exceeds the platform limit, Rust uses a bounded digest filename.
+Node rejects those ids. Addresses accepted by Node retain their exact paths;
+the persisted metadata, pid and event names do not change. Rust listing and
+lookup map bounded sockets through their id-named registry companions.
+Rust rejects IDs above 209 ASCII characters before launch so id-based sidecars
+and their atomic temporary filenames stay within the filesystem component limit.
+
 **Three surfaces.** The Node package has three parts. The parity rule differs
 per part:
 

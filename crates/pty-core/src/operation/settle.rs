@@ -87,8 +87,11 @@ pub fn observe_occupancy(root: &Path, name: &str) -> Occupancy {
         };
     }
     // A pid file alone is still a row that is not completely absent.
-    for companion in [".sock", ".json", ".pid"] {
-        let path = root.join(format!("{name}{companion}"));
+    for path in [
+        registry::socket_path_in(root, name),
+        root.join(format!("{name}.json")),
+        root.join(format!("{name}.pid")),
+    ] {
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Occupancy::Ended { incarnation: None },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

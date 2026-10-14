@@ -1,8 +1,8 @@
 //! Allocate a pseudo-terminal and start a child process in it.
 //!
 //! **This crate is deliberately small, and deliberately free of the terminal
-//! emulator.** It depends on `portable-pty` and nothing else, so it builds with
-//! plain `cargo` on any platform the toolchain supports.
+//! emulator.** It uses `portable-pty` and the emulator-free `pty-core` registry
+//! helpers, so it builds with plain `cargo` on supported platforms.
 //!
 //! That matters more than it looks. The rest of this workspace builds
 //! `libghostty` from source with Zig, pinned at 0.15.2, and that Zig cannot

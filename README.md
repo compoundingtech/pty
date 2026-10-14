@@ -262,6 +262,14 @@ registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
+Session ids remain independent of Unix socket pathname limits. A socket uses
+`<id>.sock` when that address fits; longer addresses use an `@`-prefixed digest
+filename within the same registry. Metadata, pid files and events keep their
+id-based names. Socket clients use `SessionInfo.socket_path` or
+`pty_core::registry::socket_path_in`, rather than constructing a pathname.
+Existing readable socket addresses are unchanged. Rust IDs are limited to 209
+ASCII characters to leave room for registry sidecars and atomic publication.
+
 `pty list --json --strict` reports one registry as
 `{"root":"…","complete":true,"entries":[…],"errors":[]}`. The root is resolved
 through global `--root`, `PTY_ROOT`, or the default above and returned verbatim:

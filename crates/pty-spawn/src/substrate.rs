@@ -81,7 +81,7 @@ impl SessionRef {
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> &str { &self.id }
     pub fn generation(&self) -> &str { &self.generation }
-    pub fn socket_path(&self) -> PathBuf { self.root.join(format!("{}.sock", self.id)) }
+    pub fn socket_path(&self) -> PathBuf { pty_core::registry::socket_path_in(&self.root, &self.id) }
 }
 
 /// The only lifecycle outcomes a client can observe from the substrate.
