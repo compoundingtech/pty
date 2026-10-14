@@ -568,6 +568,7 @@ fn marker_component(scan: &ArgvScan, digest: &str) -> Component {
             "complete": scan.complete,
             "rows": scan.rows.len(),
             "zombies": scan.zombies,
+            "kernelThreads": scan.kernel_threads,
             "unreadable": scan.unreadable,
             "matches": matches.iter().map(|row| json!({
                 "pid": row.pid,

@@ -538,14 +538,19 @@ impl OperationStore {
     ) -> Result<(), CreateError> {
         self.ensure_dir().map_err(CreateError::Io)?;
         // The lock exists before the record does, so every later reader can
-        // open it without creating anything.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(self.lock_path(digest))
-            .map_err(CreateError::Io)?;
+        // open it without creating anything. Opened like every other lock
+        // file descriptor, so this close cannot drop a lock of this process.
+        drop(
+            LockFile::open(
+                &self.lock_path(digest),
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_CLOEXEC),
+            )
+            .map_err(CreateError::Io)?,
+        );
         let target = self.record_path(digest);
         let tmp = registry::atomic::tmp_path_for(&target);
         let bytes = encode(record).map_err(CreateError::Io)?;
@@ -656,58 +661,142 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// lock too: a held child stopped between its fork and its descriptor
 /// cleanup would keep a dead daemon's lock for ever. A record lock belongs
 /// to the process and is never inherited by a fork. The one rule that comes
-/// with it: a process must not open and close the lock file anywhere else
-/// while it holds the lock, since closing any descriptor of the file drops
-/// it.
+/// with it: closing ANY descriptor of the file drops every record lock the
+/// process holds on it, and the process's own requests never conflict with
+/// its own locks. [`LockFile`] keeps that rule for every thread.
 #[derive(Debug)]
 pub struct OperationLock {
-    file: File,
-    /// The lock file, as this process named it, while held exclusively.
-    exclusive: Option<PathBuf>,
+    /// Held for the lock it carries; dropping it releases the lock.
+    #[cfg_attr(not(test), allow(dead_code))]
+    file: LockFile,
 }
 
-/// The lock files this process holds exclusively. A record lock is dropped
-/// when its holder closes ANY descriptor of the file, and it never conflicts
-/// with the holder's own requests, so a holder that opened the same lock file
-/// to observe it would silently lose its lock (or "acquire" a second one).
-/// Every observing path refuses a lock file in this set instead.
-static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-
-fn held_here(path: &Path) -> bool {
-    HELD.lock()
-        .map(|held| held.iter().any(|p| p == path))
-        .unwrap_or(true)
+/// **One descriptor per lock file per process, opened and closed under one
+/// mutex.** Every descriptor this process opens on a lock file, for any
+/// purpose (the write lock, a read lock, the holder query, the creation),
+/// is in [`OPEN`] from before any other thread could see it until after it
+/// is closed. The file is named by its device and inode, so two spellings of
+/// one file are one file. The open and its registration, and the close and
+/// its removal, each happen with [`OPEN`] held, so no thread can open the
+/// file between them. A second open of a registered file is refused: closing
+/// that second descriptor would drop the first one's lock.
+#[derive(Debug)]
+struct LockFile {
+    /// `None` only while the descriptor is being closed.
+    file: Option<File>,
+    key: FileKey,
 }
+
+/// A file's device and inode.
+type FileKey = (u64, u64);
+
+static OPEN: std::sync::Mutex<Vec<FileKey>> = std::sync::Mutex::new(Vec::new());
 
 fn held_by_this_process() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
-        "this process holds the operation lock; observing it here would drop it",
+        "this process has the operation lock file open; a second descriptor would drop its lock",
     )
 }
 
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        if let Some(path) = &self.exclusive
-            && let Ok(mut held) = HELD.lock()
+fn file_key(metadata: &std::fs::Metadata) -> FileKey {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+impl LockFile {
+    fn open(path: &Path, options: &std::fs::OpenOptions) -> io::Result<LockFile> {
+        // A poisoned list may be missing a registration: refuse.
+        let mut open = OPEN.lock().map_err(|_| held_by_this_process())?;
+        if let Ok(metadata) = std::fs::metadata(path)
+            && open.contains(&file_key(&metadata))
         {
-            held.retain(|p| p != path);
+            return Err(held_by_this_process());
         }
+        let file = options.open(path)?;
+        let key = match file.metadata() {
+            Ok(metadata) => file_key(&metadata),
+            Err(error) => {
+                // Which file it is cannot be told, so closing it might drop
+                // a lock: it stays open, unused.
+                std::mem::forget(file);
+                return Err(error);
+            }
+        };
+        if open.contains(&key) {
+            // The path came to name a file this process has open between the
+            // look and the open. Closing this descriptor would drop that
+            // file's lock, so it stays open, unused.
+            std::mem::forget(file);
+            return Err(held_by_this_process());
+        }
+        open.push(key);
+        Ok(LockFile {
+            file: Some(file),
+            key,
+        })
     }
+
+    fn fd(&self) -> i32 {
+        self.file
+            .as_ref()
+            .expect("a lock file is open until it is dropped")
+            .as_raw_fd()
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // The close and the removal as one step, even after a panic
+        // elsewhere: no thread may open the file while it is still listed
+        // but closing, or once it is unlisted but not yet closed.
+        let mut open = OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause_at("closing");
+        drop(self.file.take());
+        open.retain(|key| *key != self.key);
+    }
+}
+
+/// A named point a unit test can stop one of its own threads at, to hold a
+/// window open while another thread runs.
+#[cfg(test)]
+mod pause {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    thread_local! {
+        pub(super) static AT: RefCell<Option<(&'static str, SyncSender<()>, Receiver<()>)>> =
+            const { RefCell::new(None) };
+    }
+}
+
+fn pause_at(point: &'static str) {
+    #[cfg(test)]
+    pause::AT.with(|at| {
+        let armed = at
+            .borrow()
+            .as_ref()
+            .is_some_and(|(name, _, _)| *name == point);
+        if armed && let Some((_, reached, release)) = at.borrow_mut().take() {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    });
+    #[cfg(not(test))]
+    let _ = point;
 }
 
 impl OperationLock {
     /// The lock `reserve` created. Nothing is created here: a reader that
     /// finds no lock finds no operation.
-    fn open(store: &OperationStore, digest: &str, write: bool) -> io::Result<File> {
-        if held_here(&store.lock_path(digest)) {
-            return Err(held_by_this_process());
-        }
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(write)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(store.lock_path(digest))
+    fn open(store: &OperationStore, digest: &str, write: bool) -> io::Result<LockFile> {
+        LockFile::open(
+            &store.lock_path(digest),
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(write)
+                .custom_flags(libc::O_CLOEXEC),
+        )
     }
 
     /// Take the write lock, polling for up to `wait`. `Ok(None)` means
@@ -720,15 +809,9 @@ impl OperationLock {
         let file = Self::open(store, digest, true)?;
         let deadline = Instant::now() + wait;
         loop {
-            if try_lock(&file, libc::F_WRLCK as libc::c_int)? {
-                let path = store.lock_path(digest);
-                if let Ok(mut held) = HELD.lock() {
-                    held.push(path.clone());
-                }
-                return Ok(Some(OperationLock {
-                    file,
-                    exclusive: Some(path),
-                }));
+            if try_lock(file.fd(), libc::F_WRLCK as libc::c_int)? {
+                pause_at("locked");
+                return Ok(Some(OperationLock { file }));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -741,11 +824,8 @@ impl OperationLock {
     /// the write lock: it is alive. It reads and creates nothing.
     pub fn shared_now(store: &OperationStore, digest: &str) -> io::Result<Option<OperationLock>> {
         let file = Self::open(store, digest, false)?;
-        if try_lock(&file, libc::F_RDLCK as libc::c_int)? {
-            Ok(Some(OperationLock {
-                file,
-                exclusive: None,
-            }))
+        if try_lock(file.fd(), libc::F_RDLCK as libc::c_int)? {
+            Ok(Some(OperationLock { file }))
         } else {
             Ok(None)
         }
@@ -761,20 +841,21 @@ impl OperationLock {
         lock.l_type = libc::F_RDLCK as _;
         lock.l_whence = libc::SEEK_SET as _;
         // SAFETY: `file` owns a valid descriptor; `lock` is a valid flock.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } != 0 {
+        if unsafe { libc::fcntl(file.fd(), libc::F_GETLK, &mut lock) } != 0 {
             return None;
         }
         (lock.l_type as libc::c_int != libc::F_UNLCK as libc::c_int).then_some(lock.l_pid as i32)
     }
 
-    /// The descriptor, for a holder that must keep it across `exec`.
-    pub fn raw_fd(&self) -> i32 {
-        self.file.as_raw_fd()
+    /// The descriptor, for a test's forked child to probe the lock with.
+    #[cfg(test)]
+    fn raw_fd(&self) -> i32 {
+        self.file.fd()
     }
 }
 
 /// `F_SETLK` over the whole file.
-fn try_lock(file: &File, kind: libc::c_int) -> io::Result<bool> {
+fn try_lock(fd: i32, kind: libc::c_int) -> io::Result<bool> {
     loop {
         // SAFETY: an all-zero flock is a valid value to fill in.
         let mut lock: libc::flock = unsafe { std::mem::zeroed() };
@@ -782,8 +863,8 @@ fn try_lock(file: &File, kind: libc::c_int) -> io::Result<bool> {
         lock.l_whence = libc::SEEK_SET as _;
         lock.l_start = 0;
         lock.l_len = 0;
-        // SAFETY: `file` owns a valid descriptor; `lock` is a valid flock.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == 0 {
+        // SAFETY: `fd` is a lock file's open descriptor; `lock` is a valid flock.
+        if unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) } == 0 {
             return Ok(true);
         }
         let error = io::Error::last_os_error();
@@ -925,6 +1006,7 @@ mod tests {
         // Another process takes the write lock. Everything it needs is made
         // before the fork; the child only locks, reports and waits.
         let file = OperationLock::open(&store, &h, true).unwrap();
+        let fd = file.fd();
         let mut pipe = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         // SAFETY: the child calls only fcntl, write and pause.
@@ -935,7 +1017,7 @@ mod tests {
                 let mut lock: libc::flock = std::mem::zeroed();
                 lock.l_type = libc::F_WRLCK as _;
                 lock.l_whence = libc::SEEK_SET as _;
-                let ok = libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0;
+                let ok = libc::fcntl(fd, libc::F_SETLK, &lock) == 0;
                 libc::write(pipe[1], [ok as u8].as_ptr().cast(), 1);
                 libc::pause();
                 libc::_exit(0);
@@ -947,6 +1029,9 @@ mod tests {
             1
         );
         assert_eq!(byte[0], 1, "the other process took the lock");
+        // This process's own descriptor is no part of that lock; while it is
+        // open, this process may open the file for nothing else.
+        drop(file);
         assert!(OperationLock::shared_now(&store, &h).unwrap().is_none());
         assert!(
             OperationLock::exclusive(&store, &h, Duration::from_millis(20))
@@ -991,7 +1076,188 @@ mod tests {
             "a forked child must not inherit the parent's lock"
         );
         drop(held);
-        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Can another process take the write lock now? A forked child tries.
+    /// It calls only `open`, `fcntl` and `_exit`, so the fork is safe from a
+    /// test with other threads running.
+    fn free_to_another_process(path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the child calls only async-signal-safe functions.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(2);
+                }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as _;
+                lock.l_whence = libc::SEEK_SET as _;
+                libc::_exit(if libc::fcntl(fd, libc::F_SETLK, &lock) == 0 {
+                    1
+                } else {
+                    0
+                });
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child forked above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        match libc::WEXITSTATUS(status) {
+            0 => false,
+            1 => true,
+            other => panic!("the probe could not open the lock file ({other})"),
+        }
+    }
+
+    fn reserved() -> (OperationStore, PathBuf, String) {
+        let (store, dir) = store();
+        let envelope = envelope();
+        let h = envelope.digest();
+        store
+            .create_exclusive(&h, &OperationRecord::reserved(&envelope))
+            .unwrap();
+        (store, dir, h)
+    }
+
+    /// Stop the calling thread at `point` until the returned sender sends;
+    /// the receiver hears when it got there.
+    fn arm(
+        point: &'static str,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached_tx, reached) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        pause::AT.with(|at| *at.borrow_mut() = Some((point, reached_tx, release_rx)));
+        (reached, release)
+    }
+
+    /// **The write lock is registered before it is taken.** Thread A is
+    /// stopped holding the fresh lock, before `exclusive` returns. Every
+    /// other way into the file from this process is refused meanwhile, and
+    /// none of them drops A's lock.
+    #[test]
+    fn no_thread_can_open_a_lock_file_between_its_lock_and_its_return() {
+        let (store, dir, h) = reserved();
+        let (to_a, from_test) = std::sync::mpsc::sync_channel(1);
+        let a = std::thread::spawn({
+            let (dir, h) = (dir.clone(), h.clone());
+            move || {
+                let (reached, release) = arm("locked");
+                to_a.send((reached, release)).unwrap();
+                OperationLock::exclusive(&OperationStore::at(&dir), &h, Duration::ZERO)
+                    .unwrap()
+                    .unwrap()
+            }
+        });
+        let (reached, release) = from_test.recv().unwrap();
+        reached.recv().unwrap();
+        let path = store.lock_path(&h);
+        assert!(OperationLock::holder(&store, &h).is_none());
+        assert!(OperationLock::shared_now(&store, &h).is_err());
+        assert!(OperationLock::exclusive(&store, &h, Duration::ZERO).is_err());
+        assert!(!free_to_another_process(&path), "A still holds its lock");
+        release.send(()).unwrap();
+        let lock = a.join().unwrap();
+        assert!(!free_to_another_process(&path));
+        drop(lock);
+        assert!(free_to_another_process(&path), "dropped, it is released");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// **A descriptor is closed and unregistered as one step.** Thread A is
+    /// stopped in the middle of dropping its lock. Thread B asks for the
+    /// lock meanwhile, and waits: had it opened the file, A's close would
+    /// drop the lock B then took. The fixed order passes in every
+    /// interleaving; the 500 ms only gives the old order time to fail.
+    #[test]
+    fn no_thread_can_open_a_lock_file_while_its_descriptor_closes() {
+        let (store, dir, h) = reserved();
+        let lock = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let (to_test, from_a) = std::sync::mpsc::sync_channel(1);
+        let a = std::thread::spawn(move || {
+            let (reached, release) = arm("closing");
+            to_test.send((reached, release)).unwrap();
+            drop(lock);
+        });
+        let (reached, release) = from_a.recv().unwrap();
+        reached.recv().unwrap();
+        let (done_tx, done) = std::sync::mpsc::sync_channel(1);
+        let b = std::thread::spawn({
+            let (dir, h) = (dir.clone(), h.clone());
+            move || {
+                let got =
+                    OperationLock::exclusive(&OperationStore::at(&dir), &h, Duration::from_secs(5));
+                let _ = done_tx.send(());
+                got.unwrap().expect("free once A has closed")
+            }
+        });
+        assert!(
+            done.recv_timeout(Duration::from_millis(500)).is_err(),
+            "B must wait for A's close to finish"
+        );
+        release.send(()).unwrap();
+        a.join().unwrap();
+        let held = b.join().unwrap();
+        assert!(
+            !free_to_another_process(&store.lock_path(&h)),
+            "A's close did not take B's lock with it"
+        );
+        drop(held);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A read lock is dropped by a stray close exactly as a write lock is,
+    /// so its descriptor is registered the same way.
+    #[test]
+    fn a_read_lock_is_kept_like_the_write_lock() {
+        let (store, dir, h) = reserved();
+        let path = store.lock_path(&h);
+        let reader = OperationLock::shared_now(&store, &h).unwrap().unwrap();
+        assert!(OperationLock::holder(&store, &h).is_none());
+        assert!(OperationLock::shared_now(&store, &h).is_err());
+        assert!(
+            !free_to_another_process(&path),
+            "the read lock still excludes a writer"
+        );
+        drop(reader);
+        assert!(free_to_another_process(&path));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The registry names a file by device and inode: a symlinked root and a
+    /// hard link are the same lock file.
+    #[test]
+    fn two_spellings_of_one_lock_file_are_one_file() {
+        let (store, dir, h) = reserved();
+        let alias_root = dir.with_extension("alias");
+        std::os::unix::fs::symlink(&dir, &alias_root).unwrap();
+        let alias = OperationStore::at(&alias_root);
+        assert_ne!(alias.lock_path(&h), store.lock_path(&h));
+        let linked = dir.join("linked.lock");
+        std::fs::hard_link(store.lock_path(&h), &linked).unwrap();
+
+        let lock = OperationLock::exclusive(&store, &h, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert!(OperationLock::holder(&alias, &h).is_none());
+        assert!(OperationLock::shared_now(&alias, &h).is_err());
+        assert!(
+            LockFile::open(&linked, std::fs::OpenOptions::new().read(true)).is_err(),
+            "nor through a hard link"
+        );
+        assert!(!free_to_another_process(&store.lock_path(&h)));
+        drop(lock);
+        assert!(OperationLock::shared_now(&alias, &h).unwrap().is_some());
+        std::fs::remove_file(alias_root).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

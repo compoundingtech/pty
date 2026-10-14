@@ -40,6 +40,9 @@ pub struct ArgvScan {
     pub listed: usize,
     /// Zombies of the scanned uid: exited, so never a match.
     pub zombies: usize,
+    /// Kernel threads of the scanned uid (root's, on Linux): no argv, and
+    /// never a participant, so never a match.
+    pub kernel_threads: usize,
     /// Live processes of the scanned uid whose argv could not be read.
     pub unreadable: Vec<i32>,
     pub rows: Vec<ArgvRow>,
@@ -54,6 +57,7 @@ impl ArgvScan {
             complete: false,
             listed: 0,
             zombies: 0,
+            kernel_threads: 0,
             unreadable: Vec::new(),
             rows: Vec::new(),
         }
@@ -110,6 +114,7 @@ mod linux {
             complete: true,
             listed: 0,
             zombies: 0,
+            kernel_threads: 0,
             unreadable: Vec::new(),
             rows: Vec::new(),
         };
@@ -132,6 +137,7 @@ mod linux {
             match classify(pid, uid) {
                 Class::Gone | Class::OtherUser => {}
                 Class::Zombie => scan.zombies += 1,
+                Class::KernelThread => scan.kernel_threads += 1,
                 Class::Live(row) => scan.rows.push(row),
                 Class::Unreadable => scan.unreadable.push(pid),
                 Class::OwnerUnknown => scan.complete = false,
@@ -149,6 +155,7 @@ mod linux {
         Gone,
         OtherUser,
         Zombie,
+        KernelThread,
         Live(ArgvRow),
         Unreadable,
         OwnerUnknown,
@@ -158,10 +165,10 @@ mod linux {
         error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     }
 
-    /// `Uid:` (real uid) and `State:` from `/proc/<pid>/status`.
-    /// Whether both the real and the effective uid are `uid`, and the
-    /// state, from `/proc/<pid>/status`.
-    fn owner_and_state(pid: i32, uid: u32) -> Result<(bool, char), std::io::Error> {
+    /// Whether both the real and the effective uid are `uid`, the state,
+    /// and, where the kernel says (`Kthread:`), whether it is a kernel
+    /// thread, from `/proc/<pid>/status`.
+    fn owner_and_state(pid: i32, uid: u32) -> Result<(bool, char, Option<bool>), std::io::Error> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
         let mut owned = None;
         let mut state = None;
@@ -177,13 +184,36 @@ mod linux {
             }
         }
         match (owned, state) {
-            (Some(owned), Some(state)) => Ok((owned, state)),
+            (Some(owned), Some(state)) => Ok((owned, state, status_kernel_thread(&status))),
             _ => Err(std::io::Error::other("status without Uid or State")),
         }
     }
 
+    /// The `Kthread:` line of `/proc/<pid>/status`, which newer kernels
+    /// print. `None` where the line is absent or unparsable.
+    pub(super) fn status_kernel_thread(status: &str) -> Option<bool> {
+        let rest = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Kthread:"))?;
+        match rest.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `PF_KTHREAD` in the flags of `/proc/<pid>/stat` (field 9), which every
+    /// kernel prints. The kernel sets it; a user process cannot.
+    pub(super) fn stat_kernel_thread(stat: &str) -> Option<bool> {
+        const PF_KTHREAD: u64 = 0x0020_0000;
+        let tail = &stat[stat.rfind(')')? + 1..];
+        // tail's first field is field 3 (state), so field 9 is its seventh.
+        let flags: u64 = tail.split_whitespace().nth(6)?.parse().ok()?;
+        Some(flags & PF_KTHREAD != 0)
+    }
+
     fn classify(pid: i32, uid: u32) -> Class {
-        let (owned, state) = match owner_and_state(pid, uid) {
+        let (owned, state, kthread) = match owner_and_state(pid, uid) {
             Ok(found) => found,
             Err(error) if gone(&error) => return Class::Gone,
             Err(_) => return Class::OwnerUnknown,
@@ -194,11 +224,21 @@ mod linux {
         if state == 'Z' {
             return Class::Zombie;
         }
-        let identity = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => crate::proctable::parse_proc_stat(pid, &stat).and_then(|row| row.identity),
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => Some(stat),
             Err(error) if gone(&error) => return Class::Gone,
             Err(_) => None,
         };
+        // A kernel thread (root's) has an empty cmdline and is never a
+        // participant: outside the domain, not unreadable. Only the kernel's
+        // own word counts; a process neither source can place stays in it.
+        if kthread.or_else(|| stat.as_deref().and_then(stat_kernel_thread)) == Some(true) {
+            return Class::KernelThread;
+        }
+        let identity = stat
+            .as_deref()
+            .and_then(|stat| crate::proctable::parse_proc_stat(pid, stat))
+            .and_then(|row| row.identity);
         match std::fs::read(format!("/proc/{pid}/cmdline")) {
             Ok(bytes) if !bytes.is_empty() => Class::Live(ArgvRow {
                 pid,
@@ -209,7 +249,7 @@ mod linux {
             // way out (its memory already released). Ask again what it is.
             Ok(_) => match owner_and_state(pid, uid) {
                 Err(error) if gone(&error) => Class::Gone,
-                Ok((_, 'Z')) => Class::Zombie,
+                Ok((_, 'Z', _)) => Class::Zombie,
                 _ => Class::Unreadable,
             },
             Err(error) if gone(&error) => Class::Gone,
@@ -241,6 +281,7 @@ mod macos {
             complete: listed_whole,
             listed: 0,
             zombies: 0,
+            kernel_threads: 0,
             unreadable: Vec::new(),
             rows: Vec::new(),
         };
@@ -403,6 +444,75 @@ mod tests {
         assert_eq!(split_nul_args(b"pty\0run\0--\0"), vec!["pty", "run", "--"]);
         assert_eq!(split_nul_args(b"a\0\0b\0"), vec!["a", "", "b"]);
         assert!(split_nul_args(b"").is_empty());
+    }
+
+    /// `kthreadd`'s own lines on Linux 7.0, and a user process's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_thread_is_told_by_the_kernels_own_word() {
+        use super::linux::{stat_kernel_thread, status_kernel_thread};
+        let kthreadd_status =
+            "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0\t0\t0\t0\nKthread:\t1\n";
+        let kthreadd_stat = "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 321 0 0 20 0 1 0 15 0 0 18446744073709551615 0";
+        assert_eq!(status_kernel_thread(kthreadd_status), Some(true));
+        assert_eq!(stat_kernel_thread(kthreadd_stat), Some(true));
+
+        // Older kernels print no `Kthread:` line; the stat flags still say.
+        let old_status = "Name:\tkworker/0:1\nState:\tI (idle)\nUid:\t0\t0\t0\t0\n";
+        assert_eq!(status_kernel_thread(old_status), None);
+
+        let user_status = "Name:\tsh\nState:\tS (sleeping)\nUid:\t0\t0\t0\t0\nKthread:\t0\n";
+        let user_stat = "4242 (sh) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 99 0 0";
+        assert_eq!(status_kernel_thread(user_status), Some(false));
+        assert_eq!(stat_kernel_thread(user_stat), Some(false));
+
+        // A name with a parenthesis and spaces cannot shift the flags field.
+        let tricky = "4243 (a) 0 0 0 0 0 2129984 (b) S 1 1 1 0 -1 4194560 0 0";
+        assert_eq!(stat_kernel_thread(tricky), Some(false));
+        assert_eq!(stat_kernel_thread("4244 (truncated"), None);
+    }
+
+    /// **Root's scan leaves kernel threads out of the domain.** They are
+    /// live, uid 0, and have an empty cmdline; counted as unreadable they
+    /// would keep every root operation from settling closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scan_of_root_counts_kernel_threads_outside_the_domain() {
+        let kernel: Vec<i32> = std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| super::linux::stat_kernel_thread(&stat))
+                    == Some(true)
+            })
+            .collect();
+        if std::fs::read_to_string("/proc/2/comm").is_ok_and(|comm| comm.trim() == "kthreadd") {
+            assert!(
+                !kernel.is_empty(),
+                "kthreadd is pid 2, so kernel threads are visible"
+            );
+        } else {
+            eprintln!(
+                "no kthreadd at pid 2 (a pid namespace): only the absence of kernel threads among the unreadable is checked"
+            );
+        }
+        let scan = scan_argv(0);
+        assert!(scan.readable);
+        let unreadable_kernel: Vec<_> = scan
+            .unreadable
+            .iter()
+            .filter(|pid| kernel.contains(pid))
+            .collect();
+        assert!(
+            unreadable_kernel.is_empty(),
+            "kernel threads read as unreadable: {unreadable_kernel:?}"
+        );
+        assert!(scan.rows.iter().all(|row| !kernel.contains(&row.pid)));
+        if !kernel.is_empty() {
+            assert!(scan.kernel_threads > 0);
+        }
     }
 
     #[cfg(target_os = "linux")]

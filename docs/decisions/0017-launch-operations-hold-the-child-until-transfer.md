@@ -104,6 +104,17 @@ dead daemon's lock for ever. A record lock belongs to the process and is never
 inherited by a fork. A reader that finds the lock held names its holder
 (`F_GETLK`).
 
+The price of a record lock is that closing any descriptor of the file drops
+every lock the process holds on it, and the process's own requests never
+conflict with its own locks. So a process keeps at most one descriptor per
+lock file, whatever it is for: the write lock, a read lock, the holder query,
+or the creation. The file is named by device and inode, so a symlinked root
+or a hard link is the same file. Each open is registered, and each close
+unregistered, under one process-wide mutex, so no thread can open the file
+between the open and its registration, or between the close and its
+removal. A second open of a registered file is refused. Every lock
+descriptor is close-on-exec and never handed to another program.
+
 **Descriptors.** The launcher's `pre_exec` marks every descriptor from 3 up
 close-on-exec, then clears the flag on exactly the config, readiness, control
 and gate descriptors. A launcher handed other descriptors, including a stray
@@ -154,10 +165,21 @@ them:
 - The argv scan's domain is processes whose real and effective uid are both
   the operation's. No participant changes uid before its release. On macOS
   a setuid process such as `login` refuses its argv to the user; inside the
-  domain it would make every scan unknown.
-- A process may not open the operation lock file to observe it (settle, or
-  the holder query) while it holds the write lock. Closing that descriptor
-  would drop its own record lock, so the call is refused instead.
+  domain it would make every scan unknown. A Linux kernel thread (root's)
+  has no argv and is never a participant, so it is outside the domain too.
+  The kernel's own word decides: the `Kthread:` line of
+  `/proc/<pid>/status`, or else `PF_KTHREAD` in `/proc/<pid>/stat`. A
+  process neither source places stays in the domain.
+- On macOS, a process `proc_pidinfo` refuses is placed by `KERN_PROC_PID`,
+  whose `kinfo_proc` offsets were measured on one Mac. Before any of them is
+  believed, each process reads its own row once and every field must say
+  back what it knows of itself: its pid, parent, group, real and effective
+  uid, start time and running state. A layout that fails makes every such
+  read unknown, and so the scan incomplete. Its limit: a field that reads a
+  neighbour holding the same value for the reading process passes.
+- A process may not open an operation lock file it already has open
+  (settle, or the holder query, while it holds the write lock, say). The
+  call is refused instead.
 
 **Residuals, stated plainly.**
 
@@ -170,7 +192,9 @@ them:
   nothing and the operation stays unclosed with a live child, until a
   person ends it.
 - The daemon handles SIGTERM and SIGINT from its start: before the transfer
-  they retire the operation.
+  they retire the operation. Once the transfer is committed they are the
+  serving daemon's, as for any session, even before the release: the
+  session ends, and a child not yet released never runs.
 
 **Tests.** `crates/pty/tests/launch_operation.rs` plays the owner. Debug
 builds honor `PTY_TEST_OPERATION_BARRIERS=<dir>`: a barrier writes
@@ -201,4 +225,9 @@ signal mask and dispositions to match. Each of these was reverted once to see it
 - the boot-identity rule;
 - retire's tuple check;
 - the refusal to signal without a pidfd;
-- the record lock.
+- the record lock;
+- the lock registry's four rules: registered before the lock is returned,
+  closed and unregistered as one step, read locks registered, files named
+  by inode;
+- the kernel-thread rule, and the layout check of every `kinfo_proc` field;
+- the hand-over of a kill after the commit.

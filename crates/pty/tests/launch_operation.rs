@@ -1330,6 +1330,41 @@ fn a_release_lost_with_the_daemon_leaves_transferred_unreleased() {
     assert!(v["record"]["transfer"]["released"].is_null());
 }
 
+/// **A kill after the commit is the serving daemon's**, as for any session,
+/// even while the release and the last record write are still to come: the
+/// session ends, and a child not yet released never runs its command.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "barriers exist only in debug builds")]
+fn a_kill_after_the_transfer_commits_ends_the_session_like_any_other() {
+    for barrier in ["transfer-committed-before-release", "released-before-ack"] {
+        let rig = Rig::new();
+        let mut owner = Owner::start(
+            &rig,
+            "kill-after-commit",
+            Plan {
+                hold: vec![barrier],
+                ..Plan::default()
+            },
+        );
+        let ready = owner.wait_for("ready");
+        let (daemon, child) = (daemon_of(&ready), child_of(&ready));
+        owner.transfer("t-kill", &ready["incarnation"]);
+        owner.wait_reached(barrier);
+        assert_eq!(owner.record(&rig)["state"], "transferred", "{barrier}");
+        kill(daemon, libc::SIGTERM);
+        // The barrier still holds: only the serving daemon's own shutdown
+        // can end these two.
+        wait_gone(daemon);
+        wait_gone(child);
+        owner.release(barrier);
+        if barrier == "transfer-committed-before-release" {
+            assert!(!owner.ran(), "a child killed before its release never runs");
+        }
+        let v = owner.settle(&rig);
+        assert_eq!(verdict(&v), ("transferred".into(), None), "{barrier}");
+    }
+}
+
 // ── The held child ───────────────────────────────────────────────────────
 
 #[test]

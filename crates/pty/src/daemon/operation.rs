@@ -1329,6 +1329,13 @@ impl Actor {
                     None,
                     Some("producer:terminated".into()),
                 ),
+                // Committed: the session is the serving daemon's, and so is
+                // the kill, even while the release and its last record write
+                // are still to come. This actor commits the transfer, so a
+                // kill it reads after the commit is never one it judged.
+                State::Transferred => {
+                    let _ = self.msgs.send(Msg::ExternalKill);
+                }
                 _ => {}
             },
             ActorEvent::Owner(input) => self.on_owner(input),
