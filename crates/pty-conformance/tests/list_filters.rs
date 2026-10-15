@@ -61,7 +61,11 @@ fn keeps_a_session_whose_socket_is_missing_but_pid_is_alive() {
     // The test process itself stands in for a live daemon.
     std::fs::write(rig.pid_path(&name), std::process::id().to_string()).unwrap();
     // Older than 24 h, no socket: both former cleanup triggers.
-    write_fake_metadata(rig.root(), &name, FakeMeta::created(-48 * 3600));
+    write_fake_metadata(
+        rig.root(),
+        &name,
+        FakeMeta::created(-48 * 3600).identity(std::process::id() as i32),
+    );
     let found = rig.list_entry(&name).expect("listed");
     assert_eq!(found["status"], "running", "pid is alive: {found}");
     assert!(rig.meta_path(&name).exists(), "metadata must survive a list");
@@ -224,13 +228,7 @@ fn summary_reports_no_matching_sessions() {
 
 fn sort_keys(v: &[serde_json::Value]) -> Vec<String> {
     v.iter()
-        .map(|s| {
-            s["displayName"]
-                .as_str()
-                .or(s["name"].as_str())
-                .unwrap()
-                .to_string()
-        })
+        .map(|s| s["displayName"].as_str().or(s["name"].as_str()).unwrap().to_string())
         .collect()
 }
 

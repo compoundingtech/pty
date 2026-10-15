@@ -20,7 +20,10 @@ fn start(rig: &Rig, id: &str, tags: &[(&str, &str)]) -> Daemon {
 /// behind without an exit record (status vanished).
 fn kill_daemon_hard(pid: i32) {
     kill_pid(pid, libc::SIGKILL);
-    assert!(poll_for(Duration::from_secs(5), || !pid_alive(pid)), "daemon {pid} did not die");
+    assert!(
+        poll_for(Duration::from_secs(5), || !pid_alive(pid)),
+        "daemon {pid} did not die"
+    );
 }
 
 /// An unused pid so ESRCH is deterministic (probing downward from 999999).
@@ -36,7 +39,11 @@ fn find_dead_pid() -> i32 {
 }
 
 fn tags(rig: &Rig, id: &str) -> serde_json::Value {
-    rig.meta(id).expect("metadata").get("tags").cloned().unwrap_or(serde_json::Value::Null)
+    rig.meta(id)
+        .expect("metadata")
+        .get("tags")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// node: tests/gc.test.ts:121
@@ -128,11 +135,17 @@ fn dry_run_previews_orphan_tag_pruning() {
     assert_eq!(tags(&rig, "gc7")[&key], "1");
     let dry = rig.pty(&["gc", "--dry-run"]);
     expect_status(&dry, 0);
-    expect_contains(&dry.stdout(), &format!("Would prune orphan tags on gc7: #{key}"));
+    expect_contains(
+        &dry.stdout(),
+        &format!("Would prune orphan tags on gc7: #{key}"),
+    );
     assert_eq!(tags(&rig, "gc7")[&key], "1");
     let real = rig.pty(&["gc"]);
     expect_status(&real, 0);
-    expect_contains(&real.stdout(), &format!("Pruned orphan tags on gc7: #{key}"));
+    expect_contains(
+        &real.stdout(),
+        &format!("Pruned orphan tags on gc7: #{key}"),
+    );
     assert!(tags(&rig, "gc7").get(&key).is_none());
 }
 
@@ -153,6 +166,12 @@ fn n_is_an_alias_for_dry_run() {
 fn reaps_synthetic_vanished_metadata() {
     let rig = Rig::new();
     write_fake_metadata(rig.root(), "gc9", FakeMeta::created(0));
+    let dead_pid = find_dead_pid();
+    let mut metadata = rig.meta("gc9").expect("synthetic metadata");
+    metadata["daemonPid"] = serde_json::json!(dead_pid);
+    metadata["daemonStartToken"] = serde_json::json!("fixture:dead");
+    metadata["daemonBootId"] = serde_json::json!(pty_core::registry::read_boot_id().unwrap());
+    std::fs::write(rig.meta_path("gc9"), metadata.to_string()).unwrap();
     let out = rig.pty(&["gc"]);
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "Removed: gc9");
@@ -167,7 +186,10 @@ fn print_launchd_plist_emits_a_plist() {
     expect_status(&out, 0);
     let s = out.stdout();
     expect_contains(&s, "<!DOCTYPE plist");
-    expect_regex(&s, r"<string>com\.compoundingtech\.pty\.gc(?:\.[A-Za-z0-9._-]+)?</string>");
+    expect_regex(
+        &s,
+        r"<string>com\.compoundingtech\.pty\.gc(?:\.[A-Za-z0-9._-]+)?</string>",
+    );
     expect_contains(&s, "<key>StartInterval</key>");
     expect_contains(&s, "<integer>30</integer>");
     expect_contains(&s, "<key>PTY_ROOT</key>");
@@ -179,7 +201,10 @@ fn print_launchd_plist_preserves_the_invoked_binary() {
     let rig = Rig::new();
     let out = rig.pty(&["gc", "--print-launchd-plist"]);
     expect_status(&out, 0);
-    expect_contains(&out.stdout(), &format!("<string>{}</string>", pty_bin().display()));
+    expect_contains(
+        &out.stdout(),
+        &format!("<string>{}</string>", pty_bin().display()),
+    );
 }
 
 /// node: tests/gc.test.ts:314
@@ -224,7 +249,10 @@ fn non_default_root_gets_a_suffixed_label() {
     let rig = Rig::new();
     let dir = rig.make_dir("my-network");
     let plist = plist_for(&rig, &[("PTY_ROOT", dir.to_str().unwrap())]);
-    expect_contains(&plist, "<string>com.compoundingtech.pty.gc.my-network</string>");
+    expect_contains(
+        &plist,
+        "<string>com.compoundingtech.pty.gc.my-network</string>",
+    );
 }
 
 /// node: tests/pty-root.test.ts:172
@@ -233,7 +261,10 @@ fn non_default_root_log_path_lives_inside_the_root() {
     let rig = Rig::new();
     let dir = rig.make_dir("another-net");
     let plist = plist_for(&rig, &[("PTY_ROOT", dir.to_str().unwrap())]);
-    expect_contains(&plist, &format!("<string>{}/gc.log</string>", dir.display()));
+    expect_contains(
+        &plist,
+        &format!("<string>{}/gc.log</string>", dir.display()),
+    );
 }
 
 /// node: tests/pty-root.test.ts:179
@@ -252,5 +283,8 @@ fn sanitizes_a_pathological_basename_into_the_label() {
     let rig = Rig::new();
     let dir = rig.make_dir("weird name with spaces");
     let plist = plist_for(&rig, &[("PTY_ROOT", dir.to_str().unwrap())]);
-    expect_contains(&plist, "<string>com.compoundingtech.pty.gc.weird-name-with-spaces</string>");
+    expect_contains(
+        &plist,
+        "<string>com.compoundingtech.pty.gc.weird-name-with-spaces</string>",
+    );
 }

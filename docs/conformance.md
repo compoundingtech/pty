@@ -65,8 +65,8 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 | kill-wait.test.ts | cli | kill_wait.rs | 3 | 39, 54, 68 |
 | list-filters.test.ts | cli | list_filters.rs | 18 | 124, 138, 149, 172, 200, 220, 245, 254, 267, 281, 288, 305, 325, 343, 361, 391, 411, 428 |
 | list-live-session-race.test.ts | cli | list_live_session_race.rs | 2 | 92, 111 |
-| list-liveness-budget.test.ts | cli | list_liveness_budget.rs | 3 | 31, 39, 61 — 100 unreachable sockets listed in under 3 s; EPERM counts as alive |
-| list-purity.test.ts | cli | list_purity.rs | 7 | 49, 57, 67, 74, 89, 113, 148 — CLI half; the raw-candidate revalidation case is library-only |
+| list-liveness-budget.test.ts | cli | list_liveness_budget.rs | 3 | 31, 39, 61 — 100 unreachable sockets listed in under 3 s; Rust requires birth identity even when a PID exists or kill-zero returns EPERM |
+| list-purity.test.ts | cli | list_purity.rs | 7 | 49, 57, 67, 74, 89, 113, 148 — CLI half; Rust preserves raw runtime debris without readable ownership evidence; the raw-candidate revalidation case is library-only |
 | message.test.ts | not-portable | — | 0 | TUI widget / framework test against the Node in-process renderer |
 | metadata-events.test.ts | cli | metadata_events.rs | 24 | 265, 290, 310, 339, 359, 371, 390, 408, 428, 441, 456, 469, 481, 526, 539, 553, 567, 580, 593, 637, 649, 660, 672, 682 — CLI half; patchMetadataById / EventFollower cases are library-only |
 | mouse-parse.test.ts | unit | — | 0 | pty-core mouse parser unit tests |
@@ -168,6 +168,19 @@ Run: `PTY_TEST_BIN=$(which pty) cargo test -p pty-conformance` (Node) and `cargo
 
 - `tests/fixtures/parity/{screens,shapes}.json` (Node-owned, vendored byte-identical; checked against `PTY_NODE_CHECKOUT` when set) — `parity_fixtures.rs`, `parity_shapes.rs`.
 - `crates/pty-conformance/fixtures/*.json` (Rust-owned, v1) — `fixtures_protocol.rs`: bytes-split, escape-split, raw-bytes (decision 0001), attach-identity, late-events, frame-limits, slow-reader.
+
+Registry fixtures that represent a live daemon must record its real PID,
+start token, and boot identity. `FakeMeta::identity(pid)` provides these fields;
+use a known absent PID for an exited fixture. A socket or PID sidecar alone
+does not prove a live Rust session or authorize deletion of unknown runtime
+debris. Recipe-replacement tests wait for published exit metadata, not PID
+absence: an exited session must be recreated even while its matching daemon
+finishes shutdown or remains an adopted zombie. Production zombie identity
+behavior is unchanged; a birth-identity Match alone does not imply that the
+session's child is still running.
+Typed publication fixtures must also reflect publication defaults, including
+`ephemeral: Some(false)`, when comparing records read back from disk.
+
 
 ## Still to do
 

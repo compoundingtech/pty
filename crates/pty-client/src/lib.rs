@@ -89,7 +89,9 @@ pub use stats::{
     STATS_TIMEOUT, query_stats, query_stats_batch_in, query_stats_in, query_stats_in_with_timeout,
     query_stats_with_timeout, query_status_json,
 };
-pub use stop::{Aftermath, SHUTDOWN_WAIT, StopError, Stopped, stop, stop_in};
+pub use stop::{
+    Aftermath, SHUTDOWN_WAIT, SignalledDaemon, StopError, Stopped, signal_daemon, stop, stop_in,
+};
 pub use stream::{parse_attach_stream_fd_token, validate_attach_stream_fd};
 
 use pty_core::registry;

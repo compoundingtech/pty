@@ -130,6 +130,15 @@ fn daemon_start_identity_accepts_additive_rust_and_node_recovery_shapes() {
         ..Default::default()
     };
     assert_eq!(rust.daemon_start_token(), Some("linux:rust"));
+    let native = SessionMetadata {
+        daemon_boot_id: Some("boot-identity".into()),
+        ..rust
+    };
+    let published = native.publication_map();
+    assert_eq!(published["daemonBootId"], json!("boot-identity"));
+    let retained = SessionMetadata::from_map(published).unwrap();
+    assert_eq!(retained.daemon_boot_id.as_deref(), Some("boot-identity"));
+    assert_eq!(retained.daemon_start_token(), Some("linux:rust"));
 
     let node = SessionMetadata {
         recovery: Some(json!({
@@ -558,8 +567,7 @@ fn patch_creation_wait_does_not_block_daemon_events() {
     let event_lock = registry::acquire_event_lock(&name).unwrap();
     let patch_name = name.clone();
     let patcher = std::thread::spawn(move || {
-        let patch =
-            MetadataPatch::from_json(&json!({"tags": {"created-by-child": "1"}})).unwrap();
+        let patch = MetadataPatch::from_json(&json!({"tags": {"created-by-child": "1"}})).unwrap();
         registry::patch_metadata_by_id(&patch_name, &patch)
     });
 

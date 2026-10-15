@@ -3,7 +3,7 @@
 //!
 //! node: src/cli.ts:1570-1587 (parsing), 3776-3845 (`cmdDown`)
 
-use pty_core::registry::{self, cleanup_all, cleanup_socket, update_tags};
+use pty_core::registry;
 
 use super::CliResult;
 use super::up::{find_bound, label_of, read_manifest, split_dir_and_names, toml_path};
@@ -23,56 +23,55 @@ pub fn run(args: &[String]) -> CliResult {
     let toml_path = toml_path(&file);
     let existing = registry::list_sessions();
     let mut stopped = 0usize;
+    let mut failed = false;
 
     for sess in &sessions {
         let Some(existing_session) = find_bound(&existing, &toml_path, &sess.short_name) else {
             continue;
         };
         let label = label_of(existing_session);
-        let tags = existing_session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.tags.as_ref());
-
-        // Strip `strategy` so `pty gc` does not treat the session as
-        // supervised on its next tick.
-        let was_permanent = tags.and_then(|t| t.get("strategy")).map(String::as_str)
-            == Some("permanent");
-        if was_permanent {
-            let _ = update_tags(
-                &existing_session.name,
-                &Default::default(),
-                &["strategy".to_string()],
-            );
+        if existing_session.identity == registry::DaemonIdentityCheck::Unknown {
+            eprintln!("  \u{2717} {label}: daemon identity is unknown.");
+            failed = true;
+            continue;
         }
-
-        if existing_session.is_running()
-            && let Some(pid) = existing_session.pid
-        {
-            // SAFETY: signalling a pid we just read from the registry.
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc == 0 {
-                println!(
-                    "  \u{25cb} {label} (stopped{})",
-                    if was_permanent {
-                        ", removed from supervision"
-                    } else {
-                        ""
-                    }
-                );
-                stopped += 1;
-            } else {
-                eprintln!("  \u{2717} {label}: failed to stop");
+        if existing_session.is_running() {
+            let generation = existing_session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.generation.as_deref());
+            match pty_client::stop(&existing_session.name, generation) {
+                Ok(result) if result.verified_empty() => {
+                    println!(
+                        "  \u{25cb} {label} (stopped{})",
+                        if result.was_permanent {
+                            ", removed from supervision"
+                        } else {
+                            ""
+                        }
+                    );
+                    stopped += 1;
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "  \u{2717} {label}: daemon stopped, but process tree could not be verified empty."
+                    );
+                    failed = true;
+                }
+                Err(error) => {
+                    eprintln!("  \u{2717} {label}: {error}");
+                    failed = true;
+                }
             }
-            cleanup_socket(&existing_session.name);
         } else if existing_session.is_gone() {
-            match cleanup_all(&existing_session.name) {
+            match pty_client::remove(&existing_session.name) {
                 Ok(()) => {
                     println!("  \u{25cb} {label} (cleaned up)");
                     stopped += 1;
                 }
-                Err(busy) => {
-                    eprintln!("  \u{2717} {label}: {}", busy.message(&existing_session.name));
+                Err(error) => {
+                    eprintln!("  \u{2717} {label}: {error}");
+                    failed = true;
                 }
             }
         }
@@ -97,5 +96,5 @@ pub fn run(args: &[String]) -> CliResult {
     if any_toml_managed && stopped > 0 {
         eprintln!("\nNote: strategy tags will be restored on the next 'pty up'.");
     }
-    Ok(0)
+    Ok(if failed { 1 } else { 0 })
 }
