@@ -2,6 +2,7 @@
 //! write, and a read's answer held until it is whole.
 
 use super::*;
+use pty_core::protocol::encode_screen;
 use pty_terminal::enhanced_paste::{Location, MAX_ANSWER, MAX_ID, MAX_PACKET};
 
 /// `image/png text/plain`, base64.
@@ -15,9 +16,9 @@ struct Rig {
     sent: Receiver<Packet>,
 }
 
-fn rig(readonly: bool) -> Rig {
-    let (tx, _rx) = mpsc::channel::<Msg>();
-    let (ours, mut daemon) = UnixStream::pair().expect("socket pair");
+/// The packets arriving at the daemon's end of a stream, read on their own
+/// thread.
+fn read_packets(mut daemon: UnixStream) -> Receiver<Packet> {
     let (packets, sent) = mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = PacketReader::new();
@@ -30,6 +31,13 @@ fn rig(readonly: bool) -> Rig {
             }
         }
     });
+    sent
+}
+
+fn rig(readonly: bool) -> Rig {
+    let (tx, _rx) = mpsc::channel::<Msg>();
+    let (ours, daemon) = UnixStream::pair().expect("socket pair");
+    let sent = read_packets(daemon);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             attempt: 1,
@@ -547,5 +555,148 @@ fn a_request_cut_off_by_a_disconnect_is_never_finished() {
     r.core.attempt = AttemptId(2);
     r.output(2, tail.as_bytes());
     assert_eq!(r.paste_events(), [mode(1, true), mode(1, false)]);
+    assert_eq!(r.sent(), b"");
+}
+
+/// A rig whose one reconnect succeeds, and the packets its new stream
+/// carries to the daemon.
+fn reconnecting_rig() -> (Rig, Receiver<Packet>) {
+    let mut r = rig(false);
+    let (ours, daemon) = UnixStream::pair().expect("socket pair");
+    let second = read_packets(daemon);
+    let ours = Mutex::new(Some(ours));
+    if let Backend::Attach { connector, .. } = &mut r.core.backend {
+        *connector = Box::new(move || {
+            ours.lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| io::Error::other("one reconnect"))
+        });
+    }
+    (r, second)
+}
+
+/// The types of the packets a stream has carried so far.
+fn types(sent: &Receiver<Packet>) -> Vec<MessageType> {
+    std::iter::from_fn(|| sent.recv_timeout(Duration::from_millis(100)).ok())
+        .map(|packet| packet.type_)
+        .collect()
+}
+
+fn frame(bytes: Vec<u8>) -> Packet {
+    PacketReader::new().feed(&bytes).unwrap().remove(0)
+}
+
+fn listing() -> PastePacket {
+    PastePacket::Listing {
+        location: Location::Clipboard,
+        password: None,
+        mimes: vec!["image/png".into()],
+    }
+}
+
+/// A write made while attempt 1 was current, then dispatched after a
+/// reconnect whose SCREEN turned paste events on again, is refused there.
+/// It reaches neither stream: the race a caller would have if it read the
+/// attempt and then wrote.
+#[test]
+fn a_write_queued_before_a_reconnect_is_refused_after_it() {
+    let (mut r, second) = reconnecting_rig();
+    r.output(1, b"\x1b[?5522h");
+    let (reply, answer) = mpsc::channel();
+    let queued = Msg::EnhancedPaste {
+        attempt: AttemptId(1),
+        target: PasteTarget::Paste,
+        packet: listing(),
+        reply,
+    };
+    r.core.reconnect().expect("reconnect");
+    r.core.dispatch(Msg::Frame {
+        attempt: AttemptId(2),
+        packet: frame(encode_screen(b"\x1b[?5522h")),
+    });
+    assert!(r.core.actor.modes().enhanced_paste);
+    r.core.dispatch(queued);
+    assert_eq!(answer.recv().unwrap(), Err(PasteRefusal::StaleAttempt));
+    assert_eq!(types(&r.sent), [MessageType::Detach]);
+    assert_eq!(types(&second), [MessageType::Attach]);
+}
+
+/// A request cut off by a reconnect is never finished by the new stream,
+/// even when its peer sends output before its SCREEN.
+#[test]
+fn a_request_cut_off_by_a_reconnect_is_never_finished() {
+    let (mut r, _second) = reconnecting_rig();
+    r.output(1, b"\x1b[?5522h");
+    let request = format!("\x1b]5522;type=read:id=a;{PNG_AND_TEXT}\x1b\\");
+    let (head, tail) = request.split_at(20);
+    r.output(1, head.as_bytes());
+    r.core.reconnect().expect("reconnect");
+    r.output(2, tail.as_bytes());
+    assert_eq!(r.paste_events(), [mode(1, true), mode(1, false)]);
+}
+
+/// A frame from an attempt that is no longer current, SCREEN or DATA,
+/// publishes nothing and changes no mode.
+#[test]
+fn a_stale_frame_publishes_no_paste_events() {
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    let request = format!("\x1b]5522;type=read:id=a;{PNG_AND_TEXT}\x1b\\");
+    for bytes in [
+        encode_data(format!("\x1b[?5522l{request}").as_bytes()),
+        encode_screen(request.as_bytes()),
+    ] {
+        r.core.dispatch(Msg::Frame {
+            attempt: AttemptId(0),
+            packet: frame(bytes),
+        });
+    }
+    assert_eq!(r.paste_events(), [mode(1, true)]);
+    assert!(r.core.actor.modes().enhanced_paste);
+}
+
+/// Output split anywhere, or fed one byte at a time, publishes what the
+/// whole does.
+#[test]
+fn a_split_at_every_byte_through_the_handle_changes_nothing() {
+    let stream = format!("\x1b[?5522h\x1b]5522;type=read:id=a;{PNG_AND_TEXT}\x1b\\text\x1b[?5522l")
+        .into_bytes();
+    let whole = {
+        let mut r = rig(false);
+        r.output(1, &stream);
+        r.paste_events()
+    };
+    assert_eq!(whole.len(), 3, "{whole:?}");
+    for split in 1..stream.len() {
+        let mut r = rig(false);
+        r.output(1, &stream[..split]);
+        r.output(1, &stream[split..]);
+        assert_eq!(r.paste_events(), whole, "split at {split}");
+    }
+    let mut r = rig(false);
+    for byte in &stream {
+        r.output(1, std::slice::from_ref(byte));
+    }
+    assert_eq!(r.paste_events(), whole, "one byte at a time");
+}
+
+/// After the child exits, a write is refused as disconnected and sends
+/// nothing.
+#[test]
+fn a_write_after_the_child_exits_is_refused_and_sends_nothing() {
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    r.request("a");
+    let read = r.open_read().unwrap();
+    r.core.dispatch(Msg::ChildExited {
+        attempt: AttemptId(1),
+        code: 0,
+    });
+    assert_eq!(
+        r.write_to(1, PasteTarget::Read(read), PastePacket::ReadOk),
+        Err(PasteRefusal::Disconnected)
+    );
+    assert_eq!(r.write(1, listing()), Err(PasteRefusal::Disconnected));
     assert_eq!(r.sent(), b"");
 }
