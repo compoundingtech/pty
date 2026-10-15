@@ -612,7 +612,7 @@ mod tests {
         let many = PastePacket::Listing {
             location: Location::Clipboard,
             password: None,
-            mimes: vec!["x".repeat(1000); 60],
+            mimes: vec!["x".repeat(MAX_MIME); 300],
         };
         assert_eq!(many.encode(None), Err(PacketError::TooLarge));
         for invalid in [
