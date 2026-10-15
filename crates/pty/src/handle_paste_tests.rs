@@ -57,6 +57,7 @@ fn rig(readonly: bool) -> Rig {
         dirty: false,
         last_publish: Instant::now(),
         paste: PasteRead::default(),
+        paste_reads: 0,
     };
     let (sub, events) = mpsc::channel();
     core.shared.subs.lock().unwrap().push(sub);
@@ -71,14 +72,35 @@ impl Rig {
         });
     }
 
+    /// Write `packet` to its natural target: a listing to the paste, any
+    /// other packet to whichever read is open now (or to a read never
+    /// handed out, when none is).
     fn write(&mut self, attempt: u64, packet: PastePacket) -> Result<(), PasteRefusal> {
+        let target = match packet {
+            PastePacket::Listing { .. } => PasteTarget::Paste,
+            _ => PasteTarget::Read(self.open_read().unwrap_or(PasteReadId(0))),
+        };
+        self.write_to(attempt, target, packet)
+    }
+
+    fn write_to(
+        &mut self,
+        attempt: u64,
+        target: PasteTarget,
+        packet: PastePacket,
+    ) -> Result<(), PasteRefusal> {
         let (reply, answer) = mpsc::channel();
         self.core.dispatch(Msg::EnhancedPaste {
             attempt: AttemptId(attempt),
+            target,
             packet,
             reply,
         });
         answer.recv().unwrap()
+    }
+
+    fn open_read(&self) -> Option<PasteReadId> {
+        self.core.paste.open.as_ref().map(|open| open.read)
     }
 
     /// What the child has been sent: every write is finished by the time
@@ -144,7 +166,10 @@ fn events_carry_their_attempt_and_stale_output_publishes_none() {
             enabled: true
         }
     );
-    let HandleEvent::EnhancedPasteRequest { attempt, request } = &events[1] else {
+    let HandleEvent::EnhancedPasteRequest {
+        attempt, request, ..
+    } = &events[1]
+    else {
         panic!("{events:?}");
     };
     assert_eq!(*attempt, AttemptId(1));
@@ -174,28 +199,44 @@ fn a_write_is_checked_in_dispatch() {
         r.write(0, PastePacket::ReadOk),
         Err(PasteRefusal::StaleAttempt)
     );
-    assert_eq!(
-        r.write(1, PastePacket::ReadOk),
-        Err(PasteRefusal::OutOfOrder)
-    );
+    for packet in [
+        PastePacket::ReadOk,
+        data(1),
+        PastePacket::ReadDone,
+        PastePacket::ReadError(ReadError::Denied),
+    ] {
+        assert_eq!(
+            r.write(1, packet),
+            Err(PasteRefusal::StaleRead),
+            "no read is open"
+        );
+    }
+    // Within a read, data or DONE before OK is out of order, and a packet
+    // aimed at the wrong kind of target is invalid.
+    r.request("x");
+    let read = r.open_read().unwrap();
     assert_eq!(r.write(1, data(1)), Err(PasteRefusal::OutOfOrder));
     assert_eq!(
         r.write(1, PastePacket::ReadDone),
         Err(PasteRefusal::OutOfOrder)
     );
-    assert_eq!(
-        r.write(1, PastePacket::ReadError(ReadError::Denied)),
-        Err(PasteRefusal::OutOfOrder)
-    );
-    assert_eq!(r.sent(), b"", "a refusal sends nothing");
-
-    let mut readonly = rig(true);
-    readonly.output(1, b"\x1b[?5522h");
     let listing = PastePacket::Listing {
         location: Location::Clipboard,
         password: None,
         mimes: vec!["image/png".into()],
     };
+    assert_eq!(
+        r.write_to(1, PasteTarget::Read(read), listing.clone()),
+        Err(PasteRefusal::Invalid)
+    );
+    assert_eq!(
+        r.write_to(1, PasteTarget::Paste, PastePacket::ReadOk),
+        Err(PasteRefusal::Invalid)
+    );
+    assert_eq!(r.sent(), b"", "a refusal sends nothing");
+
+    let mut readonly = rig(true);
+    readonly.output(1, b"\x1b[?5522h");
     assert_eq!(
         readonly.write(1, listing.clone()),
         Err(PasteRefusal::ReadOnly)
@@ -276,7 +317,7 @@ fn an_oversized_packet_or_answer_is_dropped_whole() {
     );
     assert_eq!(
         r.write(1, PastePacket::ReadDone),
-        Err(PasteRefusal::OutOfOrder)
+        Err(PasteRefusal::StaleRead)
     );
 
     r.request("huge");
@@ -308,6 +349,49 @@ fn the_largest_answer_arrives_whole() {
     assert!(sent == expected, "the answer arrived whole and in order");
 }
 
+/// A read is answered only under its own id. Read A's late answer, after
+/// the mode was turned off and on and read B opened on the same attempt,
+/// is refused; it can neither carry A's data under B's id nor close B.
+#[test]
+fn a_late_answer_never_lands_on_a_later_read() {
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    r.request("old");
+    let a = r.open_read().unwrap();
+    r.write_to(1, PasteTarget::Read(a), PastePacket::ReadOk)
+        .unwrap();
+    r.output(1, b"\x1b[?5522l\x1b[?5522h");
+    assert_eq!(r.open_read(), None, "turning the mode off closed A");
+    r.request("new");
+    let b = r.open_read().unwrap();
+    assert_ne!(a, b);
+    let secret = PastePacket::ReadData {
+        mime: "text/plain".into(),
+        data: b"old-secret".to_vec(),
+    };
+    for packet in [
+        PastePacket::ReadOk,
+        secret,
+        PastePacket::ReadDone,
+        PastePacket::ReadError(ReadError::Denied),
+    ] {
+        assert_eq!(
+            r.write_to(1, PasteTarget::Read(a), packet),
+            Err(PasteRefusal::StaleRead)
+        );
+    }
+    assert_eq!(r.open_read(), Some(b), "B is still open");
+    r.write_to(1, PasteTarget::Read(b), PastePacket::ReadOk)
+        .unwrap();
+    r.write_to(1, PasteTarget::Read(b), data(3)).unwrap();
+    r.write_to(1, PasteTarget::Read(b), PastePacket::ReadDone)
+        .unwrap();
+    let mut expected = PastePacket::ReadOk.encode(Some("new")).unwrap();
+    expected.extend(data(3).encode(Some("new")).unwrap());
+    expected.extend(PastePacket::ReadDone.encode(Some("new")).unwrap());
+    assert_eq!(r.sent_at_least(expected.len()), expected);
+}
+
 /// Turning the mode off, a disconnect or a reconnect closes the open read:
 /// nothing of the old attempt is answered later.
 #[test]
@@ -315,9 +399,13 @@ fn a_reset_closes_the_open_read() {
     let mut r = rig(false);
     r.output(1, b"\x1b[?5522h");
     r.request("a");
+    let a = r.open_read().unwrap();
     r.write(1, PastePacket::ReadOk).unwrap();
     r.output(1, b"\x1b[?5522l\x1b[?5522h");
-    assert_eq!(r.write(1, data(1)), Err(PasteRefusal::OutOfOrder));
+    assert_eq!(
+        r.write_to(1, PasteTarget::Read(a), data(1)),
+        Err(PasteRefusal::StaleRead)
+    );
     r.request("b");
     let events = r.paste_events();
     assert!(

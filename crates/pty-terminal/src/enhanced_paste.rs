@@ -248,8 +248,8 @@ impl PastePacket {
                     keys.push_str(":pw=");
                     keys.push_str(pw);
                 }
-                let list = crate::graphics::base64(mimes.join(" ").as_bytes());
-                if list.len() + keys.len() > MAX_METADATA {
+                let list = mimes.join(" ");
+                if list.len().div_ceil(3) * 4 + keys.len() > MAX_METADATA {
                     return Err(PacketError::TooLarge);
                 }
                 let pw_only = password
@@ -257,11 +257,11 @@ impl PastePacket {
                     .map(|pw| format!(":pw={pw}"))
                     .unwrap_or_default();
                 osc(&mut out, &format!("type=read:status=OK{keys}"), "");
-                osc(
-                    &mut out,
-                    &format!("type=read:status=DATA:mime=Lg=={pw_only}"),
-                    &list,
-                );
+                // The listing is data for MIME type `.`, chunked like any.
+                let metadata = format!("type=read:status=DATA:mime=Lg=={pw_only}");
+                for chunk in list.as_bytes().chunks(DATA_CHUNK) {
+                    osc(&mut out, &metadata, &crate::graphics::base64(chunk));
+                }
                 osc(&mut out, &format!("type=read:status=DONE{pw_only}"), "");
             }
             PastePacket::ReadOk => osc(&mut out, &read_status("OK", id), ""),
@@ -465,6 +465,35 @@ mod tests {
                 b64("image/png text/plain")
             )
         );
+    }
+
+    /// A listing is data for MIME type `.`: over 4096 bytes it is chunked
+    /// like any other, and the chunks rejoin to the whole list.
+    #[test]
+    fn a_long_listing_is_chunked() {
+        let mimes: Vec<String> = (0..500).map(|_| "text/plain".to_string()).collect();
+        let listing = PastePacket::Listing {
+            location: Location::Clipboard,
+            password: Some(b64("token")),
+            mimes: mimes.clone(),
+        };
+        let bytes = String::from_utf8(listing.encode(None).unwrap()).unwrap();
+        let pw = b64("token");
+        let data_head = format!("\x1b]5522;type=read:status=DATA:mime=Lg==:pw={pw};");
+        let mut joined = Vec::new();
+        let mut chunks = 0;
+        for sequence in bytes.split_terminator("\x1b\\") {
+            if let Some(payload) = sequence.strip_prefix(&data_head) {
+                let chunk = decode(payload.as_bytes()).unwrap();
+                assert!(chunk.len() <= DATA_CHUNK, "{}", chunk.len());
+                joined.extend(chunk);
+                chunks += 1;
+            }
+        }
+        assert_eq!(chunks, 2, "5499 bytes: 4096 + 1403");
+        assert_eq!(String::from_utf8(joined).unwrap(), mimes.join(" "));
+        assert!(bytes.starts_with(&format!("\x1b]5522;type=read:status=OK:pw={pw}\x1b\\")));
+        assert!(bytes.ends_with(&format!("\x1b]5522;type=read:status=DONE:pw={pw}\x1b\\")));
     }
 
     #[test]

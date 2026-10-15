@@ -219,13 +219,29 @@ pub enum HandleEvent {
     /// hears the program's current state.
     EnhancedPasteMode { attempt: AttemptId, enabled: bool },
     /// The child asked to read clipboard types. Answer it with
-    /// [`TerminalHandle::write_enhanced_paste`] under the same attempt: one
-    /// read is open at a time, and the child hears `EBUSY` for any other
-    /// until this one is answered.
+    /// [`TerminalHandle::write_enhanced_paste`] under the same attempt and
+    /// [`PasteTarget::Read`] with this `read`: one read is open at a time,
+    /// and the child hears `EBUSY` for any other until this one is answered.
     EnhancedPasteRequest {
         attempt: AttemptId,
+        read: PasteReadId,
         request: ReadRequest,
     },
+}
+
+/// Names one published read. Never reused by a handle, so an answer meant
+/// for a read that has since closed can never be taken for a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PasteReadId(u64);
+
+/// What a [`TerminalHandle::write_enhanced_paste`] packet answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteTarget {
+    /// A paste the user made: a [`PastePacket::Listing`].
+    Paste,
+    /// The read published with this id: its `ReadOk`, `ReadData`,
+    /// `ReadDone` or `ReadError`.
+    Read(PasteReadId),
 }
 
 /// Why [`TerminalHandle::write_enhanced_paste`] sent nothing.
@@ -241,10 +257,13 @@ pub enum PasteRefusal {
     Closed,
     /// The child has not turned paste events on.
     ModeDisabled,
-    /// A read's answer with no read open, or data before `ReadOk`.
+    /// The read this answers is not the open one: it was answered, refused,
+    /// or closed by a reset, a disconnect or a reconnect.
+    StaleRead,
+    /// Data or `ReadDone` before `ReadOk`, or a second `ReadOk`.
     OutOfOrder,
-    /// A MIME type, id or password the protocol cannot carry, or an empty
-    /// listing.
+    /// A MIME type, id or password the protocol cannot carry, an empty
+    /// listing, or a packet sent to the wrong kind of target.
     Invalid,
     /// Over 64 KiB of listing or 1 MiB of data in one packet.
     PacketTooLarge,
@@ -287,6 +306,7 @@ enum Msg {
     },
     EnhancedPaste {
         attempt: AttemptId,
+        target: PasteTarget,
         packet: PastePacket,
         reply: Sender<Result<(), PasteRefusal>>,
     },
@@ -354,6 +374,8 @@ struct Core {
     dirty: bool,
     last_publish: Instant,
     paste: PasteRead,
+    /// The last [`PasteReadId`] handed out.
+    paste_reads: u64,
 }
 
 /// The current attempt's open read. Its answer is held until `ReadDone`,
@@ -361,12 +383,17 @@ struct Core {
 /// dropped whole and replaced by an error status.
 #[derive(Default)]
 struct PasteRead {
-    /// The open request's id (`Some(None)`: a request without one).
-    open: Option<Option<String>>,
+    open: Option<OpenRead>,
     /// `ReadOk` and the data so far, encoded.
     answer: Option<Vec<u8>>,
     /// Data bytes in `answer`.
     data: usize,
+}
+
+struct OpenRead {
+    read: PasteReadId,
+    /// The request's own `id`, echoed in every answer.
+    id: Option<String>,
 }
 
 impl Core {
@@ -441,9 +468,15 @@ impl Core {
                         self.refuse_read(request.id.as_deref());
                         continue;
                     }
-                    self.paste.open = Some(request.id.clone());
+                    self.paste_reads += 1;
+                    let read = PasteReadId(self.paste_reads);
+                    self.paste.open = Some(OpenRead {
+                        read,
+                        id: request.id.clone(),
+                    });
                     HandleEvent::EnhancedPasteRequest {
                         attempt: self.attempt,
+                        read,
                         request,
                     }
                 }
@@ -557,7 +590,12 @@ impl Core {
 
     /// Check a paste packet against this attempt, the stream and the mode,
     /// here in dispatch where none of them can change underneath it.
-    fn write_paste(&mut self, attempt: AttemptId, packet: PastePacket) -> Result<(), PasteRefusal> {
+    fn write_paste(
+        &mut self,
+        attempt: AttemptId,
+        target: PasteTarget,
+        packet: PastePacket,
+    ) -> Result<(), PasteRefusal> {
         if attempt != self.attempt {
             return Err(PasteRefusal::StaleAttempt);
         }
@@ -572,7 +610,21 @@ impl Core {
         if !self.actor.modes().enhanced_paste {
             return Err(PasteRefusal::ModeDisabled);
         }
-        let id = self.paste.open.clone().flatten();
+        match (target, &packet) {
+            (PasteTarget::Paste, PastePacket::Listing { .. }) => {}
+            (PasteTarget::Read(read), packet) if !matches!(packet, PastePacket::Listing { .. }) => {
+                if self
+                    .paste
+                    .open
+                    .as_ref()
+                    .is_none_or(|open| open.read != read)
+                {
+                    return Err(PasteRefusal::StaleRead);
+                }
+            }
+            _ => return Err(PasteRefusal::Invalid),
+        }
+        let id = self.paste.open.as_ref().and_then(|open| open.id.clone());
         let encode = |packet: &PastePacket| {
             packet.encode(id.as_deref()).map_err(|error| match error {
                 PacketError::Invalid => PasteRefusal::Invalid,
@@ -585,7 +637,7 @@ impl Core {
                 self.input(&bytes);
             }
             PastePacket::ReadOk => {
-                if self.paste.open.is_none() || self.paste.answer.is_some() {
+                if self.paste.answer.is_some() {
                     return Err(PasteRefusal::OutOfOrder);
                 }
                 self.paste.answer = Some(encode(&packet)?);
@@ -619,9 +671,6 @@ impl Core {
                 self.input(&answer);
             }
             PastePacket::ReadError(_) => {
-                if self.paste.open.is_none() {
-                    return Err(PasteRefusal::OutOfOrder);
-                }
                 // Nothing of a held answer has been sent, so an error can
                 // still stand in place of its `ReadOk`.
                 let bytes = encode(&packet)?;
@@ -634,7 +683,7 @@ impl Core {
 
     /// Drop the open read's answer whole and tell the child `EBUSY`.
     fn refuse_open_read(&mut self) {
-        let id = self.paste.open.clone().flatten();
+        let id = self.paste.open.as_ref().and_then(|open| open.id.clone());
         self.paste = PasteRead::default();
         self.refuse_read(id.as_deref());
     }
@@ -860,10 +909,11 @@ impl Core {
             }
             Msg::EnhancedPaste {
                 attempt,
+                target,
                 packet,
                 reply,
             } => {
-                let _ = reply.send(self.write_paste(attempt, packet));
+                let _ = reply.send(self.write_paste(attempt, target, packet));
             }
             Msg::Reconnect { reply } => {
                 let r = self.reconnect();
@@ -1084,6 +1134,7 @@ impl TerminalHandle {
                 dirty: false,
                 last_publish: Instant::now(),
                 paste: PasteRead::default(),
+                paste_reads: 0,
             };
             run(core, rx);
         });
@@ -1148,6 +1199,7 @@ impl TerminalHandle {
                 dirty: false,
                 last_publish: Instant::now(),
                 paste: PasteRead::default(),
+                paste_reads: 0,
             };
             run(core, rx);
         });
@@ -1464,24 +1516,26 @@ impl TerminalHandle {
     }
 
     /// Answer the child's paste events (`?5522`): offer a paste's MIME types
-    /// with [`PastePacket::Listing`], or answer an
+    /// with [`PastePacket::Listing`] to [`PasteTarget::Paste`], or answer an
     /// [`HandleEvent::EnhancedPasteRequest`] with `ReadOk`, `ReadData`...,
-    /// `ReadDone`, or a `ReadError`.
+    /// `ReadDone`, or a `ReadError` to [`PasteTarget::Read`] with its `read`.
     ///
     /// Checked in the terminal actor, in order with everything else: the
-    /// attempt must be current, the stream connected and writable, and the
-    /// mode on. A read's answer is held until `ReadDone` and sent whole; one
-    /// that fails is dropped and the child hears `EBUSY`. Nothing is ever
-    /// truncated or sent as plain input.
+    /// attempt must be current, the stream connected and writable, the mode
+    /// on, and the read still the open one. A read's answer is held until
+    /// `ReadDone` and sent whole; one that fails is dropped and the child
+    /// hears `EBUSY`. Nothing is ever truncated or sent as plain input.
     pub fn write_enhanced_paste(
         &self,
         attempt: AttemptId,
+        target: PasteTarget,
         packet: PastePacket,
     ) -> Result<(), PasteRefusal> {
         let (reply, answer) = mpsc::channel();
         self.tx
             .send(Msg::EnhancedPaste {
                 attempt,
+                target,
                 packet,
                 reply,
             })
@@ -1735,6 +1789,7 @@ mod tests {
             dirty: false,
             last_publish: Instant::now(),
             paste: PasteRead::default(),
+            paste_reads: 0,
         };
         (core, tx)
     }
