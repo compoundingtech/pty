@@ -29,6 +29,18 @@ pub const MAX_PACKET: usize = 1024 * 1024;
 /// The most data one read's answer may carry, over all its packets.
 pub const MAX_TRANSACTION: usize = 32 * 1024 * 1024;
 
+/// The most a read's answer may take encoded, as held until `ReadDone`.
+/// Every `DATA` sequence repeats the id and MIME type, so data alone does not
+/// bound it. This fits a full [`MAX_TRANSACTION`] in 4096-byte chunks with
+/// the longest id and MIME type.
+pub const MAX_ANSWER: usize = 48 * 1024 * 1024;
+
+/// The longest request id this side accepts or echoes.
+pub const MAX_ID: usize = 256;
+
+/// The longest MIME type, per RFC 6838's 127-character type and subtype.
+pub const MAX_MIME: usize = 255;
+
 /// The protocol's chunk: data is sent at most this many bytes, before
 /// encoding, per `DATA` sequence.
 const DATA_CHUNK: usize = 4096;
@@ -315,13 +327,14 @@ fn osc(out: &mut Vec<u8>, metadata: &str, payload: &str) {
 
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
+        && id.len() <= MAX_ID
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_+.".contains(&b))
 }
 
 fn valid_mime(mime: &str) -> bool {
-    !mime.is_empty() && mime.bytes().all(|b| b.is_ascii_graphic())
+    !mime.is_empty() && mime.len() <= MAX_MIME && mime.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Strict RFC 4648 base64 with the standard alphabet: padding required, no
@@ -501,6 +514,37 @@ mod tests {
         assert_eq!(String::from_utf8(joined).unwrap(), mimes.join(" "));
         assert!(bytes.starts_with(&format!("\x1b]5522;type=read:status=OK:pw={pw}\x1b\\")));
         assert!(bytes.ends_with(&format!("\x1b]5522;type=read:status=DONE:pw={pw}\x1b\\")));
+    }
+
+    /// The encoded bound holds a full answer at the longest id and MIME
+    /// type, and both lengths are finite.
+    #[test]
+    fn a_full_answer_fits_the_encoded_bound() {
+        let id = "i".repeat(MAX_ID);
+        let mime = "m".repeat(MAX_MIME);
+        let packet = PastePacket::ReadData {
+            mime: mime.clone(),
+            data: vec![0; MAX_PACKET],
+        };
+        let encoded = PastePacket::ReadOk.encode(Some(&id)).unwrap().len()
+            + packet.encode(Some(&id)).unwrap().len() * (MAX_TRANSACTION / MAX_PACKET)
+            + PastePacket::ReadDone.encode(Some(&id)).unwrap().len();
+        assert!(encoded <= MAX_ANSWER, "{encoded} > {MAX_ANSWER}");
+
+        let too_long = PastePacket::ReadData {
+            mime: "m".repeat(MAX_MIME + 1),
+            data: vec![0],
+        };
+        assert_eq!(too_long.encode(None), Err(PacketError::Invalid));
+        assert_eq!(
+            PastePacket::ReadOk.encode(Some(&"i".repeat(MAX_ID + 1))),
+            Err(PacketError::Invalid)
+        );
+        let long_id = format!("type=read:id={}", "i".repeat(MAX_ID + 1));
+        assert_eq!(
+            ReadRequest::parse(&request(&long_id, &b64("image/png"))),
+            None
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use pty_core::protocol::{
     encode_resize_with_cell,
 };
 use pty_terminal::enhanced_paste::{
-    MAX_TRANSACTION, PacketError, PastePacket, ReadError, ReadRequest,
+    MAX_ANSWER, MAX_TRANSACTION, PacketError, PastePacket, ReadError, ReadRequest,
 };
 use pty_terminal::{
     CellGrid, CellSize, GraphicsOptions, GraphicsState, ImageBytes, KeyEvent, Modes,
@@ -267,8 +267,8 @@ pub enum PasteRefusal {
     Invalid,
     /// Over 64 KiB of listing or 1 MiB of data in one packet.
     PacketTooLarge,
-    /// The answer passed 32 MiB. It was dropped whole, and the child heard
-    /// `EBUSY` in place of it.
+    /// The answer passed 32 MiB of data, or 48 MiB encoded. It was dropped
+    /// whole, and the child heard `EBUSY` in place of it.
     TransactionTooLarge,
 }
 
@@ -646,8 +646,14 @@ impl Core {
                 if self.paste.answer.is_none() {
                     return Err(PasteRefusal::OutOfOrder);
                 }
+                let held = self.paste.answer.as_ref().map_or(0, Vec::len);
                 let bytes = match encode(&packet) {
-                    Ok(bytes) if self.paste.data + data.len() <= MAX_TRANSACTION => bytes,
+                    Ok(bytes)
+                        if self.paste.data + data.len() <= MAX_TRANSACTION
+                            && held + bytes.len() <= MAX_ANSWER =>
+                    {
+                        bytes
+                    }
                     Ok(_) => {
                         self.refuse_open_read();
                         return Err(PasteRefusal::TransactionTooLarge);

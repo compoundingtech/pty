@@ -2,7 +2,7 @@
 //! write, and a read's answer held until it is whole.
 
 use super::*;
-use pty_terminal::enhanced_paste::{Location, MAX_PACKET};
+use pty_terminal::enhanced_paste::{Location, MAX_ANSWER, MAX_ID, MAX_PACKET};
 
 /// `image/png text/plain`, base64.
 const PNG_AND_TEXT: &str = "aW1hZ2UvcG5nIHRleHQvcGxhaW4=";
@@ -327,6 +327,40 @@ fn an_oversized_packet_or_answer_is_dropped_whole() {
     }
     assert_eq!(r.write(1, data(1)), Err(PasteRefusal::TransactionTooLarge));
     assert_eq!(r.sent(), b"\x1b]5522;type=read:status=EBUSY:id=huge\x1b\\");
+}
+
+/// Every DATA sequence repeats the id and MIME type, so empty or tiny
+/// packets under the longest id must still meet a bound: the held answer
+/// is capped encoded, and dropped whole with EBUSY when it passes.
+#[test]
+fn empty_packets_cannot_grow_an_answer_without_bound() {
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    let id = "i".repeat(MAX_ID);
+    r.request(&id);
+    r.write(1, PastePacket::ReadOk).unwrap();
+    let empty = PastePacket::ReadData {
+        mime: "image/png".into(),
+        data: Vec::new(),
+    };
+    let per_packet = empty.encode(Some(&id)).unwrap().len();
+    let mut accepted = 0;
+    let refusal = loop {
+        match r.write(1, empty.clone()) {
+            Ok(()) => accepted += 1,
+            Err(refusal) => break refusal,
+        }
+        assert!(
+            accepted <= MAX_ANSWER / per_packet,
+            "no bound after {accepted}"
+        );
+    };
+    assert_eq!(refusal, PasteRefusal::TransactionTooLarge);
+    assert!(r.core.paste.answer.is_none(), "dropped whole");
+    let busy = PastePacket::ReadError(ReadError::Busy)
+        .encode(Some(&id))
+        .unwrap();
+    assert_eq!(r.sent(), busy);
 }
 
 /// A whole 32 MiB answer outgrows one protocol packet; it arrives split
