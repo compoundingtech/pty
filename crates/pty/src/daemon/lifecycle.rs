@@ -1365,6 +1365,7 @@ impl Daemon {
         self.broadcast(&encode_exit(code));
         self.events
             .append(Event::session_exit(&self.name, code, signal));
+        self.events.flush();
         if matches!(
             self.save_exit_metadata(),
             MutateStatus::Busy | MutateStatus::Stale

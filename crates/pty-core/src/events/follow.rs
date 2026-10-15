@@ -1,8 +1,8 @@
 //! `pty events -f`: tail one session's log, a named set, or (`--all`) every
 //! log in the registry as they appear. Existing files start at their
 //! current end; files that appear while following replay from offset 0 so
-//! their `session_start` line is not skipped; a shrink (retention rewrite
-//! or truncation) restarts at 0.
+//! their `session_start` line is not skipped; a shrink or changed consumed
+//! prefix (retention rewrite or truncation) restarts at 0.
 //!
 //! Change detection is the `notify` crate on the registry directory plus a
 //! poll every 250 ms, so delivery is deterministic even when the watcher
@@ -111,6 +111,20 @@ impl Drop for EventFollower {
 struct Tracked {
     path: PathBuf,
     offset: u64,
+    snapshot: Vec<u8>,
+    identity: Option<(u64, u64)>,
+}
+
+impl Tracked {
+    fn existing(path: PathBuf) -> Self {
+        let snapshot = std::fs::read(&path).unwrap_or_default();
+        Self {
+            path,
+            offset: snapshot.len() as u64,
+            identity: None,
+            snapshot,
+        }
+    }
 }
 
 fn name_of(file_name: &str) -> Option<&str> {
@@ -127,8 +141,7 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
         Some(names) => {
             for name in names {
                 let path = events_path(name);
-                let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                tracked.insert(name.clone(), Tracked { path, offset });
+                tracked.insert(name.clone(), Tracked::existing(path));
             }
         }
         None => {
@@ -139,8 +152,7 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
                         continue;
                     };
                     let path = entry.path();
-                    let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    tracked.insert(name.to_string(), Tracked { path, offset });
+                    tracked.insert(name.to_string(), Tracked::existing(path));
                 }
             }
         }
@@ -197,47 +209,95 @@ fn discover_new(dir: &Path, tracked: &mut BTreeMap<String, Tracked>) {
                 Tracked {
                     path: entry.path(),
                     offset: 0,
+                    snapshot: Vec::new(),
+                    identity: None,
                 },
             );
         }
     }
 }
 
-/// Deliver every complete line past the tracked offset; a shrink restarts
-/// at 0. A trailing partial line waits for its newline.
+/// Deliver every complete line past the tracked offset. A shrink or changed
+/// consumed prefix restarts at 0, even if retention regrew between scans.
+/// A trailing partial line waits for its newline.
 ///
 /// node: src/events.ts:489-514
 fn read_new_lines(t: &mut Tracked, on_event: &mut impl FnMut(Event)) {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(meta) = std::fs::metadata(&t.path) else {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(mut file) = std::fs::File::open(&t.path) else {
         return;
     };
-    let size = meta.len();
-    if size < t.offset {
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let identity = (metadata.dev(), metadata.ino());
+    if t.identity == Some(identity) && metadata.len() == t.snapshot.len() as u64 {
+        return;
+    }
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    if file.read_to_end(&mut content).is_err() {
+        return;
+    }
+    t.identity = Some(identity);
+    let offset = t.offset as usize;
+    if content.len() < offset || t.snapshot.get(..offset) != content.get(..offset) {
         t.offset = 0;
     }
-    if size == t.offset {
-        return;
-    }
-    let Ok(mut f) = std::fs::File::open(&t.path) else {
-        return;
-    };
-    if f.seek(SeekFrom::Start(t.offset)).is_err() {
-        return;
-    }
-    let mut buf = Vec::with_capacity((size - t.offset) as usize);
-    if f.take(size - t.offset).read_to_end(&mut buf).is_err() {
-        return;
-    }
-    let Some(last_newline) = buf.iter().rposition(|b| *b == b'\n') else {
+    let offset = t.offset as usize;
+    let Some(last_newline) = content[offset..].iter().rposition(|b| *b == b'\n') else {
+        t.snapshot = content;
         return;
     };
-    let complete = &buf[..=last_newline];
-    t.offset += complete.len() as u64;
-    let chunk = String::from_utf8_lossy(complete);
+    let end = offset + last_newline + 1;
+    let chunk = String::from_utf8_lossy(&content[offset..end]);
+    t.offset = end as u64;
     for line in chunk.split('\n').filter(|l| !l.is_empty()) {
         if let Ok(event) = serde_json::from_str::<Event>(line) {
             on_event(event);
         }
+    }
+    t.snapshot = content;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesced_retention_and_regrowth_replays_every_retained_new_record() {
+        let path =
+            std::env::temp_dir().join(format!("pty-follower-regrowth-{}", std::process::id()));
+        let history: String = (0..900)
+            .map(|i| {
+                format!(
+                    "{}\n",
+                    Event::bell("regrowth")
+                        .with_ts(&format!("old-{i}"))
+                        .to_json()
+                )
+            })
+            .collect();
+        std::fs::write(&path, &history).unwrap();
+        let mut tracked = Tracked::existing(path.clone());
+        let padding = "x".repeat(2000);
+        let batch: Vec<_> = (0..300)
+            .map(|i| {
+                Event::new("regrowth", "user.batch")
+                    .with("seq", i)
+                    .with("padding", padding.as_str())
+            })
+            .collect();
+        crate::events::append_batch(&path, &batch, &mut 0).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > history.len() as u64);
+        let mut seen = std::collections::BTreeSet::new();
+        read_new_lines(&mut tracked, &mut |event| {
+            if event.r#type == "user.batch" {
+                seen.insert(event.get("seq").unwrap().as_u64().unwrap());
+            }
+        });
+        assert_eq!(seen, (0..300).collect());
+        std::fs::remove_file(path).unwrap();
     }
 }
