@@ -16,6 +16,11 @@ use std::fmt;
 /// The longest OSC 5522 sequence the scanner holds back, payload included:
 /// the limit on request and listing metadata. Longer ones pass through as
 /// bytes and are never typed.
+///
+/// While a sequence is held, so is the output behind it: an unterminated
+/// `ESC ] 5522 ;` delays up to this many bytes of the child's output from
+/// reaching clients, until its terminator, a cancel (CAN, SUB or a new ESC)
+/// or this limit. Other OSCs hold at most [`crate::strip::MAX_OSC`].
 pub const MAX_METADATA: usize = 64 * 1024;
 
 /// Which clipboard a request reads.
@@ -74,13 +79,17 @@ impl ReadRequest {
         let mut id = None;
         let mut password = None;
         let mut name = None;
-        let mut seen = Vec::new();
+        // Only the keys the protocol defines may not repeat. Tracking every
+        // key would cost quadratic time over 64 KiB of distinct junk keys.
+        let mut seen = [false; KEYS.len()];
         for pair in metadata.split(':') {
             let (key, value) = pair.split_once('=')?;
-            if seen.contains(&key) {
-                return None;
+            if let Some(i) = KEYS.iter().position(|known| *known == key) {
+                if seen[i] {
+                    return None;
+                }
+                seen[i] = true;
             }
-            seen.push(key);
             match key {
                 "type" => kind = Some(value),
                 "loc" if value == "primary" => location = Location::Primary,
@@ -123,6 +132,10 @@ impl ReadRequest {
         })
     }
 }
+
+/// The metadata keys this side of the protocol knows. Any other key is
+/// ignored.
+const KEYS: [&str; 7] = ["type", "loc", "id", "pw", "name", "status", "mime"];
 
 /// Strict RFC 4648 base64 with the standard alphabet: padding required, no
 /// whitespace, no other byte. The protocol tells terminals to reject rather
@@ -225,6 +238,21 @@ mod tests {
         let mut long = request("type=read", &png);
         long.resize(MAX_METADATA + 1, b'A');
         assert_eq!(ReadRequest::parse(&long), None);
+    }
+
+    /// Duplicate checks cover only known keys, so distinct unknown keys
+    /// cost linear time and are ignored.
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let junk: Vec<String> = (0..8000).map(|i| format!("k{i}=v")).collect();
+        let metadata = format!("type=read:{}", junk.join(":"));
+        let parsed = ReadRequest::parse(&request(&metadata, &b64("image/png")));
+        assert_eq!(parsed.map(|r| r.mimes), Some(vec!["image/png".to_string()]));
+        assert_eq!(
+            ReadRequest::parse(&request("type=read:k=1:k=2", &b64("image/png"))).map(|r| r.mimes),
+            Some(vec!["image/png".to_string()]),
+            "an unknown key may repeat"
+        );
     }
 
     #[test]

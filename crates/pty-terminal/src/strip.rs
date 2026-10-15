@@ -16,7 +16,8 @@
 //! longer than [`MAX_CSI`] bytes or an OSC longer than [`MAX_OSC`] bytes is
 //! given up on and passed through). An OSC 5522 may hold up to
 //! [`crate::enhanced_paste::MAX_METADATA`] bytes, the enhanced-paste limit on
-//! request and listing metadata.
+//! request and listing metadata; while it is held, the output behind it waits
+//! too, so an unterminated `ESC ] 5522 ;` can delay up to 64 KiB of output.
 
 /// Longest CSI sequence the scanner will hold back while waiting for its
 /// final byte. Everything Node strips or tracks is far shorter.

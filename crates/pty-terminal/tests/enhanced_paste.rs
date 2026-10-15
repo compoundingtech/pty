@@ -127,6 +127,70 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
+/// Unterminated, a sequence over the limit is given up on: nothing of it is
+/// held back, and clients get every byte as it comes.
+#[test]
+fn an_unterminated_sequence_over_the_limit_is_not_held() {
+    let mut a = actor();
+    let mut stream = b"\x1b]5522;type=read;".to_vec();
+    stream.resize(2 + MAX_METADATA + 1, b'A');
+    let mut broadcast = Vec::new();
+    for chunk in stream.chunks(4096) {
+        broadcast.extend(a.write(chunk));
+    }
+    assert_eq!(broadcast, stream, "nothing held");
+    a.write(b"\x1b\\");
+    assert_eq!(paste_events(&mut a), vec![]);
+}
+
+/// A valid request of exactly the limit is held whole and typed; one byte
+/// more and it is refused.
+#[test]
+fn a_valid_request_at_the_limit_is_typed() {
+    let head = "5522;type=read:pad=";
+    let tail = format!(";{PNG_AND_TEXT}");
+    for (extra, typed) in [(0, true), (1, false)] {
+        let pad = "a".repeat(MAX_METADATA - head.len() - tail.len() + extra);
+        let payload = format!("{head}{pad}{tail}");
+        assert_eq!(payload.len(), MAX_METADATA + extra);
+        let sequence = format!("\x1b]{payload}\x1b\\");
+        let mut a = actor();
+        let mut broadcast = Vec::new();
+        for chunk in sequence.as_bytes().chunks(4096) {
+            broadcast.extend(a.write(chunk));
+        }
+        assert_eq!(broadcast, sequence.as_bytes());
+        let events = paste_events(&mut a);
+        assert_eq!(
+            matches!(&events[..], [TerminalEvent::EnhancedPasteRead(r)] if r.mimes == ["image/png", "text/plain"]),
+            typed,
+            "{} bytes: {events:?}",
+            payload.len()
+        );
+    }
+}
+
+#[test]
+fn bel_ends_a_request_and_can_or_sub_cancel_one() {
+    let mut a = actor();
+    let bel = format!("\x1b]5522;type=read;{PNG_AND_TEXT}\x07");
+    assert_eq!(a.write(bel.as_bytes()), bel.as_bytes());
+    assert_eq!(paste_events(&mut a).len(), 1);
+    for cancel in [0x18u8, 0x1a] {
+        let mut stream = format!("\x1b]5522;type=read;{PNG_AND_TEXT}").into_bytes();
+        stream.push(cancel);
+        stream.extend(b"\x1b\\");
+        assert_eq!(a.write(&stream), stream);
+        assert_eq!(paste_events(&mut a), vec![], "cancelled by {cancel:#x}");
+    }
+    assert_eq!(a.write(&read_request()), read_request());
+    assert_eq!(
+        paste_events(&mut a).len(),
+        1,
+        "and the next request is seen"
+    );
+}
+
 /// Over the metadata limit a request is refused: no event, no partial
 /// sequence held, the bytes pass through, and the next request is seen.
 #[test]
