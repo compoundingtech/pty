@@ -1525,6 +1525,17 @@ impl TerminalHandle {
     /// on, and the read still the open one. A read's answer is held until
     /// `ReadDone` and sent whole; one that fails is dropped and the child
     /// hears `EBUSY`. Nothing is ever truncated or sent as plain input.
+    ///
+    /// A read stays open until it is answered: there is no timeout, and the
+    /// child hears `EBUSY` for any other read meanwhile. A consumer that
+    /// will not serve a read (no clipboard, the user declined, the pane is
+    /// not focused) answers it with a `ReadError`; which clipboard to offer
+    /// and whether to ask the user are its decisions.
+    ///
+    /// The answer is written on the terminal actor's thread, like all
+    /// input. A child that stops reading its input holds the handle until
+    /// the write completes; an answer can be up to 32 MiB (about 44 MiB on
+    /// the wire).
     pub fn write_enhanced_paste(
         &self,
         attempt: AttemptId,

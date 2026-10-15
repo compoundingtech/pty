@@ -177,7 +177,7 @@ pub enum PastePacket {
     /// Opens a read's answer: `status=OK`.
     ReadOk,
     /// Data for one MIME type, at most [`MAX_PACKET`] bytes. It is sent in
-    /// the protocol's 4096-byte chunks.
+    /// the protocol's 4096-byte chunks; empty data is one empty `DATA`.
     ReadData { mime: String, data: Vec<u8> },
     /// Ends a read's answer: `status=DONE`.
     ReadDone,
@@ -279,6 +279,13 @@ impl PastePacket {
                 );
                 for chunk in data.chunks(DATA_CHUNK) {
                     osc(&mut out, &metadata, &crate::graphics::base64(chunk));
+                }
+                // An empty type still gets one DATA sequence, so the child
+                // can tell it from a type that was not sent at all.
+                if data.is_empty() {
+                    out.extend_from_slice(b"\x1b]5522;");
+                    out.extend_from_slice(metadata.as_bytes());
+                    out.extend_from_slice(b";\x1b\\");
                 }
             }
             PastePacket::ReadDone => osc(&mut out, &read_status("DONE", id), ""),
@@ -494,6 +501,21 @@ mod tests {
         assert_eq!(String::from_utf8(joined).unwrap(), mimes.join(" "));
         assert!(bytes.starts_with(&format!("\x1b]5522;type=read:status=OK:pw={pw}\x1b\\")));
         assert!(bytes.ends_with(&format!("\x1b]5522;type=read:status=DONE:pw={pw}\x1b\\")));
+    }
+
+    #[test]
+    fn empty_data_is_one_empty_data_sequence() {
+        let empty = PastePacket::ReadData {
+            mime: "text/plain".into(),
+            data: Vec::new(),
+        };
+        assert_eq!(
+            String::from_utf8(empty.encode(Some("e")).unwrap()).unwrap(),
+            format!(
+                "\x1b]5522;type=read:status=DATA:id=e:mime={};\x1b\\",
+                b64("text/plain")
+            )
+        );
     }
 
     #[test]
