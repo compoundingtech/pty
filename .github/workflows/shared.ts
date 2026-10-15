@@ -28,3 +28,9 @@ export const macosRunner = namespaceRunner({
 export const nixSetupOptions = { binaryCaches: [effectUtilsCache] }
 
 export const nixSetupSteps = () => plainFlakeSetupSteps({ nix: nixSetupOptions })
+
+/** Superseded revisions share a group only within one PR and workflow. */
+export const pullRequestConcurrency = {
+  group: '${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}',
+  'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
+}

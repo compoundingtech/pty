@@ -3,10 +3,11 @@ import {
   githubWorkflow,
   githubWorkflowEvent,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner, nixSetupSteps } from './shared.ts'
+import { linuxRunner, nixSetupSteps, pullRequestConcurrency } from './shared.ts'
 
 export default githubWorkflow({
   name: "Conformance",
+  concurrency: pullRequestConcurrency,
   on: {
     pull_request: githubWorkflowEvent.all,
     push: {

@@ -226,6 +226,9 @@ mechanism. That trade holds while the daily users are the affected users. If
 this ever ships to people who are not in the room, the trade changes and a
 pull-request macOS job comes back — via Nix, because Cargo cannot build it there.
 
+Each pull-request workflow cancels older runs of the same workflow on the same
+pull request. Other pull requests, pushes to `main`, and releases run independently.
+
 All workflows and `.github/repo-settings.json` are generated from their
 neighboring `.genie.ts` sources. The generator has its own shell so ordinary
 `nix develop` and Rust CI do not build generator tooling:
@@ -233,6 +236,7 @@ neighboring `.genie.ts` sources. The generator has its own shell so ordinary
 ```sh
 nix develop .#genie -c genie
 nix develop .#genie -c genie --check
+python3 scripts/check-workflow-policy.py
 ```
 
 That shell links the pinned effect-utils flake source into `repos/effect-utils`;
