@@ -1,8 +1,9 @@
 //! Session registry: the on-disk layout under `$PTY_ROOT`, byte-compatible
 //! with the Node project's `src/sessions.ts` so Rust and Node daemons and
-//! CLIs can share one root.
+//! CLIs can share one root. IDs whose readable socket address would exceed
+//! the kernel limit use a bounded Rust extension; see [`socket_path_in`].
 //!
-//! Per session: `<name>.json` (metadata), `<name>.sock`, `<name>.pid`,
+//! Per session: `<name>.json` (metadata), a socket from [`socket_path_in`], `<name>.pid`,
 //! `<name>.events.jsonl`, `<name>.lock`, `<name>.events.lock`,
 //! `.recovery/<name>.revision.json`, and the Rust daemon's output-activity
 //! sidecar `.activity/<name>.json` ([`activity`]). Atomic writes go through
@@ -79,7 +80,7 @@ pub use names::{
 pub use root::{
     SUN_PATH_MAX, RootSource, default_session_dir, ensure_session_dir, event_lock_path, events_path, lock_path,
     metadata_path, output_activity_path, pid_path, recovery_revision_path, root_length_check,
-    resolve_session_dir, session_dir, socket_path, with_root,
+    resolve_session_dir, session_dir, socket_path, socket_path_in, with_root,
 };
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,

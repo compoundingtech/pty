@@ -425,7 +425,7 @@ pub fn peek_screen_bytes_in(
     name: &str,
     opts: PeekScreenOptions,
 ) -> Result<Vec<u8>, ClientError> {
-    match peek_screen_bytes_at(&root.join(format!("{name}.sock")), name, opts) {
+    match peek_screen_bytes_at(&registry::socket_path_in(root, name), name, opts) {
         Err(PeekScreenReadError::Client(
             error @ (ClientError::NotReachable { .. } | ClientError::ClosedBeforeScreen { .. }),
         )) if opts.full => retained_screen_bytes_in(root, name).ok_or(error),

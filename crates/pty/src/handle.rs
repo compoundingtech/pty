@@ -61,7 +61,7 @@ pub enum ReadyOutcome {
     TimedOut,
 }
 
-/// A session daemon to attach to: `<root>/<id>.sock`.
+/// A session daemon to attach to within a registry root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     /// The registry root (`$PTY_ROOT`).
@@ -71,9 +71,9 @@ pub struct SessionRef {
 }
 
 impl SessionRef {
-    /// `<root>/<id>.sock`.
+    /// The registry's transport address for this session id.
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join(format!("{}.sock", self.id))
+        pty_core::registry::socket_path_in(&self.root, &self.id)
     }
 }
 

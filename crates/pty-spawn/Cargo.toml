@@ -6,5 +6,6 @@ rust-version.workspace = true
 description = "Allocate a pseudo-terminal and start a child in it. No terminal emulator, no Zig."
 
 [dependencies]
+pty-core.workspace = true
 portable-pty.workspace = true
 libc.workspace = true
