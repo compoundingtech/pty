@@ -11,12 +11,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::list::{DaemonIdentityCheck, check_record_identity, read_session_pid};
+use super::list::{DaemonIdentityCheck, check_record_identity_in, read_session_pid};
 use super::lock::{acquire_event_lock, acquire_lock};
 use super::metadata::{SESSION_EXIT_LAST_LINES_LIMIT, SessionMetadata};
 use super::names::validate_name;
 use super::root::{
-    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, socket_path,
+    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, session_dir,
+    socket_path,
 };
 
 const METADATA_MAX_BYTES: u64 = 1024 * 1024;
@@ -208,7 +209,9 @@ fn read_evidence_metadata(name: &str) -> EvidenceMetadataRead {
 }
 
 fn generation_identity(name: &str, metadata: &EvidenceMetadata) -> DaemonIdentityCheck {
-    check_record_identity(read_session_pid(name), Some(&metadata.identity))
+    check_record_identity_in(
+        &session_dir(), name, read_session_pid(name), Some(&metadata.identity),
+    )
 }
 
 pub fn get_session_exit_evidence(name: &str) -> SessionExitEvidenceResult {

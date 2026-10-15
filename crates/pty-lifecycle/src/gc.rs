@@ -800,7 +800,9 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
 /// existence/reachability and a missing read_pid_with result are never proof.
 fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
     let sidecar = read_session_pid(name);
-    let check = registry::check_record_identity(sidecar, Some(metadata));
+    let check = registry::check_record_identity_in(
+        &registry::session_dir(), name, sidecar, Some(metadata),
+    );
     if check == DaemonIdentityCheck::Match
         && sidecar
             .or(metadata.daemon_pid)
@@ -1285,5 +1287,29 @@ mod tests {
             .insert("strategy.abandon-if-cwd-gone".into(), "false".into());
         assert!(classify_abandoned(&missing, None, 0).is_some());
         assert!(revalidate_abandonment(&missing, &opted_out, None, 0).is_none());
+    }
+
+    #[test]
+    fn gc_reaps_pidless_metadata_without_companions() {
+        let root = std::env::temp_dir().join(format!("pty-gc-pidless-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        registry::with_root(&root, || {
+            let metadata = SessionMetadata {
+                generation: Some("legacy-history".into()),
+                ..Default::default()
+            };
+            write_metadata("legacy", &metadata).unwrap();
+            assert!(!registry::pid_path("legacy").exists());
+            assert!(!socket_path("legacy").exists());
+            let observed = registry::get_session_by_name("legacy").unwrap();
+            assert_eq!(observed.identity, DaemonIdentityCheck::Gone);
+            assert_eq!(daemon_identity("legacy", &metadata), observed.identity);
+            let result = gc(GcOptions::default());
+            assert_eq!(result.removed, vec!["legacy".to_string()]);
+            assert!(!metadata_path("legacy").exists());
+            assert!(result.killed_orphan_children.is_empty());
+            assert!(result.respawned.is_empty());
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -189,3 +189,27 @@ fn unknown_identity_refuses_snapshot_and_generation_removal() {
     );
     assert!(registry::metadata_path(&name).exists());
 }
+
+#[test]
+fn pidless_generation_evidence_agrees_with_listing_and_removal() {
+    root();
+    let name = unique_name("pidless-generation");
+    let mut metadata = terminal_metadata("legacy-generation");
+    metadata.daemon_pid = None;
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    let listed = registry::get_session_by_name(&name).unwrap();
+    assert_eq!(listed.identity, registry::DaemonIdentityCheck::Gone);
+    let SessionExitEvidenceResult::Snapshot { snapshot } =
+        registry::get_session_exit_evidence(&name)
+    else {
+        panic!("pidless generation must have terminal evidence");
+    };
+    assert_eq!(snapshot.generation, "legacy-generation");
+    assert_eq!(snapshot.status, SessionExitStatus::Exited);
+    assert_eq!(snapshot.exit_code, Some(7));
+    assert_eq!(
+        registry::remove_session_generation(&name, "legacy-generation").unwrap(),
+        RemoveSessionGenerationResult::Removed,
+    );
+    assert!(!registry::metadata_path(&name).exists());
+}

@@ -302,3 +302,22 @@ fn run_same_name_preserves_conflicting_live_sidecar() {
     assert!(out.stderr.contains("already in use"), "{out:?}");
     fixture.assert_preserved(&rig);
 }
+
+#[test]
+fn run_reuses_pidless_metadata_name_without_companions() {
+    let rig = Rig::new();
+    rig.write_meta(
+        "legacy",
+        serde_json::json!({"generation": "legacy-history", "displayName": "legacy recipe"}),
+    );
+    assert!(!rig.path("legacy.pid").exists());
+    assert!(!rig.path("legacy.sock").exists());
+    rig.spawn_cat("legacy", &[]);
+    let current = rig.read_meta("legacy").unwrap();
+    assert_ne!(current["generation"], "legacy-history");
+    assert!(current["daemonPid"].as_u64().is_some());
+    assert_eq!(
+        rig.ok(&["list", "--json"]).json()[0]["status"],
+        "running",
+    );
+}
