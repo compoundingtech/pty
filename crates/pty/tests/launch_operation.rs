@@ -433,11 +433,11 @@ fn wait_gone(pid: i32) {
 }
 
 /// Settle until the verdict is `verdict` (and its kind `kind`), waiting in
-/// between on exactly the processes the evidence names (a live writer or
-/// participant, a marked or unreadable process) to exit. A process of this
-/// user caught exiting is honestly unreadable for that capture; the next
-/// capture follows its exit, not a timer. A verdict that names no process to
-/// wait for fails at once.
+/// between on exactly the processes the evidence names (a writer or
+/// participant that has not exited, a marked or unreadable process) to exit.
+/// A process of this user caught exiting is honestly unknown for that
+/// capture; the next capture follows its exit, not a timer. A verdict that
+/// names no process to wait for fails at once.
 fn settle_reactively(
     rig: &Rig,
     operation_id: &str,
@@ -473,13 +473,14 @@ fn settle_reactively(
     panic!("settle never became {verdict}/{kind:?}");
 }
 
-/// Every process a settle verdict names as still live or unreadable.
+/// Every process a settle verdict names as not yet exited: live, caught
+/// exiting, or unreadable.
 fn named_processes(v: &Value) -> Vec<i32> {
     let mut pids = Vec::new();
     for component in v["components"].as_array().into_iter().flatten() {
         let detail = &component["detail"];
         match component["name"].as_str() {
-            Some("writer") if component["status"] == "pending" => {
+            Some("writer") if component["status"] != "verified" => {
                 let pid = detail["pid"]
                     .as_i64()
                     .or_else(|| detail["holderPid"].as_i64())
@@ -488,7 +489,7 @@ fn named_processes(v: &Value) -> Vec<i32> {
             }
             Some("participants") => {
                 for p in detail["participants"].as_array().into_iter().flatten() {
-                    if p["status"] == "live" {
+                    if p["status"] != "gone" {
                         pids.extend(p["pid"].as_i64().map(|pid| pid as i32));
                     }
                 }
@@ -507,6 +508,39 @@ fn named_processes(v: &Value) -> Vec<i32> {
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+/// A participant or writer caught exiting makes the verdict unknown, and is
+/// the process to wait for: the shape a loaded macOS host produced, with
+/// the producer still exiting while the launcher and the child were gone.
+#[test]
+fn a_process_caught_exiting_is_one_to_wait_for() {
+    let participants = json!({
+        "verdict": "unknown",
+        "kind": "participants",
+        "components": [
+            {"name": "writer", "status": "verified", "detail": {"role": "none"}},
+            {"name": "participants", "status": "unknown", "detail": {
+                "tableComplete": true,
+                "participants": [
+                    {"role": "launcher", "pid": 11, "startToken": "a", "status": "gone"},
+                    {"role": "producer", "pid": 12, "startToken": "b", "status": "exiting"},
+                    {"role": "child", "pid": 13, "startToken": "c", "status": "gone"},
+                ],
+            }},
+        ],
+    });
+    assert_eq!(named_processes(&participants), [12]);
+    let writer = json!({
+        "verdict": "unknown",
+        "kind": "writer",
+        "components": [
+            {"name": "writer", "status": "unknown", "detail": {
+                "role": "producer", "pid": 21, "startToken": "d", "status": "exiting",
+            }},
+        ],
+    });
+    assert_eq!(named_processes(&writer), [21]);
 }
 
 fn kill(pid: i32, signal: i32) {
