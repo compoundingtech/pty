@@ -376,6 +376,9 @@ struct Core {
     paste: PasteRead,
     /// The last [`PasteReadId`] handed out.
     paste_reads: u64,
+    /// The paste-events mode as of the event being published: a read is
+    /// admitted only while it is on, in stream order.
+    paste_mode: bool,
 }
 
 /// The current attempt's open read. Its answer is held until `ReadDone`,
@@ -456,12 +459,19 @@ impl Core {
                     if !enabled {
                         self.paste = PasteRead::default();
                     }
+                    self.paste_mode = enabled;
                     HandleEvent::EnhancedPasteMode {
                         attempt: self.attempt,
                         enabled,
                     }
                 }
                 TerminalEvent::EnhancedPasteRead(request) => {
+                    // Only a read made while paste events are on is ours to
+                    // answer: with the mode off nothing can be written to
+                    // it, so it must not hold the one read slot.
+                    if !self.paste_mode {
+                        continue;
+                    }
                     if self.paste.open.is_some() {
                         // One read at a time, as the protocol asks of
                         // multiplexers: any other is refused now.
@@ -1141,6 +1151,7 @@ impl TerminalHandle {
                 last_publish: Instant::now(),
                 paste: PasteRead::default(),
                 paste_reads: 0,
+                paste_mode: false,
             };
             run(core, rx);
         });
@@ -1206,6 +1217,7 @@ impl TerminalHandle {
                 last_publish: Instant::now(),
                 paste: PasteRead::default(),
                 paste_reads: 0,
+                paste_mode: false,
             };
             run(core, rx);
         });
@@ -1807,6 +1819,7 @@ mod tests {
             last_publish: Instant::now(),
             paste: PasteRead::default(),
             paste_reads: 0,
+            paste_mode: false,
         };
         (core, tx)
     }

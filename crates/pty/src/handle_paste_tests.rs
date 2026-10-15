@@ -58,6 +58,7 @@ fn rig(readonly: bool) -> Rig {
         last_publish: Instant::now(),
         paste: PasteRead::default(),
         paste_reads: 0,
+        paste_mode: false,
     };
     let (sub, events) = mpsc::channel();
     core.shared.subs.lock().unwrap().push(sub);
@@ -381,6 +382,33 @@ fn the_largest_answer_arrives_whole() {
     r.write(1, PastePacket::ReadDone).unwrap();
     let sent = r.sent_at_least(expected.len());
     assert!(sent == expected, "the answer arrived whole and in order");
+}
+
+/// A read made while paste events are off is not ours to answer and holds
+/// nothing: once the mode is on, the next read is published, not refused.
+#[test]
+fn a_read_with_the_mode_off_holds_no_slot() {
+    let mut r = rig(false);
+    r.request("early");
+    assert_eq!(r.open_read(), None);
+    assert_eq!(r.paste_events(), []);
+    assert_eq!(
+        r.write(1, PastePacket::ReadError(ReadError::NotAvailable)),
+        Err(PasteRefusal::ModeDisabled)
+    );
+    // In stream order: off, a read, on, all in one chunk.
+    r.output(
+        1,
+        b"\x1b[?5522h\x1b[?5522l\x1b]5522;type=read;Lg==\x1b\\\x1b[?5522h",
+    );
+    assert_eq!(r.open_read(), None, "the read came while the mode was off");
+    r.request("later");
+    let events = r.paste_events();
+    assert!(
+        matches!(events.last(), Some(HandleEvent::EnhancedPasteRequest { request, .. }) if request.id.as_deref() == Some("later")),
+        "{events:?}"
+    );
+    assert_eq!(r.sent(), b"", "no EBUSY for the later read");
 }
 
 /// A read is answered only under its own id. Read A's late answer, after
