@@ -46,7 +46,7 @@ pub use evidence::{
 pub use list::{
     DEFAULT_SOCKET_PROBE_BUDGET, DaemonIdentityCheck, DaemonIdentityCounters, Inventory,
     InventoryError, InventoryErrorKind, ListOptions, SessionInfo, SessionStatus, all_session_names,
-    ambiguous_reference_message, check_daemon_identity, check_record_identity,
+    ambiguous_reference_message, check_daemon_identity, check_record_identity, check_record_identity_in,
     daemon_identity_counters, get_session, get_session_by_name, has_process_exited_for_reap,
     list_sessions, list_sessions_in, list_sessions_strict_in, list_sessions_with,
     observe_session_strict_in, pid_alive, probe_sockets_within_budget, read_boot_id, read_pid,

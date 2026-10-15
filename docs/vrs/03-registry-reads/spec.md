@@ -69,14 +69,17 @@ token on Linux and macOS, plus thread-group leadership on Linux. Compare
 readable start tokens first: a difference proves Mismatch even without boot
 evidence. Matching tokens with missing/unreadable boot evidence remain Unknown.
 Legacy `darwin:{...}` boottime evidence cannot prove a boot match or mismatch.
-Unknown is not gone (`PTY.REG-R09`): retain `running` and the named PID, and
-carry `SessionInfo.identity` as the additive `identity` list JSON/remote field
-(`match`, `mismatch`, `gone`, `unknown`). This projection grants no signal,
-cleanup or replacement authority. Teardown uses the existing
+Unknown is not gone (`PTY.REG-R09`): retain the named PID and conservative
+`running` status unless an explicit exit record says `exited`. Carry
+`SessionInfo.identity` as the additive `identity` list JSON/remote field
+(`match`, `mismatch`, `gone`, `unknown`); Unknown never grants signal,
+cleanup or replacement authority, even with an exit record. Metadata with no
+named PID and absent PID/socket companions is Gone and removable; unreadable
+or malformed companions never prove absence. Teardown uses the existing
 `operation::exact::Exact` pinned-owner abstraction (Linux pidfd / macOS audit
 token); socket probes cannot substitute for identity requirements.
 
-Strict inventory probes transport only when daemon identity is unconfirmed; a probe cannot change that identity result. Unknown remains conservatively listed as running regardless of transport reachability. Failed or unanswered probes make transport diagnostics incomplete. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`. Ordinary listings classify identity without probing sockets.
+Strict inventory probes transport only when daemon identity is unconfirmed; a probe cannot change that identity result or the lifecycle projection. Failed or unanswered probes make transport diagnostics incomplete. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`. Ordinary listings classify identity without probing sockets.
 
 ## Batch STATUS
 

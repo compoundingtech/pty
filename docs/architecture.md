@@ -118,10 +118,12 @@ Both recorded identities must match; a recovery start token alone does not
 authorize legacy records. Linux also requires `/proc/<pid>/status` to identify
 the PID as its own thread-group leader. Missing boot identity or start token
 is Unknown, never Match, and grants no signal authority. A reachable socket
-cannot rescue a mismatched or absent identity. Unknown identity is not running
-and makes strict inventory incomplete. Run, up, down, restart, attach and the
-interactive picker recheck identity before cleanup or replacement; Unknown
-preserves the record.
+cannot rescue a mismatched or absent identity. Unknown keeps the named PID and
+conservatively lists as running unless an exit record proves the child exited;
+strict inventory remains incomplete. The separate identity field still blocks
+signals, removal and replacement. Metadata with no named PID and no PID/socket
+companions is Gone and removable. Run, up, down, restart, attach and the
+interactive picker recheck identity before cleanup or replacement.
 Manifest stop and restart use the same pinned stop path as `pty kill`.
 `registry::daemon_identity_counters()` exposes process-local match, mismatch,
 gone and unknown observations without logging every scan.

@@ -39,16 +39,17 @@ fn bind_live(value: &mut Value) {
     value["daemonBootId"] = json!(registry::read_boot_id().unwrap());
 }
 
-/// Metadata without a named PID cannot prove its owner has gone.
+/// No named PID and no socket preserve the legacy metadata-only loss projection.
 #[test]
-fn json_only_with_no_exit_record_is_unknown_not_gone() {
+fn json_only_with_no_exit_record_and_no_pid_is_gone() {
     let _ = root();
     let name = unique_name("van");
     write_json(&name, base(&name));
     let s = find(&name);
-    assert_eq!(s.status, SessionStatus::Running);
+    assert_eq!(s.status, SessionStatus::Vanished);
+    assert_eq!(s.identity, registry::DaemonIdentityCheck::Gone);
     assert_eq!(s.pid, None);
-    assert!(!s.is_gone());
+    assert!(s.is_gone());
     let m = s.metadata.unwrap();
     assert_eq!(m.exit_code, None);
     assert_eq!(m.exited_at, None);
@@ -486,7 +487,7 @@ fn session_metadata_defaults_for_sparse_records() {
     assert_eq!(m.command, "");
     assert_eq!(m.args, Vec::<String>::new());
     assert_eq!(m.extra.get("name"), Some(&json!(name)));
-    assert_eq!(find(&name).status, SessionStatus::Running);
+    assert_eq!(find(&name).status, SessionStatus::Vanished);
 }
 
 fn strict_root() -> std::path::PathBuf {

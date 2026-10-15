@@ -261,3 +261,86 @@ fn b1_transient_unreadable_boot_lists_running_and_refuses_stop_remove() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn exit_evidence_keeps_unknown_owner_exited_with_named_pid() {
+    for (field, value) in [
+        ("exitCode", serde_json::json!(0)),
+        ("exitedAt", serde_json::json!("2026-10-15T00:00:00.000Z")),
+    ] {
+        let mut fixture = Fixture::new(child());
+        let pid = fixture.child.id() as i32;
+        let _socket = fixture.record(pid, Some(token(pid)), None);
+        let path = fixture.root.join("owner.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record[field] = value;
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let sessions = pty_core::registry::list_sessions_in(
+            &fixture.root,
+            &pty_core::registry::ListOptions::default(),
+        );
+        assert_eq!(sessions[0].status, pty_core::registry::SessionStatus::Exited);
+        assert_eq!(sessions[0].pid, Some(pid));
+        assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
+        fixture.refused();
+        assert!(pty_client::remove_in(&fixture.root, "owner").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn metadata_without_pid_or_socket_is_gone_and_removable() {
+    let mut fixture = Fixture::new(child());
+    for exited in [false, true] {
+        let mut record = serde_json::json!({"generation": "original", "command": "cat"});
+        if exited {
+            record["exitCode"] = serde_json::json!(0);
+        }
+        std::fs::write(
+            fixture.root.join("owner.json"),
+            serde_json::to_vec(&record).unwrap(),
+        ).unwrap();
+        let sessions = pty_core::registry::list_sessions_in(
+            &fixture.root,
+            &pty_core::registry::ListOptions::default(),
+        );
+        assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Gone);
+        assert_eq!(sessions[0].pid, None);
+        assert_eq!(
+            sessions[0].status,
+            if exited {
+                pty_core::registry::SessionStatus::Exited
+            } else {
+                pty_core::registry::SessionStatus::Vanished
+            },
+        );
+        pty_client::remove_in(&fixture.root, "owner").unwrap();
+        assert!(!fixture.root.join("owner.json").exists());
+        assert!(fixture.child.try_wait().unwrap().is_none());
+    }
+}
+
+#[test]
+fn pidless_metadata_with_companions_remains_unknown_and_not_removable() {
+    let fixture = Fixture::new(child());
+    let record = br#"{"generation":"original","command":"cat"}"#;
+    std::fs::write(fixture.root.join("owner.json"), record).unwrap();
+    for companion in ["owner.sock", "owner.pid"] {
+        let path = fixture.root.join(companion);
+        std::fs::write(&path, b"unproven companion").unwrap();
+        let sessions = pty_core::registry::list_sessions_in(
+            &fixture.root,
+            &pty_core::registry::ListOptions::default(),
+        );
+        assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
+        assert!(pty_client::remove_in(&fixture.root, "owner").is_err());
+        assert_eq!(
+            std::fs::read(fixture.root.join("owner.json")).unwrap().as_slice(),
+            record.as_slice(),
+        );
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+}

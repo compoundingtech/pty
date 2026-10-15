@@ -100,7 +100,9 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
     let generation = session.metadata.as_ref().and_then(|m| m.generation.clone());
     let sidecar = registry::read_session_pid(name);
     let daemon_pid = sidecar.or_else(|| session.metadata.as_ref().and_then(|m| m.daemon_pid));
-    match registry::check_record_identity(sidecar, session.metadata.as_ref()) {
+    match registry::check_record_identity_in(
+        &registry::session_dir(), name, sidecar, session.metadata.as_ref(),
+    ) {
         DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => {}
         DaemonIdentityCheck::Unknown => {
             return Err(RemoveError::IdentityUnverified {

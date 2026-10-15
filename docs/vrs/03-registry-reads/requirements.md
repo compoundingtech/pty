@@ -4,6 +4,10 @@
 
 This node defines how pty-core reads the session registry and the session daemons behind it for a caller in the same process. It covers bounded socket transport diagnostics inside a strict listing (`list_sessions_in`, `list_sessions_with`, `socket_reachable`) and STATUS reads, single (`query_stats_in_with_timeout`) and batched (`query_stats_batch_in`). Identity Match requires a live daemon with matching recorded stable boot identity and start token on Linux and macOS, plus thread-group leadership on Linux. Unknown is not gone: listings conservatively retain `running` and the named PID, while an additive `identity` field carries `match`, `mismatch`, `gone` or `unknown`. Missing or unreadable evidence never grants signal, cleanup or replacement authority; socket reachability is not identity authority. Teardown signals only pinned exact owners through the existing `Exact` abstraction (Linux pidfd / macOS audit token), without a raw-PID or process-group fallback. Classification is tracked in [docs/parity.md](../../parity.md) section 5.2. This node constrains how the reads are performed. The rationale is in [decision 0014](../../decisions/0014-registry-reads-run-on-the-callers-thread.md).
 
+An explicit exit record keeps `exited` even with Unknown identity; retain the
+named PID and refuse destructive work. Legacy metadata with no named PID and
+no PID/socket companion is Gone and may be removed.
+
 ## Assumptions
 
 - **PTY.REG-A01 Periodic embedders:** A viewer or supervisor links pty-core and, for the life of its process, lists the registry and reads STATUS for every running session on a fixed cadence of seconds.
@@ -42,4 +46,4 @@ This node defines how pty-core reads the session registry and the session daemon
 
 ### Must not invent owner loss
 
-- **PTY.REG-R09 Unknown is not gone:** Missing or unreadable identity evidence must not project a session as `vanished` or `exited`, erase its named live PID, or authorize signalling, removal or replacement. Keep the existing status strings; project Unknown conservatively as `running` and expose the independent identity result. A differing readable start token proves Mismatch without boot evidence; Match requires complete stable boot evidence and process leadership.
+- **PTY.REG-R09 Unknown is not gone:** Missing or unreadable identity evidence alone must not project owner loss, erase its named live PID, or authorize signalling, removal or replacement. Keep the existing status strings: project Unknown conservatively as `running` unless explicit `exitedAt`/`exitCode` evidence says `exited`, and expose the independent identity result. Metadata with no named PID and no PID/socket companion is Gone; malformed or unreadable companions are not absence. A differing readable start token proves Mismatch without boot evidence; Match requires complete stable boot evidence and process leadership.

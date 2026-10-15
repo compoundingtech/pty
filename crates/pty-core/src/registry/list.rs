@@ -422,6 +422,28 @@ pub fn check_record_identity(
     }
 }
 
+/// Check an observed record with its companion paths. Legacy metadata with
+/// no named PID is Gone only when both PID and socket companions are absent.
+/// A malformed, unreadable or non-regular companion never proves absence.
+pub fn check_record_identity_in(
+    root: &Path,
+    name: &str,
+    sidecar: Option<i32>,
+    metadata: Option<&SessionMetadata>,
+) -> DaemonIdentityCheck {
+    if sidecar.is_none() && metadata.is_some_and(|record| record.daemon_pid.is_none()) {
+        let absent = |extension| {
+            std::fs::symlink_metadata(root.join(format!("{name}.{extension}")))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        if absent("pid") && absent("sock") {
+            record_daemon_identity_check(DaemonIdentityCheck::Gone);
+            return DaemonIdentityCheck::Gone;
+        }
+    }
+    check_record_identity(sidecar, metadata)
+}
+
 fn process_status_is_gone(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
@@ -939,7 +961,7 @@ fn scan_sessions(
             }
             continue;
         }
-        let identity = check_record_identity(sidecar, metadata.as_ref());
+        let identity = check_record_identity_in(root, name, sidecar, metadata.as_ref());
         if identity == DaemonIdentityCheck::Unknown {
             scanner.error(
                 &root.join(&metadata_name),
@@ -953,9 +975,7 @@ fn scan_sessions(
         // Unknown is not a loss observation. Retain the named PID without
         // turning old pid/socket evidence into signal or cleanup authority.
         let retained = matches!(identity, DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown);
-        let status = if identity == DaemonIdentityCheck::Unknown {
-            SessionStatus::Running
-        } else if metadata
+        let status = if metadata
             .as_ref()
             .is_some_and(|record| record.has_exited() || record.exit_code.is_some())
         {

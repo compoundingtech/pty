@@ -35,6 +35,10 @@ sessions cannot be stopped through `pty kill` or `stop_in` until a new daemon
 publishes complete identity evidence. They cannot be removed or replaced on
 the strength of that conservative projection either. Readable differing start
 tokens independently prove Mismatch before boot evidence is required.
+An explicit `exitedAt` or `exitCode` keeps the listing `exited`, including an
+Unknown owner; its named PID and identity remain available, and Unknown still
+refuses removal. Legacy metadata with no named PID and no PID/socket companion
+is Gone and can be removed; a malformed or unreadable companion is not absence.
 
 **The existing `Exact` abstraction pins the owner.** The client uses
 `operation::exact::Exact` rather than a separate daemon pinning implementation.
