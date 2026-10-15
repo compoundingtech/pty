@@ -28,12 +28,18 @@ use pty_core::protocol::{
     encode_attach_with_cell, encode_data, encode_detach, encode_peek, encode_resize,
     encode_resize_with_cell,
 };
+use pty_terminal::enhanced_paste::{
+    MAX_TRANSACTION, PacketError, PastePacket, ReadError, ReadRequest,
+};
 use pty_terminal::{
     CellGrid, CellSize, GraphicsOptions, GraphicsState, ImageBytes, KeyEvent, Modes,
     MouseEvent, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The most input one DATA packet carries.
+const INPUT_PACKET: usize = 1024 * 1024;
 
 /// Identifies one connection attempt (or the spawned child). Bumped by
 /// [`TerminalHandle::reconnect`]; frames tagged with an older id are ignored.
@@ -208,6 +214,43 @@ pub enum HandleEvent {
     /// [`TerminalHandle::reconnect`]. The screen follows as the attempt's
     /// first SCREEN, so `Connected` means "reattached", not "ready".
     Connected(AttemptId),
+    /// The child turned paste events (`?5522`, enhanced paste) on or off, as
+    /// this attempt's stream says. A SCREEN restates the mode, so a reattach
+    /// hears the program's current state.
+    EnhancedPasteMode { attempt: AttemptId, enabled: bool },
+    /// The child asked to read clipboard types. Answer it with
+    /// [`TerminalHandle::write_enhanced_paste`] under the same attempt: one
+    /// read is open at a time, and the child hears `EBUSY` for any other
+    /// until this one is answered.
+    EnhancedPasteRequest {
+        attempt: AttemptId,
+        request: ReadRequest,
+    },
+}
+
+/// Why [`TerminalHandle::write_enhanced_paste`] sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteRefusal {
+    /// Not the handle's current attempt: the stream it was meant for is gone.
+    StaleAttempt,
+    /// A read-only attach writes nothing.
+    ReadOnly,
+    /// No stream to write to: disconnected, reconnecting, or the child exited.
+    Disconnected,
+    /// The handle was closed.
+    Closed,
+    /// The child has not turned paste events on.
+    ModeDisabled,
+    /// A read's answer with no read open, or data before `ReadOk`.
+    OutOfOrder,
+    /// A MIME type, id or password the protocol cannot carry, or an empty
+    /// listing.
+    Invalid,
+    /// Over 64 KiB of listing or 1 MiB of data in one packet.
+    PacketTooLarge,
+    /// The answer passed 32 MiB. It was dropped whole, and the child heard
+    /// `EBUSY` in place of it.
+    TransactionTooLarge,
 }
 
 enum Msg {
@@ -239,7 +282,14 @@ enum Msg {
         reply: Sender<Option<Vec<u8>>>,
     },
     SetPalette(Vec<(u8, u8, u8)>),
-    Reconnect { reply: Sender<io::Result<()>> },
+    Reconnect {
+        reply: Sender<io::Result<()>>,
+    },
+    EnhancedPaste {
+        attempt: AttemptId,
+        packet: PastePacket,
+        reply: Sender<Result<(), PasteRefusal>>,
+    },
     Close,
 }
 
@@ -303,6 +353,20 @@ struct Core {
     backend: Backend,
     dirty: bool,
     last_publish: Instant,
+    paste: PasteRead,
+}
+
+/// The current attempt's open read. Its answer is held until `ReadDone`,
+/// so the child never receives part of one: an answer that fails is
+/// dropped whole and replaced by an error status.
+#[derive(Default)]
+struct PasteRead {
+    /// The open request's id (`Some(None)`: a request without one).
+    open: Option<Option<String>>,
+    /// `ReadOk` and the data so far, encoded.
+    answer: Option<Vec<u8>>,
+    /// Data bytes in `answer`.
+    data: usize,
 }
 
 impl Core {
@@ -360,10 +424,29 @@ impl Core {
                 TerminalEvent::Bell => HandleEvent::Bell,
                 TerminalEvent::TitleChange(t) => HandleEvent::Title(t),
                 TerminalEvent::Notification(n) => HandleEvent::Notification(n),
-                TerminalEvent::FocusRequest
-                | TerminalEvent::CursorVisible
-                | TerminalEvent::EnhancedPasteMode(_)
-                | TerminalEvent::EnhancedPasteRead(_) => continue,
+                TerminalEvent::FocusRequest | TerminalEvent::CursorVisible => continue,
+                TerminalEvent::EnhancedPasteMode(enabled) => {
+                    if !enabled {
+                        self.paste = PasteRead::default();
+                    }
+                    HandleEvent::EnhancedPasteMode {
+                        attempt: self.attempt,
+                        enabled,
+                    }
+                }
+                TerminalEvent::EnhancedPasteRead(request) => {
+                    if self.paste.open.is_some() {
+                        // One read at a time, as the protocol asks of
+                        // multiplexers: any other is refused now.
+                        self.refuse_read(request.id.as_deref());
+                        continue;
+                    }
+                    self.paste.open = Some(request.id.clone());
+                    HandleEvent::EnhancedPasteRequest {
+                        attempt: self.attempt,
+                        request,
+                    }
+                }
             };
             self.shared.emit(ev);
         }
@@ -448,6 +531,7 @@ impl Core {
 
     fn on_exit(&mut self, code: i32) {
         self.publish();
+        self.paste = PasteRead::default();
         self.flush_frame(false);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,6 +543,7 @@ impl Core {
     }
 
     fn on_disconnected(&mut self) {
+        self.paste = PasteRead::default();
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.connected = false;
@@ -468,6 +553,101 @@ impl Core {
         }
         self.shared.cv.notify_all();
         self.shared.emit(HandleEvent::Disconnected);
+    }
+
+    /// Check a paste packet against this attempt, the stream and the mode,
+    /// here in dispatch where none of them can change underneath it.
+    fn write_paste(&mut self, attempt: AttemptId, packet: PastePacket) -> Result<(), PasteRefusal> {
+        if attempt != self.attempt {
+            return Err(PasteRefusal::StaleAttempt);
+        }
+        match &self.backend {
+            Backend::Attach { opts, .. } if opts.readonly => return Err(PasteRefusal::ReadOnly),
+            Backend::Attach { stream: None, .. } => return Err(PasteRefusal::Disconnected),
+            _ => {}
+        }
+        if self.state_exited() {
+            return Err(PasteRefusal::Disconnected);
+        }
+        if !self.actor.modes().enhanced_paste {
+            return Err(PasteRefusal::ModeDisabled);
+        }
+        let id = self.paste.open.clone().flatten();
+        let encode = |packet: &PastePacket| {
+            packet.encode(id.as_deref()).map_err(|error| match error {
+                PacketError::Invalid => PasteRefusal::Invalid,
+                PacketError::TooLarge => PasteRefusal::PacketTooLarge,
+            })
+        };
+        match &packet {
+            PastePacket::Listing { .. } => {
+                let bytes = encode(&packet)?;
+                self.input(&bytes);
+            }
+            PastePacket::ReadOk => {
+                if self.paste.open.is_none() || self.paste.answer.is_some() {
+                    return Err(PasteRefusal::OutOfOrder);
+                }
+                self.paste.answer = Some(encode(&packet)?);
+            }
+            PastePacket::ReadData { data, .. } => {
+                if self.paste.answer.is_none() {
+                    return Err(PasteRefusal::OutOfOrder);
+                }
+                let bytes = match encode(&packet) {
+                    Ok(bytes) if self.paste.data + data.len() <= MAX_TRANSACTION => bytes,
+                    Ok(_) => {
+                        self.refuse_open_read();
+                        return Err(PasteRefusal::TransactionTooLarge);
+                    }
+                    Err(refusal) => {
+                        self.refuse_open_read();
+                        return Err(refusal);
+                    }
+                };
+                self.paste.data += data.len();
+                if let Some(answer) = &mut self.paste.answer {
+                    answer.extend_from_slice(&bytes);
+                }
+            }
+            PastePacket::ReadDone => {
+                let Some(mut answer) = self.paste.answer.take() else {
+                    return Err(PasteRefusal::OutOfOrder);
+                };
+                answer.extend_from_slice(&encode(&packet)?);
+                self.paste = PasteRead::default();
+                self.input(&answer);
+            }
+            PastePacket::ReadError(_) => {
+                if self.paste.open.is_none() {
+                    return Err(PasteRefusal::OutOfOrder);
+                }
+                // Nothing of a held answer has been sent, so an error can
+                // still stand in place of its `ReadOk`.
+                let bytes = encode(&packet)?;
+                self.paste = PasteRead::default();
+                self.input(&bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the open read's answer whole and tell the child `EBUSY`.
+    fn refuse_open_read(&mut self) {
+        let id = self.paste.open.clone().flatten();
+        self.paste = PasteRead::default();
+        self.refuse_read(id.as_deref());
+    }
+
+    fn refuse_read(&mut self, id: Option<&str>) {
+        if let Ok(bytes) = PastePacket::ReadError(ReadError::Busy).encode(id) {
+            self.input(&bytes);
+        }
+    }
+
+    fn state_exited(&self) -> bool {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed || st.exit_code.is_some()
     }
 
     fn input(&mut self, data: &[u8]) {
@@ -480,7 +660,13 @@ impl Core {
                 if !opts.readonly
                     && let Some(s) = stream
                 {
-                    let _ = s.write_all(&encode_data(data));
+                    // A paste answer can outgrow one packet; the daemon
+                    // writes DATA to the child in order, so split it.
+                    for chunk in data.chunks(INPUT_PACKET) {
+                        if s.write_all(&encode_data(chunk)).is_err() {
+                            break;
+                        }
+                    }
                     let _ = s.flush();
                 }
             }
@@ -538,6 +724,7 @@ impl Core {
             let _ = old.shutdown(std::net::Shutdown::Both);
         }
         self.attempt = AttemptId(self.attempt.0 + 1);
+        self.paste = PasteRead::default();
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.ready = false;
@@ -670,6 +857,13 @@ impl Core {
             Msg::SetPalette(colors) => {
                 self.actor.set_palette(&colors);
                 self.publish();
+            }
+            Msg::EnhancedPaste {
+                attempt,
+                packet,
+                reply,
+            } => {
+                let _ = reply.send(self.write_paste(attempt, packet));
             }
             Msg::Reconnect { reply } => {
                 let r = self.reconnect();
@@ -889,6 +1083,7 @@ impl TerminalHandle {
                 backend: Backend::Spawn { master, writer },
                 dirty: false,
                 last_publish: Instant::now(),
+                paste: PasteRead::default(),
             };
             run(core, rx);
         });
@@ -952,6 +1147,7 @@ impl TerminalHandle {
                 },
                 dirty: false,
                 last_publish: Instant::now(),
+                paste: PasteRead::default(),
             };
             run(core, rx);
         });
@@ -1267,6 +1463,32 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Focus(gained));
     }
 
+    /// Answer the child's paste events (`?5522`): offer a paste's MIME types
+    /// with [`PastePacket::Listing`], or answer an
+    /// [`HandleEvent::EnhancedPasteRequest`] with `ReadOk`, `ReadData`...,
+    /// `ReadDone`, or a `ReadError`.
+    ///
+    /// Checked in the terminal actor, in order with everything else: the
+    /// attempt must be current, the stream connected and writable, and the
+    /// mode on. A read's answer is held until `ReadDone` and sent whole; one
+    /// that fails is dropped and the child hears `EBUSY`. Nothing is ever
+    /// truncated or sent as plain input.
+    pub fn write_enhanced_paste(
+        &self,
+        attempt: AttemptId,
+        packet: PastePacket,
+    ) -> Result<(), PasteRefusal> {
+        let (reply, answer) = mpsc::channel();
+        self.tx
+            .send(Msg::EnhancedPaste {
+                attempt,
+                packet,
+                reply,
+            })
+            .map_err(|_| PasteRefusal::Closed)?;
+        answer.recv().unwrap_or(Err(PasteRefusal::Closed))
+    }
+
     /// Paste text, bracketed when the child asked for it. Check
     /// [`pty_terminal::input::paste_is_safe`] first if the surface wants to confirm
     /// a multi-line paste.
@@ -1512,6 +1734,7 @@ mod tests {
             },
             dirty: false,
             last_publish: Instant::now(),
+            paste: PasteRead::default(),
         };
         (core, tx)
     }
@@ -1614,3 +1837,7 @@ mod tests {
 #[cfg(test)]
 #[path = "frame_bench.rs"]
 mod frame_bench;
+
+#[cfg(test)]
+#[path = "handle_paste_tests.rs"]
+mod paste_tests;

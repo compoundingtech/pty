@@ -7,9 +7,9 @@
 //! <https://sw.kovidgoyal.net/kitty/clipboard/> and
 //! <https://rockorager.dev/misc/bracketed-paste-mime/>.
 //!
-//! This module types the program's side: the read request the scanner finds
-//! in the child's output. Nothing here holds clipboard bytes, and no `Debug`
-//! output carries a password.
+//! This module types both sides: the read request the scanner finds in the
+//! child's output, and the [`PastePacket`]s a client answers with. No `Debug`
+//! output carries clipboard bytes or a password.
 
 use std::fmt;
 
@@ -22,6 +22,16 @@ use std::fmt;
 /// reaching clients, until its terminator, a cancel (CAN, SUB or a new ESC)
 /// or this limit. Other OSCs hold at most [`crate::strip::MAX_OSC`].
 pub const MAX_METADATA: usize = 64 * 1024;
+
+/// The most data one [`PastePacket::ReadData`] may carry.
+pub const MAX_PACKET: usize = 1024 * 1024;
+
+/// The most data one read's answer may carry, over all its packets.
+pub const MAX_TRANSACTION: usize = 32 * 1024 * 1024;
+
+/// The protocol's chunk: data is sent at most this many bytes, before
+/// encoding, per `DATA` sequence.
+const DATA_CHUNK: usize = 4096;
 
 /// Which clipboard a request reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +105,7 @@ impl ReadRequest {
                 "loc" if value == "primary" => location = Location::Primary,
                 "loc" => return None,
                 "id" => {
-                    let valid = !value.is_empty()
-                        && value
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"-_+.".contains(&b));
-                    if !valid {
+                    if !valid_id(value) {
                         return None;
                     }
                     id = Some(value.to_string());
@@ -119,10 +125,7 @@ impl ReadRequest {
         }
         let list = String::from_utf8(decode(payload)?).ok()?;
         let mimes: Vec<String> = list.split_ascii_whitespace().map(str::to_string).collect();
-        let valid = !mimes.is_empty()
-            && mimes
-                .iter()
-                .all(|mime| mime.bytes().all(|b| b.is_ascii_graphic()));
+        let valid = !mimes.is_empty() && mimes.iter().all(|mime| valid_mime(mime));
         valid.then_some(ReadRequest {
             mimes,
             location,
@@ -136,6 +139,183 @@ impl ReadRequest {
 /// The metadata keys this side of the protocol knows. Any other key is
 /// ignored.
 const KEYS: [&str; 7] = ["type", "loc", "id", "pw", "name", "status", "mime"];
+
+/// Why a read was refused, in place of its `status=OK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// `ENOSYS`: the requested clipboard is not available.
+    NotAvailable,
+    /// `EPERM`: the user or the system denied the read.
+    Denied,
+    /// `EBUSY`: another read is in flight, or the answer could not be sent.
+    Busy,
+}
+
+impl ReadError {
+    fn status(self) -> &'static str {
+        match self {
+            ReadError::NotAvailable => "ENOSYS",
+            ReadError::Denied => "EPERM",
+            ReadError::Busy => "EBUSY",
+        }
+    }
+}
+
+/// What a client sends the program, typed. A read's answer is `ReadOk`,
+/// any number of `ReadData`, then `ReadDone`, or a single `ReadError`; the
+/// request's `id` is echoed by whoever sends them.
+#[derive(Clone, PartialEq, Eq)]
+pub enum PastePacket {
+    /// The paste event: the clipboard's MIME types, unsolicited, with the
+    /// one-time password (base64, as it will be sent) the program reads
+    /// them with.
+    Listing {
+        location: Location,
+        password: Option<String>,
+        mimes: Vec<String>,
+    },
+    /// Opens a read's answer: `status=OK`.
+    ReadOk,
+    /// Data for one MIME type, at most [`MAX_PACKET`] bytes. It is sent in
+    /// the protocol's 4096-byte chunks.
+    ReadData { mime: String, data: Vec<u8> },
+    /// Ends a read's answer: `status=DONE`.
+    ReadDone,
+    /// Refuses a read, in place of `ReadOk`.
+    ReadError(ReadError),
+}
+
+impl fmt::Debug for PastePacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PastePacket::Listing {
+                location, mimes, ..
+            } => f
+                .debug_struct("Listing")
+                .field("location", location)
+                .field("mimes", mimes)
+                .finish_non_exhaustive(),
+            PastePacket::ReadOk => f.write_str("ReadOk"),
+            PastePacket::ReadData { mime, data } => f
+                .debug_struct("ReadData")
+                .field("mime", mime)
+                .field("bytes", &data.len())
+                .finish(),
+            PastePacket::ReadDone => f.write_str("ReadDone"),
+            PastePacket::ReadError(error) => f.debug_tuple("ReadError").field(error).finish(),
+        }
+    }
+}
+
+/// Why a packet cannot be sent as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketError {
+    /// An empty listing, or a MIME type, id or password the protocol would
+    /// not carry.
+    Invalid,
+    /// Over [`MAX_METADATA`] of listing, or [`MAX_PACKET`] of data.
+    TooLarge,
+}
+
+impl PastePacket {
+    /// The packet as OSC 5522 sequences, echoing `id` (a read request's).
+    /// Validated and within limits, or an error and no bytes.
+    pub fn encode(&self, id: Option<&str>) -> Result<Vec<u8>, PacketError> {
+        if id.is_some_and(|id| !valid_id(id)) {
+            return Err(PacketError::Invalid);
+        }
+        let mut out = Vec::new();
+        match self {
+            PastePacket::Listing {
+                location,
+                password,
+                mimes,
+            } => {
+                if mimes.is_empty() || !mimes.iter().all(|mime| valid_mime(mime)) {
+                    return Err(PacketError::Invalid);
+                }
+                if password
+                    .as_deref()
+                    .is_some_and(|pw| decode(pw.as_bytes()).is_none())
+                {
+                    return Err(PacketError::Invalid);
+                }
+                let mut keys = String::new();
+                if *location == Location::Primary {
+                    keys.push_str(":loc=primary");
+                }
+                if let Some(pw) = password {
+                    keys.push_str(":pw=");
+                    keys.push_str(pw);
+                }
+                let list = crate::graphics::base64(mimes.join(" ").as_bytes());
+                if list.len() + keys.len() > MAX_METADATA {
+                    return Err(PacketError::TooLarge);
+                }
+                let pw_only = password
+                    .as_ref()
+                    .map(|pw| format!(":pw={pw}"))
+                    .unwrap_or_default();
+                osc(&mut out, &format!("type=read:status=OK{keys}"), "");
+                osc(
+                    &mut out,
+                    &format!("type=read:status=DATA:mime=Lg=={pw_only}"),
+                    &list,
+                );
+                osc(&mut out, &format!("type=read:status=DONE{pw_only}"), "");
+            }
+            PastePacket::ReadOk => osc(&mut out, &read_status("OK", id), ""),
+            PastePacket::ReadData { mime, data } => {
+                if !valid_mime(mime) {
+                    return Err(PacketError::Invalid);
+                }
+                if data.len() > MAX_PACKET {
+                    return Err(PacketError::TooLarge);
+                }
+                let metadata = format!(
+                    "{}:mime={}",
+                    read_status("DATA", id),
+                    crate::graphics::base64(mime.as_bytes())
+                );
+                for chunk in data.chunks(DATA_CHUNK) {
+                    osc(&mut out, &metadata, &crate::graphics::base64(chunk));
+                }
+            }
+            PastePacket::ReadDone => osc(&mut out, &read_status("DONE", id), ""),
+            PastePacket::ReadError(error) => osc(&mut out, &read_status(error.status(), id), ""),
+        }
+        Ok(out)
+    }
+}
+
+fn read_status(status: &str, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("type=read:status={status}:id={id}"),
+        None => format!("type=read:status={status}"),
+    }
+}
+
+/// `ESC ] 5522 ; metadata [; payload] ESC \`.
+fn osc(out: &mut Vec<u8>, metadata: &str, payload: &str) {
+    out.extend_from_slice(b"\x1b]5522;");
+    out.extend_from_slice(metadata.as_bytes());
+    if !payload.is_empty() {
+        out.push(b';');
+        out.extend_from_slice(payload.as_bytes());
+    }
+    out.extend_from_slice(b"\x1b\\");
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_+.".contains(&b))
+}
+
+fn valid_mime(mime: &str) -> bool {
+    !mime.is_empty() && mime.bytes().all(|b| b.is_ascii_graphic())
+}
 
 /// Strict RFC 4648 base64 with the standard alphabet: padding required, no
 /// whitespace, no other byte. The protocol tells terminals to reject rather
@@ -265,6 +445,124 @@ mod tests {
         let debug = format!("{parsed:?}");
         assert!(!debug.contains(&b64("secret-token")), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn a_listing_is_ok_data_done() {
+        let listing = PastePacket::Listing {
+            location: Location::Primary,
+            password: Some(b64("token")),
+            mimes: vec!["image/png".into(), "text/plain".into()],
+        };
+        let bytes = String::from_utf8(listing.encode(None).unwrap()).unwrap();
+        let pw = b64("token");
+        assert_eq!(
+            bytes,
+            format!(
+                "\x1b]5522;type=read:status=OK:loc=primary:pw={pw}\x1b\\\
+                 \x1b]5522;type=read:status=DATA:mime=Lg==:pw={pw};{}\x1b\\\
+                 \x1b]5522;type=read:status=DONE:pw={pw}\x1b\\",
+                b64("image/png text/plain")
+            )
+        );
+    }
+
+    #[test]
+    fn data_is_chunked_and_echoes_the_id() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let packet = PastePacket::ReadData {
+            mime: "image/png".into(),
+            data: data.clone(),
+        };
+        let bytes = String::from_utf8(packet.encode(Some("w1")).unwrap()).unwrap();
+        let sequences: Vec<&str> = bytes.split_terminator("\x1b\\").collect();
+        assert_eq!(sequences.len(), 3, "4096 + 4096 + 1808");
+        let mut joined = Vec::new();
+        for sequence in sequences {
+            let rest = sequence
+                .strip_prefix(&format!(
+                    "\x1b]5522;type=read:status=DATA:id=w1:mime={};",
+                    b64("image/png")
+                ))
+                .unwrap();
+            let chunk = decode(rest.as_bytes()).unwrap();
+            assert!(chunk.len() <= DATA_CHUNK);
+            joined.extend(chunk);
+        }
+        assert_eq!(joined, data);
+        assert_eq!(
+            PastePacket::ReadOk.encode(None).unwrap(),
+            b"\x1b]5522;type=read:status=OK\x1b\\"
+        );
+        assert_eq!(
+            PastePacket::ReadError(ReadError::Busy)
+                .encode(Some("w1"))
+                .unwrap(),
+            b"\x1b]5522;type=read:status=EBUSY:id=w1\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_packet_over_a_limit_or_malformed_sends_nothing() {
+        let big = PastePacket::ReadData {
+            mime: "image/png".into(),
+            data: vec![0; MAX_PACKET + 1],
+        };
+        assert_eq!(big.encode(None), Err(PacketError::TooLarge));
+        let exact = PastePacket::ReadData {
+            mime: "image/png".into(),
+            data: vec![0; MAX_PACKET],
+        };
+        assert!(exact.encode(None).is_ok());
+        let many = PastePacket::Listing {
+            location: Location::Clipboard,
+            password: None,
+            mimes: vec!["x".repeat(1000); 60],
+        };
+        assert_eq!(many.encode(None), Err(PacketError::TooLarge));
+        for invalid in [
+            PastePacket::Listing {
+                location: Location::Clipboard,
+                password: None,
+                mimes: vec![],
+            },
+            PastePacket::Listing {
+                location: Location::Clipboard,
+                password: Some("not base64".into()),
+                mimes: vec!["image/png".into()],
+            },
+            PastePacket::ReadData {
+                mime: "image png".into(),
+                data: vec![1],
+            },
+        ] {
+            assert_eq!(
+                invalid.encode(None),
+                Err(PacketError::Invalid),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            PastePacket::ReadOk.encode(Some("bad id")),
+            Err(PacketError::Invalid)
+        );
+    }
+
+    #[test]
+    fn debug_output_never_shows_data_or_a_password() {
+        let data = PastePacket::ReadData {
+            mime: "image/png".into(),
+            data: b"SECRET-PIXELS".to_vec(),
+        };
+        let listing = PastePacket::Listing {
+            location: Location::Clipboard,
+            password: Some(b64("secret-token")),
+            mimes: vec!["image/png".into()],
+        };
+        for debug in [format!("{data:?}"), format!("{listing:?}")] {
+            assert!(!debug.contains("SECRET"), "{debug}");
+            assert!(!debug.contains(&b64("secret-token")), "{debug}");
+        }
     }
 
     #[test]
