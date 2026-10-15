@@ -1,10 +1,14 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_os = "linux", debug_assertions))]
 use std::time::Duration;
 #[cfg(debug_assertions)]
 use std::time::Instant;
@@ -65,6 +69,7 @@ impl Drop for Fixture {
 fn child() -> Child {
     Command::new("sleep").arg("60").spawn().unwrap()
 }
+#[cfg(target_os = "linux")]
 fn boot() -> String {
     format!(
         "linux:{}",
@@ -73,6 +78,24 @@ fn boot() -> String {
             .trim()
     )
 }
+#[cfg(target_os = "macos")]
+fn boot() -> String {
+    // Read real evidence even in the child with the debug unreadable-boot
+    // hook. Only the production reader sees that injected failure.
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.bootsessionuuid"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    format!("darwin:{}", String::from_utf8(output.stdout).unwrap().trim())
+}
+
+#[cfg(target_os = "macos")]
+fn token(pid: i32) -> String {
+    pty_core::registry::read_process_start_token(pid).expect("child has a start token")
+}
+
+#[cfg(target_os = "linux")]
 fn token(pid: i32) -> String {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     format!(
@@ -150,6 +173,7 @@ fn matching_owner_remains_stoppable() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn thread_fixture() {
     if std::env::var_os("PTY_IDENTITY_THREAD_CHILD").is_none() {
@@ -166,6 +190,7 @@ fn thread_fixture() {
     worker.join().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn reused_pid_is_nonleader_thread_refuses_stop() {
     let process = Command::new(std::env::current_exe().unwrap())
