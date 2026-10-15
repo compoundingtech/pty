@@ -956,6 +956,8 @@ mod tests {
             Liveness::Unknown("exiting")
         );
         assert_eq!(id.liveness(&table("Z"), Some("boot")), Liveness::Gone);
+        // Linux, mid-reap: the row is still there, the process is not.
+        assert_eq!(id.liveness(&table("X"), Some("boot")), Liveness::Gone);
     }
 
     /// After an observed exit the table is read again until it shows the

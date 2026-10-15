@@ -193,8 +193,14 @@ pub struct Row {
 impl Row {
     /// A zombie is a dead process that still has a row, still has a process
     /// group, and still answers `kill(pid, 0)`.
+    ///
+    /// **On Linux that includes `X` (dead).** A process being reaped reads
+    /// as `X` for a moment before its row disappears, and its exit is as
+    /// final as a zombie's. A pidfd announces the exit before that moment
+    /// ends, so a waiter that reads the row at once can see `X`: read as
+    /// live, a process that a SIGKILL had already ended was reported live.
     pub fn is_zombie(&self) -> bool {
-        self.state.starts_with('Z')
+        self.state.starts_with('Z') || self.state.starts_with('X')
     }
 
     /// A process whose exit is under way and that is not yet a zombie
@@ -526,15 +532,7 @@ pub fn process(pid: i32) -> Answer<Row> {
     }
     #[cfg(target_os = "linux")]
     {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => match parse_proc_stat(pid, &stat) {
-                Some(row) => Answer::Known(row),
-                None => Answer::Unknown(Unknown::FieldUnparsable),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Answer::NotPresent,
-            // Permission denied, or /proc not mounted. We did not find out.
-            Err(_) => Answer::Unknown(Unknown::TableUnreadable),
-        }
+        stat_answer(pid, std::fs::read_to_string(format!("/proc/{pid}/stat")))
     }
     #[cfg(target_os = "macos")]
     {
@@ -561,6 +559,27 @@ pub fn process(pid: i32) -> Answer<Row> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         ProcTable::read().row(pid).map(|r| r.clone())
+    }
+}
+
+/// One `/proc/<pid>/stat` read as an answer. A process reaped between the
+/// open and the read fails the read with `ESRCH`: it is as gone as a
+/// missing file, the same answer the table reader gives.
+#[cfg(any(target_os = "linux", test))]
+fn stat_answer(pid: i32, read: std::io::Result<String>) -> Answer<Row> {
+    match read {
+        Ok(stat) => match parse_proc_stat(pid, &stat) {
+            Some(row) => Answer::Known(row),
+            None => Answer::Unknown(Unknown::FieldUnparsable),
+        },
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Answer::NotPresent
+        }
+        // Permission denied, or /proc not mounted. We did not find out.
+        Err(_) => Answer::Unknown(Unknown::TableUnreadable),
     }
 }
 
@@ -1314,6 +1333,47 @@ mod tests {
         // Gone between the listing and the read: really absent, not a gap.
         assert!(with(|| Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_complete());
         assert!(with(|| Err(std::io::Error::from_raw_os_error(libc::ESRCH))).is_complete());
+    }
+
+    /// A reaped process can be read as `X` (dead) before its row is gone.
+    /// That is an exit, like a zombie, and nothing else is.
+    #[test]
+    fn a_dead_row_reads_as_exited_like_a_zombie() {
+        for (state, exited) in [
+            ("Z", true),
+            ("X", true),
+            ("S", false),
+            ("R", false),
+            ("D", false),
+            ("T", false),
+            ("t", false),
+        ] {
+            let row = parse_proc_stat(9, &stat(9, 1, state)).unwrap();
+            assert_eq!(row.is_zombie(), exited, "state {state}");
+        }
+    }
+
+    /// Reaped between the open and the read: `ESRCH` is a process that is
+    /// not there, as `ENOENT` is. A refused read is still not an answer.
+    #[test]
+    fn a_process_reaped_between_the_open_and_the_read_is_not_present() {
+        let error = |e: std::io::Error| stat_answer(9, Err(e));
+        assert!(matches!(
+            error(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            Answer::NotPresent
+        ));
+        assert!(matches!(
+            error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            Answer::NotPresent
+        ));
+        assert!(matches!(
+            error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Answer::Unknown(Unknown::TableUnreadable)
+        ));
+        assert!(matches!(
+            stat_answer(9, Ok(stat(9, 1, "S"))),
+            Answer::Known(row) if row.pid == 9
+        ));
     }
 
     #[test]
