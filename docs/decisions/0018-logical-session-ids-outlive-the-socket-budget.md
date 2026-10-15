@@ -15,6 +15,13 @@ sidecar names. The longest sidecar limits an ID to 209 ASCII characters;
 reject 210 characters before creating session state. Reject roots that
 cannot hold even the bounded socket name.
 
+Once a socket is published, its filename is authoritative across registry
+root aliases. Lookup recognizes real socket entries, not regular files or
+symlinks in either namespace. If both socket candidates exist, the bounded
+name wins and strict inventory reports the other entry as noncanonical.
+When an alias makes a published readable address too long, connection uses
+a shorter symlink target or canonical root without changing the filename.
+
 **Why.** A transport address is not a session identity. Rejecting a logical
 ID because of the combined root and ID length prevents long session names
 from working on Darwin and unnecessarily constrains names on Linux. The

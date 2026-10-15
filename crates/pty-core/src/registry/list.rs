@@ -726,7 +726,7 @@ fn scan_sessions(
             } else {
                 stem
             };
-            if socket_path_in(root, name) != root.join(entry) {
+            if socket_path_in(root, name).file_name() != Some(std::ffi::OsStr::new(entry)) {
                 scanner.error(
                     &root.join(entry),
                     InventoryErrorKind::EntryUnreadable,

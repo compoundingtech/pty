@@ -163,14 +163,14 @@ pub fn socket_path(name: &str) -> PathBuf {
     socket_path_in(&session_dir(), name)
 }
 
-/// Preserve a readable address when it fits; otherwise bound the transport
-/// filename independently of the logical id. `@` cannot occur in an id, so
-/// the digest namespace cannot alias a readable session's socket.
+/// Preserve a published socket's filename across differently spelled registry
+/// roots. For a new session, preserve a readable address when it fits.
+/// `@` cannot occur in an id, so the digest namespace cannot alias a readable
+/// session's socket.
 pub fn socket_path_in(root: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::FileTypeExt;
+
     let readable = root.join(format!("{name}.sock"));
-    if readable.as_os_str().len() <= SUN_PATH_MAX {
-        return readable;
-    }
     let digest = Sha256::digest(name.as_bytes());
     let mut filename = String::from("@");
     for byte in &digest[..16] {
@@ -178,7 +178,40 @@ pub fn socket_path_in(root: &Path, name: &str) -> PathBuf {
         write!(filename, "{byte:02x}").expect("writing to a String cannot fail");
     }
     filename.push_str(".sock");
-    root.join(filename)
+    let bounded = root.join(&filename);
+    // A registry can be reached through both a short path and a longer
+    // symlink. The listener, not the caller's root spelling, owns its basename.
+    // Ignore regular-file and symlink debris; never follow it as a socket.
+    let is_socket = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+    };
+    let published_bounded = is_socket(&bounded);
+    if published_bounded || is_socket(&readable) {
+        let path = if published_bounded { bounded } else { readable };
+        if path.as_os_str().len() > SUN_PATH_MAX {
+            // Try the explicit alias target before canonicalization: on some
+            // platforms a conventional short prefix is itself a symlink.
+            let target = std::fs::read_link(root).ok().map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    root.parent().unwrap_or(Path::new(".")).join(target)
+                }
+            });
+            for real_root in target.into_iter().chain(root.canonicalize().ok()) {
+                let real_path = real_root.join(path.file_name().expect("socket has a filename"));
+                if real_path.as_os_str().len() <= SUN_PATH_MAX {
+                    return real_path;
+                }
+            }
+        }
+        return path;
+    }
+    if readable.as_os_str().len() <= SUN_PATH_MAX {
+        readable
+    } else {
+        bounded
+    }
 }
 
 /// Path to a session's pid file, `<root>/<name>.pid`.
@@ -278,6 +311,46 @@ mod tests {
                     .is_err()
             );
         });
+    }
+
+    #[test]
+    fn published_socket_survives_differently_sized_root_aliases() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let base = PathBuf::from(format!(
+            "/tmp/pty-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("r");
+        let alias = base.join("long-registry-alias");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        let id = "a".repeat(SUN_PATH_MAX - real.as_os_str().len() - 6);
+        let bounded = socket_path_in(&alias, &id);
+        assert!(bounded.file_name().unwrap().to_str().unwrap().starts_with('@'));
+        let listener = UnixListener::bind(&bounded).unwrap();
+        let from_real = socket_path_in(&real, &id);
+        assert_eq!(from_real.file_name(), bounded.file_name());
+        let stream = UnixStream::connect(&from_real).unwrap();
+        drop(stream);
+        drop(listener);
+        std::fs::remove_file(&bounded).unwrap();
+
+        let readable = socket_path_in(&real, &id);
+        assert_eq!(readable.file_name().unwrap(), format!("{id}.sock").as_str());
+        let listener = UnixListener::bind(&readable).unwrap();
+        let from_alias = socket_path_in(&alias, &id);
+        assert_eq!(from_alias.file_name(), readable.file_name());
+        assert!(from_alias.as_os_str().len() <= SUN_PATH_MAX);
+        let stream = UnixStream::connect(&from_alias).unwrap();
+        drop(stream);
+        drop(listener);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
