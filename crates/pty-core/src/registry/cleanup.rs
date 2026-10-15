@@ -126,69 +126,20 @@ pub fn retire_stale_daemon_record(name: &str, observed: &super::metadata::Sessio
     retire_stale_daemon_observation(name, observed, observed_pid)
 }
 
-fn current_boot_started_at_ms() -> Option<i64> {
-    // Cache only successful observations; unavailable boot evidence must stay
-    // retryable rather than permanently authorizing or preventing retirement.
-    static BOOT_STARTED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    if let Some(started) = BOOT_STARTED.get() {
-        return Some(*started);
-    }
-    let started = read_boot_started_at_ms()?;
-    let _ = BOOT_STARTED.set(started);
-    BOOT_STARTED.get().copied()
-}
-
-#[cfg(target_os = "linux")]
-fn read_boot_started_at_ms() -> Option<i64> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let seconds = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime ")?.trim().parse::<i64>().ok())?;
-    seconds.checked_mul(1000)
-}
-
-#[cfg(target_os = "macos")]
-fn read_boot_started_at_ms() -> Option<i64> {
-    let mut oid = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    let mut boot = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
+fn record_has_stale_boot_identity(metadata: &super::metadata::SessionMetadata) -> bool {
+    // Calendar dates cannot prove a boot boundary: both kern.boottime and
+    // Linux btime move with clock steps. The old Darwin boot identity was
+    // itself a calendar date, so it cannot authorize retirement either.
+    let Some(recorded) = metadata
+        .daemon_boot_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && !id.starts_with("darwin:{"))
+    else {
+        return false;
     };
-    let mut size = std::mem::size_of_val(&boot);
-    // SAFETY: oid and boot are valid buffers with the indicated lengths. This
-    // read-only sysctl has no new-value buffer and mutates only our output.
-    let result = unsafe {
-        libc::sysctl(
-            oid.as_mut_ptr(),
-            oid.len() as libc::c_uint,
-            (&mut boot as *mut libc::timeval).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 || size != std::mem::size_of_val(&boot) {
-        return None;
-    }
-    boot.tv_sec.checked_mul(1000)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_boot_started_at_ms() -> Option<i64> {
-    None
-}
-
-fn record_predates_current_boot(metadata: &super::metadata::SessionMetadata) -> bool {
-    if let Some(recorded) = &metadata.daemon_boot_id {
-        return super::list::current_boot_id().is_some_and(|current| current != recorded.as_str());
-    }
-    match (
-        super::time::parse_iso8601_ms(&metadata.created_at),
-        current_boot_started_at_ms(),
-    ) {
-        (Some(created), Some(boot_started)) => created < boot_started,
-        _ => false,
-    }
+    super::list::current_boot_id()
+        .filter(|id| !id.starts_with("darwin:{"))
+        .is_some_and(|current| current != recorded)
 }
 
 fn retire_stale_daemon_observation(
@@ -218,7 +169,7 @@ fn retire_stale_daemon_observation(
         let identity = check_record_identity(observed_pid, Some(&current));
         match identity {
             DaemonIdentityCheck::Mismatch => {}
-            DaemonIdentityCheck::Gone if record_predates_current_boot(&current) => {}
+            DaemonIdentityCheck::Gone if record_has_stale_boot_identity(&current) => {}
             _ => return false,
         }
         // Keep metadata until every companion is removed, so an I/O failure

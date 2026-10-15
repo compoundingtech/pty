@@ -58,6 +58,14 @@ sockets never supply independent signal authority. Runtime debris without
 recorded identity is retained; malformed metadata can be reclaimed only when
 no socket or PID sidecars accompany it.
 
+**Calendar time is not boot identity.** Startup retirement never compares
+`createdAt` with `kern.boottime` or Linux `btime`: these dates can move when
+the clock is stepped. A Gone record without a stable recorded boot identity
+keeps its history, however old its calendar date looks. The legacy
+`darwin:{ sec = S, usec = U }` value cannot prove a boot mismatch either.
+macOS requires the stable boot-session UUID; legacy values stay Unknown
+unless a different start token independently proves loss.
+
 **Removal does not wait on reused PIDs.** `pty rm` skips daemon waiting when
 Gone or Mismatch already proves the old incarnation is lost. For a matching
 exited record it waits by repeatedly checking that recorded identity, not raw
