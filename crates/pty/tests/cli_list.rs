@@ -94,6 +94,7 @@ fn strict_retains_lifecycle_tags_and_projects_recorded_identity_only() {
         expected.push(json!({
             "name": name,
             "status": if exited { "exited" } else { "vanished" },
+            "identity": "gone",
             "pid": null,
             "command": meta["displayCommand"],
             "cwd": meta["cwd"],
@@ -175,8 +176,9 @@ fn strict_refused_socket_requires_dead_pid_before_cleanup_is_allowed() {
     let inventory = out.json();
     assert_eq!(inventory["complete"], false);
     assert_eq!(inventory["errors"][0]["kind"], "identity-unknown");
-    assert_eq!(inventory["entries"][0]["status"], "vanished");
-    assert_eq!(rig.ok(&["list", "--json"]).json()[0]["status"], "vanished");
+    assert_eq!(inventory["entries"][0]["status"], "running");
+    assert_eq!(inventory["entries"][0]["identity"], "unknown");
+    assert_eq!(rig.ok(&["list", "--json"]).json()[0]["status"], "running");
     std::fs::write(rig.path("unknown.pid"), DEAD_PID.to_string()).unwrap();
     let inventory = rig.ok(&["list", "--json", "--strict"]).json();
     assert_eq!(inventory["complete"], true);
@@ -279,10 +281,10 @@ fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
 #[test]
 fn json_status_and_key_order() {
     let rig = Rig::new();
-    rig.write_meta("van", json!({"displayCommand": "sleep 1", "tags": {"a": "1"}}));
+    rig.write_meta("van", json!({"daemonPid": DEAD_PID, "displayCommand": "sleep 1", "tags": {"a": "1"}}));
     rig.write_meta(
         "ex",
-        json!({"exitCode": 0, "exitedAt": iso_now(0), "displayName": "friendly"}),
+        json!({"daemonPid": DEAD_PID, "exitCode": 0, "exitedAt": iso_now(0), "displayName": "friendly"}),
     );
     // A dead pid without a socket is vanished; its files are kept.
     rig.write_meta("deadpid", json!({}));
@@ -301,7 +303,7 @@ fn json_status_and_key_order() {
     let keys: Vec<&String> = van.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["name", "status", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "tags"]
+        ["name", "status", "identity", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "tags"]
     );
     let ex = arr.iter().find(|s| s["name"] == "ex").unwrap();
     assert_eq!(ex["status"], "exited");
@@ -309,7 +311,7 @@ fn json_status_and_key_order() {
     let keys: Vec<&String> = ex.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["name", "status", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "displayName"]
+        ["name", "status", "identity", "pid", "command", "cwd", "createdAt", "exitCode", "exitedAt", "displayName"]
     );
     assert_eq!(
         arr.iter().find(|s| s["name"] == "deadpid").unwrap()["status"],
@@ -325,8 +327,8 @@ fn json_status_and_key_order() {
 #[test]
 fn status_and_age_filters() {
     let rig = Rig::new();
-    rig.write_meta("old", json!({"createdAt": iso_now(-2 * 3_600_000), "tags": {"env": "prod"}}));
-    rig.write_meta("recent", json!({"exitCode": 1, "exitedAt": iso_now(0)}));
+    rig.write_meta("old", json!({"daemonPid": DEAD_PID, "createdAt": iso_now(-2 * 3_600_000), "tags": {"env": "prod"}}));
+    rig.write_meta("recent", json!({"daemonPid": DEAD_PID, "exitCode": 1, "exitedAt": iso_now(0)}));
     let names = |args: &[&str]| -> Vec<String> {
         rig.ok(args)
             .json()
@@ -373,9 +375,9 @@ fn summary_text_and_json() {
     let rig = Rig::new();
     rig.write_meta(
         "old",
-        json!({"createdAt": iso_now(-2 * 3_600_000), "exitCode": 0, "exitedAt": iso_now(-3_600_000), "displayName": "Old One"}),
+        json!({"daemonPid": DEAD_PID, "createdAt": iso_now(-2 * 3_600_000), "exitCode": 0, "exitedAt": iso_now(-3_600_000), "displayName": "Old One"}),
     );
-    rig.write_meta("recent", json!({"createdAt": iso_now(-5_000)}));
+    rig.write_meta("recent", json!({"daemonPid": DEAD_PID, "createdAt": iso_now(-5_000)}));
     let out = rig.ok(&["list", "--summary"]);
     assert_eq!(
         out.stdout,
@@ -405,7 +407,7 @@ fn summary_text_and_json() {
     );
     // One session: singular, and no `newest` line when it is the oldest.
     let rig2 = Rig::new();
-    rig2.write_meta("only", json!({"createdAt": iso_now(-65_000)}));
+    rig2.write_meta("only", json!({"daemonPid": DEAD_PID, "createdAt": iso_now(-65_000)}));
     assert_eq!(
         rig2.ok(&["list", "--summary"]).stdout,
         "1 session — 1 vanished\noldest: only (vanished, 1m5s)\n"
@@ -442,13 +444,13 @@ fn text_layout_is_byte_exact() {
     let created = iso_now(-90_000);
     rig.write_meta(
         "van1",
-        json!({"createdAt": created, "cwd": format!("{home}/proj"), "displayCommand": "node app.js",
+        json!({"daemonPid": DEAD_PID, "createdAt": created, "cwd": format!("{home}/proj"), "displayCommand": "node app.js",
                "tags": {"role": "web", "ptyfile": "/x/pty.toml", "ptyfile.session": "w", "ptyfile.tags": "role",
                         "strategy": "permanent", ":l1234-abc": "1", "env": "dev"}}),
     );
     rig.write_meta(
         "ex1",
-        json!({"exitCode": 3, "exitedAt": iso_now(-5_000), "cwd": home, "displayCommand": "cat",
+        json!({"daemonPid": DEAD_PID, "exitCode": 3, "exitedAt": iso_now(-5_000), "cwd": home, "displayCommand": "cat",
                "displayName": "Pretty", "tags": {"strategy.status": "flapping", "strategy": "permanent"}}),
     );
     let out = rig.ok(&["list"]);

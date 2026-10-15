@@ -171,6 +171,12 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
             actual: generation.map(str::to_string),
         });
     }
+    // Running is a conservative display projection, not ownership authority.
+    if session.identity == DaemonIdentityCheck::Unknown {
+        return Err(StopError::SignalFailed {
+            name: name.to_string(),
+        });
+    }
     let (SessionStatus::Running, Some(pid)) = (session.status, session.pid) else {
         return Err(StopError::NotRunning {
             name: name.to_string(),

@@ -130,6 +130,7 @@ mod tests {
             socket_path: Default::default(),
             pid: None,
             status,
+            identity: pty_core::registry::DaemonIdentityCheck::Match,
             metadata: None,
         }
     }

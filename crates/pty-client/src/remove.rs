@@ -82,6 +82,11 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
             name: name.to_string(),
         });
     };
+    if session.identity == DaemonIdentityCheck::Unknown {
+        return Err(RemoveError::IdentityUnverified {
+            name: name.to_string(),
+        });
+    }
     if session.status == SessionStatus::Running {
         return Err(RemoveError::StillRunning {
             name: name.to_string(),

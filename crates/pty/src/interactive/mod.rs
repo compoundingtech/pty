@@ -479,7 +479,7 @@ mod tests {
                 std::os::unix::net::UnixListener::bind(registry::socket_path("unknown")).unwrap();
             let before = std::fs::read(registry::metadata_path("unknown")).unwrap();
             let session = registry::get_session_by_name("unknown").unwrap();
-            assert_eq!(session.status, registry::SessionStatus::Vanished);
+            assert_eq!(session.status, registry::SessionStatus::Running);
             let error = Picker::restart(&session).unwrap_err();
             assert!(error.contains("identity is unknown"), "{error}");
             assert!(child.0.try_wait().unwrap().is_none());

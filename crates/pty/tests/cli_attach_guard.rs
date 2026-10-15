@@ -35,8 +35,8 @@ fn auto_restart_preserves_missing_boot_live_child() {
     let rig = Rig::new();
     let mut fixture = cli_common::MissingBootSession::new(&rig, "unknown", serde_json::json!({}));
     // --auto-restart is this CLI's noninteractive restart policy (-r).
-    // Unknown projects as vanished, so this reaches the destructive restart
-    // guard without needing a terminal or a daemon answering STATUS.
+    // Unknown stays conservatively running; the independent identity result
+    // must refuse before any restart or transport-based ownership fallback.
     let out = rig.run(&["attach", "--auto-restart", "unknown"]);
     assert_eq!(out.code, 1, "{out:?}");
     assert!(out.stderr.contains("identity is unknown"), "{out:?}");

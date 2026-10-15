@@ -115,6 +115,30 @@ fn missing_identity_refuses_stop() {
 }
 
 #[test]
+fn b1_live_legacy_missing_boot_lists_running_and_refuses_stop_remove() {
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, Some(token(pid)), None);
+    assert_unknown_listing_and_refusal(&mut fixture, pid);
+}
+
+fn assert_unknown_listing_and_refusal(fixture: &mut Fixture, pid: i32) {
+    let sessions = pty_core::registry::list_sessions_in(
+        &fixture.root, &pty_core::registry::ListOptions::default(),
+    );
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].status, pty_core::registry::SessionStatus::Running);
+    assert_eq!(sessions[0].pid, Some(pid));
+    let record = std::fs::read(fixture.root.join("owner.json")).unwrap();
+    fixture.refused();
+    assert!(pty_client::remove_in(&fixture.root, "owner").is_err());
+    assert!(fixture.child.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::read(fixture.root.join("owner.json")).unwrap(), record);
+    assert_eq!(std::fs::read_to_string(fixture.root.join("owner.pid")).unwrap(), pid.to_string());
+    assert!(fixture.root.join("owner.sock").exists());
+}
+
+#[test]
 fn matching_owner_remains_stoppable() {
     let fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
@@ -175,12 +199,20 @@ fn unreadable_identity_child() {
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some(boot()));
-    fixture.refused();
+    assert_unknown_listing_and_refusal(&mut fixture, pid);
+    let mut metadata: pty_core::registry::SessionMetadata =
+        serde_json::from_slice(&std::fs::read(fixture.root.join("owner.json")).unwrap()).unwrap();
+    metadata.daemon_start_token = Some("stale:previous-owner".into());
+    assert_eq!(
+        pty_core::registry::check_daemon_identity(pid, &metadata),
+        pty_core::registry::DaemonIdentityCheck::Mismatch,
+        "B3: stale tokens disprove ownership even while current boot is unreadable",
+    );
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn unreadable_boot_identity_refuses_stop() {
+fn b1_transient_unreadable_boot_lists_running_and_refuses_stop_remove() {
     let mut process = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "unreadable_identity_child", "--nocapture"])
         .env("PTY_IDENTITY_UNREADABLE_CHILD", "1")

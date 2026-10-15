@@ -28,6 +28,9 @@ pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct RemoteSessionRow {
     pub name: String,
     pub status: String,
+    /// Absent for older peers; absence never supplies identity authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<pty_core::registry::DaemonIdentityCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -25,7 +25,7 @@ use crate::unix_connect::{self, Connect};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
-    /// The daemon's leader PID, start token and recorded boot identity match.
+    /// A matching daemon, or an unproven owner conservatively retained.
     Running,
     /// The daemon wrote an exit record before shutting down.
     Exited,
@@ -63,16 +63,18 @@ pub struct SessionInfo {
     /// The stable id.
     pub name: String,
     pub socket_path: PathBuf,
-    /// The daemon pid when it is known to be alive, else `None`.
+    /// The named daemon pid, retained on Unknown; never signal authority.
     pub pid: Option<i32>,
     pub status: SessionStatus,
+    /// Ownership evidence, independent of the conservative display status.
+    pub identity: DaemonIdentityCheck,
     /// `None` when `<name>.json` is missing or unreadable (a socket-only
     /// entry).
     pub metadata: Option<SessionMetadata>,
 }
 
 impl SessionInfo {
-    /// Is the daemon alive?
+    /// Is the session conservatively listed as running? Not signal authority.
     pub fn is_running(&self) -> bool {
         self.status == SessionStatus::Running
     }
@@ -295,7 +297,8 @@ fn read_session_pid_at(path: &Path) -> Option<i32> {
     parse_leading_int(content.trim())
 }
 /// The result of proving a registry record against the live daemon identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DaemonIdentityCheck {
     Match,
     Mismatch,
@@ -383,7 +386,7 @@ pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIden
     let result = match linux_thread_group(pid) {
         Ok(Some(tgid)) if tgid != pid => DaemonIdentityCheck::Mismatch,
         Ok(Some(_)) => check_daemon_identity_with(pid, metadata, read_linux_leader_start_token),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DaemonIdentityCheck::Gone,
+        Err(error) if process_status_is_gone(&error) => DaemonIdentityCheck::Gone,
         _ => DaemonIdentityCheck::Unknown,
     };
     #[cfg(not(target_os = "linux"))]
@@ -419,10 +422,23 @@ pub fn check_record_identity(
     }
 }
 
+fn process_status_is_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn check_daemon_identity_with(
     pid: i32,
     metadata: &SessionMetadata,
     live_start_token: impl Fn(i32) -> Option<String>,
+) -> DaemonIdentityCheck {
+    check_daemon_identity_evidence(pid, metadata, live_start_token, current_boot_id)
+}
+
+fn check_daemon_identity_evidence(
+    pid: i32,
+    metadata: &SessionMetadata,
+    live_start_token: impl Fn(i32) -> Option<String>,
+    live_boot_id: impl FnOnce() -> Option<String>,
 ) -> DaemonIdentityCheck {
     use DaemonIdentityCheck::{Gone, Match, Mismatch, Unknown};
     if pid <= 0 {
@@ -430,18 +446,6 @@ fn check_daemon_identity_with(
     }
     if metadata.daemon_pid.is_some_and(|recorded| recorded != pid) {
         return Mismatch;
-    }
-    let Some(recorded) = metadata
-        .daemon_boot_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-    else {
-        return Unknown;
-    };
-    match current_boot_id() {
-        Some(live) if live != recorded => return Mismatch,
-        None => return Unknown,
-        _ => {}
     }
     let Some(expected) = metadata
         .daemon_start_token()
@@ -454,13 +458,31 @@ fn check_daemon_identity_with(
         return Unknown;
     };
     match live_start_token(pid) {
-        Some(live) if live == expected => Match,
-        Some(_) => Mismatch,
+        Some(live) if live != expected => Mismatch,
+        Some(_) => {
+            // A different readable token disproves ownership on any boot.
+            // Only a token match needs complete, stable boot evidence.
+            let Some(recorded) = metadata.daemon_boot_id.as_deref().filter(|id| !id.is_empty())
+            else {
+                return Unknown;
+            };
+            // Legacy macOS boottime changes with wall-clock steps. It cannot
+            // prove either equality or mismatch, including after a UUID upgrade.
+            if recorded.starts_with("darwin:{") {
+                return Unknown;
+            }
+            match live_boot_id() {
+                Some(live) if live.starts_with("darwin:{") => Unknown,
+                Some(live) if live == recorded => Match,
+                Some(_) => Mismatch,
+                None => Unknown,
+            }
+        }
         None => {
             #[cfg(target_os = "linux")]
             match linux_thread_group(pid) {
                 Ok(Some(tgid)) if tgid != pid => return Mismatch,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Gone,
+                Err(error) if process_status_is_gone(&error) => return Gone,
                 _ => {}
             }
             #[cfg(not(target_os = "linux"))]
@@ -928,13 +950,17 @@ fn scan_sessions(
                 uncertain_sockets.push(root.join(format!("{name}.sock")));
             }
         }
-        let live = identity == DaemonIdentityCheck::Match;
-        let status = if metadata
+        // Unknown is not a loss observation. Retain the named PID without
+        // turning old pid/socket evidence into signal or cleanup authority.
+        let retained = matches!(identity, DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown);
+        let status = if identity == DaemonIdentityCheck::Unknown {
+            SessionStatus::Running
+        } else if metadata
             .as_ref()
             .is_some_and(|record| record.has_exited() || record.exit_code.is_some())
         {
             SessionStatus::Exited
-        } else if live {
+        } else if retained {
             SessionStatus::Running
         } else {
             SessionStatus::Vanished
@@ -944,8 +970,9 @@ fn scan_sessions(
         sessions.push(SessionInfo {
             name: name.to_string(),
             socket_path: root.join(format!("{name}.sock")),
-            pid: if live { pid } else { None },
+            pid: if retained { pid } else { None },
             status,
+            identity,
             metadata,
         });
     }
@@ -1122,5 +1149,57 @@ mod identity_observation_tests {
             check_daemon_identity_with(pid, &metadata, |_| None),
             DaemonIdentityCheck::Unknown,
         );
+    }
+
+    #[test]
+    fn b3_stale_token_disproves_owner_before_missing_or_unreadable_boot() {
+        let pid = std::process::id() as i32;
+        for recorded_boot in [None, Some("linux:recorded"), Some("darwin:{ sec = 1, usec = 0 }")] {
+            let metadata = SessionMetadata {
+                daemon_pid: Some(pid),
+                daemon_start_token: Some("old-token".into()),
+                daemon_boot_id: recorded_boot.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_daemon_identity_evidence(pid, &metadata, |_| Some("new-token".into()), || {
+                    panic!("token mismatch must not require readable boot evidence")
+                }),
+                DaemonIdentityCheck::Mismatch,
+            );
+        }
+    }
+
+    #[test]
+    fn b3_matching_token_requires_complete_stable_boot_evidence() {
+        let pid = std::process::id() as i32;
+        for (recorded_boot, current_boot, expected) in [
+            (None, Some("linux:current"), DaemonIdentityCheck::Unknown),
+            (Some("linux:current"), None, DaemonIdentityCheck::Unknown),
+            (Some("darwin:{ sec = 1, usec = 0 }"), Some("darwin:uuid"), DaemonIdentityCheck::Unknown),
+            (Some("darwin:uuid"), Some("darwin:{ sec = 1, usec = 0 }"), DaemonIdentityCheck::Unknown),
+            (Some("darwin:uuid"), Some("darwin:uuid"), DaemonIdentityCheck::Match),
+        ] {
+            let metadata = SessionMetadata {
+                daemon_pid: Some(pid),
+                daemon_start_token: Some("same-token".into()),
+                daemon_boot_id: recorded_boot.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_daemon_identity_evidence(
+                    pid, &metadata, |_| Some("same-token".into()),
+                    || current_boot.map(str::to_string),
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn linux_status_esrch_is_exit_evidence_not_unknown() {
+        assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(!process_status_is_gone(&std::io::Error::from_raw_os_error(libc::EACCES)));
     }
 }

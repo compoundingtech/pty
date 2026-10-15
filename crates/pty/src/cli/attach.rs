@@ -143,6 +143,10 @@ fn attach_session(
         eprintln!("Session \"{name}\" not found.");
         return Ok(1);
     };
+    if session.identity == registry::DaemonIdentityCheck::Unknown {
+        eprintln!("pty attach: refusing session \"{name}\": daemon identity is unknown.");
+        return Ok(1);
+    }
 
     if session.status == SessionStatus::Running {
         if !force {
