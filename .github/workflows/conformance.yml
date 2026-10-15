@@ -17,11 +17,7 @@ env:
 
 jobs:
   shard:
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=2,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=2;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -136,11 +132,7 @@ jobs:
   gate:
     needs: shard
     if: always()
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=2,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=2;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

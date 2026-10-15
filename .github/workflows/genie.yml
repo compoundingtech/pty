@@ -16,11 +16,7 @@ jobs:
   freshness:
     name: genie freshness
     timeout-minutes: 15
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;job.priority=2,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=2;github.run-id=${{ github.run_id }}"]
     permissions:
       contents: read
     defaults:

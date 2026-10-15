@@ -35,8 +35,10 @@ def scheduling_errors(text, is_pr):
         if 'namespace-profile-' in runner:
             if runner.count('job.priority=2') != 1:
                 errors.append(f'{match.group(1)}: expected one delivery priority 2')
-            if 'github.run-id=${{ github.run_id }}' not in runner:
-                errors.append(f'{match.group(1)}: missing existing run affinity')
+            if not re.search(r'namespace-profile-[\w-]+;job\.priority=2;github\.run-id=\$\{\{ github\.run_id \}\}', runner):
+                errors.append(f'{match.group(1)}: priority and existing run affinity must be inline on the profile')
+            if 'namespace-features:' in runner:
+                errors.append(f'{match.group(1)}: profiles cannot use separate feature labels')
     concurrency = block(text, 'concurrency')
     if is_pr:
         values = dict(re.findall(r'^  ([\w-]+): (.+)$', concurrency, re.M))
@@ -63,6 +65,8 @@ class WorkflowPolicy(unittest.TestCase):
     def test_controls_reject_missing_priority_and_broad_cancellation(self):
         text = (ROOT / '.github/workflows/test.yml').read_text()
         self.assertTrue(scheduling_errors(text.replace('job.priority=2', 'job.priority=5'), True))
+        self.assertTrue(scheduling_errors(text.replace(';github.run-id=', ', namespace-features:github.run-id='), True))
+        self.assertTrue(scheduling_errors(text.replace('github.run-id=', 'github.wrong-id='), True))
         self.assertTrue(scheduling_errors(text.replace(CANCEL, 'true'), True))
         self.assertTrue(scheduling_errors(text.replace(GROUP, '${{ github.workflow }}-${{ github.ref }}'), True))
 
