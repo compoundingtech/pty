@@ -827,6 +827,20 @@ impl TerminalActor {
         output
     }
 
+    /// The stream feeding this terminal has ended or is being replaced: the
+    /// child exited, or the client lost or dropped its connection. A partial
+    /// sequence can no longer be finished, so it is forgotten, and paste
+    /// events are turned off, as an event, because nothing on this stream
+    /// can answer them now. The screen and every other mode stay as they
+    /// are.
+    pub fn end_stream(&mut self) {
+        self.scanner.reset();
+        if self.modes.enhanced_paste {
+            self.modes.enhanced_paste = false;
+            self.events.push(TerminalEvent::EnhancedPasteMode(false));
+        }
+    }
+
     /// Full reset (RIS): screen, scrollback, modes, title. The tracked mode
     /// flags and any partial sequence in the scanner are cleared too. Used
     /// before replaying a SCREEN. Turning paste events off is an event, so a

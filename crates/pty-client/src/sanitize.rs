@@ -28,6 +28,7 @@ pub const TERMINAL_SANITIZE: &str = concat!(
     "\x1b(B",      // reset G0 charset to ASCII
     "\x1b[<99u",   // pop all Kitty keyboard protocol levels
     "\x1b[>4m",    // reset xterm modifyOtherKeys, which vim and Claude Code set
+    "\x1b[?5522l", // turn kitty paste events (enhanced paste) off
 );
 
 /// Move the cursor to the bottom of the visible screen so status messages
