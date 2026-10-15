@@ -792,11 +792,11 @@ fn scan_sessions(
     }
     let candidates: Vec<Candidate> = sockets
         .iter()
-        .map(|(name, filename)| {
+        .map(|(name, _filename)| {
             let (metadata, pid) = records.remove(*name).expect("socket record was observed");
             Candidate {
                 name: name.to_string(),
-                socket_path: root.join(filename),
+                socket_path: socket_path_in(root, name),
                 pid,
                 pid_alive: pid.is_some_and(pid_alive),
                 metadata,

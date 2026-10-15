@@ -338,6 +338,16 @@ mod tests {
         assert_eq!(from_real.file_name(), bounded.file_name());
         let stream = UnixStream::connect(&from_real).unwrap();
         drop(stream);
+        let pid_file = real.join(format!("{id}.pid"));
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let inventory = super::super::list_sessions_strict_in(
+            &real,
+            &super::super::ListOptions::default(),
+        );
+        assert!(inventory.complete, "{:?}", inventory.errors);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].socket_path, from_real);
+        std::fs::remove_file(pid_file).unwrap();
         drop(listener);
         std::fs::remove_file(&bounded).unwrap();
 
@@ -348,6 +358,15 @@ mod tests {
         assert_eq!(from_alias.file_name(), readable.file_name());
         assert!(from_alias.as_os_str().len() <= SUN_PATH_MAX);
         let stream = UnixStream::connect(&from_alias).unwrap();
+        drop(stream);
+        let inventory = super::super::list_sessions_strict_in(
+            &alias,
+            &super::super::ListOptions::default(),
+        );
+        assert!(inventory.complete, "{:?}", inventory.errors);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].socket_path, from_alias);
+        let stream = UnixStream::connect(&inventory.entries[0].socket_path).unwrap();
         drop(stream);
         drop(listener);
         std::fs::remove_dir_all(&base).unwrap();
