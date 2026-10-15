@@ -1056,13 +1056,13 @@ fn orphan_layout_tag_pid(key: &str) -> Option<Option<i64>> {
     Some(rest[..digits].parse::<i64>().ok())
 }
 
-/// Drop layout tags whose owning pid is dead on every running session.
+/// Drop layout tags whose owning pid is dead on every verified running session.
 ///
 /// node: src/sessions.ts:2042-2074
 pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
     let mut out = Vec::new();
     for s in registry::list_sessions() {
-        if !s.is_running() {
+        if !s.is_running() || s.identity != registry::DaemonIdentityCheck::Match {
             continue;
         }
         let Some(tags) = s.metadata.as_ref().and_then(|m| m.tags.as_ref()) else {
@@ -1200,6 +1200,36 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[test]
+    fn b1_layout_pruning_preserves_unknown_session_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "pty-layout-unknown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        registry::with_root(&root, || {
+            let pid = std::process::id();
+            let metadata = SessionMetadata {
+                generation: Some("legacy-layout".into()),
+                daemon_pid: Some(pid as i32),
+                daemon_start_token: registry::read_process_start_token(pid as i32),
+                daemon_boot_id: None,
+                tags: Some(TagMap::from([(":l0-abc".into(), "retained".into())])),
+                ..Default::default()
+            };
+            write_metadata("unknown", &metadata).unwrap();
+            registry::write_pid("unknown", pid).unwrap();
+            let observed = registry::get_session_by_name("unknown").unwrap();
+            assert!(observed.is_running());
+            assert_eq!(observed.identity, registry::DaemonIdentityCheck::Unknown);
+            let before = std::fs::read(metadata_path("unknown")).unwrap();
+            assert!(prune_orphan_layout_tags(true).is_empty());
+            assert!(prune_orphan_layout_tags(false).is_empty());
+            assert_eq!(std::fs::read(metadata_path("unknown")).unwrap(), before);
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

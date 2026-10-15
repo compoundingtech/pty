@@ -66,6 +66,8 @@ capability and waits on its pinned process after releasing locks. Reachable
 sockets never supply independent signal authority. Runtime debris without
 recorded identity is retained; malformed metadata can be reclaimed only when
 no socket or PID sidecars accompany it.
+Layout-tag pruning also requires Match; an Unknown row's conservative Running
+projection grants no authority to change its metadata, even in a dry-run plan.
 
 **Calendar time is not boot identity.** Startup retirement never compares
 `createdAt` with `kern.boottime` or Linux `btime`: these dates can move when
