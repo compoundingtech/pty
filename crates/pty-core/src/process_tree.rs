@@ -72,11 +72,12 @@ pub fn groups_in_tree(root_pid: i32, table: &ProcTable) -> Vec<i32> {
 
 /// The live pids that still belong to any of `groups`. A zombie is excluded:
 /// `ps` still lists it with its group, and counting it would make the sweep
-/// report a group it has already emptied.
+/// report a group it has already emptied. So is a process already exiting,
+/// which no signal reaches any more.
 pub fn members_of_groups(groups: &[i32], table: &ProcTable) -> Vec<i32> {
     let mut out: Vec<i32> = table
         .rows()
-        .filter(|r| !r.is_zombie() && groups.contains(&r.pgid))
+        .filter(|r| !r.is_zombie() && !r.is_exiting() && groups.contains(&r.pgid))
         .map(|r| r.pid)
         .collect();
     out.sort_unstable();

@@ -202,13 +202,6 @@ fn rapid_exit_and_attached_detach_soak_leaves_no_resources() {
     std::fs::remove_dir(&observations).unwrap();
 }
 
-#[cfg(target_os = "linux")]
-fn fd_count(pid: i32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap_or_else(|e| panic!("read /proc/{pid}/fd: {e}"))
-        .count()
-}
-
 /// Each open descriptor and what it points at, to name one that leaked.
 #[cfg(target_os = "linux")]
 fn fd_table(pid: i32) -> std::collections::BTreeMap<u32, String> {
@@ -310,9 +303,21 @@ fn repeated_attach_detach_keeps_daemon_fd_count_stable() {
         // A timeout here must not panic before the tables are read: the report
         // is what says which descriptor is extra, and whether the count came
         // back to the baseline at all before it was read again.
+        //
+        // **Assert on the table the wait accepted, not on a second read.** The
+        // daemon holds its metadata record, or the record's `.tmp.` file, open
+        // for a moment whenever it reads or rewrites it, and a second read can
+        // land inside one of those moments. Hosted CI did that repeatedly
+        // (#134): the wait returned at the baseline, and the next read saw one
+        // more descriptor, the record itself or its tmp file. A real leak
+        // never comes back to the baseline, so it still fails here, after the
+        // budget, with the last table it showed.
         let budget = operation_budget();
-        let returned = poll_for(budget, || fd_count(pid) <= baseline);
-        let final_fds = fd_table(pid);
+        let mut final_fds = fd_table(pid);
+        let returned = poll_for(budget, || {
+            final_fds = fd_table(pid);
+            final_fds.len() <= baseline
+        });
         let final_count = final_fds.len();
         assert!(
             final_count <= baseline,

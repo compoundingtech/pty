@@ -64,7 +64,9 @@ impl ProcessId {
 
     /// Is this exact process gone, by `table`? A pid alone never answers:
     /// another start token or another boot is another process, a zombie has
-    /// exited, and only a complete table can say a pid is absent.
+    /// exited, and only a complete table can say a pid is absent. A process
+    /// still exiting is unknown: it runs no user code, but a system call
+    /// already under way in it may still finish, so it is not yet gone.
     pub fn liveness(&self, table: &ProcTable, boot_id: Option<&str>) -> Liveness {
         // A pid and a start token mean something only within one boot. With
         // no current boot identity nothing here can be told apart.
@@ -78,6 +80,7 @@ impl ProcessId {
             Answer::Known(row) => match &row.identity {
                 Some(identity) if identity.as_str() != self.start_token => Liveness::Gone,
                 Some(_) if row.is_zombie() => Liveness::Gone,
+                Some(_) if row.is_exiting() => Liveness::Unknown("exiting"),
                 Some(_) => Liveness::Live,
                 None => Liveness::Unknown("start-identity-unreadable"),
             },
@@ -91,14 +94,54 @@ impl ProcessId {
 impl ProcessId {
     /// [`ProcessId::liveness`] for this one pid, read now.
     pub fn liveness_now(&self, boot_id: Option<&str>) -> Liveness {
-        let table = match crate::proctable::process(self.pid as i32) {
+        self.liveness(&Self::table_of(self.pid), boot_id)
+    }
+
+    /// After this process's exit was observed (see
+    /// [`super::exact::ExitWatch`]): its liveness once the table shows the
+    /// zombie or no process, read again for at most `cap` until it does.
+    ///
+    /// **The observed exit is the fence and the zombie is the proof.** On
+    /// macOS the table says the process is still exiting for a moment after
+    /// the kernel's exit event; a row still exiting when `cap` runs out
+    /// answers `Unknown("exiting")`, never gone.
+    pub fn liveness_after_exit(&self, boot_id: Option<&str>, cap: Duration) -> Liveness {
+        self.liveness_after_exit_with(boot_id, cap, || Self::table_of(self.pid))
+    }
+
+    fn liveness_after_exit_with(
+        &self,
+        boot_id: Option<&str>,
+        cap: Duration,
+        mut read: impl FnMut() -> ProcTable,
+    ) -> Liveness {
+        let deadline = Instant::now() + cap;
+        loop {
+            let liveness = self.liveness(&read(), boot_id);
+            if liveness == Liveness::Gone || Instant::now() >= deadline {
+                return liveness;
+            }
+            std::thread::sleep(AFTER_EXIT_POLL);
+        }
+    }
+
+    fn table_of(pid: u32) -> ProcTable {
+        match crate::proctable::process(pid as i32) {
             Answer::Known(row) => ProcTable::from_rows(vec![row]),
             Answer::NotPresent => ProcTable::from_rows(Vec::new()),
             Answer::Unknown(_) => ProcTable::unreadable(),
-        };
-        self.liveness(&table, boot_id)
+        }
     }
 }
+
+/// How long [`ProcessId::liveness_after_exit`] waits, at most, for the table
+/// to show an observed exit. Measured on macOS 27, the table had caught up
+/// with every exit event within a millisecond; this is a hard cap, and the
+/// wait ends as soon as the table shows the zombie.
+pub const AFTER_EXIT_CAP: Duration = Duration::from_millis(10);
+
+/// The pause between two of those reads.
+const AFTER_EXIT_POLL: Duration = Duration::from_micros(200);
 
 /// What a recorded identity's process is doing now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,6 +922,79 @@ fn try_lock(fd: i32, kind: libc::c_int) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(state: &str, token: &str) -> crate::proctable::Row {
+        crate::proctable::Row {
+            pid: 4242,
+            ppid: 1,
+            pgid: 4242,
+            state: state.into(),
+            rss_kb: None,
+            cpu_percent: None,
+            identity: Some(crate::proctable::LiveIdentity::new(token)),
+        }
+    }
+
+    fn recorded() -> ProcessId {
+        ProcessId {
+            pid: 4242,
+            start_token: "darwin:1790000000.123456".into(),
+            boot_id: "boot".into(),
+            uid: 501,
+        }
+    }
+
+    /// **An exiting process is not gone.** It returns to no user code, but a
+    /// system call already under way in it may still finish.
+    #[test]
+    fn an_exiting_process_is_unknown_not_gone() {
+        let id = recorded();
+        let table = |state| ProcTable::from_rows(vec![row(state, &id.start_token)]);
+        assert_eq!(id.liveness(&table("S"), Some("boot")), Liveness::Live);
+        assert_eq!(
+            id.liveness(&table("E"), Some("boot")),
+            Liveness::Unknown("exiting")
+        );
+        assert_eq!(id.liveness(&table("Z"), Some("boot")), Liveness::Gone);
+        // Linux, mid-reap: the row is still there, the process is not.
+        assert_eq!(id.liveness(&table("X"), Some("boot")), Liveness::Gone);
+    }
+
+    /// After an observed exit the table is read again until it shows the
+    /// zombie, for at most the cap. One still exiting past the cap stays
+    /// unknown; one that turns into a zombie within it is gone.
+    #[test]
+    fn an_observed_exit_is_gone_once_the_zombie_shows_within_the_cap() {
+        let id = recorded();
+        let token = id.start_token.clone();
+        let cap = Duration::from_millis(5);
+
+        let started = Instant::now();
+        let reads = std::cell::Cell::new(0);
+        let still_exiting = id.liveness_after_exit_with(Some("boot"), cap, || {
+            reads.set(reads.get() + 1);
+            ProcTable::from_rows(vec![row("E", &token)])
+        });
+        assert_eq!(still_exiting, Liveness::Unknown("exiting"));
+        assert!(started.elapsed() >= cap, "it waited out the cap");
+        assert!(reads.get() > 1, "and read again in between");
+
+        let reads = std::cell::Cell::new(0);
+        let zombie_in_time = id.liveness_after_exit_with(Some("boot"), cap, || {
+            reads.set(reads.get() + 1);
+            let state = if reads.get() < 3 { "E" } else { "Z" };
+            ProcTable::from_rows(vec![row(state, &token)])
+        });
+        assert_eq!(zombie_in_time, Liveness::Gone);
+        assert_eq!(reads.get(), 3, "and stopped reading once it showed");
+
+        let reaped =
+            id.liveness_after_exit_with(Some("boot"), cap, || ProcTable::from_rows(Vec::new()));
+        assert_eq!(reaped, Liveness::Gone, "a complete table without it");
+
+        let unreadable = id.liveness_after_exit_with(Some("boot"), cap, ProcTable::unreadable);
+        assert_eq!(unreadable, Liveness::Unknown("process-table-unreadable"));
+    }
 
     fn store() -> (OperationStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
