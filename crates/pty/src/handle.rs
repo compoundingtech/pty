@@ -360,7 +360,10 @@ impl Core {
                 TerminalEvent::Bell => HandleEvent::Bell,
                 TerminalEvent::TitleChange(t) => HandleEvent::Title(t),
                 TerminalEvent::Notification(n) => HandleEvent::Notification(n),
-                TerminalEvent::FocusRequest | TerminalEvent::CursorVisible => continue,
+                TerminalEvent::FocusRequest
+                | TerminalEvent::CursorVisible
+                | TerminalEvent::EnhancedPasteMode(_)
+                | TerminalEvent::EnhancedPasteRead(_) => continue,
             };
             self.shared.emit(ev);
         }
