@@ -216,7 +216,11 @@ pub enum HandleEvent {
     Connected(AttemptId),
     /// The child turned paste events (`?5522`, enhanced paste) on or off, as
     /// this attempt's stream says. A SCREEN restates the mode, so a reattach
-    /// hears the program's current state.
+    /// hears the program's current state. They also go off, under the
+    /// attempt that had them on, when the child exits, the stream is lost or
+    /// a reconnect replaces it: before `Exited`, `Disconnected` or
+    /// `Connected`. [`TerminalHandle::enhanced_paste`] reads the current
+    /// state.
     EnhancedPasteMode { attempt: AttemptId, enabled: bool },
     /// The child asked to read clipboard types. Answer it with
     /// [`TerminalHandle::write_enhanced_paste`] under the same attempt and
@@ -573,8 +577,8 @@ impl Core {
     }
 
     fn on_exit(&mut self, code: i32) {
+        self.end_stream();
         self.publish();
-        self.paste = PasteRead::default();
         self.flush_frame(false);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -586,7 +590,9 @@ impl Core {
     }
 
     fn on_disconnected(&mut self) {
-        self.paste = PasteRead::default();
+        if self.end_stream() {
+            self.publish();
+        }
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.connected = false;
@@ -596,6 +602,18 @@ impl Core {
         }
         self.shared.cv.notify_all();
         self.shared.emit(HandleEvent::Disconnected);
+    }
+
+    /// This attempt's stream is over: the child exited, or the connection
+    /// was lost or is being replaced. Its open read can't be answered, a
+    /// partial sequence can't be finished, and paste events go off under
+    /// this attempt, so the mode reads as off until a replay restates it.
+    /// Returns whether they went off: a change for the caller to publish.
+    fn end_stream(&mut self) -> bool {
+        self.paste = PasteRead::default();
+        let enhanced_paste = self.actor.modes().enhanced_paste;
+        self.actor.end_stream();
+        enhanced_paste
     }
 
     /// Check a paste packet against this attempt, the stream and the mode,
@@ -775,6 +793,16 @@ impl Core {
     }
 
     fn reconnect(&mut self) -> io::Result<()> {
+        let Backend::Attach { stream, .. } = &mut self.backend else {
+            return Err(io::Error::other("reconnect is only for attached handles"));
+        };
+        if let Some(old) = stream.take() {
+            let _ = (&old).write_all(&encode_detach());
+            let _ = old.shutdown(std::net::Shutdown::Both);
+        }
+        if self.end_stream() {
+            self.publish();
+        }
         let Backend::Attach {
             connector,
             opts,
@@ -782,14 +810,9 @@ impl Core {
             tx,
         } = &mut self.backend
         else {
-            return Err(io::Error::other("reconnect is only for attached handles"));
+            unreachable!("an attached handle, checked above");
         };
-        if let Some(old) = stream.take() {
-            let _ = (&old).write_all(&encode_detach());
-            let _ = old.shutdown(std::net::Shutdown::Both);
-        }
         self.attempt = AttemptId(self.attempt.0 + 1);
-        self.paste = PasteRead::default();
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.ready = false;
@@ -1701,6 +1724,16 @@ impl TerminalHandle {
     /// The current attempt id.
     pub fn attempt(&self) -> AttemptId {
         AttemptId(self.state(|st| st.attempt))
+    }
+
+    /// Whether paste events (`?5522`) are on, and the attempt that says so,
+    /// read together. Subscribe first, then read this: each later change
+    /// arrives as a [`HandleEvent::EnhancedPasteMode`]. A mode the child set
+    /// before this handle attached is on once the first SCREEN is in. It is
+    /// off once the child exits or the stream is lost, and from a reconnect
+    /// until the new SCREEN restates it.
+    pub fn enhanced_paste(&self) -> (AttemptId, bool) {
+        self.state(|st| (AttemptId(st.attempt), st.modes.enhanced_paste))
     }
 
     /// Override the first `colors.len()` palette entries (a theme).

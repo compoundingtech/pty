@@ -764,7 +764,9 @@ fn install_spawner_watchdog(tx: Sender<Msg>) {
     });
 }
 
-fn clipboard_client_available(clients: &BTreeMap<u64, Client>) -> bool {
+/// Whether a client can answer the child's clipboard reads and paste
+/// events: one that is attached, writable and past its SCREEN.
+fn answering_client_available(clients: &BTreeMap<u64, Client>) -> bool {
     clients.values().any(|client| {
         client.role == Role::Writable && client.attached.is_some() && !client.is_settling()
     })
@@ -962,7 +964,9 @@ impl Daemon {
     /// node: src/server.ts:559-569
     fn on_pty_data(&mut self, bytes: &[u8]) {
         self.stamp_output_activity();
-        self.actor.set_clipboard_client_available(clipboard_client_available(&self.clients));
+        let answering = answering_client_available(&self.clients);
+        self.actor.set_clipboard_client_available(answering);
+        self.actor.set_enhanced_paste_available(answering);
         let cleaned = self.actor.write(bytes);
         let replies = self.actor.take_pty_replies();
         self.write_pty(&replies);
@@ -1354,6 +1358,10 @@ impl Daemon {
         self.exited = true;
         self.exit_code = code;
         self.exit_drain_deadline = None;
+        // Nothing can answer paste events now, so a later attach's replay
+        // must not offer them.
+        self.actor.end_stream();
+        self.forward_terminal_events();
         self.broadcast(&encode_exit(code));
         self.events
             .append(Event::session_exit(&self.name, code, signal));
@@ -1695,7 +1703,7 @@ mod tests {
         let mut clients = BTreeMap::new();
         clients.insert(1, Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))));
         let mut actor = TerminalActor::new(24, 80, 0);
-        actor.set_clipboard_client_available(clipboard_client_available(&clients));
+        actor.set_clipboard_client_available(answering_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");
         assert_eq!(actor.take_pty_replies(), b"\x1b]52;c;\x1b\\");
 
@@ -1706,7 +1714,7 @@ mod tests {
             tty: None,
             attached_at: String::new(),
         });
-        assert!(clipboard_client_available(&clients));
+        assert!(answering_client_available(&clients));
     }
 
     #[test]

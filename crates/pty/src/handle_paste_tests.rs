@@ -480,3 +480,72 @@ fn a_reset_closes_the_open_read() {
     assert!(r.core.paste.open.is_none());
     assert_eq!(r.sent(), b"");
 }
+
+fn mode(attempt: u64, enabled: bool) -> HandleEvent {
+    HandleEvent::EnhancedPasteMode {
+        attempt: AttemptId(attempt),
+        enabled,
+    }
+}
+
+/// The end of a stream turns paste events off under the attempt that had
+/// them on, before the event that ends it, and the published state agrees.
+#[test]
+fn the_end_of_a_stream_turns_paste_off_first() {
+    let ends: [(Msg, HandleEvent); 2] = [
+        (
+            Msg::Disconnected {
+                attempt: AttemptId(1),
+            },
+            HandleEvent::Disconnected,
+        ),
+        (
+            Msg::ChildExited {
+                attempt: AttemptId(1),
+                code: 0,
+            },
+            HandleEvent::Exited(0),
+        ),
+    ];
+    for (end, ended) in ends {
+        let mut r = rig(false);
+        r.output(1, b"\x1b[?5522h");
+        r.core.dispatch(end);
+        let events: Vec<_> = r
+            .events
+            .try_iter()
+            .filter(|event| {
+                matches!(event, HandleEvent::EnhancedPasteMode { .. }) || *event == ended
+            })
+            .collect();
+        assert_eq!(events, [mode(1, true), mode(1, false), ended]);
+        assert!(!r.core.shared.state.lock().unwrap().modes.enhanced_paste);
+    }
+
+    // A reconnect ends the old stream before it tries the new one, so the
+    // mode is off under the old attempt even when the new one fails.
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    assert!(r.core.reconnect().is_err());
+    assert_eq!(r.paste_events(), [mode(1, true), mode(1, false)]);
+    let st = r.core.shared.state.lock().unwrap();
+    assert_eq!((st.attempt, st.modes.enhanced_paste), (2, false));
+}
+
+/// A request cut off when its stream ended is never finished by the next
+/// stream, even one whose peer skips the SCREEN.
+#[test]
+fn a_request_cut_off_by_a_disconnect_is_never_finished() {
+    let mut r = rig(false);
+    r.output(1, b"\x1b[?5522h");
+    let request = format!("\x1b]5522;type=read:id=a;{PNG_AND_TEXT}\x1b\\");
+    let (head, tail) = request.split_at(20);
+    r.output(1, head.as_bytes());
+    r.core.dispatch(Msg::Disconnected {
+        attempt: AttemptId(1),
+    });
+    r.core.attempt = AttemptId(2);
+    r.output(2, tail.as_bytes());
+    assert_eq!(r.paste_events(), [mode(1, true), mode(1, false)]);
+    assert_eq!(r.sent(), b"");
+}

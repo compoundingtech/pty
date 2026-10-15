@@ -2,7 +2,7 @@
 //! mode, the program's read requests, DECRQM, resets and the replay.
 
 use pty_terminal::enhanced_paste::{Location, MAX_METADATA};
-use pty_terminal::{SerializeOpts, TerminalActor, TerminalEvent};
+use pty_terminal::{Range, SerializeOpts, TerminalActor, TerminalEvent};
 
 fn actor() -> TerminalActor {
     TerminalActor::new(24, 80, 100)
@@ -275,6 +275,42 @@ fn every_reset_turns_the_mode_off_as_an_event() {
             TerminalEvent::EnhancedPasteMode(true),
             TerminalEvent::EnhancedPasteMode(false)
         ]
+    );
+}
+
+/// When the stream ends, paste events go off and a partial request is
+/// forgotten, so nothing after it can finish one. The screen stays.
+#[test]
+fn the_end_of_a_stream_turns_the_mode_off_and_drops_a_fragment() {
+    let mut a = actor();
+    a.write(b"kept\x1b[?5522h");
+    let request = read_request();
+    let (head, tail) = request.split_at(request.len() / 2);
+    a.write(head);
+    a.end_stream();
+    assert!(!a.modes().enhanced_paste);
+    assert_eq!(
+        paste_events(&mut a),
+        [
+            TerminalEvent::EnhancedPasteMode(true),
+            TerminalEvent::EnhancedPasteMode(false)
+        ]
+    );
+    a.write(tail);
+    assert_eq!(paste_events(&mut a), [], "the tail is not a request");
+    assert!(a.plain(Range::Viewport).starts_with("kept"));
+    assert!(!a.serialize(SerializeOpts::ATTACH).contains("5522"));
+
+    a.write(b"\x1b[?5522h");
+    a.end_stream();
+    a.end_stream();
+    assert_eq!(
+        paste_events(&mut a),
+        [
+            TerminalEvent::EnhancedPasteMode(true),
+            TerminalEvent::EnhancedPasteMode(false)
+        ],
+        "a second end finds the mode off: no event"
     );
 }
 
