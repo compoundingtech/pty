@@ -144,6 +144,13 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
         toml_tags.insert("ptyfile.tags".to_string(), user_toml_keys.join(","));
 
         let bound = find_bound(&existing, &toml_path, &sess.short_name);
+        if let Some(bound) = bound
+            && bound.identity == registry::DaemonIdentityCheck::Unknown
+        {
+            eprintln!("  \u{2717} {}: daemon identity is unknown.", label_of(bound));
+            skipped += 1;
+            continue;
+        }
 
         if let Some(bound) = bound
             && bound.is_running()
