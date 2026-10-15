@@ -27,6 +27,15 @@ Linux. The registry generation alone is not proof. Missing boot identity or
 start token is Unknown, never a legacy Match, and grants no signal authority.
 Unreadable identity also refuses teardown.
 
+**Unknown is not gone.** Legacy live records without a boot id, and records
+whose evidence is transiently unreadable, stay listed as `running` with their
+named PID. The additive `identity` list JSON/remote field preserves the separate
+ownership result; `running` is not signal or cleanup authority. Such legacy
+sessions cannot be stopped through `pty kill` or `stop_in` until a new daemon
+publishes complete identity evidence. They cannot be removed or replaced on
+the strength of that conservative projection either. Readable differing start
+tokens independently prove Mismatch before boot evidence is required.
+
 **The existing `Exact` abstraction pins the owner.** The client uses
 `operation::exact::Exact` rather than a separate daemon pinning implementation.
 It pins with a pidfd on Linux or an audit token on macOS, rechecks recorded

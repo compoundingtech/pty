@@ -208,8 +208,8 @@ gap is in what the daemon does with the frames.
 | Behavior | Rust status |
 |---|---|
 | `listSessions` never mutates; scans `.sock` then orphan `.json`; 500 ms transport probe budget | have; probes are diagnostics, never daemon liveness authority |
-| `daemonPid` accepted only with matching recorded boot identity and start token | have; required on Linux and macOS, with thread-group leadership also required on Linux. Missing boot or token is Unknown, grants no signal authority, and makes strict inventory incomplete; mismatch is vanished. Teardown pins exact owners through `Exact` (Linux pidfd / macOS audit token), never raw PID or group fallback |
-| Status `running` / `exited` / `vanished` | have |
+| `daemonPid` grants authority only with matching recorded stable boot identity and start token | have; required on Linux and macOS, with thread-group leadership also required on Linux. A readable different start token proves Mismatch before boot is required. Missing/unreadable evidence is Unknown and makes strict inventory incomplete. Teardown pins exact owners through `Exact` (Linux pidfd / macOS audit token), never raw PID or group fallback |
+| Status `running` / `exited` / `vanished` | have; Unknown conservatively stays `running` with its named PID, never a loss projection. Additive `identity` in list JSON and remote rows is `match`, `mismatch`, `gone` or `unknown`; `running` alone grants no signal, cleanup or replacement authority |
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |
 | Behavioral tags: `strategy=permanent`, `keep`, `parent`, `role=agent`, `strategy.*` bookkeeping, `:l<pid>-*` | partial (`keep`, `permanent` only) |
