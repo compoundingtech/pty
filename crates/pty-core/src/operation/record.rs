@@ -73,7 +73,12 @@ impl ProcessId {
         let Some(boot_id) = boot_id else {
             return Liveness::Unknown("boot-identity-unavailable");
         };
-        if boot_id != self.boot_id {
+        // A record written while the macOS identity was `kern.boottime`
+        // (`darwin:{ sec = S, usec = U }`) names its boot by a value that
+        // moves with the clock, so it cannot say which boot it was. The table
+        // can still prove the process gone; it can never prove it live.
+        let legacy = self.boot_id.starts_with("darwin:{");
+        if boot_id != self.boot_id && !legacy {
             return Liveness::Gone;
         }
         match table.row(self.pid as i32) {
@@ -81,6 +86,7 @@ impl ProcessId {
                 Some(identity) if identity.as_str() != self.start_token => Liveness::Gone,
                 Some(_) if row.is_zombie() => Liveness::Gone,
                 Some(_) if row.is_exiting() => Liveness::Unknown("exiting"),
+                Some(_) if legacy => Liveness::Unknown("boot-identity-legacy"),
                 Some(_) => Liveness::Live,
                 None => Liveness::Unknown("start-identity-unreadable"),
             },
@@ -1412,6 +1418,40 @@ mod tests {
         );
         assert_eq!(
             id.liveness(&absent, None),
+            Liveness::Unknown("boot-identity-unavailable")
+        );
+    }
+
+    /// A record from before the macOS boot identity was the boot session UUID
+    /// cannot say which boot it was: its live process is unknown, not gone,
+    /// and only the table proves it gone.
+    #[test]
+    fn a_legacy_macos_boot_identity_proves_nothing_live() {
+        use crate::proctable::table_from_shape;
+        let id = ProcessId {
+            pid: 10,
+            start_token: "tok:10".into(),
+            boot_id: "darwin:{ sec = 1791126940, usec = 986480 }".into(),
+            uid: 1,
+        };
+        let boot = Some("darwin:38DDC5AC-4C5B-46E4-8D50-B011C58AC697");
+        let live = table_from_shape("10 1 10 S tok:10\n");
+        assert_eq!(
+            id.liveness(&live, boot),
+            Liveness::Unknown("boot-identity-legacy")
+        );
+        let reused = table_from_shape("10 1 10 S tok:other\n");
+        assert_eq!(id.liveness(&reused, boot), Liveness::Gone);
+        let zombie = table_from_shape("10 1 10 Z tok:10\n");
+        assert_eq!(id.liveness(&zombie, boot), Liveness::Gone);
+        let absent = table_from_shape("11 1 11 S\n");
+        assert_eq!(id.liveness(&absent, boot), Liveness::Gone);
+        assert!(matches!(
+            id.liveness(&absent.marked_incomplete(), boot),
+            Liveness::Unknown(_)
+        ));
+        assert_eq!(
+            id.liveness(&live, None),
             Liveness::Unknown("boot-identity-unavailable")
         );
     }
