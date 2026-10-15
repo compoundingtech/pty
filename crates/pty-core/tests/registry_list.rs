@@ -1041,6 +1041,9 @@ fn retirement_artifacts(name: &str) -> Vec<std::path::PathBuf> {
     ]
 }
 
+// This matrix requires stable current-boot evidence. macOS still needs #147;
+// the calendar-only preservation regression below remains platform-independent.
+#[cfg(target_os = "linux")]
 #[test]
 fn startup_retirement_removes_stale_exited_history_but_not_live_unknown_or_own_name() {
     let dir = strict_root();
@@ -1061,7 +1064,7 @@ fn startup_retirement_removes_stale_exited_history_but_not_live_unknown_or_own_n
             let mut record = stale.clone();
             if name.starts_with("gone") {
                 record.daemon_pid = Some(DEAD_PID);
-                record.daemon_boot_id = None;
+                record.daemon_boot_id = Some("previous-boot".into());
             }
             seed_retirement_record(name, &record);
         }
