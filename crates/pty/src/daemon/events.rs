@@ -33,6 +33,11 @@ impl Daemon {
                 ),
                 TerminalEvent::FocusRequest => Event::focus_request(&self.name),
                 TerminalEvent::CursorVisible => Event::cursor_visible(&self.name),
+                // Paste events belong to the attached client that answers
+                // them, never to the session's event log.
+                TerminalEvent::EnhancedPasteMode(_) | TerminalEvent::EnhancedPasteRead(_) => {
+                    continue;
+                }
             };
             self.events.append(event);
         }

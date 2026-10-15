@@ -158,7 +158,7 @@ fn tree_snapshot(
     let Some(root) = by_pid.get(&root_pid) else {
         return Err("child-identity-unavailable".to_string());
     };
-    if root.is_zombie() || root.identity.as_ref() != Some(root_identity) {
+    if root.is_zombie() || root.is_exiting() || root.identity.as_ref() != Some(root_identity) {
         return Err("child-identity-unavailable".to_string());
     }
     let mut queue = VecDeque::from([root_pid]);

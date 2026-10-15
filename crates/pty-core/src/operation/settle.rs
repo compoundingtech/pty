@@ -15,8 +15,8 @@ use serde_json::{Map, Value, json};
 
 use super::envelope::operation_digest;
 use super::record::{
-    Cause, Decision, Liveness, OperationLock, OperationRecord, OperationStore, ProcessId,
-    Retirement, RetirementPhase, State, Writer, WriterRole,
+    AFTER_EXIT_CAP, Cause, Decision, Liveness, OperationLock, OperationRecord, OperationStore,
+    ProcessId, Retirement, RetirementPhase, State, Writer, WriterRole,
 };
 use crate::proctable::ProcTable;
 use crate::proctable::argv::{ArgvRow, ArgvScan, scan_argv};
@@ -648,6 +648,11 @@ pub struct RetireRefusal {
 /// the recorded process. Where it cannot be pinned safely nothing is sent,
 /// and the child is reported unknown. A held child never forks, so there is
 /// no group to signal.
+///
+/// Its exit must be observed on the pin, and then the zombie seen: the table
+/// is read again for at most [`AFTER_EXIT_CAP`] until it shows one, since on
+/// macOS it says the process is still exiting for a moment after the event.
+/// A process still exiting after that is unknown, never gone.
 fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if id.liveness_now(boot) != Liveness::Live {
         return id.liveness_now(boot);
@@ -663,7 +668,7 @@ fn kill_recorded(id: &ProcessId, boot: Option<&str>) -> Liveness {
     if !pinned.wait_exit(Duration::from_secs(5)) {
         return Liveness::Live;
     }
-    id.liveness_now(boot)
+    id.liveness_after_exit(boot, AFTER_EXIT_CAP)
 }
 
 /// `pty operation retire`: retire an operation whose writer and every
@@ -911,6 +916,29 @@ fn unwind_row(root: &Path, record: &OperationRecord) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A recorded child killed through its pin is gone once its exit is
+    /// observed**, whatever the process table says a moment later. On macOS
+    /// the table said running for a while after the exit, and recovery used
+    /// to read it again and record the child live.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_recorded_child_killed_through_its_pin_is_gone() {
+        let boot = crate::boot::read_boot_identity();
+        for round in 0..200 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let id = ProcessId::of(child.id()).unwrap();
+            assert_eq!(
+                kill_recorded(&id, boot.as_deref()),
+                Liveness::Gone,
+                "round {round}"
+            );
+            assert!(!child.wait().unwrap().success(), "round {round}: killed");
+        }
+    }
 
     fn argv(text: &str) -> Vec<String> {
         text.split(' ').map(str::to_string).collect()
