@@ -90,3 +90,37 @@ ST_AGENT and ST_ROOT, so the new process can use its own provenance file. \
 Explicit persisted --env values remain unchanged. Remove this entry when \
 Node removes the same ambient trace path on restart.
 """
+
+[[divergence]]
+test = "list_liveness_budget::eperm_on_kill_zero_does_not_prove_daemon_identity"
+side = "node"
+kind = "intended"
+reason = """
+PTY.REG-R09 and decision 0010 separate display status from owner identity. \
+An unproven live PID remains running but must carry identity=unknown; EPERM \
+from kill-zero cannot grant Match or signal authority. The Node reference \
+does not expose this independent identity field. The shared case deliberately \
+requires the Rust contract rather than accepting PID existence as identity.
+"""
+
+[[divergence]]
+test = "list_liveness_budget::permission_denied_fleet_without_identity_is_listed_in_name_order"
+side = "node"
+kind = "intended"
+reason = """
+The shared case retains name ordering and requires running with identity=unknown \
+for every unproven PID, as specified by PTY.REG-R09 and decision 0010. \
+The Node reference has no independent identity field. Keep this divergence \
+until it exposes Unknown separately without treating missing evidence as death.
+"""
+
+[[divergence]]
+test = "list_liveness_budget::unreachable_fleet_waits_one_shared_deadline"
+side = "node"
+kind = "intended"
+reason = """
+The shared case retains its name-order and one-deadline timing assertions, \
+and requires unidentified socket rows to carry running with identity=unknown \
+under PTY.REG-R09 and decision 0010. The Node reference does not expose this \
+identity field. Socket reachability never proves owner identity.
+"""

@@ -41,6 +41,8 @@ refuses removal. Legacy metadata with no named PID and no PID/socket companion
 is Gone and can be removed; a malformed or unreadable companion is not absence.
 Listing, removal, GC, name replacement and exact-generation evidence all use
 the same companion-aware identity check for these legacy records.
+The `up`, `down` and `restart` CLIs report "daemon identity is unknown" instead
+of calling stop for such a row; the lower-level stop refusal vocabulary is unchanged.
 
 **The existing `Exact` abstraction pins the owner.** The client uses
 `operation::exact::Exact` rather than a separate daemon pinning implementation.

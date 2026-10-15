@@ -30,6 +30,11 @@ pub fn run(args: &[String]) -> CliResult {
             continue;
         };
         let label = label_of(existing_session);
+        if existing_session.identity == registry::DaemonIdentityCheck::Unknown {
+            eprintln!("  \u{2717} {label}: daemon identity is unknown.");
+            failed = true;
+            continue;
+        }
         if existing_session.is_running() {
             let generation = existing_session
                 .metadata

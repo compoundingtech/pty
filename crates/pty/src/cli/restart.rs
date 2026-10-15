@@ -85,6 +85,10 @@ pub fn run(args: &[String]) -> CliResult {
         eprintln!("Session \"{name}\" not found.");
         return Ok(1);
     };
+    if session.identity == registry::DaemonIdentityCheck::Unknown {
+        eprintln!("pty restart: Session \"{name}\" daemon identity is unknown.");
+        return Ok(1);
+    }
     let Some(meta) = session.metadata.clone() else {
         eprintln!("Session \"{name}\" has no metadata — cannot restart.");
         return Ok(1);
