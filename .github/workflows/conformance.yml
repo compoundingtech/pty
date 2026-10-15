@@ -1,6 +1,10 @@
 # Generated file - DO NOT EDIT
 # Source: conformance.yml.genie.ts
 
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 name: Conformance
 
 on:
@@ -14,7 +18,10 @@ env:
 jobs:
   shard:
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-linux-x86-64;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -130,7 +137,10 @@ jobs:
     needs: shard
     if: always()
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-linux-x86-64;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

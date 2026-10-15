@@ -1,9 +1,8 @@
 import {
-  defaultActionlintConfig,
   githubWorkflow,
   githubWorkflowEvent,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner, macosRunner, nixSetupSteps } from './shared.ts'
+import { defaultActionlintConfig, linuxRunner, macosRunner, nixSetupSteps } from './shared.ts'
 
 // q11 approves Namespace release runners, with both platforms verified through
 // workflow_dispatch before publishing. Debian 12 still sets the Linux glibc

@@ -1,6 +1,10 @@
 # Generated file - DO NOT EDIT
 # Source: private-names.yml.genie.ts
 
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 name: Private names
 
 on:
@@ -12,7 +16,10 @@ jobs:
   check:
     name: Private names
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-linux-x86-64;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

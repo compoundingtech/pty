@@ -1,13 +1,13 @@
 import {
-  defaultActionlintConfig,
   githubWorkflow,
   githubWorkflowEvent,
   nixDevelopStep,
   plainFlakeJob,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner, nixSetupOptions } from './shared.ts'
+import { defaultActionlintConfig, pullRequestConcurrency, linuxRunner, nixSetupOptions } from './shared.ts'
 
 export default githubWorkflow({
+  concurrency: pullRequestConcurrency,
   name: 'Genie',
   on: {
     pull_request: githubWorkflowEvent.all,
@@ -25,7 +25,7 @@ export default githubWorkflow({
       step: nixDevelopStep({
         name: 'Check generated files',
         flake: '.#genie',
-        command: ['genie', '--check'],
+        command: ['sh', '-c', 'genie --check && python3 scripts/check-workflow-policy.py'],
       }),
     }),
   },

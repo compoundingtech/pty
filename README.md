@@ -209,6 +209,31 @@ inside Debian 12 to preserve the glibc floor, and macOS still uses the pinned Ni
 SDK before relocation and ad-hoc signing. This does not provide macOS coverage
 for each pull request.
 
+Namespace capacity is shared across projects with the following static priorities
+(lower numbers run first among waiting jobs):
+
+| Priority | Work |
+| --- | --- |
+| 1 | effect-utils delivery |
+| 2 | Smalltalk, PTY and tooling delivery |
+| 3 | LiveStore delivery |
+| 4 | effect-utils background |
+| 5 | Smalltalk and tooling background |
+| 6 | LiveStore background |
+
+Delivery includes required checks and prerequisites, main verification, releases,
+and deployment outputs. Background means optional benchmarks, advisory reports,
+and maintenance; scheduled verification remains delivery work. All current PTY
+Namespace jobs are delivery work at priority 2 on both platforms. The Test job's
+report-only formatting and clippy share the required workspace-test job and keep
+its delivery priority. This policy does not reserve capacity or preempt running
+jobs; runner profiles, run affinity and caches stay unchanged.
+
+PR workflows cancel superseded runs of the same PR and workflow. Separate PRs,
+main pushes, manual runs and tag releases retain independent runs. The generator
+freshness job checks the emitted runner labels and concurrency policy with
+`python3 scripts/check-workflow-policy.py`.
+
 The release workflow's manual dispatch builds and verifies both platforms
 without publishing, even when dispatched against a tag. Only a pushed `v*` tag
 can run the publishing job; dispatch jobs have read-only repository permissions.

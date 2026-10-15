@@ -1,11 +1,11 @@
 import {
-  defaultActionlintConfig,
   githubWorkflow,
   githubWorkflowEvent,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner } from './shared.ts'
+import { defaultActionlintConfig, pullRequestConcurrency, linuxRunner } from './shared.ts'
 
 export default githubWorkflow({
+  concurrency: pullRequestConcurrency,
   name: 'Private names',
   on: {
     pull_request: githubWorkflowEvent.all,

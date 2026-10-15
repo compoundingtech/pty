@@ -1,11 +1,11 @@
 import {
-  defaultActionlintConfig,
   githubWorkflow,
   githubWorkflowEvent,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner, nixSetupSteps } from './shared.ts'
+import { defaultActionlintConfig, pullRequestConcurrency, linuxRunner, nixSetupSteps } from './shared.ts'
 
 export default githubWorkflow({
+  concurrency: pullRequestConcurrency,
   name: "Conformance",
   on: {
     pull_request: githubWorkflowEvent.all,

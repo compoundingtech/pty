@@ -17,7 +17,10 @@ env:
 jobs:
   linux-x86_64:
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-linux-x86-64;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     container: "debian:12"
     timeout-minutes: 60
     steps:
@@ -90,7 +93,10 @@ jobs:
           if-no-files-found: error
   macos-arm64:
     runs-on:
-      [namespace-profile-macos-arm64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-macos-arm64;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
