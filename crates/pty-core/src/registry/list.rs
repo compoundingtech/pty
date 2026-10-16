@@ -275,6 +275,12 @@ fn read_session_pid_at(path: &Path) -> Option<i32> {
     parse_leading_int(content.trim())
 }
 
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    pub(crate) static PROCESS_START_TOKEN_SPAWNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The token that proves an OS process identity: Linux `linux:<starttime>`
 /// (`/proc/<pid>/stat` field 22), macOS `darwin:<ps -o lstart=>`.
 ///
@@ -290,6 +296,8 @@ pub fn read_process_start_token(pid: i32) -> Option<String> {
         return Some(format!("linux:{start_time}"));
     }
     if cfg!(target_os = "macos") {
+        #[cfg(all(test, target_os = "macos"))]
+        PROCESS_START_TOKEN_SPAWNS.with(|count| count.set(count.get() + 1));
         // **THE LAST `ps` IN THIS CODEBASE, AND IT STAYS.**
         //
         // Everything else moved to `proctable`, which reads `/proc` on Linux
@@ -495,7 +503,17 @@ pub fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 ///
 /// node: src/sessions.ts:2129-2175
 pub fn probe_sockets_within_budget(paths: &[PathBuf], budget: Duration) -> HashMap<PathBuf, bool> {
-    probe_socket_outcomes(paths, budget, |result| result.is_ok())
+    probe_socket_results(paths, budget)
+        .into_iter()
+        .map(|(path, result)| (path, result.is_ok()))
+        .collect()
+}
+
+pub(crate) fn probe_socket_results(
+    paths: &[PathBuf],
+    budget: Duration,
+) -> HashMap<PathBuf, std::io::Result<()>> {
+    probe_socket_outcomes(paths, budget, std::convert::identity)
 }
 
 fn probe_socket_outcomes<T>(

@@ -109,14 +109,47 @@ impl<T> Answer<T> {
 /// the same run.
 ///
 /// **This is deliberately not the same type as the registry's
-/// `recovery.processStartToken`, and it must never be compared with it.** That
-/// token is written into session metadata, read by the Node tool from the same
-/// registry, and its exact text is a contract between the two. This one is
-/// private to a single command's lifetime, so it is free to be whatever is
-/// cheapest to read. Making them different types is what stops the two from
-/// meeting.
+/// `recovery.processStartToken`.** That token is written into session metadata
+/// and its exact text is a cross-runtime contract. Native identities are
+/// compared directly only with another native read; the narrow
+/// [`LiveIdentity::matches_registry_start_token`] boundary normalizes the
+/// legacy representation without spawning a subprocess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveIdentity(String);
+
+#[cfg(target_os = "macos")]
+fn matches_darwin_registry_tm(token: &str, local: &libc::tm) -> bool {
+    use std::io::Write as _;
+
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Some(weekday) = WEEKDAYS.get(local.tm_wday as usize) else {
+        return false;
+    };
+    let Some(month) = MONTHS.get(local.tm_mon as usize) else {
+        return false;
+    };
+    let mut output = [0u8; 64];
+    let capacity = output.len();
+    let mut remaining = &mut output[..];
+    if write!(
+        remaining,
+        "darwin:{weekday} {month} {:>2} {:02}:{:02}:{:02} {}",
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec,
+        local.tm_year + 1900
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let written = capacity - remaining.len();
+    token.as_bytes() == &output[..written]
+}
 
 impl LiveIdentity {
     pub fn new(value: impl Into<String>) -> Self {
@@ -126,9 +159,39 @@ impl LiveIdentity {
     /// The text, for a record that is only ever compared with another
     /// reading from this same module on the same boot. The launch-operation
     /// record stores it next to the boot identity for exactly that reason;
-    /// it is still never compared with `recovery.processStartToken`.
+    /// registry-token compatibility goes only through the normalizing method.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Compare the native birth identity with the registry's legacy token
+    /// without spawning `ps`. Linux tokens are already `linux:<starttime>`.
+    /// macOS registry tokens keep English `ps -o lstart=` text, so normalize
+    /// the native `proc_pidinfo` timestamp with fixed names and spacing;
+    /// `localtime_r` intentionally preserves the process timezone.
+    pub(crate) fn matches_registry_start_token(&self, token: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(raw) = self.0.strip_prefix("darwin:") else {
+                return false;
+            };
+            let Some((seconds, _micros)) = raw.split_once('.') else {
+                return false;
+            };
+            let Ok(seconds) = seconds.parse::<libc::time_t>() else {
+                return false;
+            };
+            let mut local: libc::tm = unsafe { std::mem::zeroed() };
+            // SAFETY: both pointers are valid for the duration of the call.
+            if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
+                return false;
+            }
+            matches_darwin_registry_tm(token, &local)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.0 == token
+        }
     }
 }
 
@@ -1221,6 +1284,21 @@ mod tests {
     fn me() -> i32 {
         std::process::id() as i32
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_registry_identity_has_fixed_english_names_and_spacing() {
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        local.tm_wday = 1;
+        local.tm_mon = 0;
+        local.tm_mday = 5;
+        local.tm_hour = 4;
+        local.tm_year = 126;
+        assert!(matches_darwin_registry_tm(
+            "darwin:Mon Jan  5 04:00:00 2026",
+            &local
+        ));
+    }
+
 
     // ---- the truncation guard -------------------------------------------
 
