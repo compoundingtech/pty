@@ -19,6 +19,7 @@ pub mod activity;
 pub mod atomic;
 pub mod cleanup;
 pub mod evidence;
+pub mod keyed;
 pub mod list;
 pub mod lock;
 pub mod metadata;
@@ -42,6 +43,10 @@ pub use evidence::{
     EvidenceStream, EvidenceUnavailableReason, RemoveSessionGenerationResult, SessionExitEvidence,
     SessionExitEvidenceResult, SessionExitEvidenceTail, SessionExitStatus,
     get_session_exit_evidence, remove_session_generation,
+};
+pub use keyed::{
+    KeyedSession, KeyedSessionError, KeyedSessionErrorKind, KeyedSessionOptions,
+    observe_session_in,
 };
 pub use list::{
     DEFAULT_SOCKET_PROBE_BUDGET, Inventory, InventoryError, InventoryErrorKind, ListOptions,

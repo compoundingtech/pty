@@ -163,6 +163,18 @@ pub fn socket_path(name: &str) -> PathBuf {
     socket_path_in(&session_dir(), name)
 }
 
+pub(crate) fn socket_filenames(name: &str) -> (String, String) {
+    let readable = format!("{name}.sock");
+    let digest = Sha256::digest(name.as_bytes());
+    let mut bounded = String::from("@");
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        write!(bounded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    bounded.push_str(".sock");
+    (readable, bounded)
+}
+
 /// Preserve a published socket's filename across differently spelled registry
 /// roots. For a new session, preserve a readable address when it fits.
 /// `@` cannot occur in an id, so the digest namespace cannot alias a readable
@@ -170,15 +182,9 @@ pub fn socket_path(name: &str) -> PathBuf {
 pub fn socket_path_in(root: &Path, name: &str) -> PathBuf {
     use std::os::unix::fs::FileTypeExt;
 
-    let readable = root.join(format!("{name}.sock"));
-    let digest = Sha256::digest(name.as_bytes());
-    let mut filename = String::from("@");
-    for byte in &digest[..16] {
-        use std::fmt::Write;
-        write!(filename, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    filename.push_str(".sock");
-    let bounded = root.join(&filename);
+    let (readable, bounded) = socket_filenames(name);
+    let readable = root.join(readable);
+    let bounded = root.join(bounded);
     // A registry can be reached through both a short path and a longer
     // symlink. The listener, not the caller's root spelling, owns its basename.
     // Ignore regular-file and symlink debris; never follow it as a socket.

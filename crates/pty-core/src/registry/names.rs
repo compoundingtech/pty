@@ -16,7 +16,7 @@ fn is_name_char(c: char) -> bool {
 /// Node's order.
 ///
 /// node: src/sessions.ts:35-64
-pub fn validate_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_name_lexical(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Session name cannot be empty.".to_string());
     }
@@ -38,6 +38,11 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.len() > 209 {
         return Err("Session name too long for registry sidecars (max 209 characters).".to_string());
     }
+    Ok(())
+}
+
+pub fn validate_name(name: &str) -> Result<(), String> {
+    validate_name_lexical(name)?;
     let byte_len = socket_path(name).as_os_str().len();
     if byte_len > SUN_PATH_MAX {
         let overflow = byte_len - SUN_PATH_MAX;
