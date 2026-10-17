@@ -490,6 +490,18 @@ fn spawn_prepared_daemon(
     params: SpawnParams,
 ) -> Result<SpawnedDaemon, SpawnError> {
     let name = params.name.clone();
+    if let Some(binding) = &params.publication_binding {
+        // Durable revocation is monotonic: this deny-only preflight needs no
+        // publication lock. Report the revoked intent before a live survivor
+        // can mask the daemon's refusal as AlreadyPublished. A missing record
+        // is not admission; the daemon still checks under its creation claim.
+        if registry::revocation::read(&name, &binding.operation)
+            .map_err(|error| SpawnError::Io(error.to_string()))?
+            .is_some()
+        {
+            return Err(SpawnError::Io("operation-revoked".into()));
+        }
+    }
     let timeout = params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT);
     let (mut watch, pid) = start_daemon_process(daemon_executable, &params, None)?;
     let outcome = wait_for_publication(&name, pid, timeout, &mut watch);

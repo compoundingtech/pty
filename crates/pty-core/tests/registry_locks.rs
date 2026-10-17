@@ -502,6 +502,33 @@ fn delegated_publication_transfer_survives_old_owner_release() {
 }
 
 #[test]
+fn delegated_publication_claim_can_return_to_its_original_coordinator() {
+    use std::io::{Read, Write};
+
+    let root = root();
+    let name = unique_name("pub-delegated-return");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let pid = owner.child.id();
+    let pin = registry::lock::pin_publication(&name, Some(pid as i32)).unwrap();
+    assert_eq!(pin.delegated_owner_pid(), Some(pid));
+    let claim = pin.into_daemon_claim().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+    claim.hand_over(pid).expect("restore coordinator after child spawn");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), pid.to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "coordinator still owns the name");
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    owner.control().write_all(b"R").unwrap();
+    let mut messages = [0; 2];
+    owner.control().read_exact(&mut messages).unwrap();
+    assert_eq!(messages, *b"AD");
+    assert!(owner.child.wait().unwrap().success());
+    assert!(!path.exists(), "original coordinator can release its restored claim");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after coordinator release");
+}
+
+#[test]
 fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
     use std::os::unix::fs::MetadataExt;
     use pty_core::registry::revocation::{self, PublicationBinding};

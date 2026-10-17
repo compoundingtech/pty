@@ -171,9 +171,15 @@ pub struct PublicationLock {
     _inode: std::fs::File,
     _claim: Option<LockGuard>,
     path: PathBuf,
+    delegated_owner_pid: Option<u32>,
 }
 
 impl PublicationLock {
+    /// The validated external owner to restore after the child has spawned.
+    pub fn delegated_owner_pid(&self) -> Option<u32> {
+        self.delegated_owner_pid
+    }
+
     /// Transfer the pinned claim to this daemon before it forks. The old
     /// launcher's expected-owner release cannot remove the new PID claim.
     /// No open lock descriptor survives into the ordinary child's fork.
@@ -238,7 +244,12 @@ pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Res
             std::io::ErrorKind::PermissionDenied, "publication creation ownership changed",
         ));
     }
-    Ok(PublicationLock { _inode: inode, _claim: claim, path })
+    Ok(PublicationLock {
+        _inode: inode,
+        _claim: claim,
+        path,
+        delegated_owner_pid: existing_owner.filter(|pid| *pid != me).map(|pid| pid as u32),
+    })
 }
 
 fn holder_is_alive(file: &std::fs::File) -> bool {

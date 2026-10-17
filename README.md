@@ -512,6 +512,11 @@ hold descriptor-free daemon-owned claims across `fork`: a child stopped before
 descriptor cleanup cannot retain a dead daemon's flock or prevent recovery.
 The earlier delegated publication boundary still pins its inode while a separate
 launcher may die; after handover, daemon death leaves no surviving publisher.
+After ordinary child spawn returns, a still-live delegated coordinator receives
+its claim back, preserving its original PID and pathname until that coordinator
+releases it. A revoked managed binding is rejected before spawning a publisher,
+so a live survivor cannot mask that refusal as an already-running error; this
+deny-only preflight does not replace the final serialized publication check.
 
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,

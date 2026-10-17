@@ -378,6 +378,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     // Publish while the delegated claim is pinned, then atomically hand it
     // to this daemon. No flock descriptor may cross the ordinary child fork:
     // a stopped pre-exec child must not prevent recovery after daemon death.
+    let delegated_owner = publication_lock.delegated_owner_pid();
     let creation_claim = publication_lock
         .into_daemon_claim()
         .map_err(|error| format!("Failed to take daemon creation claim: {error}"))?;
@@ -416,7 +417,14 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
-    drop(creation_claim);
+    if let Some(owner) = delegated_owner.filter(|pid| registry::pid_alive(*pid as i32)) {
+        // A coordinating parent owns its claim beyond successful publication.
+        // Restore it only after fork has returned, never as an inherited fd.
+        creation_claim.hand_over(owner)
+            .map_err(|error| format!("Failed to restore delegated creation claim: {error}"))?;
+    } else {
+        drop(creation_claim);
+    }
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
