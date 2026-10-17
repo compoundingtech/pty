@@ -471,7 +471,9 @@ against the actual enrolled root before publication. Managed metadata carries
 tags are not substitutes for this immutable launch provenance. The
 `st3.start-operation` tag is required and must exactly match the binding's
 operation. Recreating an ended managed row requires an explicit new binding;
-an ordinary unbound `run` cannot inherit its provenance for a different task.
+an ordinary unbound `run` or library launch cannot overwrite its retained
+provenance or events. The common final creation-claim admission enforces this
+rule before any publication effect, regardless of the caller.
 
 Managed restart, picker restart, recreation and permanent GC prepare the publisher
 before predecessor cleanup: they hold its native executable open, probe

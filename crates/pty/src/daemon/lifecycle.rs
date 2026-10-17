@@ -520,6 +520,13 @@ pub(crate) fn prepare_publication(
     if observed.entries.iter().any(|session| session.is_running()) {
         return Err(format!("Session id \"{}\" is already in use.", cfg.name));
     }
+    if cfg.publication_binding.is_none()
+        && observed.entries.iter().any(|session| {
+            session.metadata.as_ref().is_some_and(|metadata| metadata.publication_binding.is_some())
+        })
+    {
+        return Err("recreating a managed session requires a new explicit publication binding".into());
+    }
     Ok(guard)
 }
 

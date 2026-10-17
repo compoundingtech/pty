@@ -381,6 +381,69 @@ fn library_managed_launch_rejects_revoked_binding_without_touching_live_survivor
 }
 
 #[test]
+fn library_unbound_recreation_preserves_ended_managed_provenance_until_explicit_replacement() {
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let name = unique_name("library-managed-recreation");
+    let root = registry::revocation::root_id().unwrap();
+    let old_marker = ROOT.join(format!("{name}-old-ran"));
+    let unbound_marker = ROOT.join(format!("{name}-unbound-ran"));
+    let replacement_marker = ROOT.join(format!("{name}-replacement-ran"));
+    let old = managed_params(&name, "ended-library-start", &"a".repeat(64), &root, &old_marker);
+    registry::revocation::install(
+        &name, old.publication_binding.as_ref().unwrap(), &"b".repeat(64), &root,
+    ).unwrap();
+    let metadata = SessionMetadata {
+        generation: Some("retained-managed-generation".into()),
+        daemon_pid: Some(DEAD_PID),
+        command: old.command.clone(),
+        args: old.args.clone(),
+        display_command: old.display_command.clone(),
+        cwd: old.cwd.clone(),
+        created_at: registry::now_iso8601(),
+        tags: Some(old.tags.clone()),
+        publication_binding: old.publication_binding.clone(),
+        publication_root_id: old.publication_root_id.clone(),
+        publication_capability: Some(1),
+        ..Default::default()
+    };
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    registry::write_pid(&name, DEAD_PID as u32).unwrap();
+    std::fs::write(registry::events_path(&name), b"retained managed predecessor evidence\n").unwrap();
+    let before = artifact_snapshot(&name);
+    let mut unbound = SpawnParams::new(&name, "/bin/sh", &[
+        "-c".into(), "printf ran > \"$1\"; exec cat".into(),
+        "sh".into(), unbound_marker.to_string_lossy().into_owned(),
+    ]);
+    unbound.cwd = ROOT.to_string_lossy().into_owned();
+    let refused = spawn_daemon(Path::new(pty_bin()), unbound).unwrap_err();
+    assert!(refused.to_string().contains("requires a new explicit publication binding"), "{refused}");
+    assert_eq!(artifact_snapshot(&name), before);
+    let retained = registry::read_metadata(&name).unwrap();
+    assert_eq!(retained.publication_binding, old.publication_binding);
+    assert_eq!(retained.publication_root_id.as_deref(), Some(root.as_str()));
+    assert_eq!(retained.publication_capability, Some(1));
+    assert!(!unbound_marker.exists());
+    assert!(!old_marker.exists());
+    assert!(!registry::socket_path(&name).exists());
+
+    let replacement = managed_params(
+        &name, "replacement-library-start", &"c".repeat(64), &root, &replacement_marker,
+    );
+    let started = spawn_daemon(Path::new(pty_bin()), replacement.clone()).unwrap();
+    let _cleanup = DaemonCleanup { name: &name, started: &started };
+    wait_for_marker(&replacement_marker);
+    let published = registry::read_metadata(&name).unwrap();
+    assert_ne!(published.generation, metadata.generation);
+    assert_eq!(published.publication_binding, replacement.publication_binding);
+    assert_eq!(published.publication_root_id.as_deref(), Some(root.as_str()));
+    assert_eq!(published.publication_capability, Some(1));
+    assert!(registry::revocation::read(&name, "ended-library-start").unwrap().is_some());
+    assert!(!unbound_marker.exists());
+}
+
+#[test]
 fn library_gc_retains_revoked_desired_state_and_respawns_distinct_managed_binding() {
     skip_without_a_real_machine!();
     let _serial = serial();
