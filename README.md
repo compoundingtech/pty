@@ -476,11 +476,19 @@ provenance or events. The common final creation-claim admission enforces this
 rule before any publication effect, regardless of the caller.
 
 Managed restart, picker restart, recreation and permanent GC prepare the publisher
-before predecessor cleanup: they hold its native executable open, probe
-`publication-revocation` v1 through that exact descriptor, and execute the same
-image. An unsupported/downgraded publisher or script wrapper refuses without
-changing the predecessor; atomic install-path replacement cannot switch the
-verified image. Library callers preparing their own cleanup use
+before predecessor cleanup. Linux probes and executes its pinned `/proc/self/fd`
+image. Darwin cannot execute `/dev/fd` vnodes, so it probes and executes a private
+`0500` snapshot in the registry's `0700` `.publisher-images` cache. The cache key
+includes the image digest and source quarantine provenance; reuse verifies the
+bytes and permissions without rewriting the image. This avoids a new
+Gatekeeper/XProtect first-exec assessment for every restart. Native copying
+preserves embedded code signatures and extended attributes, including quarantine;
+admission neither strips quarantine nor re-signs the image. Copies remain cached
+for subsequent launches rather than being deleted after spawn.
+An unsupported/downgraded publisher or script wrapper refuses without changing
+the predecessor; atomic install-path replacement or unlink cannot switch the
+verified image. These guarantees exclude hostile same-UID cache mutation.
+Library callers preparing their own cleanup use
 `pty_lifecycle::prepare_daemon(executable, &params)` and retain the returned
 `PreparedDaemon` through its `spawn(params)` call. Publisher images must still
 come from the trusted immutable deployment; capability output is not executable

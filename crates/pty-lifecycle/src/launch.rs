@@ -346,6 +346,10 @@ impl ChildWatch {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "macos_publisher.rs"]
+mod macos_publisher;
+
 /// A selected publisher held open from capability admission through exec.
 /// Prepare this before deleting a managed predecessor; never probe one path
 /// and subsequently execute its potentially downgraded replacement.
@@ -364,8 +368,9 @@ impl PreparedDaemon {
 }
 
 /// Legacy launches keep their existing executable selection. Managed launches
-/// execute the same open native image that answered the capability handshake.
-/// Descriptor paths also retain an unlinked image after an atomic downgrade.
+/// probe and execute the same image: an open descriptor on Linux, or a verified
+/// private content-addressed snapshot on Darwin. Neither reopens the selected
+/// pathname after admission, including after replacement or unlink.
 pub fn prepare_daemon(
     executable: &std::path::Path,
     params: &SpawnParams,
@@ -387,19 +392,24 @@ pub fn prepare_daemon(
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 || !native {
         return Err(SpawnError::Io("managed publisher must be a native executable, not a wrapper".into()));
     }
-    // Keep the image clear of the config/operation descriptors. CLOEXEC closes
-    // it only after the kernel has opened this exact image for exec.
-    // SAFETY: image owns a valid descriptor; fcntl creates a distinct descriptor.
-    let fd = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
-    if fd < 0 {
-        return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
-    }
-    // SAFETY: fcntl returned a newly owned descriptor.
-    let image = unsafe { File::from_raw_fd(fd) };
     #[cfg(target_os = "linux")]
-    let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
-    #[cfg(not(target_os = "linux"))]
-    let pinned = std::path::PathBuf::from(format!("/dev/fd/{fd}"));
+    let (pinned, image) = {
+        // CLOEXEC closes the pin only after the kernel opens this exact image.
+        // Keep it clear of the config/operation descriptors.
+        let fd = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+        if fd < 0 {
+            return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
+        }
+        // SAFETY: fcntl returned a newly owned descriptor.
+        (std::path::PathBuf::from(format!("/proc/self/fd/{fd}")), unsafe { File::from_raw_fd(fd) })
+    };
+    #[cfg(target_os = "macos")]
+    let (pinned, image) = macos_publisher::pin(image)
+        .map_err(|error| SpawnError::Io(format!("cannot snapshot managed publisher: {error}")))?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let pinned: std::path::PathBuf = return Err(SpawnError::Io(
+        "managed publisher image pinning is unsupported on this platform".into(),
+    ));
     let mut probe = Command::new(&pinned).args(["capabilities", "--json"])
         // Old PTYs can forward an unknown verb to pty-capabilities on PATH.
         // Only this image's built-in implementation may establish capability.
