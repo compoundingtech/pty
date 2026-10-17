@@ -490,6 +490,12 @@ impl Worker {
                                 creation_lock: &publication_lock,
                             })
                         });
+                    // Completion hands the claim back to the actor, which
+                    // releases it nonblocking before issuing ForkChild.
+                    // End the worker's publication critical section first:
+                    // otherwise that release races this still-held pin and
+                    // can leave our live-PID claim behind after pin cleanup.
+                    drop(publication_lock);
                     match result {
                         Ok((listener, _metadata)) => {
                             published = Some(Published {

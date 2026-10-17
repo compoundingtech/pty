@@ -519,7 +519,9 @@ binding digest. Binding and operation-tag disagreement is also refused.
 `None`/`None` retains ordinary unmanaged publication behavior; it is not proof
 of capable managed launch.
 
-Operation-mode child creation rechecks the fence and exact published generation
+Operation-mode publication drops its inode pin before reporting completion to
+the actor, so the actor can release the creation claim before handing off to
+child creation. Child creation rechecks the fence and exact published generation
 under a fresh creation claim owned by the daemon itself. Ordinary publication
 pins the delegated launcher's inode through publication, then atomically replaces
 its owner record with the daemon's PID before spawning the child. The launcher's
