@@ -107,6 +107,12 @@ pub(super) fn refresh(
     if quarantine(image)?.as_deref() == expected {
         return Ok(None);
     }
+    if expected.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot discard quarantine added after publisher admission",
+        ));
+    }
     let parent = path.parent().ok_or_else(|| io::Error::other("publisher image has no cache"))?;
     snapshot(image.try_clone()?, parent, expected, false).map(Some)
 }

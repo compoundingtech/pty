@@ -362,26 +362,26 @@ pub struct PreparedDaemon {
 
 impl PreparedDaemon {
     pub fn spawn(self, params: SpawnParams) -> Result<SpawnedDaemon, SpawnError> {
-        #[cfg(target_os = "macos")]
-        let mut prepared = self;
-        #[cfg(not(target_os = "macos"))]
-        let prepared = self;
-        if params.publication_binding.is_some() && prepared._image.is_none() {
+        spawn_prepared_daemon(self, params)
+    }
+
+    fn executable_for_spawn(&mut self, params: &SpawnParams) -> Result<&std::path::Path, SpawnError> {
+        if params.publication_binding.is_some() && self._image.is_none() {
             return Err(SpawnError::Io("managed publisher was not verified".into()));
         }
         #[cfg(target_os = "macos")]
-        if let Some(image) = &prepared._image
+        if let Some(image) = &self._image
             && let Some((path, image)) = macos_publisher::refresh(
-                &prepared.executable, image, prepared.quarantine.as_deref(),
+                &self.executable, image, self.quarantine.as_deref(),
             ).map_err(|error| SpawnError::Io(format!("cannot refresh managed publisher policy: {error}")))?
         {
             // The capability exec may have changed the cached quarantine.
             // A fresh immutable snapshot retains the admitted bytes and raw
             // source policy without making the assessed image writable.
-            prepared.executable = path;
-            prepared._image = Some(image);
+            self.executable = path;
+            self._image = Some(image);
         }
-        spawn_prepared_daemon(&prepared.executable, params)
+        Ok(&self.executable)
     }
 }
 
@@ -521,7 +521,7 @@ pub fn spawn_daemon(
 }
 
 fn spawn_prepared_daemon(
-    daemon_executable: &std::path::Path,
+    mut publisher: PreparedDaemon,
     params: SpawnParams,
 ) -> Result<SpawnedDaemon, SpawnError> {
     let name = params.name.clone();
@@ -538,7 +538,7 @@ fn spawn_prepared_daemon(
         }
     }
     let timeout = params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT);
-    let (mut watch, pid) = start_daemon_process(daemon_executable, &params, None)?;
+    let (mut watch, pid) = start_daemon_process(&mut publisher, &params, None)?;
     let outcome = wait_for_publication(&name, pid, timeout, &mut watch);
     if let Err(err) = &outcome
         && !matches!(err, SpawnError::DaemonExited { .. })
@@ -633,7 +633,7 @@ pub fn spawn_gated_daemon(
     params: SpawnParams,
     operation: OperationLaunch,
 ) -> Result<GatedDaemon, SpawnError> {
-    let publisher = prepare_daemon(daemon_executable, &params)?;
+    let mut publisher = prepare_daemon(daemon_executable, &params)?;
     let mut gate = [0i32; 2];
     // Close-on-exec from creation, so no other thread's fork and exec can
     // inherit an end before it is re-homed.
@@ -655,7 +655,7 @@ pub fn spawn_gated_daemon(
     };
     // SAFETY: freshly re-homed descriptor owned here.
     let gate_write = unsafe { File::from_raw_fd(gate_write) };
-    let started = start_daemon_process(&publisher.executable, &params, Some((&operation, gate_read)));
+    let started = start_daemon_process(&mut publisher, &params, Some((&operation, gate_read)));
     // SAFETY: the parent's copy of the gate read end; the daemon has its own.
     unsafe { libc::close(gate_read) };
     let (watch, pid) = started?;
@@ -752,7 +752,7 @@ fn rehome_cloexec(fd: RawFd) -> Result<RawFd, ()> {
 /// Start the daemon process with the config on fd 3 and the readiness pipe,
 /// plus the operation descriptors when there are any.
 fn start_daemon_process(
-    daemon_executable: &std::path::Path,
+    publisher: &mut PreparedDaemon,
     params: &SpawnParams,
     operation: Option<(&OperationLaunch, RawFd)>,
 ) -> Result<(ChildWatch, u32), SpawnError> {
@@ -761,6 +761,10 @@ fn start_daemon_process(
     {
         return Err(SpawnError::EnvExclusive);
     }
+    // This is the only execution boundary for ordinary and gated launches.
+    // A prepared publisher is required, and every path rechecks final policy
+    // here before allocating launch descriptors or spawning a process.
+    let daemon_executable = publisher.executable_for_spawn(params)?;
     let config = serde_json::to_string(&config_for(params))
         .map_err(|e| SpawnError::Io(format!("cannot encode daemon config: {e}")))?;
 
@@ -1053,6 +1057,73 @@ pub fn wait_for_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gated_publisher_rechecks_quarantine_changed_after_capability_probe() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "pty-gated-policy-{}", registry::atomic::random_hex16()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let cache = root.join("cache");
+        std::fs::DirBuilder::new().mode(0o700).create(&cache).unwrap();
+        let path = cache.join("admitted-image");
+        std::fs::copy("/usr/bin/true", &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let image = File::open(&path).unwrap();
+        let value = b"0081;00000000;pty-gated-test;";
+        // Model the post-probe state: an initially unquarantined admitted image
+        // gained quarantine during capability execution. Build that fixture
+        // before making it immutable; no production hook or writable window.
+        assert_eq!(unsafe { libc::fsetxattr(
+            image.as_raw_fd(), c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0, 0,
+        ) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut publisher = PreparedDaemon {
+            executable: path, _image: Some(image), quarantine: None,
+        };
+        let mut params = SpawnParams::new("gated-policy", "/usr/bin/true", &[]);
+        params.publication_binding = Some(registry::revocation::PublicationBinding {
+            operation: "gated-policy".into(), digest: "a".repeat(64),
+        });
+        let operation = OperationLaunch { control_fd: -1, digest: "b".repeat(64) };
+        // Deliberately invalid gate/control descriptors establish that the
+        // shared gated execution boundary checks policy before launch effects.
+        let result = start_daemon_process(&mut publisher, &params, Some((&operation, -1)));
+        assert!(matches!(&result, Err(SpawnError::Io(message))
+            if message.contains("cannot discard quarantine added after publisher admission")));
+        // Also model the security-sensitive flags-only case: the probe's
+        // image became user-approved, but the captured source was not.
+        let approved_path = cache.join("approved-after-probe");
+        std::fs::copy("/usr/bin/true", &approved_path).unwrap();
+        std::fs::set_permissions(&approved_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let approved = File::open(&approved_path).unwrap();
+        let approved_value = b"00c1;00000000;pty-gated-test;";
+        assert_eq!(unsafe { libc::fsetxattr(
+            approved.as_raw_fd(), c"com.apple.quarantine".as_ptr(),
+            approved_value.as_ptr().cast(), approved_value.len(), 0, 0,
+        ) }, 0);
+        std::fs::set_permissions(&approved_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        publisher = PreparedDaemon {
+            executable: approved_path.clone(), _image: Some(approved),
+            quarantine: Some(value.to_vec()),
+        };
+        let result = start_daemon_process(&mut publisher, &params, Some((&operation, -1)));
+        assert!(matches!(&result, Err(SpawnError::Io(message))
+            if message.contains("failed to start daemon")));
+        assert_ne!(publisher.executable, approved_path, "gated launch must refresh changed flags");
+        assert!(macos_publisher::refresh(
+            &publisher.executable, publisher._image.as_ref().unwrap(), Some(value),
+        ).unwrap().is_none(), "the final image must carry the exact original raw policy");
+        assert_eq!(
+            std::fs::metadata(approved_path).unwrap().permissions().mode() & 0o777,
+            0o500, "the assessed image must never become writable",
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn error_texts_match_node() {

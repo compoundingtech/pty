@@ -489,9 +489,11 @@ The cache key includes the image digest and the full raw source quarantine
 value, including every flag: user approval and restriction states never share
 an identity. Reuse verifies exact quarantine equality, bytes and permissions.
 A changed cached quarantine is a cache miss, yielding a fresh immutable entry;
-the already-assessed entry is neither modified nor made writable. Admission
-rechecks this policy before actual launch, since the capability probe is also
-an exec. Native copying preserves embedded code signatures and source xattrs;
+the already-assessed entry is neither modified nor made writable. One shared
+execution boundary rechecks policy for both ordinary and gated operation-mode
+launches, since the capability probe is also an exec. If quarantine was newly
+added to an initially unquarantined image, launch refuses rather than stripping
+it. Native copying preserves embedded code signatures and source xattrs;
 because Darwin can synthesize quarantine provenance during copy, each fresh
 snapshot restores and verifies the captured full source value before becoming
 `0500`. Admission never strips quarantine or re-signs the image. Unchanged
