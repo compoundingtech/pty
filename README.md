@@ -533,8 +533,10 @@ neither the library nor daemon borrows a claim merely because its PID matches.
 revocation installation holds that pin through its final effects. Delegated
 publication validates the nonce and owner on the same inode under flock, so an
 in-process install or gc claim cannot authorize an unrelated library launch.
-Delegation lazily creates a private per-claim token; ordinary event writes do
-not create or remove token sidecars. Release withdraws that token before a
+Delegation lazily creates a private per-claim token whose hashed filename keeps
+the session-ID boundary valid for sidecars and their atomic temporary files.
+Ordinary event writes do not create or remove token sidecars.
+Release withdraws that token before a
 nonblocking inode-lock attempt, so a stopped pinned daemon cannot hang the
 launcher, restart, or gc coordinator. A withdrawn token cannot be reactivated,
 and return checks it both before and after replacing the owner record.

@@ -184,12 +184,14 @@ fn replace_owner_record(path: &Path, record: &str) -> std::io::Result<()> {
 // Token state only changes from active to withdrawn. Keeping the withdrawn
 // inode until canonical cleanup prevents an external bridge reactivating it.
 fn claim_token(path: &Path, nonce: &str) -> PathBuf {
-    use std::fmt::Write as _;
-    let mut suffix = String::from("claim-");
-    for byte in nonce.bytes() {
-        let _ = write!(suffix, "{byte:02x}");
-    }
-    path.with_extension(suffix)
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(path.file_name().unwrap_or_default().as_encoded_bytes());
+    digest.update([0]);
+    digest.update(nonce.as_bytes());
+    // Keep both this sidecar and its atomic temporary name within NAME_MAX,
+    // independent of the session ID's already-supported boundary length.
+    path.with_file_name(format!(".claim-{:x}", digest.finalize()))
 }
 
 fn publish_claim_token(token: &Path, value: &[u8]) -> std::io::Result<()> {
@@ -629,6 +631,32 @@ mod tests {
             std::process::id().to_string()
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn boundary_length_claim_names_keep_delegation_sidecars_and_temporaries_short() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-claim-boundary-{}-{}", std::process::id(),
+            super::super::atomic::random_hex16()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(format!("{}.lock", "s".repeat(209)));
+        assert!(try_create(&path).unwrap());
+        let record = std::fs::read_to_string(&path).unwrap();
+        let delegate = CreationClaimDelegate {
+            owner_pid: std::process::id() as i32,
+            nonce: record_nonce(&record).unwrap().to_owned(),
+        };
+        activate_claim(&path, &delegate.nonce).unwrap();
+        let token = claim_token(&path, &delegate.nonce);
+        assert!(token.file_name().unwrap().len() < 100);
+        let publication = pin_claim(&path, &delegate, None, true).unwrap();
+        publication.into_daemon_claim().unwrap().hand_back(&delegate).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
+        withdraw_claim(&path, &delegate.nonce);
+        assert!(release_file_lock_checked_nonce(&path, Some(std::process::id()), Some(&delegate.nonce)));
+        assert!(!token.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

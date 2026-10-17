@@ -3602,7 +3602,24 @@ fn child_fork_contention(rig: &Rig, outcome: &str) {
         wait_until("command after transient contention", || owner.ran());
         owner.drain();
         assert_eq!(owner.launcher_exit(), 0);
+        #[cfg(target_os = "linux")]
+        let reaper = {
+            let daemon = rig.read_meta(&owner.runtime_id).unwrap()["daemonPid"].as_i64().unwrap() as i32;
+            std::thread::spawn(move || {
+                // This isolated fixture is a subreaper, so after launcher
+                // exit it must perform init's job for the adopted daemon.
+                // `pty kill` waits on kill(pid, 0), which includes zombies.
+                wait_until("adopted contention daemon to be reaped", || {
+                    let mut status = 0;
+                    // SAFETY: waitpid can reap only this fixture's child with
+                    // this PID; it cannot consume an unrelated process.
+                    unsafe { libc::waitpid(daemon, &mut status, libc::WNOHANG) == daemon }
+                });
+            })
+        };
         rig.ok(&["kill", &owner.runtime_id]);
+        #[cfg(target_os = "linux")]
+        reaper.join().unwrap();
     } else {
         let retirement = owner.wait_for("retirement");
         assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
