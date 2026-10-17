@@ -485,17 +485,18 @@ with `lstat`: no symlinks, root/effective-UID ownership only, and no group/other
 writes unless a sticky ancestor protects the next trusted-owned component.
 The private leaf itself must not allow group/other writes, so another UID cannot
 rename an ancestor and substitute code between admission and execution.
-The cache key includes the image digest and source quarantine timestamp, agent,
-and UUID, but not flags that Darwin rewrites during copy or assessment. Copy and
-reuse verify that provenance, rejecting missing, malformed or changed values;
-only flags may differ. Reuse also verifies bytes and permissions without
-rewriting the image, avoiding a new Gatekeeper/XProtect first-exec assessment
-for every restart. Native copying preserves embedded code signatures and source
-extended attributes. Because Darwin can synthesize new quarantine provenance
-during copy, admission explicitly restores the captured source quarantine value
-before verifying it; admission never strips quarantine or re-signs the image.
-Copies remain cached
-for subsequent launches rather than being deleted after spawn.
+The cache key includes the image digest and the full raw source quarantine
+value, including every flag: user approval and restriction states never share
+an identity. Reuse verifies exact quarantine equality, bytes and permissions.
+A changed cached quarantine is a cache miss, yielding a fresh immutable entry;
+the already-assessed entry is neither modified nor made writable. Admission
+rechecks this policy before actual launch, since the capability probe is also
+an exec. Native copying preserves embedded code signatures and source xattrs;
+because Darwin can synthesize quarantine provenance during copy, each fresh
+snapshot restores and verifies the captured full source value before becoming
+`0500`. Admission never strips quarantine or re-signs the image. Unchanged
+copies remain cached for reuse; a policy change may require a new first-exec
+assessment rather than silently reusing a more permissive copy.
 An unsupported/downgraded publisher or script wrapper refuses without changing
 the predecessor; atomic install-path replacement or unlink cannot switch the
 verified image. These guarantees exclude hostile same-UID cache mutation.

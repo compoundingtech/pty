@@ -356,14 +356,32 @@ mod macos_publisher;
 pub struct PreparedDaemon {
     executable: std::path::PathBuf,
     _image: Option<File>,
+    #[cfg(target_os = "macos")]
+    quarantine: Option<Vec<u8>>,
 }
 
 impl PreparedDaemon {
     pub fn spawn(self, params: SpawnParams) -> Result<SpawnedDaemon, SpawnError> {
-        if params.publication_binding.is_some() && self._image.is_none() {
+        #[cfg(target_os = "macos")]
+        let mut prepared = self;
+        #[cfg(not(target_os = "macos"))]
+        let prepared = self;
+        if params.publication_binding.is_some() && prepared._image.is_none() {
             return Err(SpawnError::Io("managed publisher was not verified".into()));
         }
-        spawn_prepared_daemon(&self.executable, params)
+        #[cfg(target_os = "macos")]
+        if let Some(image) = &prepared._image
+            && let Some((path, image)) = macos_publisher::refresh(
+                &prepared.executable, image, prepared.quarantine.as_deref(),
+            ).map_err(|error| SpawnError::Io(format!("cannot refresh managed publisher policy: {error}")))?
+        {
+            // The capability exec may have changed the cached quarantine.
+            // A fresh immutable snapshot retains the admitted bytes and raw
+            // source policy without making the assessed image writable.
+            prepared.executable = path;
+            prepared._image = Some(image);
+        }
+        spawn_prepared_daemon(&prepared.executable, params)
     }
 }
 
@@ -376,7 +394,11 @@ pub fn prepare_daemon(
     params: &SpawnParams,
 ) -> Result<PreparedDaemon, SpawnError> {
     if params.publication_binding.is_none() {
-        return Ok(PreparedDaemon { executable: executable.to_owned(), _image: None });
+        return Ok(PreparedDaemon {
+            executable: executable.to_owned(), _image: None,
+            #[cfg(target_os = "macos")]
+            quarantine: None,
+        });
     }
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
@@ -404,7 +426,7 @@ pub fn prepare_daemon(
         (std::path::PathBuf::from(format!("/proc/self/fd/{fd}")), unsafe { File::from_raw_fd(fd) })
     };
     #[cfg(target_os = "macos")]
-    let (pinned, image) = macos_publisher::pin(image)
+    let (pinned, image, quarantine) = macos_publisher::pin(image)
         .map_err(|error| SpawnError::Io(format!("cannot snapshot managed publisher: {error}")))?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let pinned: std::path::PathBuf = return Err(SpawnError::Io(
@@ -476,7 +498,11 @@ pub fn prepare_daemon(
     if !verified {
         return Err(SpawnError::Io("managed publisher lacks publication-revocation v1".into()));
     }
-    Ok(PreparedDaemon { executable: pinned, _image: Some(image) })
+    Ok(PreparedDaemon {
+        executable: pinned, _image: Some(image),
+        #[cfg(target_os = "macos")]
+        quarantine,
+    })
 }
 
 /// Spawn `<daemon_executable> __daemon` detached and wait until it has
