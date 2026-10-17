@@ -973,6 +973,9 @@ impl Core {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.closed = true;
         st.connected = false;
+        // Keep registration and shutdown ordered by state, and disconnect
+        // subscribers before a waiter can observe that close has completed.
+        self.shared.subs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         drop(st);
         self.shared.cv.notify_all();
     }
@@ -1655,13 +1658,19 @@ impl TerminalHandle {
     }
 
     /// Receive events. Each subscriber gets its own channel.
+    /// Closing disconnects every subscriber after any queued events are read,
+    /// even while the handle is retained. Subscribing after close returns an
+    /// already-disconnected receiver.
     pub fn subscribe(&self) -> Receiver<HandleEvent> {
         let (tx, rx) = mpsc::channel();
-        self.shared
-            .subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(tx);
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.closed {
+            self.shared
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tx);
+        }
         rx
     }
 
