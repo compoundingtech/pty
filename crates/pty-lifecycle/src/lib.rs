@@ -17,7 +17,7 @@ pub use gc::{
 pub use launch::{
     DEFAULT_START_TIMEOUT, GATE_FD_ENV, GatedDaemon, OPERATION_FD_ENV, OperationLaunch,
     READY_FD_ENV, ReadyNotifier, SpawnError, SpawnParams, SpawnedDaemon,
-    PreparedDaemon, apply_persisted_launch_options, prepare_daemon, set_process_title,
+    PreparedDaemon, apply_persisted_launch_options, config_for, prepare_daemon, set_process_title,
     spawn_daemon, spawn_gated_daemon,
 };
 pub use pty_core::registry::{

@@ -649,7 +649,7 @@ fn reconcile_permanent(
         Ok(params) => params,
         Err(error) => return PermanentOutcome::Failed(error),
     };
-    if let Err(error) = crate::config_for(&params).check_publication() {
+    if let Err(error) = crate::launch::config_for(&params).check_publication() {
         return PermanentOutcome::Failed(error);
     }
     let now_ms = now_epoch_ms();
