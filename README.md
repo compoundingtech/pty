@@ -517,6 +517,9 @@ its claim back, preserving its original PID and pathname until that coordinator
 releases it. A revoked managed binding is rejected before spawning a publisher,
 so a live survivor cannot mask that refusal as an already-running error; this
 deny-only preflight does not replace the final serialized publication check.
+Publication clears the event log using the event writer's five-second lock
+deadline, allowing a predecessor's shutdown append to finish during restart.
+Other callers of `clear_events` retain fail-fast event-lock behavior.
 
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,

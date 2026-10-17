@@ -525,7 +525,10 @@ pub(crate) fn publish_session(
     pty_core::operation::barrier::barrier("publication-before-effects");
     let _creation_lock = p.creation_lock;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
-    pty_core::events::clear_events(name)?;
+    // The predecessor may still be flushing its shutdown events after the
+    // coordinator releases the event claim. Use the writer's bounded lock
+    // admission instead of failing publication on that transient append.
+    pty_core::events::clear_events_with_wait(name, registry::lock::EVENT_LOCK_WAIT)?;
     let socket_path = registry::socket_path(name);
     let _ = std::fs::remove_file(&socket_path);
     // SAFETY: umask(2) has no preconditions.

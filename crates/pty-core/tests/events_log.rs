@@ -298,6 +298,41 @@ fn clear_events_creates_an_empty_file() {
     );
 }
 
+#[test]
+fn publication_clear_waits_for_transient_event_ownership_with_a_deadline() {
+    let _ = root();
+    let name = unique_name("clear-wait");
+    let path = registry::events_path(&name);
+    std::fs::write(&path, "predecessor event\n").unwrap();
+    let held = registry::acquire_event_lock(&name).unwrap();
+    let started = std::time::Instant::now();
+    let budget = Duration::from_millis(50);
+    let refused = events::clear_events_with_wait(&name, budget);
+    assert!(started.elapsed() >= budget, "publication clear failed before its lock deadline");
+    assert_eq!(
+        refused,
+        Err(format!("Session id \"{name}\" event log is busy. Retry the operation."))
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "predecessor event\n");
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        done_tx.send(events::clear_events_with_wait(&name, Duration::from_secs(2))).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "publication must wait rather than reject the transient holder"
+    );
+    held.release();
+    done_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    publisher.join().unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+}
+
 /// node: tests/events.test.ts:200-212
 #[test]
 fn cleanup_all_removes_the_events_file() {
