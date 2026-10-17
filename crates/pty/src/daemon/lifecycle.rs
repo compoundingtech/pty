@@ -311,6 +311,29 @@ fn teardown_process_table() -> ProcTable {
     ProcTable::read()
 }
 
+/// Stop the actual ordinary child before any pre-exec descriptor cleanup.
+/// This debug-only hook exercises inherited descriptors, not a synthetic fork.
+#[cfg(debug_assertions)]
+fn install_ordinary_child_test_hook() -> Result<(), String> {
+    if std::env::var("PTY_TEST_ORDINARY_CHILD").as_deref() != Ok("stop-after-fork") {
+        return Ok(());
+    }
+    unsafe extern "C" fn stop_child() {
+        // SAFETY: both calls are async-signal-safe in the post-fork child.
+        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    }
+    // SAFETY: the child callback uses only async-signal-safe operations and
+    // remains valid for the process lifetime. Register just before spawn.
+    let error = unsafe { libc::pthread_atfork(None, None, Some(stop_child)) };
+    if error != 0 {
+        return Err(format!(
+            "Failed to install ordinary child test hook: {}",
+            std::io::Error::from_raw_os_error(error)
+        ));
+    }
+    Ok(())
+}
+
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
 pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
@@ -352,6 +375,12 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         marker: None,
         creation_lock: &publication_lock,
     })?;
+    // Publish while the delegated claim is pinned, then atomically hand it
+    // to this daemon. No flock descriptor may cross the ordinary child fork:
+    // a stopped pre-exec child must not prevent recovery after daemon death.
+    let creation_claim = publication_lock
+        .into_daemon_claim()
+        .map_err(|error| format!("Failed to take daemon creation claim: {error}"))?;
     let socket_path = registry::socket_path(&name);
 
     // The child: `/bin/sh -c 'exec "$@"' sh <command> <args...>`, so PATH
@@ -363,6 +392,8 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         command.env(k, v);
     }
     pty_core::operation::barrier::barrier("published-before-child-fork");
+    #[cfg(debug_assertions)]
+    install_ordinary_child_test_hook()?;
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => {
@@ -385,7 +416,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
-    drop(publication_lock);
+    drop(creation_claim);
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());

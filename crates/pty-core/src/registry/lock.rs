@@ -42,10 +42,11 @@ pub fn metadata_busy_message(name: &str) -> String {
     format!("Session id \"{name}\" metadata is busy. Retry the operation.")
 }
 
-/// A held file lock; dropping it unlinks the lock file.
+/// A held PID claim; dropping it unlinks only while its owner still matches.
 #[derive(Debug)]
 pub struct LockGuard {
     path: PathBuf,
+    owner_pid: u32,
     armed: bool,
 }
 
@@ -58,7 +59,7 @@ impl LockGuard {
     /// Release now (idempotent; dropping does the same).
     pub fn release(mut self) {
         self.armed = false;
-        release_file_lock(&self.path);
+        release_file_lock_owned_by(&self.path, self.owner_pid);
     }
 
     /// Keep the lock file on disk when this guard drops (the caller takes
@@ -74,19 +75,7 @@ impl LockGuard {
     /// lock is stale and stealable as usual. On failure the guard is dropped,
     /// which releases the lock.
     pub fn hand_over(mut self, pid: u32) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = super::atomic::tmp_path_for(&self.path);
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut file| file.write_all(pid.to_string().as_bytes()))
-            .and_then(|()| std::fs::rename(&tmp, &self.path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return written;
-        }
+        replace_owner(&self.path, pid)?;
         self.armed = false;
         Ok(())
     }
@@ -95,23 +84,32 @@ impl LockGuard {
 /// Release a lock that was handed to `pid`, only while it still names
 /// `pid`. Returns whether it did.
 pub fn release_file_lock_owned_by(lock_path: &Path, pid: u32) -> bool {
-    let named = std::fs::read_to_string(lock_path)
-        .ok()
-        .and_then(|content| parse_leading_int(content.trim()));
-    if named == Some(pid as i32) {
-        release_file_lock(lock_path);
-        true
-    } else {
-        false
-    }
+    release_file_lock_checked(lock_path, Some(pid))
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if self.armed {
-            release_file_lock(&self.path);
+            release_file_lock_owned_by(&self.path, self.owner_pid);
         }
     }
+}
+
+/// Replace a complete owner record without exposing an empty PID claim.
+fn replace_owner(path: &Path, pid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = super::atomic::tmp_path_for(path);
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(pid.to_string().as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }
 
 /// Publish a complete lock owner record without an empty-file window.
@@ -172,6 +170,35 @@ pub struct PublicationLock {
     // File drops first, releasing flock before an independently acquired claim.
     _inode: std::fs::File,
     _claim: Option<LockGuard>,
+    path: PathBuf,
+}
+
+impl PublicationLock {
+    /// Transfer the pinned claim to this daemon before it forks. The old
+    /// launcher's expected-owner release cannot remove the new PID claim.
+    /// No open lock descriptor survives into the ordinary child's fork.
+    pub fn into_daemon_claim(mut self) -> std::io::Result<LockGuard> {
+        let opened = self._inode.metadata()?;
+        let current = std::fs::symlink_metadata(&self.path)?;
+        if !same_inode(&opened, &current) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "publication claim changed before daemon handover",
+            ));
+        }
+        let owner_pid = std::process::id();
+        replace_owner(&self.path, owner_pid)?;
+        if let Some(claim) = self._claim.take() {
+            claim.forget();
+        }
+        let claim = LockGuard {
+            path: std::mem::take(&mut self.path),
+            owner_pid,
+            armed: true,
+        };
+        drop(self);
+        Ok(claim)
+    }
 }
 
 pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Result<PublicationLock> {
@@ -211,7 +238,7 @@ pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Res
             std::io::ErrorKind::PermissionDenied, "publication creation ownership changed",
         ));
     }
-    Ok(PublicationLock { _inode: inode, _claim: claim })
+    Ok(PublicationLock { _inode: inode, _claim: claim, path })
 }
 
 fn holder_is_alive(file: &std::fs::File) -> bool {
@@ -259,6 +286,7 @@ pub fn try_acquire_file_lock(lock_path: &Path) -> std::io::Result<Option<LockGua
     ensure_session_dir()?;
     let guard = |path: &Path| LockGuard {
         path: path.to_path_buf(),
+        owner_pid: std::process::id(),
         armed: true,
     };
     if try_create(lock_path)? {
@@ -370,10 +398,14 @@ pub fn take_metadata_lock(name: &str) -> Result<LockGuard, String> {
 ///
 /// node: src/sessions.ts:2374-2378
 pub fn release_file_lock(lock_path: &Path) {
+    let _ = release_file_lock_checked(lock_path, None);
+}
+
+fn release_file_lock_checked(lock_path: &Path, expected_pid: Option<u32>) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
-    let Ok(inode) = std::fs::OpenOptions::new().read(true)
+    let Ok(mut inode) = std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(lock_path) else {
-        return;
+        return false;
     };
     loop {
         // SAFETY: inode is open; a final publisher may still pin this claim.
@@ -381,14 +413,23 @@ pub fn release_file_lock(lock_path: &Path) {
             break;
         }
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
+            return false;
+        }
+    }
+    if let Some(expected) = expected_pid {
+        let mut owner = String::new();
+        if inode.read_to_string(&mut owner).is_err()
+            || parse_leading_int(owner.trim()) != Some(expected as i32)
+        {
+            return false;
         }
     }
     if let (Ok(opened), Ok(current)) = (inode.metadata(), std::fs::symlink_metadata(lock_path))
         && same_inode(&opened, &current)
     {
-        let _ = std::fs::remove_file(lock_path);
+        return std::fs::remove_file(lock_path).is_ok();
     }
+    false
 }
 
 /// `parseInt(s, 10)`: leading integer, `None` when there is none.

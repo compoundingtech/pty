@@ -504,12 +504,14 @@ binding digest. Binding and operation-tag disagreement is also refused.
 of capable managed launch.
 
 Operation-mode child creation rechecks the fence and exact published generation
-under a fresh creation claim owned by the daemon itself. That claim has no open
-lock descriptor to inherit across `fork`: a child stopped before descriptor
-cleanup must not retain a dead daemon's lock or prevent retirement. The earlier
-delegated publication boundary still pins its inode while a separate launcher
-may die; the later child fork has no surviving publisher after its own daemon
-dies.
+under a fresh creation claim owned by the daemon itself. Ordinary publication
+pins the delegated launcher's inode through publication, then atomically replaces
+its owner record with the daemon's PID before spawning the child. The launcher's
+expected-owner release cannot unlink this transferred claim. Both child paths
+hold descriptor-free daemon-owned claims across `fork`: a child stopped before
+descriptor cleanup cannot retain a dead daemon's flock or prevent recovery.
+The earlier delegated publication boundary still pins its inode while a separate
+launcher may die; after handover, daemon death leaves no surviving publisher.
 
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,

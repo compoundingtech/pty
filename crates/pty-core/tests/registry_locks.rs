@@ -291,6 +291,47 @@ fn publication_pin_preserves_an_existing_owned_claim() {
     let _next = registry::acquire_lock(&name).expect("claim released");
 }
 
+// Use a separately opened description: flock on a duplicated descriptor would
+// share the publication pin and could not prove that its lock was released.
+fn assert_publication_inode_unpinned(inode: std::fs::File) {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: `inode` owns this descriptor throughout the call. Dropping
+        // it on return also releases the test's successfully acquired flock.
+        if unsafe { libc::flock(inode.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "daemon claim must not retain a publication flock: {error}"
+        );
+    }
+}
+
+#[test]
+fn acquired_publication_pin_transfers_to_descriptor_free_daemon_claim() {
+    let root = root();
+    let name = unique_name("pub-own-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let pin = registry::lock::pin_publication(&name, None).expect("pin acquires its own claim");
+    let old_inode = std::fs::File::open(&path).expect("open pinned inode independently");
+    assert!(registry::acquire_lock(&name).is_none(), "publication owns the name");
+
+    let claim = pin.into_daemon_claim().expect("transfer publication to daemon");
+    assert_eq!(claim.path(), path.as_path());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "transfer keeps the name claimed");
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    drop(claim);
+    assert!(!path.exists(), "dropping the daemon claim releases its name");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after daemon claim drop");
+}
+
 #[test]
 fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     use pty_core::registry::revocation::{self, PublicationBinding};
@@ -409,6 +450,55 @@ fn publication_claim_owner_subprocess() {
     control.write_all(b"A").unwrap();
     claim.release();
     control.write_all(b"D").unwrap();
+}
+
+#[test]
+fn delegated_publication_transfer_survives_old_owner_release() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let root = root();
+    let name = unique_name("pub-delegated-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let pin = registry::lock::pin_publication(&name, Some(owner.child.id() as i32))
+        .expect("pin delegated owner's claim");
+    let old_inode = std::fs::File::open(&path).expect("open launcher inode independently");
+    let before = old_inode.metadata().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), owner.child.id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "launcher claim excludes contenders");
+
+    // Start launcher cleanup while publication still pins its inode. Cleanup
+    // must recheck both inode and expected owner after the transfer unblocks it.
+    owner.control().write_all(b"R").unwrap();
+    let mut message = [0];
+    owner.control().read_exact(&mut message).expect("owner starts release");
+    assert_eq!(message, [b'A']);
+    let claim = pin.into_daemon_claim().expect("transfer launcher claim to daemon");
+    assert_eq!(claim.path(), path.as_path());
+    let after = std::fs::metadata(&path).expect("daemon claim remains published");
+    assert_ne!(
+        (after.dev(), after.ino()),
+        (before.dev(), before.ino()),
+        "handover atomically replaces the launcher inode"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "daemon claim excludes contenders");
+
+    owner.control().read_exact(&mut message).expect("old owner release completes");
+    assert_eq!(message, [b'D']);
+    assert!(owner.child.wait().expect("reap released launcher").success());
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("old release must preserve daemon claim"),
+        std::process::id().to_string()
+    );
+    assert!(registry::acquire_lock(&name).is_none(), "old release cannot admit a contender");
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    drop(claim);
+    assert!(!path.exists(), "only the daemon claim releases the transferred name");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after daemon claim drop");
 }
 
 #[test]
