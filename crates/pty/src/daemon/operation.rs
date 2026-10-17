@@ -536,12 +536,15 @@ impl Worker {
                         published = Some(publication);
                         continue;
                     }
-                    // Publication released the claim to let the startup actor
-                    // progress. Re-admit the later child-creation effect: a
-                    // revocation may have won between those two effects.
-                    let child_publication_lock = match registry::lock::pin_publication(
-                        &self.cfg.name, None,
-                    ).map_err(|error| error.to_string()).and_then(|guard| {
+                    // Re-admit this later effect under the daemon's own PID
+                    // claim. Unlike publication delegated by a launcher, no
+                    // worker survives this claim's owner: if this daemon dies,
+                    // it cannot fork again. Do not carry a flock into fork:
+                    // a child stopped before descriptor cleanup inherits the
+                    // open description and would pin a dead daemon's name.
+                    let child_publication_lock = match registry::take_metadata_lock(
+                        &self.cfg.name,
+                    ).and_then(|guard| {
                         self.cfg.check_publication()?;
                         let current = registry::read_metadata(&self.cfg.name);
                         if !current.as_ref().is_some_and(|metadata| {

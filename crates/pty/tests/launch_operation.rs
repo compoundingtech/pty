@@ -3066,9 +3066,168 @@ fn without_an_identity_safe_signal_recovery_sends_none() {
     ignore = "test hooks exist only in debug builds"
 )]
 fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
-    let rig = Rig::new();
+    bounded_stopped_child_test(
+        "a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired",
+        true,
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn a_child_stopped_right_after_its_fork_is_retired_by_its_live_daemon() {
+    bounded_stopped_child_test(
+        "a_child_stopped_right_after_its_fork_is_retired_by_its_live_daemon",
+        false,
+    );
+}
+
+/// Isolate the entire scenario, including blocking CLI calls and unwinding.
+/// A thread timeout alone cannot stop an Owner/Rig destructor or retire CLI
+/// stuck on a file lock. The fixture supervisor never takes registry locks.
+fn bounded_stopped_child_test(test: &str, daemon_death: bool) {
+    const FIXTURE: &str = "PTY_STOPPED_CHILD_FIXTURE";
+    if std::env::var(FIXTURE).as_deref() == Ok(test) {
+        // Adoption is process-wide, so enable it only in this isolated test
+        // executable, never in the parallel integration-test runner.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0,
+            "enable stopped-child fixture subreaper"
+        );
+        let rig = Rig::new();
+        let directory = rig.root.parent().unwrap().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| stopped_child_scenario(&rig, daemon_death));
+            // Include Rig cleanup in the deadline, not just the assertions.
+            drop(rig);
+            let _ = send.send(result.is_ok());
+        });
+        let result = receive.recv_timeout(Duration::from_secs(30));
+        if result.is_err() {
+            eprintln!("{test}: scenario or cleanup exceeded 30 seconds");
+        }
+        let cleaned = cleanup_stopped_child_fixture(std::process::id() as i32, true);
+        let _ = std::fs::remove_dir_all(directory);
+        // A timed-out worker may still be unwinding. Do not join it or run
+        // its destructors again; all owned OS processes have been retired.
+        std::process::exit(if result == Ok(true) && cleaned { 0 } else { 1 });
+    }
+
+    // Reuse the integration harness's self-executable fixture pattern, but
+    // inherit output: reading a pipe to EOF could itself wait on a daemon.
+    let mut fixture = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(FIXTURE, test)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Some(status) = fixture.try_wait().unwrap() {
+            assert!(status.success(), "{test}: isolated fixture failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Last-resort supervision also uses exact process identities,
+            // not a saved PID that might now name an unrelated process.
+            let _ = cleanup_stopped_child_fixture(fixture.id() as i32, false);
+            let _ = fixture.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while fixture.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < reap_deadline, "{test}: killed fixture was not reaped");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("{test}: isolated fixture exceeded 40 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill only this fixture's descendants, plus its marked daemon/held child
+/// (which can already be reparented to init on macOS). Linux adopts and reaps
+/// stopped orphans; macOS's init reaps the exact-signalled orphan instead.
+fn cleanup_stopped_child_fixture(parent: i32, reap: bool) -> bool {
+    use pty_core::operation::{exact::Exact, record::ProcessId};
+    use pty_core::proctable::{ProcTable, argv::scan_argv};
+
+    let digest = sha256_hex(format!("op-fork-stop-{parent}").as_bytes());
+    let boot = pty_core::boot::read_boot_identity().expect("fixture boot identity");
+    let uid = unsafe { libc::getuid() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let table = ProcTable::read();
+        let mut descendants = std::collections::HashSet::from([parent]);
+        loop {
+            let before = descendants.len();
+            for row in table.rows() {
+                if descendants.contains(&row.ppid) {
+                    descendants.insert(row.pid);
+                }
+            }
+            if before == descendants.len() {
+                break;
+            }
+        }
+        let scan = scan_argv(uid);
+        let mut targets = Vec::new();
+        for row in table.rows().filter(|row| row.pid != parent && descendants.contains(&row.pid)) {
+            if let Some(identity) = &row.identity {
+                targets.push((row.pid, identity.clone()));
+            }
+        }
+        for row in &scan.rows {
+            if pty_core::operation::settle::argv_carries_marker(&row.argv, &digest)
+                && let Some(identity) = &row.identity
+            {
+                targets.push((row.pid, identity.clone()));
+            }
+        }
+        let mut clean = table.is_complete() && scan.complete;
+        for (pid, identity) in targets {
+            let id = ProcessId {
+                pid: pid as u32,
+                start_token: identity.as_str().to_owned(),
+                boot_id: boot.clone(),
+                uid,
+            };
+            match Exact::pin(&id, Some(&boot)) {
+                Ok(Some(process)) => {
+                    clean = false;
+                    if let Err(error) = process.signal(libc::SIGKILL) {
+                        eprintln!("fixture cleanup could not signal {pid}: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    clean = false;
+                    eprintln!("fixture cleanup could not pin {pid}: {error}");
+                }
+            }
+        }
+        if reap {
+            // Only the isolated fixture calls waitpid(-1): never steal a
+            // sibling test's children from the parallel outer runner.
+            while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+        }
+        if clean {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("stopped-child fixture cleanup exceeded 5 seconds");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stopped_child_scenario(rig: &Rig, daemon_death: bool) {
     let mut owner = Owner::start(
-        &rig,
+        rig,
         "fork-stop",
         Plan {
             env: vec![("PTY_TEST_HELD_CHILD".into(), "stop-after-fork".into())],
@@ -3076,22 +3235,32 @@ fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
         },
     );
     owner.wait_for("decision");
-    let record = loop {
-        let record = owner.record(&rig);
-        if !record["participants"]["child"].is_null() {
-            break record;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    wait_until("the stopped child's participant record", || {
+        !owner.record(rig)["participants"]["child"].is_null()
+    });
+    let record = owner.record(rig);
     let child = record["participants"]["child"]["pid"].as_i64().unwrap() as i32;
     wait_until(
         "the child to stop",
         || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
     );
-    // Stopped before it shed anything: it holds copies of every descriptor
-    // of the daemon's, the lock file's among them, and it is still in the
-    // daemon's process group.
+    // Stopped before it shed any descriptors or left the daemon's process
+    // group. Neither publication nor creation may leave an inherited pin.
     let daemon = record["participants"]["producer"]["pid"].as_i64().unwrap() as i32;
+    if !daemon_death {
+        assert!(alive(daemon), "cancel must reach a live producer");
+        owner.cancel("c-fork-stop");
+        let decision = owner.wait_for("decision");
+        assert_eq!(decision["decision"]["cause"], "cancel", "{decision:#}");
+        let retirement = owner.wait_for("retirement");
+        assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+        assert!(!alive(child), "live producer left its stopped child behind");
+        assert_ne!(owner.launcher_exit(), 0);
+        wait_gone(daemon);
+        owner.settle_until(rig, "closed");
+        assert!(!owner.ran());
+        return;
+    }
     kill(daemon, libc::SIGKILL);
     owner.launcher_exit();
     wait_gone(daemon);

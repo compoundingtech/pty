@@ -503,6 +503,14 @@ binding digest. Binding and operation-tag disagreement is also refused.
 `None`/`None` retains ordinary unmanaged publication behavior; it is not proof
 of capable managed launch.
 
+Operation-mode child creation rechecks the fence and exact published generation
+under a fresh creation claim owned by the daemon itself. That claim has no open
+lock descriptor to inherit across `fork`: a child stopped before descriptor
+cleanup must not retain a dead daemon's lock or prevent retirement. The earlier
+delegated publication boundary still pins its inode while a separate launcher
+may die; the later child fork has no surviving publisher after its own daemon
+dies.
+
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,
 bound to a persistent root identity and the canonical ID and operation in the
