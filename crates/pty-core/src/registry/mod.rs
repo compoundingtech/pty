@@ -25,6 +25,7 @@ pub mod metadata;
 pub mod mutate;
 pub mod names;
 pub mod root;
+pub mod revocation;
 pub mod tags;
 pub mod time;
 
@@ -82,6 +83,7 @@ pub use root::{
     metadata_path, output_activity_path, pid_path, recovery_revision_path, root_length_check,
     resolve_session_dir, session_dir, socket_path, socket_path_in, with_root,
 };
+pub use revocation::{PublicationBinding, PublicationRevocation, RevocationInstall};
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,
     extract_filter_tags, is_keep_expired, is_keep_requested, is_reserved_tag_key, matches_all_tags,

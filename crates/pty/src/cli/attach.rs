@@ -220,7 +220,13 @@ fn handle_dead_session(
         return Ok(0);
     }
 
-    let _ = registry::cleanup_all(name);
+    let event_guard = registry::take_event_lock(name)?;
+    let creation_guard = registry::take_metadata_lock(name)?;
+    let current = registry::read_metadata(name)
+        .ok_or_else(|| format!("Session \"{name}\" metadata became unreadable."))?;
+    if !registry::metadata_matches_observation(&meta, &current) {
+        return Err(format!("Session \"{name}\" changed before restart.").into());
+    }
     let mut params = SpawnParams::new(name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
@@ -228,7 +234,14 @@ fn handle_dead_session(
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    if let Err(msg) = super::spawn_daemon(&params) {
+    pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
+    params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+    registry::cleanup_all_while_locked(name);
+    event_guard.release();
+    let spawned = publisher.spawn(params);
+    creation_guard.release();
+    if let Err(msg) = spawned {
         eprintln!("pty attach: {msg}");
         return Ok(1);
     }

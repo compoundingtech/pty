@@ -311,6 +311,29 @@ fn teardown_process_table() -> ProcTable {
     ProcTable::read()
 }
 
+/// Stop the actual ordinary child before any pre-exec descriptor cleanup.
+/// This debug-only hook exercises inherited descriptors, not a synthetic fork.
+#[cfg(debug_assertions)]
+fn install_ordinary_child_test_hook() -> Result<(), String> {
+    if std::env::var("PTY_TEST_ORDINARY_CHILD").as_deref() != Ok("stop-after-fork") {
+        return Ok(());
+    }
+    unsafe extern "C" fn stop_child() {
+        // SAFETY: both calls are async-signal-safe in the post-fork child.
+        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    }
+    // SAFETY: the child callback uses only async-signal-safe operations and
+    // remains valid for the process lifetime. Register just before spawn.
+    let error = unsafe { libc::pthread_atfork(None, None, Some(stop_child)) };
+    if error != 0 {
+        return Err(format!(
+            "Failed to install ordinary child test hook: {}",
+            std::io::Error::from_raw_os_error(error)
+        ));
+    }
+    Ok(())
+}
+
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
 pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
@@ -341,6 +364,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     let pair = pty_spawn::open(rows, cols)
         .map_err(|e| format!("Failed to open a PTY for session \"{name}\": {e}"))?;
 
+    let publication_lock = prepare_publication(&cfg)?;
     let (listener, metadata) = publish_session(&Publication {
         cfg: &cfg,
         generation: &generation,
@@ -349,7 +373,15 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         child_env: &child_env,
         events: &events,
         marker: None,
+        creation_lock: &publication_lock,
     })?;
+    // Publish while the delegated claim is pinned, then atomically hand it
+    // to this daemon. No flock descriptor may cross the ordinary child fork:
+    // a stopped pre-exec child must not prevent recovery after daemon death.
+    let delegated_owner = publication_lock.delegate();
+    let creation_claim = publication_lock
+        .into_daemon_claim()
+        .map_err(|error| format!("Failed to take daemon creation claim: {error}"))?;
     let socket_path = registry::socket_path(&name);
 
     // The child: `/bin/sh -c 'exec "$@"' sh <command> <args...>`, so PATH
@@ -360,6 +392,9 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     for (k, v) in &child_env {
         command.env(k, v);
     }
+    pty_core::operation::barrier::barrier("published-before-child-fork");
+    #[cfg(debug_assertions)]
+    install_ordinary_child_test_hook()?;
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => {
@@ -382,6 +417,18 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
+    pty_core::operation::barrier::barrier("before-claim-hand-back");
+    if let Some(owner) = delegated_owner.filter(|delegate| registry::pid_alive(delegate.owner_pid)) {
+        // A coordinating parent owns its claim beyond successful publication.
+        // Restore it only after fork has returned, never as an inherited fd.
+        if let Err(error) = creation_claim.hand_back(&owner) {
+            // The child is already serving. hand_back drops its daemon guard
+            // on failure; report cleanup failure without killing the session.
+            eprintln!("pty daemon: Failed to restore delegated creation claim for {name}: {error}");
+        }
+    } else {
+        drop(creation_claim);
+    }
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
@@ -437,6 +484,50 @@ pub(crate) struct Publication<'a> {
     pub(crate) events: &'a EventWriter,
     /// The launch-operation marker, `{"digest":<h>,"phase":"startup"}`.
     pub(crate) marker: Option<serde_json::Value>,
+    /// Pins the exact name claim through all publication effects.
+    pub(crate) creation_lock: &'a registry::lock::PublicationLock,
+}
+
+/// Final admission, shared by ordinary, library, respawn and operation launches.
+/// The inode pin outlives every effect, even if a delegating launcher dies.
+pub(crate) fn prepare_publication(
+    cfg: &DaemonConfig,
+) -> Result<registry::lock::PublicationLock, String> {
+    pty_core::operation::barrier::barrier("publication-before-lock");
+    let owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok();
+    let nonce = std::env::var("PTY_CREATION_LOCK_NONCE").ok();
+    let delegate = match (owner, nonce) {
+        (Some(owner), Some(nonce)) => {
+            let owner_pid = if owner == "daemon" {
+                std::process::id() as i32
+            } else {
+                owner.parse().map_err(|_| "invalid creation claim owner")?
+            };
+            Some(registry::lock::CreationClaimDelegate { owner_pid, nonce })
+        }
+        (None, None) => None,
+        _ => return Err("incomplete creation claim delegation".into()),
+    };
+    let guard = registry::lock::pin_publication(&cfg.name, delegate.as_ref())
+        .map_err(|error| error.to_string())?;
+    cfg.check_publication()?;
+    let observed = registry::observe_session_strict_in(
+        &registry::session_dir(), &cfg.name, &registry::ListOptions::default(),
+    );
+    if !observed.complete {
+        return Err("publication occupancy is unreadable".into());
+    }
+    if observed.entries.iter().any(|session| session.is_running()) {
+        return Err(format!("Session id \"{}\" is already in use.", cfg.name));
+    }
+    if cfg.publication_binding.is_none()
+        && observed.entries.iter().any(|session| {
+            session.metadata.as_ref().is_some_and(|metadata| metadata.publication_binding.is_some())
+        })
+    {
+        return Err("recreating a managed session requires a new explicit publication binding".into());
+    }
+    Ok(guard)
 }
 
 /// Publication before the child spawns: dir → clear events → stale socket →
@@ -453,8 +544,14 @@ pub(crate) fn publish_session(
 ) -> Result<(UnixListener, SessionMetadata), String> {
     let cfg = p.cfg;
     let name = &cfg.name;
+    // The caller must keep this pin from admission through the last effect.
+    pty_core::operation::barrier::barrier("publication-before-effects");
+    let _creation_lock = p.creation_lock;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
-    pty_core::events::clear_events(name)?;
+    // The predecessor may still be flushing its shutdown events after the
+    // coordinator releases the event claim. Use the writer's bounded lock
+    // admission instead of failing publication on that transient append.
+    pty_core::events::clear_events_with_wait(name, registry::lock::EVENT_LOCK_WAIT)?;
     let socket_path = registry::socket_path(name);
     let _ = std::fs::remove_file(&socket_path);
     // SAFETY: umask(2) has no preconditions.
@@ -485,6 +582,9 @@ pub(crate) fn publish_session(
         created_at: p.created_at.clone(),
         display_name: cfg.display_name().map(str::to_string),
         tags: (!p.published_tags.is_empty()).then(|| p.published_tags.clone()),
+        publication_binding: cfg.publication_binding.clone(),
+        publication_root_id: cfg.publication_root_id.clone(),
+        publication_capability: cfg.publication_binding.as_ref().map(|_| 1),
         isolate_env: cfg.isolate_env().then_some(true),
         extra_env: cfg.extra_env().cloned(),
         session_env: permanent_respawn_env(cfg, p.published_tags, p.child_env),

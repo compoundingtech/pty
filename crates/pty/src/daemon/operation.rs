@@ -47,7 +47,7 @@ use pty_spawn::substrate::{ExitStatus, SessionRef};
 use super::DaemonConfig;
 use super::held::{self, Ack, HeldChild, HeldSpec};
 use super::lifecycle::{
-    Daemon, DaemonParts, Msg, Publication, live_identity, new_generation, publish_session,
+    Daemon, DaemonParts, Msg, Publication, live_identity, new_generation, prepare_publication, publish_session,
     spawn_acceptor, spawn_session_bridge,
 };
 
@@ -468,6 +468,13 @@ impl Worker {
                         continue;
                     }
                     barrier("publish-committed-before-effect");
+                    let publication_lock = match prepare_publication(&self.cfg) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            self.complete(ticket, Err(error));
+                            continue;
+                        }
+                    };
                     let events = EventWriter::new(&self.cfg.name);
                     let result = clear_predecessor(&self.cfg.name, predecessor.as_deref())
                         .and_then(|()| {
@@ -480,8 +487,15 @@ impl Worker {
                                 child_env: &child_env,
                                 events: &events,
                                 marker: Some(marker),
+                                creation_lock: &publication_lock,
                             })
                         });
+                    // Completion hands the claim back to the actor, which
+                    // releases it nonblocking before issuing ForkChild.
+                    // End the worker's publication critical section first:
+                    // otherwise that release races this still-held pin and
+                    // can leave our live-PID claim behind after pin cleanup.
+                    drop(publication_lock);
                     match result {
                         Ok((listener, _metadata)) => {
                             published = Some(Published {
@@ -528,6 +542,40 @@ impl Worker {
                         published = Some(publication);
                         continue;
                     }
+                    // Re-admit this later effect under the daemon's own PID
+                    // claim. Unlike publication delegated by a launcher, no
+                    // worker survives this claim's owner: if this daemon dies,
+                    // it cannot fork again. Do not carry a flock into fork:
+                    // a child stopped before descriptor cleanup inherits the
+                    // open description and would pin a dead daemon's name.
+                    // This committed ticket stays in flight while the worker
+                    // waits; the actor can accept cancellation but cannot
+                    // verify retirement until this bounded effect completes.
+                    // Recheck the fence and generation only after admission.
+                    let child_publication_lock = match registry::wait_for_metadata_lock(
+                        &self.cfg.name,
+                        registry::METADATA_PATCH_LOCK_WAIT,
+                    ).map_err(|refusal| match refusal {
+                        registry::LockRefusal::Busy => registry::metadata_busy_message(&self.cfg.name),
+                        registry::LockRefusal::Unavailable(cause) => cause,
+                    }).and_then(|guard| {
+                        self.cfg.check_publication()?;
+                        let current = registry::read_metadata(&self.cfg.name);
+                        if !current.as_ref().is_some_and(|metadata| {
+                            metadata.generation.as_deref() == Some(generation.as_str())
+                                && metadata.daemon_pid == Some(std::process::id() as i32)
+                        }) {
+                            return Err("published generation changed before child creation".into());
+                        }
+                        Ok(guard)
+                    }) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            published = Some(publication);
+                            self.complete(ticket, Err(error));
+                            continue;
+                        }
+                    };
                     let forked = match held::fork_held(&spec) {
                         Ok(forked) => forked,
                         Err(error) => {
@@ -536,6 +584,7 @@ impl Worker {
                             continue;
                         }
                     };
+                    drop(child_publication_lock);
                     let gate = Arc::new(forked.gate);
                     let Published {
                         events,
@@ -1196,7 +1245,8 @@ impl Actor {
         let lock_path = registry::lock_path(&self.runtime_id);
         let holds_creation_lock = std::fs::read_to_string(&lock_path)
             .ok()
-            .is_some_and(|owner| owner.trim() == self.me.pid.to_string());
+            .is_some_and(|owner| owner.split_whitespace().next() == Some(self.me.pid.to_string().as_str())
+                && owner.split_whitespace().nth(1) == std::env::var("PTY_CREATION_LOCK_NONCE").ok().as_deref());
         if !holds_creation_lock {
             return self.cancel_before_launch(
                 Cause::Refused,

@@ -4,6 +4,8 @@
 //! attaches to the one you picked, or restarts it first if it has stopped,
 //! or creates a new one from the last row. Detaching brings you back to the
 //! list rather than to the shell.
+//! Stopped-session restart revalidates the selected generation and its persisted
+//! publication binding under name locks before removing predecessor artifacts.
 //!
 //! Relay host groups are not here yet. Everything the picker does is local,
 //! so the section headers Node draws for remote hosts have nothing to show
@@ -386,7 +388,15 @@ impl Picker {
         let Some(meta) = session.metadata.clone() else {
             return Err(format!("{}: no metadata, cannot restart", session.name));
         };
-        let _ = registry::cleanup_all(&session.name);
+        // Match CLI restart's event-then-creation ordering and fence the exact
+        // observed generation before touching any predecessor artifacts.
+        let event_guard = registry::take_event_lock(&session.name)?;
+        let creation_guard = registry::take_metadata_lock(&session.name)?;
+        let current = registry::read_metadata(&session.name)
+            .ok_or_else(|| format!("{}: metadata became unreadable", session.name))?;
+        if !registry::metadata_matches_observation(&meta, &current) {
+            return Err(format!("{}: session changed before restart", session.name));
+        }
         let mut params = crate::cli::SpawnParams::new(&session.name, &meta.command, &meta.args);
         params.display_command = meta.display_command.clone();
         params.cwd = meta.cwd.clone();
@@ -397,7 +407,14 @@ impl Picker {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        crate::cli::spawn_daemon(&params).map_err(|e| format!("{}: {e}", session.name))
+        pty_lifecycle::config_for(&params).check_publication()?;
+        let publisher = crate::cli::prepare_daemon(&mut params)?;
+        params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+        registry::cleanup_all_while_locked(&session.name);
+        event_guard.release();
+        let spawned = publisher.spawn(params);
+        creation_guard.release();
+        spawned.map(|_| ()).map_err(|e| format!("{}: {e}", session.name))
     }
 
     /// One keystroke makes a session: a random id, your shell, your home

@@ -70,6 +70,13 @@ pub struct SessionMetadata {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<TagMap>,
+    /// Launcher identity, immutable through ordinary metadata/tag mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_binding: Option<super::revocation::PublicationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_capability: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolate_env: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +203,16 @@ impl SessionMetadata {
             Value::from(self.ephemeral == Some(true)),
         );
         m.insert("createdAt".into(), Value::from(self.created_at.as_str()));
+        if let Some(binding) = &self.publication_binding {
+            m.insert("publicationBinding".into(), serde_json::to_value(binding)
+                .expect("publication binding is serializable"));
+        }
+        if let Some(root) = &self.publication_root_id {
+            m.insert("publicationRootId".into(), Value::from(root.as_str()));
+        }
+        if let Some(version) = self.publication_capability {
+            m.insert("publicationCapability".into(), Value::from(version));
+        }
         if let Some(tags) = &self.tags
             && !tags.is_empty()
         {
