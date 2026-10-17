@@ -507,6 +507,8 @@ impl PublicationClaimOwner {
                 Err(error) => panic!("accept owner control: {error}"),
             }
         };
+        // BSD accepted sockets inherit the listener's O_NONBLOCK flag.
+        control.set_nonblocking(false).unwrap();
         control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         owner.control = Some(control);

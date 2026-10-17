@@ -96,7 +96,7 @@ fn publisher_admission_child() {
     let executable = scratch.join("selected-publisher");
     match case.as_str() {
         "unsupported" => {
-            assert!(prepare_daemon(Path::new("/bin/false"), &params).is_err());
+            assert!(prepare_daemon(&std::env::current_exe().unwrap(), &params).is_err());
         }
         "external-dispatch" => {
             // /usr/bin/env is a real native external-command dispatcher, not
@@ -148,9 +148,11 @@ fn publisher_admission_child() {
                 .unwrap_or_else(|error| panic!("prepare capable publisher: {error}"));
             if case == "replace" {
                 let replacement = scratch.join("downgraded-publisher");
-                std::fs::copy("/bin/false", &replacement).unwrap();
+                // A native test image without PTY's built-in capability is a
+                // portable downgrade fixture (no /bin/false assumption).
+                std::fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
                 std::fs::rename(replacement, &executable).unwrap();
-                assert!(!Command::new(&executable).status().unwrap().success());
+                assert!(!Command::new(&executable).args(["capabilities", "--json"]).status().unwrap().success());
             } else {
                 std::fs::remove_file(&executable).unwrap();
                 assert!(!executable.exists());
