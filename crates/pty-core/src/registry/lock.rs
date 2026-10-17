@@ -48,6 +48,7 @@ pub struct LockGuard {
     path: PathBuf,
     owner_pid: u32,
     nonce: String,
+    delegated: std::sync::atomic::AtomicBool,
     armed: bool,
 }
 
@@ -59,17 +60,24 @@ impl LockGuard {
 
 
     /// Explicit authority for this individual claim, never inferred from a PID.
-    pub fn delegate(&self) -> CreationClaimDelegate {
-        CreationClaimDelegate { owner_pid: self.owner_pid as i32, nonce: self.nonce.clone() }
+    /// Lazily publishes the delegation token; ordinary event appends do not
+    /// create tokens. Token I/O failure must be reported before launch.
+    pub fn delegate(&self) -> std::io::Result<CreationClaimDelegate> {
+        if !self.delegated.load(std::sync::atomic::Ordering::Relaxed) {
+            activate_claim(&self.path, &self.nonce)?;
+            self.delegated.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(CreationClaimDelegate { owner_pid: self.owner_pid as i32, nonce: self.nonce.clone() })
     }
 
     /// Nonblocking inode pin while this guard remains held. Drop the pin first.
     pub fn pin(&self) -> std::io::Result<PublicationLock> {
-        pin_claim(&self.path, &self.delegate(), None, false)
+        pin_claim(&self.path, &self.delegate()?, None, false)
     }
     /// Release now (idempotent; dropping does the same).
     pub fn release(mut self) {
         self.armed = false;
+        self.withdraw_delegation();
         release_file_lock_checked_nonce(&self.path, Some(self.owner_pid), Some(&self.nonce));
     }
 
@@ -79,6 +87,17 @@ impl LockGuard {
         self.armed = false;
     }
 
+    fn withdraw_delegation(&self) {
+        // The external-PID bridge only addresses metadata claims, and can
+        // activate their token in another process. Ordinary event appends
+        // incur no token I/O unless their guard is explicitly delegated.
+        if self.delegated.load(std::sync::atomic::Ordering::Relaxed)
+            || !self.path.file_name().is_some_and(|name| name.as_encoded_bytes().ends_with(b".events.lock"))
+        {
+            withdraw_claim(&self.path, &self.nonce);
+        }
+    }
+
     /// Hand this lock to another live process. The owner record is replaced
     /// in one rename by a complete record naming `pid` with the same nonce,
     /// and this guard stops releasing it. The new owner receives that nonce
@@ -86,20 +105,41 @@ impl LockGuard {
     /// If it dies first, the lock is stale and stealable as usual. On failure
     /// the guard is dropped, which releases the lock.
     pub fn hand_over(mut self, pid: u32) -> std::io::Result<()> {
+        let pin = self.pin()?;
         replace_owner_record(&self.path, &format!("{pid} {}", self.nonce))?;
+        drop(pin);
         self.armed = false;
         Ok(())
     }
 
-    /// Return a publication claim with the coordinator's original encoding.
+    /// Return only while the original guard still authorizes this claim.
     pub fn hand_back(mut self, delegate: &CreationClaimDelegate) -> std::io::Result<()> {
+        if !claim_active(&self.path, &delegate.nonce) {
+            let token = claim_token(&self.path, &delegate.nonce);
+            self.release();
+            let _ = std::fs::remove_file(token);
+            return Ok(());
+        }
+        // Serialize replacement with every validator/cleanup holder of the
+        // daemon's current inode. A busy pin is a nonfatal hand-back failure.
+        let pin = self.pin()?;
         let record = if delegate.nonce.starts_with("legacy:") {
             delegate.owner_pid.to_string()
         } else {
             format!("{} {}", delegate.owner_pid, delegate.nonce)
         };
         replace_owner_record(&self.path, &record)?;
+        drop(pin);
+        let _ = std::fs::remove_file(claim_token(&self.path, &self.nonce));
         self.armed = false;
+        // Release can withdraw while rename is in flight. Never leave the
+        // restored live-PID record behind after that withdrawal.
+        if !claim_active(&self.path, &delegate.nonce) {
+            let expected_nonce = (!delegate.nonce.starts_with("legacy:")).then_some(delegate.nonce.as_str());
+            if release_file_lock_checked_nonce(&self.path, Some(delegate.owner_pid as u32), expected_nonce) {
+                let _ = std::fs::remove_file(claim_token(&self.path, &delegate.nonce));
+            }
+        }
         Ok(())
     }
 }
@@ -113,6 +153,7 @@ pub fn release_file_lock_owned_by(lock_path: &Path, pid: u32) -> bool {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if self.armed {
+            self.withdraw_delegation();
             release_file_lock_checked_nonce(&self.path, Some(self.owner_pid), Some(&self.nonce));
         }
     }
@@ -136,6 +177,112 @@ fn replace_owner_record(path: &Path, record: &str) -> std::io::Result<()> {
     result
 }
 
+// Token state only changes from active to withdrawn. Keeping the withdrawn
+// inode until canonical cleanup prevents an external bridge reactivating it.
+fn claim_token(path: &Path, nonce: &str) -> PathBuf {
+    use std::fmt::Write as _;
+    let mut suffix = String::from("claim-");
+    for byte in nonce.bytes() {
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    path.with_extension(suffix)
+}
+
+fn publish_claim_token(token: &Path, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = super::atomic::tmp_path_for(token);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&tmp)?;
+        file.write_all(value)?;
+        match std::fs::hard_link(&tmp, token) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(tmp);
+    result
+}
+
+fn activate_claim(path: &Path, nonce: &str) -> std::io::Result<()> {
+    publish_claim_token(&claim_token(path, nonce), b"1")?;
+    if claim_active(path, nonce) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim was released"))
+    }
+}
+
+fn claim_active(path: &Path, nonce: &str) -> bool {
+    let mut value = [0];
+    std::fs::File::open(claim_token(path, nonce))
+        .and_then(|mut file| file.read_exact(&mut value)).is_ok() && value == *b"1"
+}
+
+fn withdraw_claim(path: &Path, nonce: &str) {
+    let token = claim_token(path, nonce);
+    let mut file = match std::fs::OpenOptions::new().write(true).open(&token) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if publish_claim_token(&token, b"0").is_err() {
+                return;
+            }
+            let Ok(file) = std::fs::OpenOptions::new().write(true).open(&token) else {
+                return;
+            };
+            file
+        }
+        Err(_) => return,
+    };
+    let _ = file.write_all(b"0");
+}
+
+// Every advisory-lock holder, including rejected validation attempts, must
+// finish cancellation before unlocking. Otherwise a transient rejected pin
+// can make a nonblocking release miss the final cleanup opportunity.
+struct WithdrawnClaimCleanup<'a> {
+    inode: &'a std::fs::File,
+    path: &'a Path,
+    legacy_nonce: Option<(i32, &'a str)>,
+    armed: bool,
+}
+
+impl Drop for WithdrawnClaimCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Ok(opened), Ok(current)) =
+            (self.inode.metadata(), std::fs::symlink_metadata(self.path)) else {
+                return;
+            };
+        if !same_inode(&opened, &current) {
+            return;
+        }
+        use std::io::{Seek, SeekFrom};
+        let mut reader = self.inode;
+        let mut record = String::new();
+        if reader.seek(SeekFrom::Start(0)).is_err()
+            || reader.read_to_string(&mut record).is_err()
+        {
+            return;
+        }
+        let Some(nonce) = record_nonce(&record).or_else(|| {
+            self.legacy_nonce.filter(|(pid, _)| parse_leading_int(&record) == Some(*pid))
+                .map(|(_, nonce)| nonce)
+        }) else { return };
+        let token = claim_token(self.path, nonce);
+        let mut value = [1];
+        if std::fs::File::open(&token).and_then(|mut file| file.read_exact(&mut value)).is_ok()
+            && value == *b"0"
+            && std::fs::remove_file(self.path).is_ok()
+        {
+            let _ = std::fs::remove_file(token);
+        }
+    }
+}
+
 /// Publish a complete lock owner record without an empty-file window.
 ///
 /// `open(O_CREAT|O_EXCL)` followed by `write(pid)` made the pathname visible
@@ -148,13 +295,14 @@ fn try_create(lock_path: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let tmp = super::atomic::tmp_path_for(lock_path);
+    let nonce = super::atomic::random_hex16();
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(format!("{} {}", std::process::id(), super::atomic::random_hex16()).as_bytes())?;
+        file.write_all(format!("{} {nonce}", std::process::id()).as_bytes())?;
         drop(file);
         match std::fs::hard_link(&tmp, lock_path) {
             Ok(()) => Ok(true),
@@ -205,27 +353,41 @@ pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<Cr
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not an external creation owner"));
     }
     let path = lock_path(name);
-    let mut inode = std::fs::OpenOptions::new().read(true).write(true)
+    let inode = std::fs::OpenOptions::new().read(true).write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path)?;
+    let mut record = String::new();
+    (&inode).read_to_string(&mut record)?;
+    if parse_leading_int(&record) != Some(owner_pid) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
+    }
+    let nonce = record_nonce(&record).map(str::to_owned)
+        .unwrap_or_else(|| format!("legacy:{}", super::atomic::random_hex16()));
+    // Activate before taking flock: a concurrent Rust guard release must
+    // either withdraw this token or unlink the still-unpinned original inode.
+    activate_claim(&path, &nonce)?;
     if !try_lock_exclusive(&inode)? {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "creation claim is pinned"));
     }
-    let mut record = String::new();
-    inode.read_to_string(&mut record)?;
+    let cleanup = WithdrawnClaimCleanup {
+        inode: &inode, path: &path, legacy_nonce: Some((owner_pid, &nonce)), armed: true,
+    };
     if !same_inode(&inode.metadata()?, &std::fs::symlink_metadata(&path)?)
-        || parse_leading_int(&record) != Some(owner_pid)
+        || !claim_active(&path, &nonce)
     {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
     }
-    let nonce = match record_nonce(&record) {
-        Some(nonce) => nonce.to_owned(),
-        None => {
-            let nonce = format!("legacy:{}", super::atomic::random_hex16());
-            // read_to_string left the cursor at EOF; preserve the original PID.
-            write!(inode, " {nonce}")?;
-            nonce
-        }
-    };
+    use std::io::{Seek, SeekFrom};
+    (&inode).seek(SeekFrom::Start(0))?;
+    let mut pinned_record = String::new();
+    (&inode).read_to_string(&mut pinned_record)?;
+    if pinned_record != record {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
+    }
+    if record_nonce(&record).is_none() {
+        // Preserve the PID prefix and restore its original encoding on return.
+        write!(&inode, " {nonce}")?;
+    }
+    drop(cleanup);
     Ok(CreationClaimDelegate { owner_pid, nonce })
 }
 /// Pins the name's creation claim through a daemon's final publication.
@@ -234,11 +396,12 @@ pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<Cr
 /// inode prevents stale recovery (or the launcher's release) from admitting a
 /// revocation or replacement if that launcher exits during publication.
 pub struct PublicationLock {
-    // File drops first, releasing flock before an independently acquired claim.
+    // The pin is closed before the independently acquired guard drops.
     _inode: std::fs::File,
     _claim: Option<LockGuard>,
     path: PathBuf,
     delegate: Option<CreationClaimDelegate>,
+    owner: CreationClaimDelegate,
 }
 
 impl PublicationLock {
@@ -263,16 +426,34 @@ impl PublicationLock {
         let nonce = super::atomic::random_hex16();
         replace_owner_record(&self.path, &format!("{owner_pid} {nonce}"))?;
         if let Some(claim) = self._claim.take() {
+            let _ = std::fs::remove_file(claim_token(&self.path, &claim.nonce));
             claim.forget();
         }
         let claim = LockGuard {
             path: std::mem::take(&mut self.path),
             owner_pid,
             nonce,
+            delegated: std::sync::atomic::AtomicBool::new(false),
             armed: true,
         };
         drop(self);
         Ok(claim)
+    }
+}
+
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        // Release may have returned without waiting for this pin. While still
+        // holding it, finish cleanup only if this is the withdrawn original.
+        if !claim_active(&self.path, &self.owner.nonce)
+            && let (Ok(opened), Ok(current)) =
+                (self._inode.metadata(), std::fs::symlink_metadata(&self.path))
+            && same_inode(&opened, &current)
+        {
+            if std::fs::remove_file(&self.path).is_ok() {
+                let _ = std::fs::remove_file(claim_token(&self.path, &self.owner.nonce));
+            }
+        }
     }
 }
 
@@ -284,7 +465,7 @@ pub fn pin_publication(name: &str, delegate: Option<&CreationClaimDelegate>) -> 
             let claim = try_acquire_file_lock(&path)?.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::WouldBlock, "publication creation lock is busy")
             })?;
-            let delegate = claim.delegate();
+            let delegate = claim.delegate()?;
             pin_claim(&path, &delegate, Some(claim), false)
         }
     }
@@ -297,7 +478,7 @@ fn pin_claim(
     delegated: bool,
 ) -> std::io::Result<PublicationLock> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut inode = std::fs::OpenOptions::new()
+    let inode = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)?;
@@ -306,24 +487,31 @@ fn pin_claim(
             std::io::ErrorKind::WouldBlock, "publication creation lock is pinned",
         ));
     }
+    let mut cleanup = WithdrawnClaimCleanup {
+        inode: &inode, path, legacy_nonce: Some((delegate.owner_pid, &delegate.nonce)), armed: true,
+    };
     let opened = inode.metadata()?;
     let current = std::fs::symlink_metadata(&path)?;
     let mut owner = String::new();
-    inode.read_to_string(&mut owner)?;
+    (&inode).read_to_string(&mut owner)?;
     if !opened.is_file() || !same_inode(&opened, &current)
         || parse_leading_int(&owner) != Some(delegate.owner_pid)
         || record_nonce(&owner) != Some(delegate.nonce.as_str())
         || !pid_alive(delegate.owner_pid)
+        || !claim_active(path, &delegate.nonce)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied, "publication creation ownership changed",
         ));
     }
+    cleanup.armed = false;
+    drop(cleanup);
     Ok(PublicationLock {
         _inode: inode,
         _claim: claim,
         path: path.to_path_buf(),
         delegate: delegated.then(|| delegate.clone()),
+        owner: delegate.clone(),
     })
 }
 
@@ -338,6 +526,9 @@ fn steal_opened_lock(lock_path: &Path, stale_inode: std::fs::File) -> std::io::R
     if !try_lock_exclusive(&stale_inode)? {
         return Ok(false);
     }
+    let _cleanup = WithdrawnClaimCleanup {
+        inode: &stale_inode, path: lock_path, legacy_nonce: None, armed: true,
+    };
 
     let opened_metadata = stale_inode.metadata()?;
     let current_metadata = match std::fs::metadata(lock_path) {
@@ -351,6 +542,11 @@ fn steal_opened_lock(lock_path: &Path, stale_inode: std::fs::File) -> std::io::R
         return Ok(false);
     }
 
+    if let Ok(record) = std::fs::read_to_string(lock_path)
+        && let Some(nonce) = record_nonce(&record)
+    {
+        let _ = std::fs::remove_file(claim_token(lock_path, nonce));
+    }
     std::fs::remove_file(lock_path)?;
     try_create(lock_path)
 }
@@ -379,6 +575,7 @@ pub fn try_acquire_file_lock(lock_path: &Path) -> std::io::Result<Option<LockGua
             path: path.to_path_buf(),
             owner_pid: std::process::id(),
             nonce,
+            delegated: std::sync::atomic::AtomicBool::new(false),
             armed: true,
         })
     };
@@ -428,6 +625,46 @@ mod tests {
             std::process::id().to_string()
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn returned_claim_rejected_contenders_finish_nonblocking_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-return-contender-{}-{}", std::process::id(),
+            super::super::atomic::random_hex16()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for stale_checker in [false, true] {
+            let path = dir.join(if stale_checker { "stale.lock" } else { "pin.lock" });
+            assert!(try_create(&path).unwrap());
+            let record = std::fs::read_to_string(&path).unwrap();
+            let coordinator = LockGuard {
+                path: path.clone(), owner_pid: std::process::id(),
+                nonce: record_nonce(&record).unwrap().to_owned(),
+                delegated: std::sync::atomic::AtomicBool::new(false), armed: true,
+            };
+            let delegate = coordinator.delegate().unwrap();
+            let publisher = pin_claim(&path, &delegate, None, true).unwrap();
+            publisher.into_daemon_claim().unwrap().hand_back(&delegate).unwrap();
+
+            // A contender pins the restored inode just before cancellation.
+            // Release must complete while that contender still has flock.
+            let contender = std::fs::File::open(&path).unwrap();
+            assert!(try_lock_exclusive(&contender).unwrap());
+            coordinator.release();
+            assert!(path.exists(), "nonblocking release defers to the pin holder");
+            if stale_checker {
+                assert!(!steal_opened_lock(&path, contender).unwrap());
+            } else {
+                drop(contender);
+                // Validation rejects the withdrawn token. Its error path,
+                // not a successful PublicationLock, must finish cleanup.
+                assert_eq!(pin_claim(&path, &delegate, None, true).err().unwrap().kind(),
+                    std::io::ErrorKind::PermissionDenied);
+            }
+            assert!(!path.exists(), "rejected contender must not strand the returned live-PID claim");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -504,28 +741,52 @@ fn release_file_lock_checked_nonce(lock_path: &Path, expected_pid: Option<u32>, 
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(lock_path) else {
         return false;
     };
-    loop {
-        // SAFETY: inode is open; a final publisher may still pin this claim.
-        if unsafe { libc::flock(inode.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            break;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return false;
-        }
+    let mut owner = String::new();
+    if inode.read_to_string(&mut owner).is_err()
+        || expected_pid.is_some_and(|pid| parse_leading_int(owner.trim()) != Some(pid as i32))
+        || expected_nonce.is_some_and(|nonce| record_nonce(&owner) != Some(nonce))
+    {
+        return false;
     }
-    if let Some(expected) = expected_pid {
-        let mut owner = String::new();
-        if inode.read_to_string(&mut owner).is_err()
-            || parse_leading_int(owner.trim()) != Some(expected as i32)
-            || expected_nonce.is_some_and(|nonce| record_nonce(&owner) != Some(nonce))
-        {
-            return false;
-        }
+    if expected_nonce.is_none()
+        && let Some(nonce) = record_nonce(&owner)
+    {
+        withdraw_claim(lock_path, nonce);
+    }
+    if !matches!(try_lock_exclusive(&inode), Ok(true)) {
+        return false;
+    }
+    let _cleanup = WithdrawnClaimCleanup {
+        inode: &inode, path: lock_path,
+        legacy_nonce: expected_pid.zip(expected_nonce).map(|(pid, nonce)| (pid as i32, nonce)), armed: true,
+    };
+    use std::io::{Seek, SeekFrom};
+    if (&inode).seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    owner.clear();
+    if (&inode).read_to_string(&mut owner).is_err()
+        || expected_pid.is_some_and(|pid| parse_leading_int(owner.trim()) != Some(pid as i32))
+        || expected_nonce.is_some_and(|nonce| record_nonce(&owner) != Some(nonce))
+    {
+        return false;
+    }
+    if expected_nonce.is_none()
+        && let Some(nonce) = record_nonce(&owner)
+    {
+        withdraw_claim(lock_path, nonce);
     }
     if let (Ok(opened), Ok(current)) = (inode.metadata(), std::fs::symlink_metadata(lock_path))
         && same_inode(&opened, &current)
     {
-        return std::fs::remove_file(lock_path).is_ok();
+        if std::fs::remove_file(lock_path).is_ok() {
+            if !lock_path.file_name().is_some_and(|name| name.as_encoded_bytes().ends_with(b".events.lock"))
+                && let Some(nonce) = record_nonce(&owner)
+            {
+                let _ = std::fs::remove_file(claim_token(lock_path, nonce));
+            }
+            return true;
+        }
     }
     false
 }
@@ -585,7 +846,7 @@ pub fn wait_for_event_lock(name: &str, wait: Duration) -> Result<LockGuard, Stri
             // say so would be five seconds spent on an answer that will not
             // change.
             Err(LockRefusal::Unavailable(cause)) => return Err(cause),
-            Err(LockRefusal::Busy) => {}
+            Err(LockRefusal::Busy) => crate::operation::barrier::barrier("event-lock-busy"),
         }
         let now = Instant::now();
         if now >= deadline {
@@ -602,6 +863,8 @@ pub fn wait_for_event_lock(name: &str, wait: Duration) -> Result<LockGuard, Stri
 /// waiting here makes that creation window invisible without changing the
 /// historical fail-fast behavior of `rename`, `tag`, or other metadata
 /// writers. A holder that outlives the budget still fails closed.
+/// Operation-mode child-fork admission shares this bounded budget so brief
+/// concurrent metadata mutations do not retire a healthy launch.
 ///
 /// node: src/sessions.ts `METADATA_PATCH_WAIT_MS`
 pub const METADATA_PATCH_LOCK_WAIT: Duration = Duration::from_millis(8_000);
@@ -623,7 +886,7 @@ pub fn wait_for_metadata_lock(name: &str, wait: Duration) -> Result<LockGuard, L
             // to say so would be time spent on an answer that will not
             // change.
             Err(refusal @ LockRefusal::Unavailable(_)) => return Err(refusal),
-            Err(LockRefusal::Busy) => {}
+            Err(LockRefusal::Busy) => crate::operation::barrier::barrier("metadata-lock-busy"),
         }
         let now = Instant::now();
         if now >= deadline {

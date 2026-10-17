@@ -13,7 +13,7 @@
 pub const BARRIERS_ENV: &str = "PTY_TEST_OPERATION_BARRIERS";
 
 /// Named launch, revocation installation and cleanup acceptance points.
-pub const BARRIERS: [&str; 18] = [
+pub const BARRIERS: [&str; 21] = [
     "launcher-before-claim",
     "launcher-before-peek",
     "launcher-before-fork",
@@ -24,6 +24,9 @@ pub const BARRIERS: [&str; 18] = [
     "publication-before-lock",
     "publication-before-effects",
     "published-before-child-fork",
+    "before-claim-hand-back",
+    "metadata-lock-busy",
+    "event-lock-busy",
     "child-forked-before-record",
     "child-prepared-before-ack-read",
     "before-ready",

@@ -513,8 +513,10 @@ descriptor cleanup cannot retain a dead daemon's flock or prevent recovery.
 The earlier delegated publication boundary still pins its inode while a separate
 launcher may die; after handover, daemon death leaves no surviving publisher.
 After ordinary child spawn returns, a still-live delegated coordinator receives
-its claim back, preserving its original PID and pathname until that coordinator
-releases it. A revoked managed binding is rejected before spawning a publisher,
+its claim back only while its guard has not released it, preserving its original
+PID and pathname until release. A hand-back I/O failure is diagnosed without
+killing the already-spawned serving session; the daemon's guard still performs
+owner-checked cleanup. A revoked managed binding is rejected before spawning a publisher,
 so a live survivor cannot mask that refusal as an already-running error; this
 deny-only preflight does not replace the final serialized publication check.
 Publication clears the event log using the event writer's five-second lock
@@ -523,12 +525,19 @@ Other callers of `clear_events` retain fail-fast event-lock behavior.
 
 Creation claims carry a decimal PID prefix plus a random per-claim nonce.
 Library launchers that already own the name must explicitly set
-`SpawnParams::creation_lock_delegate = Some(creation_guard.delegate())`;
+`SpawnParams::creation_lock_delegate = Some(creation_guard.delegate()?)`;
 neither the library nor daemon borrows a claim merely because its PID matches.
 `LockGuard::pin()` takes a nonblocking inode flock while the guard remains held;
 revocation installation holds that pin through its final effects. Delegated
 publication validates the nonce and owner on the same inode under flock, so an
 in-process install or gc claim cannot authorize an unrelated library launch.
+Delegation lazily creates a private per-claim token; ordinary event writes do
+not create or remove token sidecars. Release withdraws that token before a
+nonblocking inode-lock attempt, so a stopped pinned daemon cannot hang the
+launcher, restart, or gc coordinator. A withdrawn token cannot be reactivated,
+and return checks it both before and after replacing the owner record.
+Publication pin drop finishes a withdrawn original claim's cleanup if no
+transfer occurs, preventing a live coordinator PID from leaving the name busy.
 The CLI alone upgrades the legacy external `PTY_CREATION_LOCK_OWNER_PID`
 contract to nonce delegation and restores a PID-only coordinator's original
 encoding after ordinary child spawn. Daemon nonce/owner control values are

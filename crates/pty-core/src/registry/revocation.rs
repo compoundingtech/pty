@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ListOptions, acquire_lock, observe_session_strict_in, session_dir, validate_name};
+use super::{ListOptions, LockRefusal, lock_or_refusal, lock_path, observe_session_strict_in, session_dir, validate_name};
 
 const MAX_BYTES: u64 = 16 * 1024;
 const STORE: &str = ".publication-revocations";
@@ -193,6 +193,15 @@ fn read_json<T: for<'de> Deserialize<'de>>(parent: &File, name: &str) -> io::Res
     serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))
 }
 
+fn atomic_rename_error(error: io::Error) -> io::Error {
+    if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)) {
+        return io::Error::new(io::ErrorKind::Unsupported, format!(
+            "publication revocation requires filesystem and kernel support for atomic no-replace rename (Linux renameat2 RENAME_NOREPLACE or macOS renameatx_np RENAME_EXCL); use a supported filesystem/kernel; no unsafe link/unlink fallback is permitted: {error}"
+        ));
+    }
+    error
+}
+
 // A successful publication has exactly one directory entry, even if the
 // process dies immediately after this syscall. Never use link/unlink here:
 // validate_file deliberately rejects multiply linked canonical records.
@@ -210,7 +219,7 @@ fn rename_noreplace(parent: &File, temporary: &CString, name: &CString) -> io::R
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err(io::Error::new(io::ErrorKind::Unsupported, "atomic no-replace publication requires Linux or macOS"));
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if result < 0 { Err(atomic_rename_error(io::Error::last_os_error())) } else { Ok(()) }
 }
 
 // Return false for an existing canonical file. Never replace any canonical inode.
@@ -358,7 +367,12 @@ pub fn install(name: &str, binding: &PublicationBinding, intent_digest: &str, ex
     if identity.root_id != expected_root_id {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "publication revocation expected root identity mismatch"));
     }
-    let claim = acquire_lock(name).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "publication name is busy"))?;
+    let claim = lock_or_refusal(&lock_path(name)).map_err(|refusal| match refusal {
+        LockRefusal::Busy => io::Error::new(io::ErrorKind::WouldBlock, "publication name is busy"),
+        // LockRefusal retains the OS diagnostic but exposes it as a String,
+        // so the original error kind is unavailable. Never label it retryable.
+        LockRefusal::Unavailable(cause) => io::Error::other(format!("publication name lock unavailable: {cause}")),
+    })?;
     // Pin this exact claim nonblockingly before reading or publishing a fence.
     // In-process launches and GC must not borrow installation's ownership.
     let _pin = claim.pin()?;
@@ -430,6 +444,28 @@ pub fn check(name: &str, binding: Option<&PublicationBinding>, tag_operation: Op
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unsupported_atomic_rename_errno_explains_required_filesystem_and_kernel_support() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            let error = atomic_rename_error(io::Error::from_raw_os_error(errno));
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            let message = error.to_string();
+            assert!(message.contains("filesystem and kernel support for atomic no-replace rename"), "{message}");
+            assert!(message.contains("use a supported filesystem/kernel"), "{message}");
+            assert!(message.contains("no unsafe link/unlink fallback"), "{message}");
+        }
+    }
+
+    #[test]
+    fn other_atomic_rename_errno_preserves_os_error() {
+        for errno in [libc::EEXIST, libc::EACCES, libc::ENOSPC, libc::EROFS] {
+            let error = atomic_rename_error(io::Error::from_raw_os_error(errno));
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(error.kind(), io::Error::from_raw_os_error(errno).kind());
+        }
+    }
+
 
     #[test]
     fn atomic_publication_crash_boundary_has_no_temporary_alias_or_replacement() {

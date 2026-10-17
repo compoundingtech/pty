@@ -17,7 +17,12 @@ pub fn run(args: &[String]) -> CliResult {
     let mut json = false;
     let mut index = 1;
     while index < args.len() {
-        let flag = args[index].as_str();
+        // An inline operation value disambiguates option-shaped identities
+        // such as "--json"; a single leading '-' also works as a next argument.
+        let (flag, inline_operation) = match args[index].strip_prefix("--operation=") {
+            Some(value) => ("--operation", Some(value)),
+            None => (args[index].as_str(), None),
+        };
         if flag == "--json" {
             if json {
                 return Err(fail("--json may only be provided once.".into()));
@@ -37,12 +42,20 @@ pub fn run(args: &[String]) -> CliResult {
         if slot.is_some() {
             return Err(fail(format!("{flag} may only be provided once.")));
         }
-        let value = args
-            .get(index + 1)
-            .filter(|value| !value.is_empty() && !value.starts_with('-'))
-            .ok_or_else(|| fail(format!("{flag} requires a value.")))?;
-        *slot = Some(value.as_str());
-        index += 2;
+        let value = match inline_operation {
+            Some(value) if !value.is_empty() => value,
+            Some(_) => return Err(fail(format!("{flag} requires a value."))),
+            None => args
+                .get(index + 1)
+                .filter(|value| !value.is_empty() && (
+                    !value.starts_with('-')
+                        || (flag == "--operation" && !value.starts_with("--"))
+                ))
+                .ok_or_else(|| fail(format!("{flag} requires a value.")))?
+                .as_str(),
+        };
+        *slot = Some(value);
+        index += if inline_operation.is_some() { 1 } else { 2 };
     }
     if verb == "identity" {
         if !json {

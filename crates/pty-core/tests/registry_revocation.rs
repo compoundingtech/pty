@@ -54,6 +54,25 @@ fn private_write(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
+fn unavailable_name_lock_reports_bad_path_instead_of_busy_without_installing() {
+    let root = Root::new();
+    root.run(|| {
+        let root_id = revocation::root_id().unwrap();
+        let path = registry::lock_path("seat");
+        // A directory where a lock file must be is invalid even as root.
+        fs::create_dir(&path).unwrap();
+        let error = revocation::install("seat", &binding("op"), &intent(), &root_id).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other);
+        let message = error.to_string();
+        assert!(message.contains("publication name lock unavailable"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        assert!(!message.contains("busy"), "{message}");
+        assert!(revocation::read("seat", "op").unwrap().is_none());
+        assert!(!root.record("seat", "op").exists());
+    });
+}
+
+#[test]
 fn legacy_tag_only_checks_allow_0755_roots_only_without_a_store() {
     let root = Root::new();
     fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();

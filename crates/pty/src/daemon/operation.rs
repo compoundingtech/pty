@@ -542,9 +542,17 @@ impl Worker {
                     // it cannot fork again. Do not carry a flock into fork:
                     // a child stopped before descriptor cleanup inherits the
                     // open description and would pin a dead daemon's name.
-                    let child_publication_lock = match registry::take_metadata_lock(
+                    // This committed ticket stays in flight while the worker
+                    // waits; the actor can accept cancellation but cannot
+                    // verify retirement until this bounded effect completes.
+                    // Recheck the fence and generation only after admission.
+                    let child_publication_lock = match registry::wait_for_metadata_lock(
                         &self.cfg.name,
-                    ).and_then(|guard| {
+                        registry::METADATA_PATCH_LOCK_WAIT,
+                    ).map_err(|refusal| match refusal {
+                        registry::LockRefusal::Busy => registry::metadata_busy_message(&self.cfg.name),
+                        registry::LockRefusal::Unavailable(cause) => cause,
+                    }).and_then(|guard| {
                         self.cfg.check_publication()?;
                         let current = registry::read_metadata(&self.cfg.name);
                         if !current.as_ref().is_some_and(|metadata| {

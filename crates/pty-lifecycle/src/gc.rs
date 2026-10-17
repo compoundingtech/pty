@@ -715,9 +715,12 @@ fn reconcile_permanent(
             }
             let mut retry_meta = current.clone();
             retry_meta.tags = (!params.tags.is_empty()).then(|| params.tags.clone());
+            params.creation_lock_delegate = match creation_guard.delegate() {
+                Ok(delegate) => Some(delegate),
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             cleanup_all_while_locked(name);
             event_guard.release();
-            params.creation_lock_delegate = Some(creation_guard.delegate());
             let spawn = prepared.spawn(params).map_err(|error| error.to_string());
             if spawn.is_err() && read_metadata(name).is_none() {
                 // Preserve the desired state when launch failed before a new

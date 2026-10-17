@@ -417,11 +417,15 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
+    pty_core::operation::barrier::barrier("before-claim-hand-back");
     if let Some(owner) = delegated_owner.filter(|delegate| registry::pid_alive(delegate.owner_pid)) {
         // A coordinating parent owns its claim beyond successful publication.
         // Restore it only after fork has returned, never as an inherited fd.
-        creation_claim.hand_back(&owner)
-            .map_err(|error| format!("Failed to restore delegated creation claim: {error}"))?;
+        if let Err(error) = creation_claim.hand_back(&owner) {
+            // The child is already serving. hand_back drops its daemon guard
+            // on failure; report cleanup failure without killing the session.
+            eprintln!("pty daemon: Failed to restore delegated creation claim for {name}: {error}");
+        }
     } else {
         drop(creation_claim);
     }

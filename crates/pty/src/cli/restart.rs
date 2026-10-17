@@ -122,6 +122,7 @@ pub fn run(args: &[String]) -> CliResult {
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
     pty_lifecycle::config_for(&params).check_publication()?;
     let publisher = super::prepare_daemon(&mut params)?;
+    params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
     if session.status == SessionStatus::Running
         && let Some(pid) = session.pid
     {
@@ -131,7 +132,6 @@ pub fn run(args: &[String]) -> CliResult {
     }
     registry::cleanup_all_while_locked(&name);
     event_guard.release();
-    params.creation_lock_delegate = Some(creation_guard.delegate());
     let spawned = publisher.spawn(params);
     creation_guard.release();
     if let Err(error) = spawned {

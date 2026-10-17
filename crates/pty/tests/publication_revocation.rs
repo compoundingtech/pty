@@ -119,6 +119,65 @@ fn exact_install_replay_read_and_conflict() {
 }
 
 #[test]
+fn leading_dash_operation_roundtrips_run_install_and_read_without_option_confusion() {
+    let rig = rig();
+    let root = root_id(&rig);
+    let operation = "-operation";
+    rig.ok(&[
+        "run", "-d", "--force", "--id", "dash-operation",
+        "--publication-operation", operation, "--publication-binding", BINDING,
+        "--publication-root-id", &root, "--tag", "st3.start-operation=-operation",
+        "--", "cat",
+    ]);
+    let mut args = install_args("dash-operation", &root);
+    args[5] = operation;
+    let installed = rig.ok(&args).json();
+    assert_eq!(installed["record"]["binding"]["operation"], operation);
+    assert_eq!(read(&rig, "dash-operation", operation), installed["record"]);
+    assert_eq!(rig.ok(&[
+        "publication-revocation", "read", "--id", "dash-operation",
+        "--operation=-operation", "--json",
+    ]).json(), installed["record"]);
+
+    // An actual option is not swallowed as a missing operation's value.
+    let out = rig.run(&[
+        "publication-revocation", "read", "--id", "dash-operation",
+        "--operation", "--json",
+    ]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("--operation requires a value"), "{}", out.stderr);
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn option_shaped_operation_uses_explicit_inline_value() {
+    let rig = rig();
+    let root = root_id(&rig);
+    let installed = rig.ok(&[
+        "publication-revocation", "install", "--id", "worker",
+        "--operation=--json", "--binding", BINDING, "--intent", INTENT,
+        "--root-id", &root, "--json",
+    ]).json();
+    assert_eq!(installed["record"]["binding"]["operation"], "--json");
+    assert_eq!(rig.ok(&[
+        "publication-revocation", "read", "--id", "worker",
+        "--operation=--json", "--json",
+    ]).json(), installed["record"]);
+    let duplicate = rig.run(&[
+        "publication-revocation", "read", "--id", "worker",
+        "--operation=--json", "--operation", "other", "--json",
+    ]);
+    assert_eq!(duplicate.code, 1);
+    assert!(duplicate.stderr.contains("--operation may only be provided once"), "{}", duplicate.stderr);
+    let empty = rig.run(&[
+        "publication-revocation", "read", "--id", "worker", "--operation=", "--json",
+    ]);
+    assert_eq!(empty.code, 1);
+    assert!(empty.stderr.contains("--operation requires a value"), "{}", empty.stderr);
+}
+
+
+#[test]
 fn strict_flags_and_invalid_values_do_not_install() {
     let rig = rig();
     let root = root_id(&rig);

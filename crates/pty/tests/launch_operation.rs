@@ -3502,3 +3502,166 @@ fn managed_operation_revoked_after_publication_refuses_to_fork_child() {
     assert!(!owner.frames.iter().any(|frame| frame["type"] == "held" || frame["type"] == "ready"));
     assert!(!row_exists(&rig, &owner.runtime_id));
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_waits_for_transient_metadata_contention() {
+    bounded_stopped_child_test(
+        "child_fork_waits_for_transient_metadata_contention",
+        |rig| child_fork_contention(rig, "transient"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_metadata_contention_has_a_deadline() {
+    bounded_stopped_child_test(
+        "child_fork_metadata_contention_has_a_deadline",
+        |rig| child_fork_contention(rig, "persistent"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn cancellation_during_child_fork_admission_waits_for_the_committed_ticket() {
+    bounded_stopped_child_test(
+        "cancellation_during_child_fork_admission_waits_for_the_committed_ticket",
+        |rig| child_fork_contention(rig, "cancel"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_rechecks_generation_after_metadata_contention() {
+    bounded_stopped_child_test(
+        "child_fork_rechecks_generation_after_metadata_contention",
+        |rig| child_fork_contention(rig, "generation"),
+    );
+}
+
+#[cfg(debug_assertions)]
+fn child_fork_contention(rig: &Rig, outcome: &str) {
+    use pty_core::registry::{take_metadata_lock, with_root};
+
+    // Keep the fixture's existing exact-marker cleanup applicable on macOS,
+    // where a daemon may already have been reparented to init.
+    let mut owner = Owner::start(rig, "fork-stop", Plan {
+        hold: vec!["published-before-child-fork"],
+        ..Plan::default()
+    });
+    owner.wait_reached("published-before-child-fork");
+    let guard = with_root(&rig.root, || take_metadata_lock(&owner.runtime_id).unwrap());
+    let started = Instant::now();
+    owner.release("published-before-child-fork");
+    owner.wait_reached("metadata-lock-busy");
+    assert_eq!(owner.holder("metadata-lock-busy"), owner.holder("published-before-child-fork"));
+    assert!(!owner.reached("child-forked-before-record"));
+    assert!(!owner.ran());
+
+    if outcome == "persistent" {
+        // Keep the real claim held past the worker's entire budget. The
+        // whole-scenario supervisor catches an accidental unbounded wait,
+        // including retirement and destructor lock acquisitions.
+        let retirement = owner.wait_for("retirement");
+        assert!(started.elapsed() >= pty_core::registry::METADATA_PATCH_LOCK_WAIT);
+        assert!(!owner.reached("child-forked-before-record"));
+        assert_eq!(retirement["retirement"]["requestId"], "producer:startup-failed");
+        drop(guard);
+        owner.drain();
+        assert_ne!(owner.launcher_exit(), 0);
+        assert!(!owner.ran());
+        return;
+    }
+    if outcome == "cancel" {
+        owner.cancel("cancel-contended-fork");
+        let decision = owner.wait_for("decision");
+        let decision = if decision["decision"]["cause"] == "launch" {
+            owner.wait_for("decision")
+        } else {
+            decision
+        };
+        assert_eq!(decision["decision"]["cause"], "cancel", "{decision:#}");
+        // Retirement must not certify an effect which is still waiting.
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "retirement"));
+        assert_eq!(owner.record(rig)["retirement"]["phase"], "requested");
+    }
+    if outcome == "generation" {
+        let mut metadata = rig.read_meta(&owner.runtime_id).unwrap();
+        metadata["generation"] = json!("replacement-generation");
+        // Model a replacement under the very claim the worker is awaiting.
+        std::fs::write(rig.path(&format!("{}.json", owner.runtime_id)),
+            serde_json::to_vec(&metadata).unwrap()).unwrap();
+    }
+    drop(guard);
+    if outcome == "transient" {
+        let ready = owner.wait_for("ready");
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "retirement"));
+        assert!(!owner.ran());
+        owner.transfer("transfer-after-contention", &ready["incarnation"]);
+        assert_eq!(owner.wait_for("transferred")["transfer"]["released"], true);
+        wait_until("command after transient contention", || owner.ran());
+        owner.drain();
+        assert_eq!(owner.launcher_exit(), 0);
+        rig.ok(&["kill", &owner.runtime_id]);
+    } else {
+        let retirement = owner.wait_for("retirement");
+        assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+        owner.drain();
+        assert_ne!(owner.launcher_exit(), 0);
+        assert!(!owner.ran());
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "ready"));
+        if outcome == "generation" {
+            assert!(!owner.reached("child-forked-before-record"));
+            assert_eq!(rig.read_meta(&owner.runtime_id).unwrap()["generation"], "replacement-generation");
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_rechecks_revocation_after_waiting_for_its_installer() {
+    bounded_stopped_child_test(
+        "child_fork_rechecks_revocation_after_waiting_for_its_installer",
+        |rig| {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+                .as_str().unwrap().to_owned();
+            let operation = format!("op-fork-stop-{}", std::process::id());
+            let binding = "f".repeat(64);
+            let mut owner = Owner::start(rig, "fork-stop", Plan {
+                publication: Some((operation.clone(), binding.clone(), root.clone())),
+                hold: vec!["published-before-child-fork", "revocation-install-pinned"],
+                ..Plan::default()
+            });
+            owner.wait_reached("published-before-child-fork");
+            let mut installer = rig.cmd(&[
+                "publication-revocation", "install", "--id", &owner.runtime_id,
+                "--operation", &operation, "--binding", &binding, "--intent", &"e".repeat(64),
+                "--root-id", &root, "--json",
+            ]).env("PTY_TEST_OPERATION_BARRIERS", &owner.barriers)
+                .stdout(Stdio::null()).spawn().unwrap();
+            owner.wait_reached("revocation-install-pinned");
+            owner.release("published-before-child-fork");
+            owner.wait_reached("metadata-lock-busy");
+            assert!(!owner.reached("child-forked-before-record"));
+            // The installer writes the durable revocation only after this
+            // release, then drops its real metadata claim.
+            owner.release("revocation-install-pinned");
+            let mut status = None;
+            wait_until("contending revocation installer", || {
+                status = installer.try_wait().unwrap();
+                status.is_some()
+            });
+            assert!(status.unwrap().success());
+            let retirement = owner.wait_for("retirement");
+            assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+            owner.drain();
+            assert_ne!(owner.launcher_exit(), 0);
+            assert!(!owner.ran());
+            assert!(!owner.reached("child-forked-before-record"));
+            assert!(!owner.frames.iter().any(|frame| frame["type"] == "held" || frame["type"] == "ready"));
+        },
+    );
+}

@@ -9,6 +9,12 @@ Commands:
   install --id <stable-id> --operation <operation> --binding <sha256> --intent <sha256> --root-id <identity> --json
   read --id <stable-id> --operation <operation> --json
 
+Operations may start with '-'. Use --operation=<operation> for option-shaped
+values such as --operation=--json; a separate --json is still required.
+Installation requires filesystem/kernel support for atomic no-replace rename;
+unsupported storage fails closed rather than falling back to link/unlink.
+Lock storage failures are errors, not busy-name retry requests.
+
 Examples:
   pty publication-revocation identity --json
   pty publication-revocation read --id worker --operation revoked-start --json

@@ -314,3 +314,90 @@ fn publisher_holding_final_effects_lock_wins_without_revocation_killing_it() {
     rig.ok(&install_args("winner", &root));
     before.assert_unchanged(&rig, "winner");
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn lifecycle_publication_waits_for_the_real_event_lock_before_clearing() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    const TEST: &str = "lifecycle_publication_waits_for_the_real_event_lock_before_clearing";
+    const FIXTURE: &str = "PTY_PUBLICATION_EVENT_WAIT_FIXTURE";
+    if std::env::var_os(FIXTURE).is_some() {
+        lifecycle_event_lock_wait_scenario();
+        return;
+    }
+    // Supervise the whole fixture, including real daemon and Rig cleanup.
+    // The direct daemon remains in this process group; closing its PTY on
+    // forced cleanup also hangs up the child in its separate session.
+    let mut fixture = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(FIXTURE, "1")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = fixture.try_wait().unwrap() {
+            assert!(status.success(), "event-wait fixture failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: the unreaped direct child leads the private group we
+            // created, so this group ID cannot have been recycled.
+            unsafe { libc::kill(-(fixture.id() as i32), libc::SIGKILL); }
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while fixture.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < reap_deadline, "event-wait fixture was not reaped");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("event-wait fixture exceeded 30 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn lifecycle_event_lock_wait_scenario() {
+    use pty_core::registry::{take_event_lock, with_root};
+
+    let rig = rig();
+    let root = identity(&rig);
+    let name = "event-wait";
+    let barriers = rig.scratch.join("event-wait-barriers");
+    std::fs::create_dir(&barriers).unwrap();
+    std::fs::write(barriers.join("publication-before-effects.hold"), "").unwrap();
+    let old_events = b"{\"type\":\"predecessor-fixture\"}\n";
+    std::fs::write(rig.path(&format!("{name}.events.jsonl")), old_events).unwrap();
+    let mut daemon = direct_daemon(&rig, name, &root, &barriers);
+    wait_until("real daemon at publication effects", || {
+        barriers.join("publication-before-effects.reached").exists()
+    });
+    let guard = with_root(&rig.root, || take_event_lock(name).unwrap());
+    std::fs::write(barriers.join("publication-before-effects.release"), "").unwrap();
+    // This marker is emitted only by the bounded event-lock acquisition,
+    // not by the publication barrier. Reverting the lifecycle caller to
+    // clear_events fails here, even though the waiting primitive still exists.
+    wait_until("lifecycle event clear waiting on its real lock", || {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "publication refused transient contention");
+        barriers.join("event-lock-busy.reached").exists()
+    });
+    let waiter: u32 = std::fs::read_to_string(barriers.join("event-lock-busy.reached"))
+        .unwrap().trim().parse().unwrap();
+    assert_eq!(waiter, daemon.0.id());
+    assert_eq!(std::fs::read(rig.path(&format!("{name}.events.jsonl"))).unwrap(), old_events);
+    assert!(!rig.exists(&format!("{name}.sock")));
+    assert!(!rig.scratch.join("child-ran").exists());
+    drop(guard);
+    wait_until("publication after predecessor event writer releases", || {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "publication failed after event lock release");
+        rig.scratch.join("child-ran").exists()
+    });
+    assert!(rig.exists(&format!("{name}.sock")));
+    assert!(rig.read_meta(name).is_some());
+    wait_until("new session start event", || {
+        let events = rig.events(name);
+        !events.iter().any(|event| event["type"] == "predecessor-fixture")
+            && events.iter().any(|event| event["type"] == "session_start")
+    });
+}

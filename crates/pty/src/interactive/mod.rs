@@ -409,9 +409,9 @@ impl Picker {
             .collect();
         pty_lifecycle::config_for(&params).check_publication()?;
         let publisher = crate::cli::prepare_daemon(&mut params)?;
+        params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
         registry::cleanup_all_while_locked(&session.name);
         event_guard.release();
-        params.creation_lock_delegate = Some(creation_guard.delegate());
         let spawned = publisher.spawn(params);
         creation_guard.release();
         spawned.map(|_| ()).map_err(|e| format!("{}: {e}", session.name))
