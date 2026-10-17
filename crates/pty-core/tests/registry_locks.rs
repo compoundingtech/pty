@@ -376,6 +376,62 @@ fn acquired_publication_pin_transfers_to_descriptor_free_daemon_claim() {
 }
 
 #[test]
+fn publication_transfer_unlocks_while_an_unrelated_fork_is_still_pre_exec() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let root = root();
+    let name = unique_name("pub-fork-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let pin = registry::lock::pin_publication(&name, None).unwrap();
+    let old_inode = std::fs::File::open(&path).unwrap();
+    let (mut control, child_control) = std::os::unix::net::UnixStream::pair().unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let spawning = std::thread::spawn(move || {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.arg("--list").stdout(std::process::Stdio::null());
+        // SAFETY: the child only uses async-signal-safe libc I/O before exec.
+        // It deliberately holds every inherited CLOEXEC descriptor until the
+        // parent releases this gate, reproducing concurrent Command::spawn.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = child_control.as_raw_fd();
+                let ready = b'F';
+                if libc::write(fd, (&raw const ready).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = 0_u8;
+                if libc::read(fd, (&raw mut release).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("exec after fork gate")
+    });
+    let mut ready = [0];
+    control.read_exact(&mut ready).expect("child reached pre-exec gate");
+    assert_eq!(ready, *b"F");
+    // SAFETY: old_inode owns this separately opened descriptor. A live pin
+    // must remain exclusive even after an unrelated child inherits its fd.
+    assert_eq!(unsafe {
+        libc::flock(old_inode.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    }, -1);
+    assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+    let claim = pin.into_daemon_claim().unwrap();
+    // No waiting or WouldBlock retry: the child still holds the inherited
+    // open file description, but the owner's lease has ended.
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+    control.write_all(b"X").unwrap();
+    assert!(spawning.join().unwrap().wait().unwrap().success());
+    drop(claim);
+    assert!(!path.exists());
+}
+
+#[test]
 fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     use pty_core::registry::revocation::{self, PublicationBinding};
 

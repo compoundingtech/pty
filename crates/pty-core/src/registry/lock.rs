@@ -320,16 +320,49 @@ fn try_create(lock_path: &Path) -> std::io::Result<bool> {
     result
 }
 
-fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+/// One process-local advisory lease. Closing a descriptor alone does not end
+/// a flock if a concurrent fork inherited the same open file description.
+/// Explicit unlock ends this lease even while that child is still pre-exec;
+/// only this owner may release it, after its publication/cleanup has finished.
+struct InodeLock(std::fs::File);
+
+impl std::ops::Deref for InodeLock {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for InodeLock {
+    fn drop(&mut self) {
+        loop {
+            // SAFETY: this lease owns the live descriptor. Inherited copies
+            // must not prolong its lock beyond this owner's critical section.
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+    }
+}
+
+fn try_lock_exclusive(file: std::fs::File) -> std::io::Result<Option<InodeLock>> {
+    lock_exclusive(file, false)
+}
+
+fn lock_exclusive(file: std::fs::File, wait: bool) -> std::io::Result<Option<InodeLock>> {
+    let flags = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
     loop {
         // SAFETY: `file` owns a valid descriptor for the duration of the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(true);
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(Some(InodeLock(file)));
         }
         let error = std::io::Error::last_os_error();
         match error.kind() {
             std::io::ErrorKind::Interrupted => {}
-            std::io::ErrorKind::WouldBlock => return Ok(false),
+            std::io::ErrorKind::WouldBlock => return Ok(None),
             _ => return Err(error),
         }
     }
@@ -371,9 +404,9 @@ pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<Cr
     // Activate before taking flock: a concurrent Rust guard release must
     // either withdraw this token or unlink the still-unpinned original inode.
     activate_claim(&path, &nonce)?;
-    if !try_lock_exclusive(&inode)? {
+    let Some(inode) = try_lock_exclusive(inode)? else {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "creation claim is pinned"));
-    }
+    };
     let cleanup = WithdrawnClaimCleanup {
         inode: &inode, path: &path, legacy_nonce: Some((owner_pid, &nonce)), armed: true,
     };
@@ -383,15 +416,15 @@ pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<Cr
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
     }
     use std::io::{Seek, SeekFrom};
-    (&inode).seek(SeekFrom::Start(0))?;
+    (&*inode).seek(SeekFrom::Start(0))?;
     let mut pinned_record = String::new();
-    (&inode).read_to_string(&mut pinned_record)?;
+    (&*inode).read_to_string(&mut pinned_record)?;
     if pinned_record != record {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
     }
     if record_nonce(&record).is_none() {
         // Preserve the PID prefix and restore its original encoding on return.
-        write!(&inode, " {nonce}")?;
+        write!(&*inode, " {nonce}")?;
     }
     drop(cleanup);
     Ok(CreationClaimDelegate { owner_pid, nonce })
@@ -402,8 +435,9 @@ pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<Cr
 /// inode prevents stale recovery (or the launcher's release) from admitting a
 /// revocation or replacement if that launcher exits during publication.
 pub struct PublicationLock {
-    // The pin is closed before the independently acquired guard drops.
-    _inode: std::fs::File,
+    // Cleanup runs in Drop while still pinned; the lease then explicitly
+    // unlocks and closes before the independently acquired guard drops.
+    _inode: InodeLock,
     _claim: Option<LockGuard>,
     path: PathBuf,
     delegate: Option<CreationClaimDelegate>,
@@ -488,18 +522,18 @@ fn pin_claim(
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)?;
-    if !try_lock_exclusive(&inode)? {
+    let Some(inode) = try_lock_exclusive(inode)? else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock, "publication creation lock is pinned",
         ));
-    }
+    };
     let mut cleanup = WithdrawnClaimCleanup {
         inode: &inode, path, legacy_nonce: Some((delegate.owner_pid, &delegate.nonce)), armed: true,
     };
     let opened = inode.metadata()?;
     let current = std::fs::symlink_metadata(&path)?;
     let mut owner = String::new();
-    (&inode).read_to_string(&mut owner)?;
+    (&*inode).read_to_string(&mut owner)?;
     if !opened.is_file() || !same_inode(&opened, &current)
         || parse_leading_int(&owner) != Some(delegate.owner_pid)
         || record_nonce(&owner) != Some(delegate.nonce.as_str())
@@ -529,9 +563,13 @@ fn holder_is_alive(file: &std::fs::File) -> bool {
 }
 
 fn steal_opened_lock(lock_path: &Path, stale_inode: std::fs::File) -> std::io::Result<bool> {
-    if !try_lock_exclusive(&stale_inode)? {
+    let Some(stale_inode) = try_lock_exclusive(stale_inode)? else {
         return Ok(false);
-    }
+    };
+    steal_locked_inode(lock_path, stale_inode)
+}
+
+fn steal_locked_inode(lock_path: &Path, stale_inode: InodeLock) -> std::io::Result<bool> {
     let _cleanup = WithdrawnClaimCleanup {
         inode: &stale_inode, path: lock_path, legacy_nonce: None, armed: true,
     };
@@ -683,6 +721,49 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_event_release_waits_for_a_transient_stale_checker() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-event-checker-{}-{}", std::process::id(),
+            super::super::atomic::random_hex16()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.events.lock");
+        let claim = try_acquire_file_lock(&path).unwrap().unwrap();
+        let checker = try_lock_exclusive(std::fs::File::open(&path).unwrap()).unwrap().unwrap();
+        let (released, completion) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            claim.release();
+            released.send(()).unwrap();
+        });
+        // There is no withdrawal token for the checker to finish cleanup.
+        let before_unlock = completion.recv_timeout(Duration::from_millis(100));
+        drop(checker);
+        releaser.join().unwrap();
+        assert_eq!(before_unlock, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!path.exists(), "release must remove the live-PID event claim");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delegated_event_release_stays_nonblocking_until_publication_finishes() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-event-publication-{}-{}", std::process::id(),
+            super::super::atomic::random_hex16()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.events.lock");
+        let claim = try_acquire_file_lock(&path).unwrap().unwrap();
+        let pin = claim.pin().unwrap();
+        claim.release();
+        assert!(path.exists(), "publication still serializes the withdrawn claim");
+        assert!(try_acquire_file_lock(&path).unwrap().is_none());
+        drop(pin);
+        assert!(!path.exists(), "publication drop finishes withdrawal");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn returned_claim_rejected_contenders_finish_nonblocking_release() {
         let dir = std::env::temp_dir().join(format!(
             "pty-return-contender-{}-{}", std::process::id(),
@@ -705,11 +786,11 @@ mod tests {
             // A contender pins the restored inode just before cancellation.
             // Release must complete while that contender still has flock.
             let contender = std::fs::File::open(&path).unwrap();
-            assert!(try_lock_exclusive(&contender).unwrap());
+            let contender = try_lock_exclusive(contender).unwrap().unwrap();
             coordinator.release();
             assert!(path.exists(), "nonblocking release defers to the pin holder");
             if stale_checker {
-                assert!(!steal_opened_lock(&path, contender).unwrap());
+                assert!(!steal_locked_inode(&path, contender).unwrap());
             } else {
                 drop(contender);
                 // Validation rejects the withdrawn token. Its error path,
@@ -802,24 +883,32 @@ fn release_file_lock_checked_nonce(lock_path: &Path, expected_pid: Option<u32>, 
     {
         return false;
     }
+    // Ordinary event claims have no delegation token or publication boundary.
+    // Their only flock contenders are transient stale checkers, so preserve
+    // the original wait-for-checker release. Returning busy here strands a
+    // live-PID claim: no withdrawal token exists for the checker to clean up.
+    // Explicitly delegated event claims use the nonblocking withdrawal protocol.
+    let wait_for_checker = lock_path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".events.lock"))
+        && record_nonce(&owner).is_none_or(|nonce| !claim_token(lock_path, nonce).exists());
     if expected_nonce.is_none()
         && let Some(nonce) = record_nonce(&owner)
     {
         withdraw_claim(lock_path, nonce);
     }
-    if !matches!(try_lock_exclusive(&inode), Ok(true)) {
+    let Ok(Some(inode)) = lock_exclusive(inode, wait_for_checker) else {
         return false;
-    }
+    };
     let _cleanup = WithdrawnClaimCleanup {
         inode: &inode, path: lock_path,
         legacy_nonce: expected_pid.zip(expected_nonce).map(|(pid, nonce)| (pid as i32, nonce)), armed: true,
     };
     use std::io::{Seek, SeekFrom};
-    if (&inode).seek(SeekFrom::Start(0)).is_err() {
+    if (&*inode).seek(SeekFrom::Start(0)).is_err() {
         return false;
     }
     owner.clear();
-    if (&inode).read_to_string(&mut owner).is_err()
+    if (&*inode).read_to_string(&mut owner).is_err()
         || expected_pid.is_some_and(|pid| parse_leading_int(owner.trim()) != Some(pid as i32))
         || expected_nonce.is_some_and(|nonce| record_nonce(&owner) != Some(nonce))
     {

@@ -524,6 +524,9 @@ deny-only preflight does not replace the final serialized publication check.
 Publication clears the event log using the event writer's five-second lock
 deadline, allowing a predecessor's shutdown append to finish during restart.
 Other callers of `clear_events` retain fail-fast event-lock behavior.
+Ordinary, undelegated event claims wait for a transient stale-checker's inode
+inspection when releasing, so a live daemon cannot strand its event lock.
+Delegated event claims retain the nonblocking withdrawal protocol.
 
 Creation claims carry a decimal PID prefix plus a random per-claim nonce.
 Library launchers that already own the name must explicitly set
@@ -542,6 +545,9 @@ launcher, restart, or gc coordinator. A withdrawn token cannot be reactivated,
 and return checks it both before and after replacing the owner record.
 Publication pin drop finishes a withdrawn original claim's cleanup if no
 transfer occurs, preventing a live coordinator PID from leaving the name busy.
+Advisory inode leases explicitly unlock after their critical section, rather
+than relying on descriptor close: an unrelated concurrent fork may still hold
+an inherited close-on-exec descriptor before it reaches exec.
 The CLI alone upgrades the legacy external `PTY_CREATION_LOCK_OWNER_PID`
 contract to nonce delegation and restores a PID-only coordinator's original
 encoding after ordinary child spawn. Daemon nonce/owner control values are
