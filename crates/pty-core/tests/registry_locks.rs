@@ -296,7 +296,7 @@ fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     let intent = "b".repeat(64);
     let name = unique_name("pub-first");
     let pin = registry::lock::pin_publication(&name, None).expect("publisher wins");
-    revocation::check(&name, Some(&binding), None).expect("not revoked");
+    revocation::check(&name, Some(&binding), Some(&binding.operation)).expect("not revoked");
     assert_eq!(
         revocation::install(&name, &binding, &intent, &root_id).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
@@ -309,8 +309,10 @@ fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     let name = unique_name("revoke-first");
     let receipt = revocation::install(&name, &binding, &intent, &root_id).expect("revoker wins");
     let pin = registry::lock::pin_publication(&name, None).expect("late publisher pins");
+    let rejection = revocation::check(&name, Some(&binding), Some(&binding.operation)).unwrap_err();
+    assert_eq!(rejection.to_string(), "operation-revoked");
     assert_eq!(
-        revocation::check(&name, Some(&binding), None).unwrap_err().kind(),
+        rejection.kind(),
         std::io::ErrorKind::PermissionDenied,
         "the final check rejects the late publisher while it holds serialization"
     );
