@@ -121,6 +121,7 @@ pub fn run(args: &[String]) -> CliResult {
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
     pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
     if session.status == SessionStatus::Running
         && let Some(pid) = session.pid
     {
@@ -131,7 +132,7 @@ pub fn run(args: &[String]) -> CliResult {
     registry::cleanup_all_while_locked(&name);
     event_guard.release();
     params.creation_lock_owner_pid = Some(std::process::id() as i32);
-    let spawned = super::spawn_daemon(&params);
+    let spawned = publisher.spawn(params);
     creation_guard.release();
     if let Err(error) = spawned {
         eprintln!("pty restart: {error}");

@@ -298,3 +298,92 @@ fn revoked_restart_preserves_stopped_predecessor_without_launching() {
     picker.close();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Linux current_exe reports the deleted picker image after an atomic install.
+/// Its install-path fallback must admit the replacement before cleaning a row.
+#[test]
+#[cfg(target_os = "linux")]
+fn deleted_picker_refuses_downgraded_publisher_before_restart_cleanup() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+
+    let _serial = serial();
+    let root = unique_root();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = Command::new(pty_bin())
+        .args(["publication-revocation", "identity", "--json"])
+        .env("PTY_ROOT", &root)
+        .env_remove("PTY_SESSION")
+        .output()
+        .unwrap();
+    assert!(identity.status.success(), "{}", String::from_utf8_lossy(&identity.stderr));
+    let identity: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
+    let marker = root.join("downgrade-child-ran");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let now = pty_core::registry::iso8601_from_epoch_ms(now_ms);
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "generation": "bound-stopped-generation",
+        "command": "/bin/sh",
+        "args": ["-c", "printf ran > \"$1\"", "sh", marker],
+        "displayCommand": "bound stopped command",
+        "cwd": root,
+        "rows": 24,
+        "cols": 80,
+        "createdAt": now,
+        "exitedAt": now,
+        "exitCode": 0,
+        "tags": {"keep": "true", "st3.start-operation": "bound-start"},
+        "publicationBinding": {
+            "operation": "bound-start",
+            "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "publicationRootId": identity["root_id"],
+        "publicationCapability": 1
+    })).unwrap();
+    let events = b"{\"type\":\"fixture-predecessor\"}\n";
+    let pid = b"2147483647\n";
+    std::fs::write(root.join("bound.json"), &metadata).unwrap();
+    std::fs::write(root.join("bound.events.jsonl"), events).unwrap();
+    std::fs::write(root.join("bound.pid"), pid).unwrap();
+    drop(UnixListener::bind(root.join("bound.sock")).unwrap());
+    let socket = std::fs::metadata(root.join("bound.sock")).unwrap();
+
+    // A copy (not a hardlink) keeps replacement completely private to this test.
+    let installed = root.join("installed-pty");
+    std::fs::copy(pty_bin(), &installed).unwrap();
+    let mut picker = Session::spawn(
+        installed.to_str().unwrap(),
+        &["--force"],
+        SpawnOptions {
+            rows: Some(24),
+            cols: Some(100),
+            env: vec![
+                ("PTY_ROOT".to_string(), root.to_string_lossy().into_owned()),
+                ("HOME".to_string(), root.to_string_lossy().into_owned()),
+            ],
+            ..Default::default()
+        },
+    ).expect("spawn picker from private installed copy");
+    picker.wait_for_text("bound", 8000).expect("bound predecessor listed");
+    let replacement = root.join("unsupported-publisher");
+    std::fs::copy("/bin/false", &replacement).unwrap();
+    std::fs::rename(&replacement, &installed).unwrap();
+
+    picker.type_str("\r");
+    picker.wait_for_text("managed publisher lacks publication-revocation v1", 8000)
+        .expect("deleted picker verifies its downgraded install-path replacement");
+    assert!(!picker.has_exited(), "publisher refusal must leave the picker alive");
+    assert_eq!(std::fs::read(root.join("bound.json")).unwrap(), metadata);
+    assert_eq!(std::fs::read(root.join("bound.events.jsonl")).unwrap(), events);
+    assert_eq!(std::fs::read(root.join("bound.pid")).unwrap(), pid);
+    let after = std::fs::metadata(root.join("bound.sock")).unwrap();
+    assert_eq!((after.dev(), after.ino()), (socket.dev(), socket.ino()));
+    assert!(!marker.exists(), "downgrade refusal must not launch the command");
+
+    picker.type_str("q");
+    picker.close();
+    let _ = std::fs::remove_dir_all(&root);
+}

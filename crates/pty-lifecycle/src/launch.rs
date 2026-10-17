@@ -347,6 +347,129 @@ impl ChildWatch {
     }
 }
 
+/// A selected publisher held open from capability admission through exec.
+/// Prepare this before deleting a managed predecessor; never probe one path
+/// and subsequently execute its potentially downgraded replacement.
+pub struct PreparedDaemon {
+    executable: std::path::PathBuf,
+    _image: Option<File>,
+}
+
+impl PreparedDaemon {
+    pub fn spawn(self, params: SpawnParams) -> Result<SpawnedDaemon, SpawnError> {
+        if params.publication_binding.is_some() && self._image.is_none() {
+            return Err(SpawnError::Io("managed publisher was not verified".into()));
+        }
+        spawn_prepared_daemon(&self.executable, params)
+    }
+}
+
+/// Legacy launches keep their existing executable selection. Managed launches
+/// execute the same open native image that answered the capability handshake.
+/// Descriptor paths also retain an unlinked image after an atomic downgrade.
+pub fn prepare_daemon(
+    executable: &std::path::Path,
+    params: &SpawnParams,
+) -> Result<PreparedDaemon, SpawnError> {
+    if params.publication_binding.is_none() {
+        return Ok(PreparedDaemon { executable: executable.to_owned(), _image: None });
+    }
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let mut image = File::open(executable)
+        .map_err(|error| SpawnError::Io(format!("cannot pin managed publisher: {error}")))?;
+    let metadata = image.metadata().map_err(|error| SpawnError::Io(error.to_string()))?;
+    let mut magic = [0; 4];
+    image.read_exact(&mut magic).map_err(|error| SpawnError::Io(error.to_string()))?;
+    let native = magic == *b"\x7fELF" || matches!(magic,
+        [0xfe, 0xed, 0xfa, 0xce] | [0xce, 0xfa, 0xed, 0xfe]
+        | [0xfe, 0xed, 0xfa, 0xcf] | [0xcf, 0xfa, 0xed, 0xfe]
+        | [0xca, 0xfe, 0xba, 0xbe] | [0xbe, 0xba, 0xfe, 0xca]);
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 || !native {
+        return Err(SpawnError::Io("managed publisher must be a native executable, not a wrapper".into()));
+    }
+    // Keep the image clear of the config/operation descriptors. CLOEXEC closes
+    // it only after the kernel has opened this exact image for exec.
+    // SAFETY: image owns a valid descriptor; fcntl creates a distinct descriptor.
+    let fd = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if fd < 0 {
+        return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
+    }
+    // SAFETY: fcntl returned a newly owned descriptor.
+    let image = unsafe { File::from_raw_fd(fd) };
+    #[cfg(target_os = "linux")]
+    let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
+    #[cfg(not(target_os = "linux"))]
+    let pinned = std::path::PathBuf::from(format!("/dev/fd/{fd}"));
+    let mut probe = Command::new(&pinned).args(["capabilities", "--json"])
+        // Old PTYs can forward an unknown verb to pty-capabilities on PATH.
+        // Only this image's built-in implementation may establish capability.
+        .env_remove("PATH")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|error| SpawnError::Io(format!("cannot verify managed publisher: {error}")))?;
+    let mut stdout = probe.stdout.take().expect("capability stdout is piped");
+    let mut bytes = Vec::new();
+    let result = (|| {
+        // Bound both output and time without a reader thread that an inherited
+        // stdout in an unsupported publisher's descendant could keep alive.
+        // SAFETY: stdout owns a live pipe descriptor; these calls only change
+        // that descriptor's blocking mode.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe {
+            libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } < 0 {
+            return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut status = None;
+        loop {
+            let mut chunk = [0; 4096];
+            let ended = match stdout.read(&mut chunk) {
+                Ok(0) => true,
+                Ok(count) => {
+                    if bytes.len() + count > 65_536 {
+                        return Err(SpawnError::Io("managed publisher capability output is oversized".into()));
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(SpawnError::Io(error.to_string())),
+            };
+            if status.is_none() {
+                status = probe.try_wait().map_err(|error| SpawnError::Io(error.to_string()))?;
+            }
+            if ended && let Some(status) = status {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(SpawnError::Io("managed publisher capability probe timed out".into()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = probe.kill();
+        let _ = probe.wait();
+    }
+    let status = result?;
+    let capabilities = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let publication = capabilities.as_ref().and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("publication-revocation"));
+    let verified = status.success()
+        && publication.is_some_and(|value| {
+            value["versions"].as_array().is_some_and(|versions| versions.contains(&serde_json::json!(1)))
+                && value["recordSchemas"].as_array().is_some_and(|schemas| schemas.contains(&serde_json::json!(1)))
+                && value["atomicNamePublication"] == true
+                && value["managedImmutableBinding"] == true
+        });
+    if !verified {
+        return Err(SpawnError::Io("managed publisher lacks publication-revocation v1".into()));
+    }
+    Ok(PreparedDaemon { executable: pinned, _image: Some(image) })
+}
+
 /// Spawn `<daemon_executable> __daemon` detached and wait until it has
 /// published the session. On any failure after the process started (and it has
 /// not already exited) the daemon is sent SIGTERM.
@@ -356,6 +479,13 @@ impl ChildWatch {
 ///
 /// node: src/spawn.ts:164-243
 pub fn spawn_daemon(
+    daemon_executable: &std::path::Path,
+    params: SpawnParams,
+) -> Result<SpawnedDaemon, SpawnError> {
+    prepare_daemon(daemon_executable, &params)?.spawn(params)
+}
+
+fn spawn_prepared_daemon(
     daemon_executable: &std::path::Path,
     params: SpawnParams,
 ) -> Result<SpawnedDaemon, SpawnError> {
@@ -456,6 +586,7 @@ pub fn spawn_gated_daemon(
     params: SpawnParams,
     operation: OperationLaunch,
 ) -> Result<GatedDaemon, SpawnError> {
+    let publisher = prepare_daemon(daemon_executable, &params)?;
     let mut gate = [0i32; 2];
     // Close-on-exec from creation, so no other thread's fork and exec can
     // inherit an end before it is re-homed.
@@ -477,7 +608,7 @@ pub fn spawn_gated_daemon(
     };
     // SAFETY: freshly re-homed descriptor owned here.
     let gate_write = unsafe { File::from_raw_fd(gate_write) };
-    let started = start_daemon_process(daemon_executable, &params, Some((&operation, gate_read)));
+    let started = start_daemon_process(&publisher.executable, &params, Some((&operation, gate_read)));
     // SAFETY: the parent's copy of the gate read end; the daemon has its own.
     unsafe { libc::close(gate_read) };
     let (watch, pid) = started?;

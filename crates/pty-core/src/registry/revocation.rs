@@ -269,10 +269,31 @@ fn read_record(version: &File, identity: &RootIdentity, name: &str, operation: &
 }
 
 /// Read one exact fence without acquiring creation ownership or mutating files.
+/// Legacy roots may use their existing permissions and symlink ancestors only
+/// when descriptor-relative inspection proves the store itself is absent.
 pub fn read(name: &str, operation: &str) -> io::Result<Option<PublicationRevocation>> {
+    read_with_root_policy(name, operation, false)
+}
+
+fn read_with_root_policy(name: &str, operation: &str, managed: bool) -> io::Result<Option<PublicationRevocation>> {
     validate_name(name).map_err(invalid)?;
     validate_operation(operation)?;
-    // Absence of the store is normal; a partially present store is not.
+    if !managed {
+        // Open using the same ancestor-following semantics as legacy root.rs.
+        // Only ENOENT for the store entry permits compatibility: a dangling
+        // symlink, invalid store, or failed inspection must never bypass checks.
+        let root = File::open(session_dir())?;
+        let name = component(STORE)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: root and name are live and stat points to writable storage.
+        if unsafe { libc::fstatat(root.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound { return Ok(None); }
+            return Err(error);
+        }
+    }
+    // Managed reads always validate the root, even before store enrollment.
+    // Any present store also requires strict root and store validation.
     let root = open_root(false)?;
     match open_at(&root, STORE, true) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -348,7 +369,7 @@ pub fn check(name: &str, binding: Option<&PublicationBinding>, tag_operation: Op
     if let Some(operation) = tag_operation { validate_operation(operation)?; }
     let operation = binding.map(|binding| binding.operation.as_str()).or(tag_operation);
     if let Some(operation) = operation
-        && read(name, operation)?.is_some()
+        && read_with_root_policy(name, operation, binding.is_some())?.is_some()
     {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "operation-revoked"));
     }

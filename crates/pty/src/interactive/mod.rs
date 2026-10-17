@@ -408,12 +408,13 @@ impl Picker {
             .map(|s| s.to_string())
             .collect();
         pty_lifecycle::config_for(&params).check_publication()?;
+        let publisher = crate::cli::prepare_daemon(&mut params)?;
         registry::cleanup_all_while_locked(&session.name);
         event_guard.release();
         params.creation_lock_owner_pid = Some(std::process::id() as i32);
-        let spawned = crate::cli::spawn_daemon(&params);
+        let spawned = publisher.spawn(params);
         creation_guard.release();
-        spawned.map_err(|e| format!("{}: {e}", session.name))
+        spawned.map(|_| ()).map_err(|e| format!("{}: {e}", session.name))
     }
 
     /// One keystroke makes a session: a random id, your shell, your home

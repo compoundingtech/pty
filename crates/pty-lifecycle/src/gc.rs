@@ -19,7 +19,7 @@ use pty_core::registry::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{SpawnParams, apply_persisted_launch_options, spawn_daemon};
+use crate::{SpawnParams, apply_persisted_launch_options, prepare_daemon};
 /// Options for one stateless garbage-collection pass.
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -248,7 +248,16 @@ pub fn gc(options: GcOptions) -> GcResult {
             continue;
         }
         if dry_run {
-            let (params, ptyfile_reread) = respawn_params(&s.name, meta);
+            let (params, ptyfile_reread) = match respawn_params(&s.name, meta) {
+                Ok(params) => params,
+                Err(error) => {
+                    result.respawn_failed.push(RespawnFailed {
+                        name: s.name.clone(),
+                        error,
+                    });
+                    continue;
+                }
+            };
             let decision = classify_flapping(
                 meta,
                 &params.command,
@@ -636,7 +645,10 @@ fn reconcile_permanent(
         return PermanentOutcome::Stale;
     }
 
-    let (mut params, ptyfile_reread) = respawn_params(name, &current);
+    let (mut params, ptyfile_reread) = match respawn_params(name, &current) {
+        Ok(params) => params,
+        Err(error) => return PermanentOutcome::Failed(error),
+    };
     if let Err(error) = crate::config_for(&params).check_publication() {
         return PermanentOutcome::Failed(error);
     }
@@ -689,6 +701,12 @@ fn reconcile_permanent(
                     "daemon executable is required to respawn permanent sessions".to_string(),
                 );
             };
+            // Verify and pin the managed publisher before changing retained
+            // evidence; spawn must execute this same image after cleanup.
+            let prepared = match prepare_daemon(daemon_executable, &params) {
+                Ok(prepared) => prepared,
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             for (key, value) in &decision.bookkeeping {
                 params.tags.insert(key.clone(), value.clone());
             }
@@ -699,7 +717,7 @@ fn reconcile_permanent(
             retry_meta.tags = (!params.tags.is_empty()).then(|| params.tags.clone());
             cleanup_all_while_locked(name);
             event_guard.release();
-            let spawn = spawn_daemon(daemon_executable, params).map_err(|error| error.to_string());
+            let spawn = prepared.spawn(params).map_err(|error| error.to_string());
             if spawn.is_err() && read_metadata(name).is_none() {
                 // Preserve the desired state when launch failed before a new
                 // daemon could publish. The next gc tick must be able to retry.
@@ -718,7 +736,7 @@ fn reconcile_permanent(
 /// fresh pty.toml definition when the recorded binding still resolves.
 ///
 /// node: src/sessions.ts:899-982
-fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
+fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bool), String> {
     let mut command = meta.command.clone();
     let mut args = meta.args.clone();
     let mut display_command = meta.display_command.clone();
@@ -739,6 +757,20 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
             .cwd
             .clone()
             .unwrap_or_else(|| file.dir.to_string_lossy().into_owned());
+        // A managed binding's digest belongs to the external start request,
+        // not a hash we can reconstruct from these generic launch parameters.
+        // Compare the exact persisted executable, argument vector and cwd:
+        // env from pty.toml is already encoded in the shell argument above.
+        // Do not normalize paths or shell text and accidentally authorize a
+        // different launch under the original operation/digest/root.
+        if meta.publication_binding.is_some()
+            && (command != meta.command || args != meta.args || cwd != meta.cwd)
+        {
+            return Err(
+                "managed pty.toml launch inputs changed; a new operation and publication binding are required"
+                    .into(),
+            );
+        }
         let mut user_keys: Vec<String> = session
             .tags
             .as_ref()
@@ -777,7 +809,7 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, meta);
     params.respawn = true;
-    (params, ptyfile_reread)
+    Ok((params, ptyfile_reread))
 }
 
 fn parent_of(s: &SessionInfo) -> Option<String> {
@@ -1106,6 +1138,40 @@ pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_unbound_respawn_still_overlays_manifest_launch_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-gc-legacy-manifest-{}-{}",
+            std::process::id(),
+            now_epoch_ms(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let manifest = dir.join("pty.toml");
+        std::fs::write(
+            &manifest,
+            "[sessions.worker]\ncommand = 'echo changed'\ncwd = 'subdir'\nenv = { VALUE = 'new' }\n",
+        )
+        .unwrap();
+        let mut tags = TagMap::new();
+        tags.insert("ptyfile".into(), manifest.to_string_lossy().into_owned());
+        tags.insert("ptyfile.session".into(), "worker".into());
+        let metadata = SessionMetadata {
+            command: "/bin/true".into(),
+            args: vec!["old-argument".into()],
+            cwd: "/old-cwd".into(),
+            tags: Some(tags),
+            ..Default::default()
+        };
+        let (params, reread) = respawn_params("legacy-manifest", &metadata).unwrap();
+        assert!(reread);
+        assert_eq!(params.command, "/bin/sh");
+        assert_eq!(params.args, ["-c", "export VALUE='new'; echo changed"]);
+        assert_eq!(params.cwd, dir.join("subdir").to_string_lossy());
+        assert!(params.publication_binding.is_none());
+        assert!(params.publication_root_id.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_stalled_cwd_probe_is_inconclusive_within_the_deadline() {

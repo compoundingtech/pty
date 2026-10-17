@@ -78,8 +78,8 @@ pub fn metadata_matches_observation(observed: &SessionMetadata, current: &Sessio
 /// concurrent rewrite, then publish the mutated object (unknown fields and
 /// key order preserved). Publication provenance is immutable, including through
 /// reserved keys inserted into the flattened `extra` map. Bound sessions also
-/// retain their launch inputs so respawn cannot reuse a binding for a different
-/// launch.
+/// retain their operation tag and launch inputs so respawn cannot reuse a
+/// binding for a different launch. Unbound legacy operation tags remain mutable.
 ///
 /// node: src/sessions.ts:347-398
 pub fn mutate_metadata_under_lock(
@@ -200,14 +200,14 @@ fn mutate_metadata_under_lock_core(
     if before.publication_binding != after.publication_binding
         || before.publication_root_id != after.publication_root_id
         || before.publication_capability != after.publication_capability
-        || operation(&before) != operation(&after)
+        || (before.publication_binding.is_some()
+            && (operation(&before) != operation(&after) || after.extra.contains_key("tags")))
         // Flattened extras can override typed fields during serialization.
         // Reject those aliases before diffing, even when the typed values match.
         || [
             "publicationBinding",
             "publicationRootId",
             "publicationCapability",
-            "tags",
         ]
         .iter()
         .any(|key| after.extra.contains_key(*key))

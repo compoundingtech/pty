@@ -362,11 +362,16 @@ pub use pty_lifecycle::{SpawnParams, apply_persisted_launch_options};
 /// node: src/spawn.ts:372-393, 164-243
 pub fn spawn_daemon(p: &SpawnParams) -> Result<(), String> {
     let mut params = p.clone();
-    params.command = pty_core::spawn::resolve_command(&p.command)?;
-    let executable = daemon_executable()?;
-    pty_lifecycle::spawn_daemon(&executable, params)
+    prepare_daemon(&mut params)?.spawn(params)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Select and pin the publisher before a restart/recreation cleans its row.
+pub fn prepare_daemon(params: &mut SpawnParams) -> Result<pty_lifecycle::PreparedDaemon, String> {
+    params.command = pty_core::spawn::resolve_command(&params.command)?;
+    let executable = daemon_executable()?;
+    pty_lifecycle::prepare_daemon(&executable, params).map_err(|error| error.to_string())
 }
 
 /// The executable that implements `__daemon`: this one, or its replacement

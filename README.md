@@ -473,6 +473,23 @@ tags are not substitutes for this immutable launch provenance. The
 operation. Recreating an ended managed row requires an explicit new binding;
 an ordinary unbound `run` cannot inherit its provenance for a different task.
 
+Managed restart, picker restart, recreation and permanent GC prepare the publisher
+before predecessor cleanup: they hold its native executable open, probe
+`publication-revocation` v1 through that exact descriptor, and execute the same
+image. An unsupported/downgraded publisher or script wrapper refuses without
+changing the predecessor; atomic install-path replacement cannot switch the
+verified image. Library callers preparing their own cleanup use
+`pty_lifecycle::prepare_daemon(executable, &params)` and retain the returned
+`PreparedDaemon` through its `spawn(params)` call. Publisher images must still
+come from the trusted immutable deployment; capability output is not executable
+authentication against a malicious same-UID native binary.
+
+Permanent GC cannot reuse a managed binding after `pty.toml` changes the stored
+command, arguments or cwd. Manifest environment exports are part of the compared
+shell arguments. Such changes require a new operation/binding, not an ordinary
+respawn under the old request digest. Unbound legacy sessions retain manifest
+reload and operation-tag mutation behavior.
+
 Rust callers use `pty_core::registry::revocation::{root_id, install, read, check,
 PublicationBinding, PublicationRevocation, RevocationInstall}`. `root_id()` returns
 `io::Result<String>` for prelaunch enrollment. `install(name,
@@ -510,6 +527,11 @@ those cases; ordinary unmanaged use remains compatible. In particular, this
 feature provides no recovery claim for Fractal operation
 `01a145e9-f5e1-73a0-90d7-8c9abd6fb98c`: its exact scope is unidentified and
 producer closure remains UNPROVEN.
+
+For legacy tag-only launches, an absent revocation store does not impose enrollment
+restrictions on the existing root mode or symlinked ancestors. Absence must be
+proved without following the store entry; any present, malformed, symlinked or
+uninspectable store remains fail-closed under the strict enrolled-root checks.
 
 
 ## The crates

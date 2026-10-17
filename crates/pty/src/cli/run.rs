@@ -555,6 +555,13 @@ fn create_or_attach(
         eprintln!("pty run: {error}");
         return Ok(1);
     }
+    let publisher = match super::prepare_daemon(&mut params) {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            eprintln!("pty run: {error}");
+            return Ok(1);
+        }
+    };
     if gone.is_some() && !inherited_creation_lock {
         registry::cleanup_all_while_locked(name);
     }
@@ -564,7 +571,7 @@ fn create_or_attach(
         Some(pid) if inherited_creation_lock => pid,
         _ => std::process::id() as i32,
     });
-    let spawned = super::spawn_daemon(&params);
+    let spawned = publisher.spawn(params);
     drop(creation_lock);
     if let Err(msg) = spawned {
         eprintln!("pty run: {msg}");

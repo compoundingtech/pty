@@ -443,6 +443,116 @@ fn library_gc_retains_revoked_desired_state_and_respawns_distinct_managed_bindin
 }
 
 #[test]
+fn library_gc_requires_new_binding_for_changed_manifest_launch_inputs() {
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let name = unique_name("library-gc-manifest-binding");
+    let dir = ROOT.join(format!("{name}-manifest"));
+    std::fs::create_dir(&dir).unwrap();
+    let manifest = dir.join("pty.toml");
+    let marker = dir.join("original-ran");
+    let unrelated_marker = dir.join("unrelated-ran");
+    let command = format!("printf ran > \"{}\"; exec cat", marker.display());
+    let original = format!("[sessions.worker]\ncommand = '{command}'\n");
+    std::fs::write(&manifest, &original).unwrap();
+    let file = pty_core::ptyfile::read_pty_file(Some(&dir)).unwrap();
+    let session = &file.sessions[0];
+    let root = registry::revocation::root_id().unwrap();
+    let binding = registry::revocation::PublicationBinding {
+        operation: "manifest-bound-start".into(),
+        // This is an external request digest, not a command fingerprint.
+        digest: "d".repeat(64),
+    };
+    let mut tags = TagMap::new();
+    tags.insert("strategy".into(), "permanent".into());
+    tags.insert("st3.start-operation".into(), binding.operation.clone());
+    tags.insert("ptyfile".into(), manifest.to_string_lossy().into_owned());
+    tags.insert("ptyfile.session".into(), "worker".into());
+    let metadata = SessionMetadata {
+        generation: Some("ended-manifest-generation".into()),
+        daemon_pid: Some(DEAD_PID),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), pty_core::ptyfile::command_with_env_exports(session)],
+        display_command: session.command.clone(),
+        cwd: file.dir.to_string_lossy().into_owned(),
+        created_at: registry::now_iso8601(),
+        tags: Some(tags),
+        publication_binding: Some(binding.clone()),
+        publication_root_id: Some(root.clone()),
+        publication_capability: Some(1),
+        ..Default::default()
+    };
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    registry::write_pid(&name, DEAD_PID as u32).unwrap();
+    std::fs::write(registry::events_path(&name), b"retained manifest predecessor\n").unwrap();
+    let before = artifact_snapshot(&name);
+    // An unchanged managed task still cannot be handed to an older/native
+    // publisher without revocation support, even though it is executable.
+    for _ in 0..2 {
+        let result = gc(GcOptions {
+            daemon_executable: Some(PathBuf::from("/bin/false")),
+            ..Default::default()
+        });
+        let failed = result.respawn_failed.iter().find(|entry| entry.name == name)
+            .expect("unsupported managed publisher must report failed respawn");
+        assert!(failed.error.contains("lacks publication-revocation v1"), "{}", failed.error);
+        assert!(!result.respawned.iter().any(|entry| entry.name == name));
+        assert_eq!(artifact_snapshot(&name), before);
+        assert!(!marker.exists());
+        assert!(!unrelated_marker.exists());
+    }
+    // Legacy launchers need not implement the managed capability protocol.
+    let legacy = SpawnParams::new("legacy-publisher", "/bin/true", &[]);
+    assert!(pty_lifecycle::prepare_daemon(Path::new("/bin/false"), &legacy).is_ok());
+
+    let changed_command = format!(
+        "[sessions.worker]\ncommand = 'printf ran > \"{}\"; exec cat'\n",
+        unrelated_marker.display(),
+    );
+    let changed_env = format!("{original}env = {{ BOUND_VALUE = 'changed' }}\n");
+    let changed_cwd = format!("{original}cwd = '..'\n");
+    for changed in [changed_command, changed_env, changed_cwd] {
+        std::fs::write(&manifest, changed).unwrap();
+        for dry_run in [true, false, false] {
+            let result = gc(GcOptions {
+                dry_run,
+                daemon_executable: Some(PathBuf::from(pty_bin())),
+                ..Default::default()
+            });
+            let failed = result.respawn_failed.iter().find(|entry| entry.name == name)
+                .expect("changed managed launch must report failed respawn");
+            assert!(failed.error.contains("new operation and publication binding"), "{}", failed.error);
+            assert!(!result.respawned.iter().any(|entry| entry.name == name));
+            assert_eq!(artifact_snapshot(&name), before);
+            assert!(!marker.exists());
+            assert!(!unrelated_marker.exists());
+        }
+    }
+
+    // The original desired launch can still respawn under its exact binding.
+    std::fs::write(&manifest, original).unwrap();
+    let result = gc(GcOptions {
+        daemon_executable: Some(PathBuf::from(pty_bin())),
+        ..Default::default()
+    });
+    assert!(result.respawned.iter().any(|entry| entry.name == name));
+    wait_for_marker(&marker);
+    assert!(!unrelated_marker.exists());
+    let published = registry::read_metadata(&name).unwrap();
+    assert_eq!(published.command, metadata.command);
+    assert_eq!(published.args, metadata.args);
+    assert_eq!(published.cwd, metadata.cwd);
+    assert_eq!(published.publication_binding, Some(binding));
+    assert_eq!(published.publication_root_id.as_deref(), Some(root.as_str()));
+    stop_daemon(&name, &SpawnedDaemon {
+        pid: published.daemon_pid.unwrap() as u32,
+        generation: published.generation.unwrap(),
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 #[cfg(debug_assertions)]
 fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
     use std::os::unix::fs::MetadataExt;

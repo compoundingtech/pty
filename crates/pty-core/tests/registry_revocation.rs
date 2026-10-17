@@ -54,6 +54,69 @@ fn private_write(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
+fn legacy_tag_only_checks_allow_0755_roots_only_without_a_store() {
+    let root = Root::new();
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
+    root.run(|| {
+        assert!(revocation::read("seat", "op").unwrap().is_none());
+        revocation::check("seat", None, Some("op")).unwrap();
+        assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err());
+        assert!(revocation::root_id().is_err());
+        assert_eq!(fs::metadata(&root.0).unwrap().mode() & 0o7777, 0o755);
+        assert!(!root.0.join(".publication-revocations").exists());
+    });
+}
+
+#[test]
+fn legacy_tag_only_checks_allow_real_symlink_ancestors_only_without_a_store() {
+    let base = Root::new();
+    let real_parent = base.0.join("real");
+    let real_root = real_parent.join("registry");
+    fs::create_dir(&real_parent).unwrap();
+    fs::create_dir(&real_root).unwrap();
+    fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = base.0.join("alias");
+    symlink(&real_parent, &alias).unwrap();
+    let selected = alias.join("registry");
+    registry::with_root(&selected, || {
+        assert!(revocation::read("seat", "op").unwrap().is_none());
+        revocation::check("seat", None, Some("op")).unwrap();
+        assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err());
+        assert!(revocation::root_id().is_err());
+    });
+    // An enrolled store reached through a legacy alias must not bypass strict
+    // ancestor validation, including when the requested operation has no fence.
+    registry::with_root(&real_root, || { revocation::root_id().unwrap(); });
+    registry::with_root(&selected, || {
+        assert!(revocation::read("seat", "op").is_err());
+        assert!(revocation::check("seat", None, Some("op")).is_err());
+    });
+}
+
+#[test]
+fn legacy_0755_roots_refuse_present_malformed_and_symlink_stores() {
+    for attack in ["enrolled", "empty", "file", "symlink", "dangling-symlink"] {
+        let root = Root::new();
+        root.run(|| {
+            let store = root.0.join(".publication-revocations");
+            match attack {
+                "enrolled" => { revocation::root_id().unwrap(); }
+                "empty" => fs::create_dir(&store).unwrap(),
+                "file" => private_write(&store, b"{malformed"),
+                "symlink" => symlink(&root.0, &store).unwrap(),
+                "dangling-symlink" => symlink(root.0.join("missing"), &store).unwrap(),
+                _ => unreachable!(),
+            }
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(revocation::read("seat", "op").is_err(), "{attack}");
+            assert!(revocation::check("seat", None, Some("op")).is_err(), "{attack}");
+            assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err(), "{attack}");
+            assert_eq!(fs::metadata(&root.0).unwrap().mode() & 0o7777, 0o755);
+        });
+    }
+}
+
+#[test]
 fn before_publication_exact_fence_rejects_without_taking_creation_lock() {
     let root = Root::new();
     root.run(|| {
@@ -319,6 +382,8 @@ fn partial_store_or_malformed_root_identity_never_means_unrevoked() {
                 _ => unreachable!(),
             }
             assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err(), "{damage}");
+            assert!(revocation::read("seat", "op").is_err(), "{damage}");
+            assert!(revocation::check("seat", None, Some("op")).is_err(), "{damage}");
         });
     }
 }

@@ -329,9 +329,19 @@ fn generic_mutation_rejects_flattened_publication_provenance_without_writes() {
                     true
                 },
                 &MutateOptions::default(),
-                |_| panic!("rejected provenance mutation must not publish"),
+                |_| {
+                    assert!(!managed && key == "tags", "rejected provenance mutation must not publish");
+                },
             );
 
+            if !managed && key == "tags" {
+                assert!(matches!(status, MutateStatus::Changed(_)));
+                let persisted = registry::read_metadata(&name).unwrap();
+                assert_eq!(persisted.tags.as_ref().unwrap()["st3.start-operation"], "forged");
+                assert_eq!(persisted.extra["futureField"], json!({"keep": true}));
+                assert_eq!(std::fs::read(registry::events_path(&name)).unwrap(), events_before);
+                continue;
+            }
             assert_eq!(status, MutateStatus::GenerationMismatch, "{key}, managed={managed}");
             assert_eq!(
                 std::fs::read(registry::metadata_path(&name)).unwrap(),
@@ -393,6 +403,52 @@ fn generic_mutation_rejects_typed_publication_provenance_without_writes() {
             "{key}"
         );
     }
+}
+
+#[test]
+fn legacy_operation_tags_remain_mutable_through_typed_and_tag_apis() {
+    let _ = root();
+    let name = unique_name("legacy-operation");
+    plant(&name);
+    for operation in ["original", "replacement"] {
+        registry::update_tags(&name, &tags(&[("st3.start-operation", operation)]), &[]).unwrap();
+        assert_eq!(
+            registry::read_metadata(&name).unwrap().tags.as_ref().unwrap()["st3.start-operation"],
+            operation
+        );
+    }
+    registry::update_tags(&name, &TagMap::new(), &["st3.start-operation".into()]).unwrap();
+    assert!(!registry::read_metadata(&name).unwrap().tags.as_ref().is_some_and(|tags| tags.contains_key("st3.start-operation")));
+    let status = registry::mutate_metadata_under_lock(
+        &name,
+        |after| {
+            after.tags = Some(tags(&[("st3.start-operation", "typed")]));
+            true
+        },
+        &MutateOptions::default(),
+    );
+    assert!(matches!(status, MutateStatus::Changed(_)));
+    assert_eq!(registry::read_metadata(&name).unwrap().tags.as_ref().unwrap()["st3.start-operation"], "typed");
+}
+
+#[test]
+fn managed_operation_tags_cannot_be_replaced_or_removed_through_tag_apis() {
+    let _ = root();
+    let name = unique_name("managed-operation");
+    let mut metadata = base_metadata();
+    metadata.publication_binding = Some(registry::PublicationBinding {
+        operation: "original".into(),
+        digest: "a".repeat(64),
+    });
+    metadata.tags = Some(tags(&[("st3.start-operation", "original")]));
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    EventWriter::new(&name).append(Event::new(&name, "session_start"));
+    let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
+    let events_before = std::fs::read(registry::events_path(&name)).unwrap();
+    assert!(registry::update_tags(&name, &tags(&[("st3.start-operation", "replacement")]), &[]).is_err());
+    assert!(registry::update_tags(&name, &TagMap::new(), &["st3.start-operation".into()]).is_err());
+    assert_eq!(std::fs::read(registry::metadata_path(&name)).unwrap(), metadata_before);
+    assert_eq!(std::fs::read(registry::events_path(&name)).unwrap(), events_before);
 }
 
 #[test]
