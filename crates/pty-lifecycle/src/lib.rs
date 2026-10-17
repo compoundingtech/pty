@@ -6,6 +6,8 @@
 
 mod config;
 mod gc;
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod image_ancestry;
 mod launch;
 mod startup;
 

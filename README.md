@@ -478,8 +478,14 @@ rule before any publication effect, regardless of the caller.
 Managed restart, picker restart, recreation and permanent GC prepare the publisher
 before predecessor cleanup. Linux probes and executes its pinned `/proc/self/fd`
 image. Darwin cannot execute `/dev/fd` vnodes, so it probes and executes a private
-`0500` snapshot in the registry's `0700` `.publisher-images` cache. The cache key
-includes the image digest and source quarantine provenance; reuse verifies the
+`0500` snapshot in a `0700` `compoundingtech-pty-publishers` directory beneath
+Darwin's per-user cache (`confstr(_CS_DARWIN_USER_CACHE_DIR)`), never beneath an
+arbitrary registry root. Every component of the resolved cache path is checked
+with `lstat`: no symlinks, root/effective-UID ownership only, and no group/other
+writes unless a sticky ancestor protects the next trusted-owned component.
+The private leaf itself must not allow group/other writes, so another UID cannot
+rename an ancestor and substitute code between admission and execution.
+The cache key includes the image digest and source quarantine provenance; reuse verifies the
 bytes and permissions without rewriting the image. This avoids a new
 Gatekeeper/XProtect first-exec assessment for every restart. Native copying
 preserves embedded code signatures and extended attributes, including quarantine;

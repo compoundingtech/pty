@@ -53,7 +53,30 @@ fn open_verified(path: &Path, expected: &[u8; 32]) -> io::Result<File> {
     Ok(image)
 }
 
-pub(super) fn pin(mut source: File) -> io::Result<(PathBuf, File)> {
+pub(super) fn pin(source: File) -> io::Result<(PathBuf, File)> {
+    use std::os::unix::ffi::OsStringExt;
+    // Use Darwin's per-user cache, never an arbitrary registry root. Resolve
+    // the system /var alias, then lstat every actual component before use.
+    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, std::ptr::null_mut(), 0) };
+    if length == 0 {
+        return Err(io::Error::other("Darwin user cache directory is unavailable"));
+    }
+    let mut bytes = vec![0; length];
+    let written = unsafe { libc::confstr(
+        libc::_CS_DARWIN_USER_CACHE_DIR, bytes.as_mut_ptr().cast(), bytes.len(),
+    ) };
+    if written == 0 || written > bytes.len() || bytes[written - 1] != 0 {
+        return Err(io::Error::other("Darwin user cache directory changed during discovery"));
+    }
+    bytes.truncate(written - 1);
+    let parent = PathBuf::from(std::ffi::OsString::from_vec(bytes)).canonicalize()?;
+    pin_in(source, &parent.join("compoundingtech-pty-publishers"))
+}
+
+fn pin_in(mut source: File, directory: &Path) -> io::Result<(PathBuf, File)> {
+    let parent = directory.parent()
+        .ok_or_else(|| io::Error::other("publisher cache has no parent"))?;
+    crate::image_ancestry::validate(parent)?;
     let digest = hash(&mut source)?;
     let source_quarantine = quarantine(&source)?;
     // A newly quarantined selection must not reuse an already assessed copy
@@ -62,12 +85,14 @@ pub(super) fn pin(mut source: File) -> io::Result<(PathBuf, File)> {
     key.update(digest);
     key.update([u8::from(source_quarantine.is_some())]);
     if let Some(value) = &source_quarantine { key.update(value); }
-    let directory = pty_core::registry::root::ensure_session_dir()?.join(".publisher-images");
+    // Validate before creation and again including the leaf. A private leaf
+    // alone is insufficient if another UID can rename an ancestor.
     match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
+    crate::image_ancestry::validate(directory)?;
     let metadata = std::fs::symlink_metadata(&directory)?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o700
@@ -111,15 +136,16 @@ mod tests {
 
     #[test]
     fn cached_image_is_reused_verified_and_preserves_quarantine() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "pty-publisher-cache-{}", pty_core::registry::atomic::random_hex16()
         ));
         std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-        pty_core::registry::root::with_root(&root, || {
+        {
+            let directory = root.join("images");
             let selected = root.join("selected");
             std::fs::copy(std::env::current_exe().unwrap(), &selected).unwrap();
-            let (first, image) = pin(File::open(&selected).unwrap()).unwrap();
-            let (second, reused) = pin(File::open(&selected).unwrap()).unwrap();
+            let (first, image) = pin_in(File::open(&selected).unwrap(), &directory).unwrap();
+            let (second, reused) = pin_in(File::open(&selected).unwrap(), &directory).unwrap();
             assert_eq!(first, second);
             assert_eq!(image.metadata().unwrap().ino(), reused.metadata().unwrap().ino());
             let source = File::open(&selected).unwrap();
@@ -129,7 +155,7 @@ mod tests {
                 source.as_raw_fd(), c"com.apple.quarantine".as_ptr(),
                 value.as_ptr().cast(), value.len(), 0, 0,
             ) }, 0);
-            let (quarantined_path, quarantined) = pin(source).unwrap();
+            let (quarantined_path, quarantined) = pin_in(source, &directory).unwrap();
             assert_ne!(first, quarantined_path, "quarantine provenance is part of the cache key");
             assert_eq!(quarantine(&quarantined).unwrap(), Some(value.to_vec()));
             std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -139,7 +165,7 @@ mod tests {
             // An already admitted image remains available after selection unlink.
             assert!(quarantined.metadata().unwrap().len() > 0);
             assert!(open_verified(&first, &hash(&mut File::open(&quarantined_path).unwrap()).unwrap()).is_err());
-        });
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
