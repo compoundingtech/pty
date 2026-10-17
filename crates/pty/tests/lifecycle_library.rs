@@ -664,3 +664,152 @@ fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
         generation: metadata.generation.unwrap(),
     });
 }
+
+/// Keep process-global barrier configuration out of the parallel test runner.
+/// The outer process bounds the entire race, including blocking library calls.
+#[cfg(debug_assertions)]
+fn isolated_library_claim_race(test: &str, scenario: fn()) {
+    const FIXTURE: &str = "PTY_LIBRARY_CLAIM_RACE";
+    if std::env::var(FIXTURE).as_deref() == Ok(test) {
+        scenario();
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(FIXTURE, test)
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated library claim race failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("isolated library claim race exceeded 45 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(debug_assertions)]
+struct LibraryRaceBarrier(PathBuf);
+
+#[cfg(debug_assertions)]
+impl LibraryRaceBarrier {
+    fn hold(name: &str) -> Self {
+        let directory = ROOT.join(format!("{name}-barriers"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join(format!("{name}.hold")), "").unwrap();
+        // SAFETY: this isolated fixture configures barriers before starting
+        // its installer/GC thread or any daemon.
+        unsafe { std::env::set_var("PTY_TEST_OPERATION_BARRIERS", &directory) };
+        Self(directory.join(format!("{name}.release")))
+    }
+
+    fn wait_until_reached(&self) {
+        wait_for_marker(&self.0.with_extension("reached"));
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.0, "").unwrap();
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for LibraryRaceBarrier {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "");
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn in_process_install_pins_its_claim_before_a_library_publisher_can_check() {
+    skip_without_a_real_machine!();
+    isolated_library_claim_race(
+        "in_process_install_pins_its_claim_before_a_library_publisher_can_check",
+        || {
+            let _root = ROOT.as_path();
+            let name = unique_name("library-install-race");
+            let root = registry::revocation::root_id().unwrap();
+            let marker = ROOT.join(format!("{name}-ran"));
+            let mut params = managed_params(&name, "install-race", &"a".repeat(64), &root, &marker);
+            params.start_timeout = Some(Duration::from_secs(3));
+            params.bind_to_spawner_lifetime = true;
+            let barrier = LibraryRaceBarrier::hold("revocation-install-pinned");
+            let install_name = name.clone();
+            let binding = params.publication_binding.clone().unwrap();
+            let installer = std::thread::spawn(move || {
+                registry::revocation::install(&install_name, &binding, &"b".repeat(64), &root)
+            });
+            barrier.wait_until_reached();
+            assert!(registry::revocation::read(&name, "install-race").unwrap().is_none());
+            let attempted = spawn_daemon(Path::new(pty_bin()), params.clone());
+            if let Ok(started) = &attempted {
+                stop_daemon(&name, started);
+            }
+            let error = attempted.expect_err("publisher borrowed an in-flight install's PID claim");
+            assert!(error.to_string().contains("busy"), "{error}");
+            assert!(!marker.exists());
+            assert!(artifact_snapshot(&name).iter().all(Option::is_none));
+            barrier.release();
+            let installed = installer.join().unwrap().unwrap();
+            assert_eq!(installed.occupancy["entries"], serde_json::json!([]));
+            let refused = spawn_daemon(Path::new(pty_bin()), params).unwrap_err();
+            assert!(refused.to_string().contains("operation-revoked"), "{refused}");
+            assert!(!marker.exists());
+            assert!(artifact_snapshot(&name).iter().all(Option::is_none));
+        },
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn in_process_gc_claim_cannot_admit_a_publisher_or_delete_its_live_replacement() {
+    skip_without_a_real_machine!();
+    isolated_library_claim_race(
+        "in_process_gc_claim_cannot_admit_a_publisher_or_delete_its_live_replacement",
+        || {
+            let _root = ROOT.as_path();
+            let name = unique_name("library-gc-claim-race");
+            let metadata = SessionMetadata {
+                generation: Some("gc-predecessor".into()),
+                daemon_pid: Some(DEAD_PID),
+                command: "cat".into(),
+                display_command: "cat".into(),
+                cwd: ROOT.to_string_lossy().into_owned(),
+                created_at: registry::now_iso8601(),
+                ..Default::default()
+            };
+            registry::write_metadata_publication(&name, &metadata).unwrap();
+            registry::write_pid(&name, DEAD_PID as u32).unwrap();
+            let before = artifact_snapshot(&name);
+            let barrier = LibraryRaceBarrier::hold("gc-cleanup-before-effects");
+            let collector = std::thread::spawn(|| gc(GcOptions::default()));
+            barrier.wait_until_reached();
+            let mut params = SpawnParams::new(&name, "cat", &[]);
+            params.cwd = ROOT.to_string_lossy().into_owned();
+            params.start_timeout = Some(Duration::from_secs(3));
+            params.bind_to_spawner_lifetime = true;
+            let attempted = spawn_daemon(Path::new(pty_bin()), params.clone());
+            if let Ok(started) = &attempted {
+                stop_daemon(&name, started);
+            }
+            let error = attempted.expect_err("publisher borrowed an in-process GC's PID claim");
+            assert!(error.to_string().contains("busy"), "{error}");
+            assert_eq!(artifact_snapshot(&name), before);
+            barrier.release();
+            let collected = collector.join().unwrap();
+            assert!(collected.removed.iter().any(|removed| removed == &name));
+            let replacement = spawn_daemon(Path::new(pty_bin()), params).unwrap();
+            let _cleanup = DaemonCleanup { name: &name, started: &replacement };
+            let live = artifact_snapshot(&name);
+            let collected = gc(GcOptions::default());
+            assert!(!collected.removed.iter().any(|removed| removed == &name));
+            assert_eq!(artifact_snapshot(&name), live);
+            assert!(registry::pid_alive(replacement.pid as i32));
+        },
+    );
+}

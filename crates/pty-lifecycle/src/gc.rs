@@ -717,6 +717,7 @@ fn reconcile_permanent(
             retry_meta.tags = (!params.tags.is_empty()).then(|| params.tags.clone());
             cleanup_all_while_locked(name);
             event_guard.release();
+            params.creation_lock_delegate = Some(creation_guard.delegate());
             let spawn = prepared.spawn(params).map_err(|error| error.to_string());
             if spawn.is_err() && read_metadata(name).is_none() {
                 // Preserve the desired state when launch failed before a new
@@ -944,6 +945,7 @@ fn cleanup_observed_session(session: &SessionInfo) -> bool {
     };
     with_both_locks(&session.name, || match read_metadata(&session.name) {
         Some(current) if metadata_matches_observation(observed, &current) => {
+            pty_core::operation::barrier::barrier("gc-cleanup-before-effects");
             cleanup_all_while_locked(&session.name);
             true
         }

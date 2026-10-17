@@ -57,9 +57,8 @@ pub struct SpawnParams {
     pub startup_lease: Option<StartupLeaseOptions>,
     /// Variables removed from the daemon's (and so the child's) environment.
     pub scrub_env: Vec<String>,
-    /// The pid that already holds `<name>.lock` for this creation; carried
-    /// for the CLI-fallback path (`PTY_CREATION_LOCK_OWNER_PID`).
-    pub creation_lock_owner_pid: Option<i32>,
+    /// Explicit authority to publish under an already-held creation claim.
+    pub creation_lock_delegate: Option<registry::lock::CreationClaimDelegate>,
     /// Set `PTY_SPAWNER_PID` so the daemon shuts down when this process dies.
     pub bind_to_spawner_lifetime: bool,
     /// Override of the 30 s start budget.
@@ -798,16 +797,16 @@ fn start_daemon_process(
     if params.bind_to_spawner_lifetime {
         cmd.env("PTY_SPAWNER_PID", std::process::id().to_string());
     }
-    let creation_owner = params.creation_lock_owner_pid.or_else(|| {
-        registry::is_lock_owned_by_pid(&params.name, std::process::id() as i32)
-            .then_some(std::process::id() as i32)
-    });
-    match creation_owner {
-        Some(pid) => {
-            cmd.env("PTY_CREATION_LOCK_OWNER_PID", pid.to_string());
+    match &params.creation_lock_delegate {
+        Some(delegate) => {
+            // A gated operation atomically hands the same nonce to its daemon.
+            let owner = if operation.is_some() { "daemon".to_owned() } else { delegate.owner_pid.to_string() };
+            cmd.env("PTY_CREATION_LOCK_OWNER_PID", owner);
+            cmd.env("PTY_CREATION_LOCK_NONCE", &delegate.nonce);
         }
         None => {
             cmd.env_remove("PTY_CREATION_LOCK_OWNER_PID");
+            cmd.env_remove("PTY_CREATION_LOCK_NONCE");
         }
     }
     let inherited: Option<[RawFd; 3]> =

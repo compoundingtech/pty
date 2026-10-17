@@ -68,7 +68,7 @@ fn legacy_tag_only_checks_allow_0755_roots_only_without_a_store() {
 }
 
 #[test]
-fn legacy_tag_only_checks_allow_real_symlink_ancestors_only_without_a_store() {
+fn symlink_ancestor_enrollment_and_checks_use_the_same_canonical_root() {
     let base = Root::new();
     let real_parent = base.0.join("real");
     let real_root = real_parent.join("registry");
@@ -81,15 +81,14 @@ fn legacy_tag_only_checks_allow_real_symlink_ancestors_only_without_a_store() {
     registry::with_root(&selected, || {
         assert!(revocation::read("seat", "op").unwrap().is_none());
         revocation::check("seat", None, Some("op")).unwrap();
-        assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err());
-        assert!(revocation::root_id().is_err());
-    });
-    // An enrolled store reached through a legacy alias must not bypass strict
-    // ancestor validation, including when the requested operation has no fence.
-    registry::with_root(&real_root, || { revocation::root_id().unwrap(); });
-    registry::with_root(&selected, || {
-        assert!(revocation::read("seat", "op").is_err());
-        assert!(revocation::check("seat", None, Some("op")).is_err());
+        revocation::check("seat", Some(&binding("op")), Some("op")).unwrap();
+        let identity = revocation::root_id().unwrap();
+        install("seat", &binding("op"), &intent()).unwrap();
+        assert_eq!(revocation::check("seat", Some(&binding("op")), Some("op")).unwrap_err().to_string(), "operation-revoked");
+        registry::with_root(&real_root, || {
+            assert_eq!(revocation::root_id().unwrap(), identity);
+            assert!(revocation::read("seat", "op").unwrap().is_some());
+        });
     });
 }
 
@@ -389,16 +388,24 @@ fn partial_store_or_malformed_root_identity_never_means_unrevoked() {
 }
 
 #[test]
-fn root_creation_never_traverses_an_ancestor_symlink() {
+fn root_creation_resolves_symlink_ancestors_but_refuses_a_final_root_symlink() {
     let root = Root::new();
     let destination = root.0.join("destination");
     fs::create_dir(&destination).unwrap();
     let alias = root.0.join("alias");
     symlink(&destination, &alias).unwrap();
-    registry::with_root(&alias.join("must-not-create"), || {
-        assert!(install("seat", &binding("op"), &intent()).is_err());
+    let selected = alias.join("new-parent/new-root");
+    registry::with_root(&selected, || {
+        install("seat", &binding("op"), &intent()).unwrap();
+        assert_eq!(revocation::check("seat", Some(&binding("op")), Some("op")).unwrap_err().to_string(), "operation-revoked");
     });
-    assert!(!destination.join("must-not-create").exists());
+    assert!(destination.join("new-parent/new-root").is_dir());
+    let final_alias = root.0.join("root-alias");
+    symlink(destination.join("new-parent/new-root"), &final_alias).unwrap();
+    registry::with_root(&final_alias, || {
+        assert!(revocation::root_id().is_err());
+        assert!(revocation::read("seat", "op").is_err());
+    });
 }
 
 #[test]
@@ -435,5 +442,62 @@ fn install_requires_exact_previously_enrolled_root_identity() {
         assert!(revocation::install("seat", &binding("op"), &intent(), &wrong).is_err());
         assert_eq!(fs::read(root.record("seat", "op")).unwrap(), bytes);
         assert_eq!(installed.record.root_id, actual);
+    });
+}
+
+#[test]
+fn crash_leftover_temporary_files_do_not_poison_enrollment_or_fences() {
+    let root = Root::new();
+    root.run(|| {
+        let version = root.0.join(".publication-revocations/v1");
+        fs::create_dir_all(&version).unwrap();
+        fs::set_permissions(version.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&version, fs::Permissions::from_mode(0o700)).unwrap();
+        // A crash before atomic rename leaves only an unpublished, single-link
+        // temporary. It must not become an identity or prevent a fresh install.
+        private_write(&version.join(".tmp.crashed.identity"), b"{partial");
+        let identity = revocation::root_id().unwrap();
+        let directory = root.record("seat", "op").parent().unwrap().to_path_buf();
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        private_write(&directory.join(".tmp.crashed.record"), b"{partial");
+        let first = revocation::install("seat", &binding("op"), &intent(), &identity).unwrap();
+        assert_eq!(fs::metadata(version.join("root.json")).unwrap().nlink(), 1);
+        assert_eq!(fs::metadata(root.record("seat", "op")).unwrap().nlink(), 1);
+        // A crash after rename needs no cleanup: exact replay uses the canonical
+        // record unchanged, even with unrelated abandoned temporaries present.
+        let retry = revocation::install("seat", &binding("op"), &intent(), &identity).unwrap();
+        assert!(retry.already_installed);
+        assert_eq!(retry.record, first.record);
+        assert_eq!(revocation::root_id().unwrap(), identity);
+        assert_eq!(revocation::check("seat", Some(&binding("op")), Some("op")).unwrap_err().to_string(), "operation-revoked");
+    });
+}
+
+#[test]
+fn device_change_requires_explicit_reenrollment_without_resetting_fences() {
+    let root = Root::new();
+    root.run(|| {
+        let installed = install("seat", &binding("op"), &intent()).unwrap();
+        let path = root.record("seat", "op");
+        let fence = fs::read(&path).unwrap();
+        let identity_path = root.0.join(".publication-revocations/v1/root.json");
+        let mut identity: serde_json::Value = serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        let device = fs::metadata(&root.0).unwrap().dev();
+        identity["device"] = serde_json::json!(device.wrapping_add(1));
+        private_write(&identity_path, &serde_json::to_vec(&identity).unwrap());
+        let error = revocation::root_id().unwrap_err();
+        assert!(error.to_string().contains("re-enrollment"));
+        assert!(revocation::check("seat", Some(&binding("op")), Some("op")).is_err());
+        assert!(install("seat", &binding("other"), &intent()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), fence);
+        // Simulate the documented offline operator procedure: verify this is
+        // the same root and change only its device observation, not its ID.
+        identity["device"] = serde_json::json!(device);
+        private_write(&identity_path, &serde_json::to_vec(&identity).unwrap());
+        assert_eq!(revocation::root_id().unwrap(), installed.record.root_id);
+        assert_eq!(fs::read(&path).unwrap(), fence);
+        assert_eq!(revocation::read("seat", "op").unwrap(), Some(installed.record));
+        assert_eq!(revocation::check("seat", Some(&binding("op")), Some("op")).unwrap_err().to_string(), "operation-revoked");
     });
 }

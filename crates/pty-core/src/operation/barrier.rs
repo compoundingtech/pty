@@ -12,8 +12,8 @@
 /// The variable that names the barrier directory.
 pub const BARRIERS_ENV: &str = "PTY_TEST_OPERATION_BARRIERS";
 
-/// Every barrier name, in the order a successful launch reaches them.
-pub const BARRIERS: [&str; 16] = [
+/// Named launch, revocation installation and cleanup acceptance points.
+pub const BARRIERS: [&str; 18] = [
     "launcher-before-claim",
     "launcher-before-peek",
     "launcher-before-fork",
@@ -30,6 +30,8 @@ pub const BARRIERS: [&str; 16] = [
     "transfer-before-commit",
     "transfer-committed-before-release",
     "released-before-ack",
+    "revocation-install-pinned",
+    "gc-cleanup-before-effects",
 ];
 
 /// Record that `name` was reached, and say whether a test armed it. A

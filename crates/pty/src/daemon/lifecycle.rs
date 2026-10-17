@@ -378,7 +378,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     // Publish while the delegated claim is pinned, then atomically hand it
     // to this daemon. No flock descriptor may cross the ordinary child fork:
     // a stopped pre-exec child must not prevent recovery after daemon death.
-    let delegated_owner = publication_lock.delegated_owner_pid();
+    let delegated_owner = publication_lock.delegate();
     let creation_claim = publication_lock
         .into_daemon_claim()
         .map_err(|error| format!("Failed to take daemon creation claim: {error}"))?;
@@ -417,10 +417,10 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
-    if let Some(owner) = delegated_owner.filter(|pid| registry::pid_alive(*pid as i32)) {
+    if let Some(owner) = delegated_owner.filter(|delegate| registry::pid_alive(delegate.owner_pid)) {
         // A coordinating parent owns its claim beyond successful publication.
         // Restore it only after fork has returned, never as an inherited fd.
-        creation_claim.hand_over(owner)
+        creation_claim.hand_back(&owner)
             .map_err(|error| format!("Failed to restore delegated creation claim: {error}"))?;
     } else {
         drop(creation_claim);
@@ -490,9 +490,21 @@ pub(crate) fn prepare_publication(
     cfg: &DaemonConfig,
 ) -> Result<registry::lock::PublicationLock, String> {
     pty_core::operation::barrier::barrier("publication-before-lock");
-    let owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok()
-        .and_then(|pid| pid.parse().ok());
-    let guard = registry::lock::pin_publication(&cfg.name, owner)
+    let owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok();
+    let nonce = std::env::var("PTY_CREATION_LOCK_NONCE").ok();
+    let delegate = match (owner, nonce) {
+        (Some(owner), Some(nonce)) => {
+            let owner_pid = if owner == "daemon" {
+                std::process::id() as i32
+            } else {
+                owner.parse().map_err(|_| "invalid creation claim owner")?
+            };
+            Some(registry::lock::CreationClaimDelegate { owner_pid, nonce })
+        }
+        (None, None) => None,
+        _ => return Err("incomplete creation claim delegation".into()),
+    };
+    let guard = registry::lock::pin_publication(&cfg.name, delegate.as_ref())
         .map_err(|error| error.to_string())?;
     cfg.check_publication()?;
     let observed = registry::observe_session_strict_in(

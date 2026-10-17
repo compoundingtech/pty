@@ -112,6 +112,8 @@ pub fn build_child_env_from(
         // A launch operation's daemon descriptors are the daemon's alone.
         env.remove(pty_lifecycle::OPERATION_FD_ENV);
         env.remove(pty_lifecycle::GATE_FD_ENV);
+        env.remove("PTY_CREATION_LOCK_OWNER_PID");
+        env.remove("PTY_CREATION_LOCK_NONCE");
         env
     } else {
         source

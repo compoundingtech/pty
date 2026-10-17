@@ -1,7 +1,7 @@
-//! Node-compatible file locks: a no-replace claim, decimal holder pid,
-//! one stale steal, and release by unlink. Rust builds the 0600 owner inode
-//! under a sibling temporary name and hard-links it into place so the lock
-//! pathname is never visible before its pid content.
+//! Node-compatible file locks: a no-replace claim, decimal holder PID prefix,
+//! one stale steal, and release by unlink. Rust adds a random nonce after the
+//! PID for explicit per-claim delegation. The complete 0600 owner inode is
+//! hard-linked into place, never exposing an empty owner record.
 //!
 //! Two locks per session: `<name>.lock` (creation/metadata) and
 //! `<name>.events.lock` (event log). Whenever both are taken the order is
@@ -47,6 +47,7 @@ pub fn metadata_busy_message(name: &str) -> String {
 pub struct LockGuard {
     path: PathBuf,
     owner_pid: u32,
+    nonce: String,
     armed: bool,
 }
 
@@ -56,10 +57,20 @@ impl LockGuard {
         &self.path
     }
 
+
+    /// Explicit authority for this individual claim, never inferred from a PID.
+    pub fn delegate(&self) -> CreationClaimDelegate {
+        CreationClaimDelegate { owner_pid: self.owner_pid as i32, nonce: self.nonce.clone() }
+    }
+
+    /// Nonblocking inode pin while this guard remains held. Drop the pin first.
+    pub fn pin(&self) -> std::io::Result<PublicationLock> {
+        pin_claim(&self.path, &self.delegate(), None, false)
+    }
     /// Release now (idempotent; dropping does the same).
     pub fn release(mut self) {
         self.armed = false;
-        release_file_lock_owned_by(&self.path, self.owner_pid);
+        release_file_lock_checked_nonce(&self.path, Some(self.owner_pid), Some(&self.nonce));
     }
 
     /// Keep the lock file on disk when this guard drops (the caller takes
@@ -69,13 +80,25 @@ impl LockGuard {
     }
 
     /// Hand this lock to another live process. The owner record is replaced
-    /// in one rename by a complete record naming `pid`, so the pathname never
-    /// names nobody, and this guard stops releasing it. The new owner
-    /// releases it with [`release_file_lock_owned_by`]; if it dies first, the
-    /// lock is stale and stealable as usual. On failure the guard is dropped,
-    /// which releases the lock.
+    /// in one rename by a complete record naming `pid` with the same nonce,
+    /// and this guard stops releasing it. The new owner receives that nonce
+    /// explicitly before handover and releases with [`release_file_lock_owned_by`].
+    /// If it dies first, the lock is stale and stealable as usual. On failure
+    /// the guard is dropped, which releases the lock.
     pub fn hand_over(mut self, pid: u32) -> std::io::Result<()> {
-        replace_owner(&self.path, pid)?;
+        replace_owner_record(&self.path, &format!("{pid} {}", self.nonce))?;
+        self.armed = false;
+        Ok(())
+    }
+
+    /// Return a publication claim with the coordinator's original encoding.
+    pub fn hand_back(mut self, delegate: &CreationClaimDelegate) -> std::io::Result<()> {
+        let record = if delegate.nonce.starts_with("legacy:") {
+            delegate.owner_pid.to_string()
+        } else {
+            format!("{} {}", delegate.owner_pid, delegate.nonce)
+        };
+        replace_owner_record(&self.path, &record)?;
         self.armed = false;
         Ok(())
     }
@@ -90,13 +113,14 @@ pub fn release_file_lock_owned_by(lock_path: &Path, pid: u32) -> bool {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if self.armed {
-            release_file_lock_owned_by(&self.path, self.owner_pid);
+            release_file_lock_checked_nonce(&self.path, Some(self.owner_pid), Some(&self.nonce));
         }
     }
 }
 
 /// Replace a complete owner record without exposing an empty PID claim.
-fn replace_owner(path: &Path, pid: u32) -> std::io::Result<()> {
+
+fn replace_owner_record(path: &Path, record: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = super::atomic::tmp_path_for(path);
     let result = std::fs::OpenOptions::new()
@@ -104,7 +128,7 @@ fn replace_owner(path: &Path, pid: u32) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(pid.to_string().as_bytes()))
+        .and_then(|mut file| file.write_all(record.as_bytes()))
         .and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(tmp);
@@ -130,7 +154,7 @@ fn try_create(lock_path: &Path) -> std::io::Result<bool> {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.write_all(format!("{} {}", std::process::id(), super::atomic::random_hex16()).as_bytes())?;
         drop(file);
         match std::fs::hard_link(&tmp, lock_path) {
             Ok(()) => Ok(true),
@@ -161,6 +185,49 @@ fn same_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+/// A per-claim capability carried only across an authorized launch boundary.
+#[derive(Debug, Clone)]
+pub struct CreationClaimDelegate {
+    pub owner_pid: i32,
+    pub nonce: String,
+}
+
+fn record_nonce(record: &str) -> Option<&str> {
+    record.split_whitespace().nth(1)
+}
+
+/// Upgrade the legacy external-PID CLI contract to an explicit claim nonce.
+/// Never admits this process's ambient install/gc claim. The inode is pinned
+/// during validation and upgrade, and its PID prefix remains Node-compatible.
+pub fn delegate_external_claim(name: &str, owner_pid: i32) -> std::io::Result<CreationClaimDelegate> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if owner_pid <= 0 || owner_pid == std::process::id() as i32 || !pid_alive(owner_pid) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not an external creation owner"));
+    }
+    let path = lock_path(name);
+    let mut inode = std::fs::OpenOptions::new().read(true).write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path)?;
+    if !try_lock_exclusive(&inode)? {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "creation claim is pinned"));
+    }
+    let mut record = String::new();
+    inode.read_to_string(&mut record)?;
+    if !same_inode(&inode.metadata()?, &std::fs::symlink_metadata(&path)?)
+        || parse_leading_int(&record) != Some(owner_pid)
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation claim changed"));
+    }
+    let nonce = match record_nonce(&record) {
+        Some(nonce) => nonce.to_owned(),
+        None => {
+            let nonce = format!("legacy:{}", super::atomic::random_hex16());
+            // read_to_string left the cursor at EOF; preserve the original PID.
+            write!(inode, " {nonce}")?;
+            nonce
+        }
+    };
+    Ok(CreationClaimDelegate { owner_pid, nonce })
+}
 /// Pins the name's creation claim through a daemon's final publication.
 ///
 /// A launcher may own the PID claim while its daemon publishes. Pinning its
@@ -171,13 +238,13 @@ pub struct PublicationLock {
     _inode: std::fs::File,
     _claim: Option<LockGuard>,
     path: PathBuf,
-    delegated_owner_pid: Option<u32>,
+    delegate: Option<CreationClaimDelegate>,
 }
 
 impl PublicationLock {
-    /// The validated external owner to restore after the child has spawned.
-    pub fn delegated_owner_pid(&self) -> Option<u32> {
-        self.delegated_owner_pid
+    /// The explicit coordinator claim to restore after the child has spawned.
+    pub fn delegate(&self) -> Option<CreationClaimDelegate> {
+        self.delegate.clone()
     }
 
     /// Transfer the pinned claim to this daemon before it forks. The old
@@ -193,13 +260,15 @@ impl PublicationLock {
             ));
         }
         let owner_pid = std::process::id();
-        replace_owner(&self.path, owner_pid)?;
+        let nonce = super::atomic::random_hex16();
+        replace_owner_record(&self.path, &format!("{owner_pid} {nonce}"))?;
         if let Some(claim) = self._claim.take() {
             claim.forget();
         }
         let claim = LockGuard {
             path: std::mem::take(&mut self.path),
             owner_pid,
+            nonce,
             armed: true,
         };
         drop(self);
@@ -207,23 +276,27 @@ impl PublicationLock {
     }
 }
 
-pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Result<PublicationLock> {
-    use std::os::unix::fs::OpenOptionsExt;
+pub fn pin_publication(name: &str, delegate: Option<&CreationClaimDelegate>) -> std::io::Result<PublicationLock> {
     let path = lock_path(name);
-    let me = std::process::id() as i32;
-    let existing_owner = if is_lock_owned_by_pid(name, me) {
-        Some(me)
-    } else {
-        delegated_owner.filter(|pid| is_lock_owned_by_pid(name, *pid))
-    };
-    let claim = if existing_owner.is_none() {
-        Some(try_acquire_file_lock(&path)?.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, "publication creation lock is busy")
-        })?)
-    } else {
-        None
-    };
-    let expected = existing_owner.unwrap_or(me);
+    match delegate {
+        Some(delegate) => pin_claim(&path, delegate, None, true),
+        None => {
+            let claim = try_acquire_file_lock(&path)?.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "publication creation lock is busy")
+            })?;
+            let delegate = claim.delegate();
+            pin_claim(&path, &delegate, Some(claim), false)
+        }
+    }
+}
+
+fn pin_claim(
+    path: &Path,
+    delegate: &CreationClaimDelegate,
+    claim: Option<LockGuard>,
+    delegated: bool,
+) -> std::io::Result<PublicationLock> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut inode = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -238,7 +311,9 @@ pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Res
     let mut owner = String::new();
     inode.read_to_string(&mut owner)?;
     if !opened.is_file() || !same_inode(&opened, &current)
-        || owner.trim().parse::<i32>().ok() != Some(expected)
+        || parse_leading_int(&owner) != Some(delegate.owner_pid)
+        || record_nonce(&owner) != Some(delegate.nonce.as_str())
+        || !pid_alive(delegate.owner_pid)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied, "publication creation ownership changed",
@@ -247,8 +322,8 @@ pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Res
     Ok(PublicationLock {
         _inode: inode,
         _claim: claim,
-        path,
-        delegated_owner_pid: existing_owner.filter(|pid| *pid != me).map(|pid| pid as u32),
+        path: path.to_path_buf(),
+        delegate: delegated.then(|| delegate.clone()),
     })
 }
 
@@ -295,24 +370,31 @@ fn steal_opened_lock(lock_path: &Path, stale_inode: std::fs::File) -> std::io::R
 /// node: src/sessions.ts:2293-2336
 pub fn try_acquire_file_lock(lock_path: &Path) -> std::io::Result<Option<LockGuard>> {
     ensure_session_dir()?;
-    let guard = |path: &Path| LockGuard {
-        path: path.to_path_buf(),
-        owner_pid: std::process::id(),
-        armed: true,
+    let guard = |path: &Path| -> std::io::Result<LockGuard> {
+        let record = std::fs::read_to_string(path)?;
+        let nonce = record_nonce(&record).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "new creation claim has no nonce")
+        })?.to_owned();
+        Ok(LockGuard {
+            path: path.to_path_buf(),
+            owner_pid: std::process::id(),
+            nonce,
+            armed: true,
+        })
     };
     if try_create(lock_path)? {
-        return Ok(Some(guard(lock_path)));
+        return guard(lock_path).map(Some);
     }
 
     let stale_inode = match std::fs::OpenOptions::new().read(true).open(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(try_create(lock_path)?.then(|| guard(lock_path)));
+            return try_create(lock_path)?.then(|| guard(lock_path)).transpose();
         }
         Err(error) => return Err(error),
     };
     let acquired = steal_opened_lock(lock_path, stale_inode)?;
-    Ok(acquired.then(|| guard(lock_path)))
+    acquired.then(|| guard(lock_path)).transpose()
 }
 
 #[cfg(test)]
@@ -342,7 +424,7 @@ mod tests {
             "decision made from the stale inode must not remove its replacement"
         );
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(&path).unwrap().split_whitespace().next().unwrap(),
             std::process::id().to_string()
         );
 
@@ -413,6 +495,10 @@ pub fn release_file_lock(lock_path: &Path) {
 }
 
 fn release_file_lock_checked(lock_path: &Path, expected_pid: Option<u32>) -> bool {
+    release_file_lock_checked_nonce(lock_path, expected_pid, None)
+}
+
+fn release_file_lock_checked_nonce(lock_path: &Path, expected_pid: Option<u32>, expected_nonce: Option<&str>) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
     let Ok(mut inode) = std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(lock_path) else {
@@ -431,6 +517,7 @@ fn release_file_lock_checked(lock_path: &Path, expected_pid: Option<u32>) -> boo
         let mut owner = String::new();
         if inode.read_to_string(&mut owner).is_err()
             || parse_leading_int(owner.trim()) != Some(expected as i32)
+            || expected_nonce.is_some_and(|nonce| record_nonce(&owner) != Some(nonce))
         {
             return false;
         }

@@ -93,7 +93,7 @@ fn direct_daemon(rig: &Rig, name: &str, root: &str, barriers: &std::path::Path) 
         .env_remove("PTY_CREATION_LOCK_OWNER_PID")
         .env_remove("PTY_SPAWNER_PID")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(rig.scratch.join(format!("{name}.daemon.stderr"))).unwrap()))
         .spawn().unwrap())
 }
 
@@ -250,8 +250,39 @@ fn already_spawned_daemon_revoked_before_lock_cannot_touch_survivor() {
         status.is_some()
     });
     assert!(!status.unwrap().success());
+    let error = std::fs::read_to_string(rig.scratch.join("survivor.daemon.stderr")).unwrap();
+    assert!(error.contains("operation-revoked"), "refusal was not the fence: {error}");
     assert!(!rig.scratch.join("child-ran").exists());
     before.assert_unchanged(&rig, "survivor");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn already_spawned_daemon_revoked_without_occupancy_cannot_publish() {
+    let rig = rig();
+    let root = identity(&rig);
+    let barriers = rig.scratch.join("barriers");
+    std::fs::create_dir(&barriers).unwrap();
+    std::fs::write(barriers.join("publication-before-lock.hold"), "").unwrap();
+    let mut daemon = direct_daemon(&rig, "vacant", &root, &barriers);
+    wait_until("vacant daemon before publication lock", || {
+        barriers.join("publication-before-lock.reached").exists()
+    });
+    let installed = rig.ok(&install_args("vacant", &root)).json();
+    assert_eq!(installed["occupancy"]["entries"], json!([]));
+    std::fs::write(barriers.join("publication-before-lock.release"), "").unwrap();
+    let mut status = None;
+    wait_until("revoked vacant daemon exit", || {
+        status = daemon.0.try_wait().unwrap();
+        status.is_some()
+    });
+    assert!(!status.unwrap().success());
+    let error = std::fs::read_to_string(rig.scratch.join("vacant.daemon.stderr")).unwrap();
+    assert!(error.contains("operation-revoked"), "refusal was not the fence: {error}");
+    for suffix in ["json", "pid", "sock", "events.jsonl"] {
+        assert!(!rig.exists(&format!("vacant.{suffix}")), "published {suffix} after revocation");
+    }
+    assert!(!rig.scratch.join("child-ran").exists());
 }
 
 #[test]

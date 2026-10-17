@@ -521,18 +521,61 @@ Publication clears the event log using the event writer's five-second lock
 deadline, allowing a predecessor's shutdown append to finish during restart.
 Other callers of `clear_events` retain fail-fast event-lock behavior.
 
+Creation claims carry a decimal PID prefix plus a random per-claim nonce.
+Library launchers that already own the name must explicitly set
+`SpawnParams::creation_lock_delegate = Some(creation_guard.delegate())`;
+neither the library nor daemon borrows a claim merely because its PID matches.
+`LockGuard::pin()` takes a nonblocking inode flock while the guard remains held;
+revocation installation holds that pin through its final effects. Delegated
+publication validates the nonce and owner on the same inode under flock, so an
+in-process install or gc claim cannot authorize an unrelated library launch.
+The CLI alone upgrades the legacy external `PTY_CREATION_LOCK_OWNER_PID`
+contract to nonce delegation and restores a PID-only coordinator's original
+encoding after ordinary child spawn. Daemon nonce/owner control values are
+not inherited by the session command.
+
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,
 bound to a persistent root identity and the canonical ID and operation in the
 record. Enrollment validates the existing root too: roots/directories must be
-owner-private `0700`, files `0600`, owned by the effective UID, and traversal
-rejects symlinks and unsafe types or modes. Publication uses no-replace writes
-and file/directory durability barriers. These records survive `rm`, GC, session
+owner-private `0700`, files `0600`, owned by the effective UID. Ancestor symlinks
+(including macOS `/tmp`) are canonicalized before descriptor-relative no-follow
+traversal; the selected root's final component and every store component must
+not be symlinks. Publication uses atomic no-replace rename (`renameat2` with
+`RENAME_NOREPLACE` on Linux, `renameatx_np` with `RENAME_EXCL` on macOS) and
+file/directory durability barriers. A crash before rename may leave an ignored
+`.tmp.*` file; after rename the canonical file has exactly one link, with no
+link/unlink crash gap. These records survive `rm`, GC, session
 recreation, display-name rename, and daemon replacement. Never delete them to
 roll back an intent, downgrade, or restore metadata; disaster restoration must
 restore the durable fences and the caller's intent/receipt state together
 before publication resumes. Replacing or reinitializing a fenced root is not
 an unrevocation mechanism.
+
+**Publication root re-enrollment after a device-number change:** root identity
+validation includes canonical path, inode and `st_dev`. Device numbers can change
+across reboot/remount even when the filesystem and root are unchanged; PTY fails
+closed on this mismatch and never silently resets enrollment. Recovery is an
+explicit same-UID operator action, not `identity` enrolling a new root:
+
+1. Quiesce all publishers, launchers, installers and GC for this root. Back up
+   the complete `.publication-revocations` tree and the matching caller
+   intent/receipt state before editing anything.
+2. Independently verify this is the same filesystem and root directory (using
+   the volume's persistent identity or mount configuration), that canonical path
+   and inode still match `v1/root.json`, and that the complete fence tree was
+   retained. A changed device number alone is not proof. If these conditions
+   cannot be established, keep publication disabled and restore trusted state;
+   do not use this procedure to migrate to another root.
+3. Replace **only** `device` in `v1/root.json` with the verified root's current
+   `st_dev`, using an owner-private `0600` single-link temporary file, file fsync,
+   atomic rename and parent-directory fsync. Keep `schema`, `rootId`, `path`,
+   `inode` and every revocation record unchanged. Never delete or recreate the
+   store, remove a fence, or generate a new root ID.
+4. Query `publication-revocation identity --json` and the retained exact fences;
+   verify the original root ID and revoked operations before resuming
+   publishers. Preserve the backup until those checks succeed.
+
 
 This is a same-UID OS-principal trust boundary, not per-agent cryptography.
 Supported executable selection must exclude legacy/downgraded publishers for

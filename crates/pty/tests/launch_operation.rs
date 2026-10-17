@@ -3291,13 +3291,13 @@ fn ordinary_stopped_child_scenario(rig: &Rig) {
     );
     assert!(launcher.try_wait().unwrap().is_none(), "launcher skipped spawn readiness");
     let lock = rig.root.join(format!("{name}.lock"));
-    assert_eq!(std::fs::read_to_string(&lock).unwrap(), daemon.to_string());
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(daemon.to_string().as_str()));
     assert_ne!(daemon as u32, launcher.id());
     // Exercise the launcher's old-owner release while the transferred claim
     // still belongs to a live daemon. It must not unlink the replacement.
     assert!(alive(daemon));
     assert!(!release_file_lock_owned_by(&lock, launcher.id()));
-    assert_eq!(std::fs::read_to_string(&lock).unwrap(), daemon.to_string());
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(daemon.to_string().as_str()));
 
     let boot = pty_core::boot::read_boot_identity().unwrap();
     let table = ProcTable::read();
@@ -3327,7 +3327,7 @@ fn ordinary_stopped_child_scenario(rig: &Rig) {
     // watchdog: an inherited flock must fail the test, not hang the runner.
     with_root(&rig.root, || {
         let claim = acquire_lock(name).expect("dead daemon's name is reclaimable");
-        assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
+        assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(std::process::id().to_string().as_str()));
         claim.release();
         assert!(!lock.exists(), "reclaimed name claim was not released");
     });

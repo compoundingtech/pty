@@ -411,7 +411,7 @@ impl Picker {
         let publisher = crate::cli::prepare_daemon(&mut params)?;
         registry::cleanup_all_while_locked(&session.name);
         event_guard.release();
-        params.creation_lock_owner_pid = Some(std::process::id() as i32);
+        params.creation_lock_delegate = Some(creation_guard.delegate());
         let spawned = publisher.spawn(params);
         creation_guard.release();
         spawned.map(|_| ()).map_err(|e| format!("{}: {e}", session.name))

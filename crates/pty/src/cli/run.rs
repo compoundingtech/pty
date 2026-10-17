@@ -454,16 +454,17 @@ fn create_or_attach(
     detach: bool,
     attach_existing: bool,
 ) -> CliResult {
-    // A caller that already holds the creation lock for us (the bundled
-    // library's CLI fallback) passes its pid. It is a one-hop control value,
-    // never session environment.
-    let delegated_owner: Option<i32> = std::env::var("PTY_CREATION_LOCK_OWNER_PID")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    let inherited_creation_lock =
-        delegated_owner.is_some_and(|pid| registry::is_lock_owned_by_pid(name, pid));
-    // SAFETY: single-threaded at this point.
-    unsafe { std::env::remove_var("PTY_CREATION_LOCK_OWNER_PID") };
+    // Only this CLI boundary supports the legacy external coordinator PID.
+    // The generic library and daemon require an explicit individual claim.
+    let delegated_owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(|pid| registry::lock::delegate_external_claim(name, pid).ok());
+    let inherited_creation_lock = delegated_owner.is_some();
+    // SAFETY: single-threaded at this point; these are one-hop control values.
+    unsafe {
+        std::env::remove_var("PTY_CREATION_LOCK_OWNER_PID");
+        std::env::remove_var("PTY_CREATION_LOCK_NONCE");
+    };
 
     let mut session = registry::get_session_by_name(name);
     let mut event_lock = None;
@@ -567,10 +568,8 @@ fn create_or_attach(
     }
     event_lock.take().map(registry::LockGuard::release);
 
-    params.creation_lock_owner_pid = Some(match delegated_owner {
-        Some(pid) if inherited_creation_lock => pid,
-        _ => std::process::id() as i32,
-    });
+    params.creation_lock_delegate = delegated_owner
+        .or_else(|| creation_lock.as_ref().map(registry::LockGuard::delegate));
     let spawned = publisher.spawn(params);
     drop(creation_lock);
     if let Err(msg) = spawned {

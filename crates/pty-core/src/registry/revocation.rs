@@ -135,9 +135,29 @@ fn directory_at(parent: &File, name: &str, create: bool) -> io::Result<File> {
 
 fn open_root(create: bool) -> io::Result<File> {
     let path = session_dir();
-    // Walk even the selected root without following symlink components. Ancestors
-    // need not be private (e.g. /tmp), but the selected root itself must be.
-    let mut directory = File::open(if path.is_absolute() { Path::new("/") } else { Path::new(".") })?;
+    let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    // Resolve ancestor aliases (notably macOS /tmp -> /private/tmp), but never
+    // resolve the selected root itself: its final component must not be a symlink.
+    // Missing suffixes are still created by the descriptor-relative walk below.
+    if path.components().any(|part| matches!(part, Component::ParentDir)) {
+        return Err(invalid("registry root must not contain parent components"));
+    }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut ancestor = parent;
+    let canonical_parent = loop {
+        match ancestor.canonicalize() {
+            Ok(canonical) => break canonical.join(parent.strip_prefix(ancestor).map_err(|_| invalid("invalid registry root ancestor"))?),
+            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let path = match path.file_name() {
+        Some(name) => canonical_parent.join(name),
+        None => path.canonicalize()?,
+    };
+    let mut directory = File::open("/")?;
     for part in path.components() {
         let name = match part {
             Component::RootDir | Component::CurDir => continue,
@@ -173,6 +193,26 @@ fn read_json<T: for<'de> Deserialize<'de>>(parent: &File, name: &str) -> io::Res
     serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))
 }
 
+// A successful publication has exactly one directory entry, even if the
+// process dies immediately after this syscall. Never use link/unlink here:
+// validate_file deliberately rejects multiply linked canonical records.
+fn rename_noreplace(parent: &File, temporary: &CString, name: &CString) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the directory descriptor and both component strings remain live.
+    let result = unsafe {
+        libc::renameat2(parent.as_raw_fd(), temporary.as_ptr(), parent.as_raw_fd(), name.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: the directory descriptor and both component strings remain live.
+    let result = unsafe {
+        libc::renameatx_np(parent.as_raw_fd(), temporary.as_ptr(), parent.as_raw_fd(), name.as_ptr(), libc::RENAME_EXCL)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "atomic no-replace publication requires Linux or macOS"));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
 // Return false for an existing canonical file. Never replace any canonical inode.
 fn publish<T: Serialize>(parent: &File, name: &str, value: &T) -> io::Result<bool> {
     let bytes = serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))?;
@@ -188,17 +228,18 @@ fn publish<T: Serialize>(parent: &File, name: &str, value: &T) -> io::Result<boo
         validate_file(&file, false)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        // SAFETY: owned directory and component C strings remain live.
-        if unsafe { libc::linkat(parent.as_raw_fd(), temporary.as_ptr(), parent.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = rename_noreplace(parent, &temporary, &name) {
             if error.kind() == io::ErrorKind::AlreadyExists { return Ok(false); }
             return Err(error);
         }
         Ok(true)
     })();
-    // SAFETY: unlink only the unique temporary component created above.
-    let unlinked = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
-    if unlinked < 0 { return Err(io::Error::last_os_error()); }
+    if !matches!(&result, Ok(true)) {
+        // SAFETY: unlink only the unique temporary component created above.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     parent.sync_all()?;
     result
 }
@@ -229,7 +270,7 @@ fn store_at(root: File, create: bool) -> io::Result<(File, RootIdentity)> {
     };
     validate_digest(&identity.root_id)?;
     if identity.schema != 1 || identity.path != path || identity.device != stat.dev() || identity.inode != stat.ino() {
-        return Err(invalid("publication revocation root identity mismatch"));
+        return Err(invalid("publication revocation root identity mismatch; do not reset the store: see README publication root re-enrollment"));
     }
     Ok((version, identity))
 }
@@ -317,7 +358,11 @@ pub fn install(name: &str, binding: &PublicationBinding, intent_digest: &str, ex
     if identity.root_id != expected_root_id {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "publication revocation expected root identity mismatch"));
     }
-    let _lock = acquire_lock(name).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "publication name is busy"))?;
+    let claim = acquire_lock(name).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "publication name is busy"))?;
+    // Pin this exact claim nonblockingly before reading or publishing a fence.
+    // In-process launches and GC must not borrow installation's ownership.
+    let _pin = claim.pin()?;
+    crate::operation::barrier::barrier("revocation-install-pinned");
     let existing = read_record(&version, &identity, name, &binding.operation)?;
     let already_installed = existing.is_some();
     let durable = if let Some(record) = existing {
@@ -378,5 +423,37 @@ pub fn check(name: &str, binding: Option<&PublicationBinding>, tag_operation: Op
         (Some(binding), Some(operation)) if binding.operation != operation =>
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "publication binding and operation tag disagree")),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn atomic_publication_crash_boundary_has_no_temporary_alias_or_replacement() {
+        let path = std::env::temp_dir().join(format!("pty-revocation-rename-{}-{}", std::process::id(), super::super::random_hex16()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(&path).unwrap();
+        let temporary = component(".tmp.crashed").unwrap();
+        let canonical = component("record.json").unwrap();
+        let source = path.join(".tmp.crashed");
+        std::fs::write(&source, b"durable fence").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(&source).unwrap().sync_all().unwrap();
+        rename_noreplace(&directory, &temporary, &canonical).unwrap();
+        // This is precisely the state a killed publisher leaves after the
+        // publication syscall, without executing any temporary-file cleanup.
+        assert!(!source.exists());
+        let record = open_at(&directory, "record.json", false).unwrap();
+        assert_eq!(record.metadata().unwrap().nlink(), 1);
+        let inode = record.metadata().unwrap().ino();
+        std::fs::write(&source, b"must not replace fence").unwrap();
+        assert_eq!(rename_noreplace(&directory, &temporary, &canonical).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(path.join("record.json")).unwrap(), b"durable fence");
+        assert_eq!(std::fs::metadata(path.join("record.json")).unwrap().ino(), inode);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

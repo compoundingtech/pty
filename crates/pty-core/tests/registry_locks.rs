@@ -17,6 +17,10 @@ static PUBLICATION_ROOT_ID: std::sync::LazyLock<String> = std::sync::LazyLock::n
     registry::revocation::root_id().expect("enroll isolated root")
 });
 
+fn claim_pid(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap().split_whitespace().next().unwrap().to_owned()
+}
+
 /// node: tests/security-fixes.test.ts:47-52
 #[test]
 fn first_caller_wins_second_refused_while_holder_alive() {
@@ -44,11 +48,7 @@ fn steals_a_stale_lock_whose_holder_is_dead() {
     std::fs::write(&lock_path, "1").unwrap();
     std::fs::write(&lock_path, DEAD_PID.to_string()).unwrap();
     let guard = registry::acquire_lock(&name).expect("stale lock must be stolen");
-    let holder: u32 = std::fs::read_to_string(&lock_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let holder: u32 = claim_pid(&lock_path).parse().unwrap();
     assert_eq!(
         holder,
         std::process::id(),
@@ -73,7 +73,7 @@ fn steals_a_read_only_stale_lock() {
 
     let guard = registry::acquire_lock(&name).expect("read-only stale lock must be stolen");
     assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
+        claim_pid(&lock_path),
         std::process::id().to_string()
     );
     drop(guard);
@@ -109,7 +109,7 @@ fn only_one_of_two_sequential_steals_wins() {
     assert_eq!(a.is_some() as u8 + b.is_some() as u8, 1);
 }
 
-/// The atomically published file is `0600` and holds only the decimal pid.
+/// The atomically published file is `0600`, with a decimal PID and claim nonce.
 ///
 /// node: src/sessions.ts:2298-2310
 #[test]
@@ -122,9 +122,13 @@ fn lock_file_mode_and_content() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
+        claim_pid(&path),
         std::process::id().to_string()
     );
+    let record = std::fs::read_to_string(&path).unwrap();
+    let nonce = record.split_whitespace().nth(1).unwrap();
+    assert_eq!(nonce.len(), 16);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
 }
 
 /// node: src/sessions.ts:2273-2281; tests/gc-generation-guard.test.ts:181-207
@@ -283,12 +287,51 @@ fn publication_pin_preserves_an_existing_owned_claim() {
     let _ = root();
     let name = unique_name("pub-held");
     let claim = registry::acquire_lock(&name).expect("launcher claim");
-    let pin = registry::lock::pin_publication(&name, None).expect("pin existing claim");
+    let pin = claim.pin().expect("pin explicitly owned claim");
     drop(pin);
     assert!(claim.path().exists(), "the caller still owns its claim");
     assert!(registry::acquire_lock(&name).is_none());
     claim.release();
     let _next = registry::acquire_lock(&name).expect("claim released");
+}
+
+#[test]
+fn publication_never_borrows_an_ambient_same_pid_claim() {
+    let _ = root();
+    let name = unique_name("pub-ambient");
+    let claim = registry::acquire_lock(&name).unwrap();
+    assert_eq!(registry::lock::pin_publication(&name, None).err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock);
+    assert!(registry::lock::delegate_external_claim(&name, std::process::id() as i32).is_err());
+    let mut wrong = claim.delegate();
+    wrong.nonce.push('0');
+    assert_eq!(registry::lock::pin_publication(&name, Some(&wrong)).err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied);
+    let pin = claim.pin().unwrap();
+    assert_eq!(claim.pin().err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(registry::lock::pin_publication(&name, Some(&claim.delegate())).err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock);
+    drop(pin);
+    let delegate = claim.delegate();
+    claim.release();
+    let next = registry::acquire_lock(&name).unwrap();
+    assert_ne!(delegate.nonce, next.delegate().nonce);
+    assert!(registry::lock::pin_publication(&name, Some(&delegate)).is_err());
+}
+
+#[test]
+fn an_old_guard_cannot_release_a_new_claim_with_the_same_pid() {
+    let _ = root();
+    let name = unique_name("same-pid-replaced");
+    let old = registry::acquire_lock(&name).unwrap();
+    registry::release_lock(&name);
+    let current = registry::acquire_lock(&name).unwrap();
+    assert_ne!(old.delegate().nonce, current.delegate().nonce);
+    drop(old);
+    assert!(current.path().exists(), "old nonce must not release the new owner");
+    let pin = current.pin().unwrap();
+    drop(pin);
+    current.release();
 }
 
 // Use a separately opened description: flock on a duplicated descriptor would
@@ -322,7 +365,7 @@ fn acquired_publication_pin_transfers_to_descriptor_free_daemon_claim() {
 
     let claim = pin.into_daemon_claim().expect("transfer publication to daemon");
     assert_eq!(claim.path(), path.as_path());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
     assert!(registry::acquire_lock(&name).is_none(), "transfer keeps the name claimed");
     assert_publication_inode_unpinned(old_inode);
     assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
@@ -461,11 +504,11 @@ fn delegated_publication_transfer_survives_old_owner_release() {
     let name = unique_name("pub-delegated-transfer");
     let path = root.join(format!("{name}.lock"));
     let mut owner = PublicationClaimOwner::spawn(&name);
-    let pin = registry::lock::pin_publication(&name, Some(owner.child.id() as i32))
+    let pin = registry::lock::pin_publication(&name, Some(&registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap()))
         .expect("pin delegated owner's claim");
     let old_inode = std::fs::File::open(&path).expect("open launcher inode independently");
     let before = old_inode.metadata().unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), owner.child.id().to_string());
+    assert_eq!(claim_pid(&path), owner.child.id().to_string());
     assert!(registry::acquire_lock(&name).is_none(), "launcher claim excludes contenders");
 
     // Start launcher cleanup while publication still pins its inode. Cleanup
@@ -482,14 +525,14 @@ fn delegated_publication_transfer_survives_old_owner_release() {
         (before.dev(), before.ino()),
         "handover atomically replaces the launcher inode"
     );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
     assert!(registry::acquire_lock(&name).is_none(), "daemon claim excludes contenders");
 
     owner.control().read_exact(&mut message).expect("old owner release completes");
     assert_eq!(message, [b'D']);
     assert!(owner.child.wait().expect("reap released launcher").success());
     assert_eq!(
-        std::fs::read_to_string(&path).expect("old release must preserve daemon claim"),
+        claim_pid(&path),
         std::process::id().to_string()
     );
     assert!(registry::acquire_lock(&name).is_none(), "old release cannot admit a contender");
@@ -510,12 +553,13 @@ fn delegated_publication_claim_can_return_to_its_original_coordinator() {
     let path = root.join(format!("{name}.lock"));
     let mut owner = PublicationClaimOwner::spawn(&name);
     let pid = owner.child.id();
-    let pin = registry::lock::pin_publication(&name, Some(pid as i32)).unwrap();
-    assert_eq!(pin.delegated_owner_pid(), Some(pid));
+    let delegate = registry::lock::delegate_external_claim(&name, pid as i32).unwrap();
+    let pin = registry::lock::pin_publication(&name, Some(&delegate)).unwrap();
+    assert_eq!(pin.delegate().unwrap().owner_pid, pid as i32);
     let claim = pin.into_daemon_claim().unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
-    claim.hand_over(pid).expect("restore coordinator after child spawn");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), pid.to_string());
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
+    claim.hand_back(&delegate).expect("restore coordinator after child spawn");
+    assert_eq!(claim_pid(&path), pid.to_string());
     assert!(registry::acquire_lock(&name).is_none(), "coordinator still owns the name");
     assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
 
@@ -538,7 +582,7 @@ fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
     let name = unique_name("pub-death");
     let path = root.join(format!("{name}.lock"));
     let mut owner = PublicationClaimOwner::spawn(&name);
-    let pin = registry::lock::pin_publication(&name, Some(owner.child.id() as i32))
+    let pin = registry::lock::pin_publication(&name, Some(&registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap()))
         .expect("pin live delegated owner's inode");
     let before = std::fs::metadata(&path).unwrap();
     owner.child.kill().unwrap();
@@ -555,7 +599,7 @@ fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
     );
     let after = std::fs::metadata(&path).unwrap();
     assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), owner.child.id().to_string());
+    assert_eq!(claim_pid(&path), owner.child.id().to_string());
     drop(pin);
     let next = registry::acquire_lock(&name).expect("stale claim is stealable after publication");
     next.release();
@@ -574,7 +618,7 @@ fn delegated_owner_release_waits_for_publication_pin() {
     let name = unique_name("pub-release");
     let path = root.join(format!("{name}.lock"));
     let mut owner = PublicationClaimOwner::spawn(&name);
-    let pin = registry::lock::pin_publication(&name, Some(owner.child.id() as i32))
+    let pin = registry::lock::pin_publication(&name, Some(&registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap()))
         .expect("pin delegated claim");
     let inode = std::fs::metadata(&path).unwrap().ino().to_string();
     owner.control().write_all(b"R").unwrap();

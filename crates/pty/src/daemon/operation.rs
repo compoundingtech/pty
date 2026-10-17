@@ -1231,7 +1231,8 @@ impl Actor {
         let lock_path = registry::lock_path(&self.runtime_id);
         let holds_creation_lock = std::fs::read_to_string(&lock_path)
             .ok()
-            .is_some_and(|owner| owner.trim() == self.me.pid.to_string());
+            .is_some_and(|owner| owner.split_whitespace().next() == Some(self.me.pid.to_string().as_str())
+                && owner.split_whitespace().nth(1) == std::env::var("PTY_CREATION_LOCK_NONCE").ok().as_deref());
         if !holds_creation_lock {
             return self.cancel_before_launch(
                 Cause::Refused,
