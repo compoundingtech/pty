@@ -63,6 +63,7 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
         "metadata" => fixture!("metadata"),
         "readiness" => fixture!("readiness"),
         "evidence" => fixture!("evidence"),
+        "publication-revocation" => fixture!("publication-revocation"),
         "up" => fixture!("up"),
         "down" => fixture!("down"),
         "test" => fixture!("test"),
@@ -112,7 +113,7 @@ mod tests {
     use super::*;
 
     /// node: tests/help.test.ts:13-18 (`COMMANDS`).
-    const COMMANDS: [&str; 24] = [
+    const COMMANDS: [&str; 25] = [
         "run",
         "attach",
         "exec",
@@ -137,6 +138,7 @@ mod tests {
         "test",
         "remote-serve",
         "evidence",
+        "publication-revocation",
     ];
 
     /// node: tests/help.test.ts:38-50 — every command has focused help that

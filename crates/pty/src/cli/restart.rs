@@ -99,33 +99,42 @@ pub fn run(args: &[String]) -> CliResult {
     }
 
     if session.status == SessionStatus::Running
-        && let Some(pid) = session.pid
-    {
-        if !yes && ask::declined(&ask::ask(&format!(
+        && !yes && ask::declined(&ask::ask(&format!(
             "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        ))) {
-            return Ok(0);
-        }
-        // SAFETY: kill(2) with a pid read from the registry; an error only
-        // means the process is already gone, which is the wanted state.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        registry::cleanup_socket(&name);
-        std::thread::sleep(Duration::from_millis(200));
+        )))
+    {
+        return Ok(0);
     }
-
-    let _ = registry::cleanup_all(&name);
-
+    let event_guard = registry::take_event_lock(&name)?;
+    let creation_guard = registry::take_metadata_lock(&name)?;
+    let current = registry::read_metadata(&name)
+        .ok_or_else(|| format!("Session \"{name}\" metadata became unreadable."))?;
+    if !registry::metadata_matches_observation(&meta, &current) {
+        return Err(format!("Session \"{name}\" changed before restart.").into());
+    }
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
-    // An operator restarting by hand is saying "try again", so drop any
-    // flapping mark that would make gc skip the fresh spawn.
+    // An explicit retry drops flapping bookkeeping, never launch provenance.
     params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    if let Err(e) = super::spawn_daemon(&params) {
-        eprintln!("pty restart: {e}");
+    pty_lifecycle::config_for(&params).check_publication()?;
+    if session.status == SessionStatus::Running
+        && let Some(pid) = session.pid
+    {
+        // SAFETY: the exact observed generation remains under name ownership.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    registry::cleanup_all_while_locked(&name);
+    event_guard.release();
+    params.creation_lock_owner_pid = Some(std::process::id() as i32);
+    let spawned = super::spawn_daemon(&params);
+    creation_guard.release();
+    if let Err(error) = spawned {
+        eprintln!("pty restart: {error}");
         return Ok(1);
     }
     println!("Session \"{name}\" restarted.");

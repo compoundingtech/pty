@@ -1,0 +1,14 @@
+Usage: pty publication-revocation <identity|install|read> [flags] --json
+
+Enroll a private registry root or permanently reject one exact launch operation.
+Installation reports current occupancy; it never stops or removes a session.
+There is no clear operation. Legacy publishers do not gain this capability retroactively.
+
+Commands:
+  identity --json
+  install --id <stable-id> --operation <operation> --binding <sha256> --intent <sha256> --root-id <identity> --json
+  read --id <stable-id> --operation <operation> --json
+
+Examples:
+  pty publication-revocation identity --json
+  pty publication-revocation read --id worker --operation revoked-start --json

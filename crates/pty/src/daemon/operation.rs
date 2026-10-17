@@ -47,7 +47,7 @@ use pty_spawn::substrate::{ExitStatus, SessionRef};
 use super::DaemonConfig;
 use super::held::{self, Ack, HeldChild, HeldSpec};
 use super::lifecycle::{
-    Daemon, DaemonParts, Msg, Publication, live_identity, new_generation, publish_session,
+    Daemon, DaemonParts, Msg, Publication, live_identity, new_generation, prepare_publication, publish_session,
     spawn_acceptor, spawn_session_bridge,
 };
 
@@ -468,6 +468,13 @@ impl Worker {
                         continue;
                     }
                     barrier("publish-committed-before-effect");
+                    let publication_lock = match prepare_publication(&self.cfg) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            self.complete(ticket, Err(error));
+                            continue;
+                        }
+                    };
                     let events = EventWriter::new(&self.cfg.name);
                     let result = clear_predecessor(&self.cfg.name, predecessor.as_deref())
                         .and_then(|()| {
@@ -480,6 +487,7 @@ impl Worker {
                                 child_env: &child_env,
                                 events: &events,
                                 marker: Some(marker),
+                                creation_lock: &publication_lock,
                             })
                         });
                     match result {
@@ -528,6 +536,29 @@ impl Worker {
                         published = Some(publication);
                         continue;
                     }
+                    // Publication released the claim to let the startup actor
+                    // progress. Re-admit the later child-creation effect: a
+                    // revocation may have won between those two effects.
+                    let child_publication_lock = match registry::lock::pin_publication(
+                        &self.cfg.name, None,
+                    ).map_err(|error| error.to_string()).and_then(|guard| {
+                        self.cfg.check_publication()?;
+                        let current = registry::read_metadata(&self.cfg.name);
+                        if !current.as_ref().is_some_and(|metadata| {
+                            metadata.generation.as_deref() == Some(generation.as_str())
+                                && metadata.daemon_pid == Some(std::process::id() as i32)
+                        }) {
+                            return Err("published generation changed before child creation".into());
+                        }
+                        Ok(guard)
+                    }) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            published = Some(publication);
+                            self.complete(ticket, Err(error));
+                            continue;
+                        }
+                    };
                     let forked = match held::fork_held(&spec) {
                         Ok(forked) => forked,
                         Err(error) => {
@@ -536,6 +567,7 @@ impl Worker {
                             continue;
                         }
                     };
+                    drop(child_publication_lock);
                     let gate = Arc::new(forked.gate);
                     let Published {
                         events,

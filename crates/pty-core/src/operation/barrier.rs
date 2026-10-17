@@ -13,7 +13,7 @@
 pub const BARRIERS_ENV: &str = "PTY_TEST_OPERATION_BARRIERS";
 
 /// Every barrier name, in the order a successful launch reaches them.
-pub const BARRIERS: [&str; 14] = [
+pub const BARRIERS: [&str; 16] = [
     "launcher-before-claim",
     "launcher-before-peek",
     "launcher-before-fork",
@@ -21,6 +21,8 @@ pub const BARRIERS: [&str; 14] = [
     "before-decision",
     "publish-issued-before-commit",
     "publish-committed-before-effect",
+    "publication-before-lock",
+    "publication-before-effects",
     "published-before-child-fork",
     "child-forked-before-record",
     "child-prepared-before-ack-read",

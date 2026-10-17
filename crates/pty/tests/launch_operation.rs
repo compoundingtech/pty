@@ -85,6 +85,8 @@ struct Plan {
     executable: Option<PathBuf>,
     /// The session id, when not `rt-<tag>`.
     runtime_id: Option<String>,
+    /// Immutable managed-publication operation, digest and root identity.
+    publication: Option<(String, String, String)>,
 }
 
 /// The owner of one launch operation.
@@ -153,13 +155,21 @@ impl Owner {
             &digest,
             "--id",
             &runtime_id,
-            "--",
-        ])
-        .args(&command)
-        .env("PTY_TEST_OPERATION_BARRIERS", &barriers)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        ]);
+        if let Some((operation, binding, root)) = &plan.publication {
+            cmd.args([
+                "--publication-operation", operation,
+                "--publication-binding", binding,
+                "--publication-root-id", root,
+            ]);
+            cmd.args(["--tag", &format!("st3.start-operation={operation}")]);
+        }
+        cmd.arg("--")
+            .args(&command)
+            .env("PTY_TEST_OPERATION_BARRIERS", &barriers)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (key, value) in &plan.env {
             cmd.env(key, value);
         }
@@ -3106,4 +3116,106 @@ fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
     assert!(!alive(child));
     owner.settle_until(&rig, "closed");
     assert!(!owner.ran());
+}
+
+/// Operation mode bypasses ordinary create preflight and delegates the name
+/// claim to a gated daemon; the final worker must still enforce the fence.
+#[test]
+#[cfg(debug_assertions)]
+fn managed_operation_checks_revocation_in_the_final_publication_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+        .as_str().unwrap().to_owned();
+    let name = "managed-operation";
+    let revoked = format!("op-managed-revoked-{}", std::process::id());
+    let binding = "a".repeat(64);
+    let intent = "b".repeat(64);
+    rig.ok(&[
+        "publication-revocation", "install", "--id", name,
+        "--operation", &revoked, "--binding", &binding, "--intent", &intent,
+        "--root-id", &root, "--json",
+    ]);
+    let mut owner = Owner::start(&rig, "managed-revoked", Plan {
+        runtime_id: Some(name.into()),
+        publication: Some((revoked.clone(), binding.clone(), root.clone())),
+        hold: vec!["publication-before-lock"],
+        ..Plan::default()
+    });
+    owner.wait_reached("publication-before-lock");
+    assert_eq!(owner.operation_id, revoked);
+    assert!(!owner.ran());
+    assert!(!row_exists(&rig, name));
+    owner.release("publication-before-lock");
+    let retirement = owner.wait_for("retirement");
+    assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+    owner.drain();
+    assert_ne!(owner.launcher_exit(), 0);
+    assert!(!owner.ran(), "a revoked operation executed its command");
+    for suffix in ["json", "pid", "sock", "events.jsonl"] {
+        assert!(!rig.exists(&format!("{name}.{suffix}")), "published {suffix}");
+    }
+
+    let mut replacement = Owner::start(&rig, "managed-replacement", Plan {
+        runtime_id: Some(name.into()),
+        publication: Some(("replacement-operation".into(), "c".repeat(64), root.clone())),
+        ..Plan::default()
+    });
+    let ready = replacement.wait_for("ready");
+    assert!(!replacement.ran(), "operation child must remain held until transfer");
+    replacement.transfer("managed-replacement-transfer", &ready["incarnation"]);
+    assert_eq!(replacement.wait_for("transferred")["transfer"]["released"], true);
+    wait_until("replacement command", || replacement.ran());
+    let meta = rig.read_meta(name).unwrap();
+    assert_eq!(meta["publicationBinding"], json!({
+        "operation": "replacement-operation", "digest": "c".repeat(64),
+    }));
+    assert_eq!(meta["publicationRootId"], root);
+    assert_eq!(meta["generation"], ready["incarnation"]["generation"]);
+    assert_eq!(meta["publicationCapability"], 1);
+    replacement.drain();
+    assert_eq!(replacement.launcher_exit(), 0);
+    rig.ok(&["kill", name]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn managed_operation_revoked_after_publication_refuses_to_fork_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+        .as_str().unwrap().to_owned();
+    let operation = format!("op-revoked-before-child-{}", std::process::id());
+    let binding = "d".repeat(64);
+    let mut owner = Owner::start(&rig, "revoked-before-child", Plan {
+        publication: Some((operation.clone(), binding.clone(), root.clone())),
+        hold: vec!["published-before-child-fork"],
+        ..Plan::default()
+    });
+    owner.wait_reached("published-before-child-fork");
+    assert!(row_exists(&rig, &owner.runtime_id));
+    assert!(!owner.ran());
+    let before = rig.read_meta(&owner.runtime_id).unwrap();
+    let daemon = before["daemonPid"].as_i64().unwrap() as i32;
+    let installed = rig.ok(&[
+        "publication-revocation", "install", "--id", &owner.runtime_id,
+        "--operation", &operation, "--binding", &binding, "--intent", &"e".repeat(64),
+        "--root-id", &root, "--json",
+    ]).json();
+    assert_eq!(installed["occupancy"]["entries"][0]["status"], "running");
+    assert!(alive(daemon), "install stopped the published operation daemon");
+    assert_eq!(rig.read_meta(&owner.runtime_id).unwrap(), before);
+    assert!(!owner.ran());
+    owner.release("published-before-child-fork");
+    let retirement = owner.wait_for("retirement");
+    assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+    owner.drain();
+    assert_ne!(owner.launcher_exit(), 0);
+    assert!(!owner.ran(), "revocation between publication and fork executed the command");
+    assert!(!owner.frames.iter().any(|frame| frame["type"] == "held" || frame["type"] == "ready"));
+    assert!(!row_exists(&rig, &owner.runtime_id));
 }

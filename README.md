@@ -10,8 +10,9 @@ same commands and JSON output. This repository is a Rust port of the Node
 [libghostty](https://libghostty.tip.ghostty.org/) (the terminal core extracted
 from [Ghostty](https://ghostty.org)) in place of `@xterm/headless`. The port is
 meant as a drop-in: same commands, flags, texts, JSON shapes, exit codes, files
-under `$PTY_ROOT`, and socket protocol, so the two implementations can share a
-registry while a fleet migrates.
+under `$PTY_ROOT`, and socket protocol, so the two implementations can share an
+ordinary unmanaged registry while a fleet migrates. Managed publication-revocation
+roots exclude legacy publishers; see the compatibility boundary below.
 
 ## Where it stands
 
@@ -422,6 +423,94 @@ Node contender can still unlink a newer Rust or Node claim. Such recovery
 must be externally serialized in a mixed registry.
 `crates/pty-core/src/registry/lock.rs` and `docs/hardening.md` describe the
 boundary in full.
+
+### Durable publication revocation (version 1)
+
+Publication revocation fences one exact stable session ID and start operation
+in one registry root. It is not a stop, remove, or recovery command:
+
+```sh
+pty publication-revocation identity --json
+pty publication-revocation install --id worker --operation start-operation \
+  --binding <64-lowercase-hex-launch-binding> \
+  --intent <64-lowercase-hex-repair-intent-digest> \
+  --root-id <enrolled-root-id> --json
+pty publication-revocation read --id worker --operation start-operation --json
+```
+
+All three forms require the exact flags shown (`--json` is required); duplicate or
+unknown flags are errors. There is no clear verb. IDs are stable IDs, never
+display-name lookups, and operation IDs are exact, not prefixes. Install returns
+`{record, occupancy, alreadyInstalled}`: the durable tombstone, the current
+strict occupancy observation, and whether this exact record was already
+installed. Read returns the exact record, or exits nonzero if absent. Read does
+not infer current occupancy. Conflicting binding or intent digests fail rather
+than overwrite a record. Installing a fence against a live session reports its
+occupancy without signaling, replacing, or changing its metadata.
+Installation requires the expected enrolled root identity and refuses a mismatch
+before writing a record. Records include `capabilityVersion: 1`, `revoked: true`,
+`attestationReceiptOrIntentId` (the supplied intent digest), `writerUid`, and
+`recordedAt`, alongside the schema, exact root/name/binding, and intent digest.
+
+
+`identity --json` establishes or validates the root's durable enrollment identity
+and returns `{"root_id":"…"}` without targeting or altering any session. Capture
+this identity before managed launch, then supply all three immutable launch flags
+together:
+
+```sh
+pty run -d --id worker --publication-operation start-operation \
+  --publication-binding <64-lowercase-hex-launch-binding> \
+  --publication-root-id <enrolled-root-id> \
+  --tag st3.start-operation=start-operation -- command
+```
+
+Partial flag sets are refused, and the daemon checks the supplied root identity
+against the actual enrolled root before publication. Managed metadata carries
+`publicationBinding`, `publicationCapability: 1`, and `publicationRootId`; mutable
+tags are not substitutes for this immutable launch provenance. The
+`st3.start-operation` tag is required and must exactly match the binding's
+operation. Recreating an ended managed row requires an explicit new binding;
+an ordinary unbound `run` cannot inherit its provenance for a different task.
+
+Rust callers use `pty_core::registry::revocation::{root_id, install, read, check,
+PublicationBinding, PublicationRevocation, RevocationInstall}`. `root_id()` returns
+`io::Result<String>` for prelaunch enrollment. `install(name,
+&binding, intent_digest, expected_root_id)` serializes with publication using the name creation
+lock and durably installs the immutable record; `read(name, operation)` returns
+`io::Result<Option<PublicationRevocation>>`. `check(name, binding,
+tag_operation)` must be called while the publisher holds that same creation
+lock and never acquires it itself. A revoked operation is refused with
+`PermissionDenied` / `operation-revoked`, even if a caller supplies a different
+binding digest. Binding and operation-tag disagreement is also refused.
+`None`/`None` retains ordinary unmanaged publication behavior; it is not proof
+of capable managed launch.
+
+Version-1 records live at
+`$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,
+bound to a persistent root identity and the canonical ID and operation in the
+record. Enrollment validates the existing root too: roots/directories must be
+owner-private `0700`, files `0600`, owned by the effective UID, and traversal
+rejects symlinks and unsafe types or modes. Publication uses no-replace writes
+and file/directory durability barriers. These records survive `rm`, GC, session
+recreation, display-name rename, and daemon replacement. Never delete them to
+roll back an intent, downgrade, or restore metadata; disaster restoration must
+restore the durable fences and the caller's intent/receipt state together
+before publication resumes. Replacing or reinitializing a fenced root is not
+an unrevocation mechanism.
+
+This is a same-UID OS-principal trust boundary, not per-agent cryptography.
+Supported executable selection must exclude legacy/downgraded publishers for
+a managed root; an old binary cannot be trusted to obey a new fence. Existing
+serving daemons remain untouched, but installing a new binary does not upgrade
+their at-launch proof. Missing binding/root identity, old binaries or
+intermediaries, and mixed uncontrolled publishers are **UNPROVEN**, not
+retroactively authorized repair. New consumers must refuse attested repair in
+those cases; ordinary unmanaged use remains compatible. In particular, this
+feature provides no recovery claim for Fractal operation
+`01a145e9-f5e1-73a0-90d7-8c9abd6fb98c`: its exact scope is unidentified and
+producer closure remains UNPROVEN.
+
 
 ## The crates
 

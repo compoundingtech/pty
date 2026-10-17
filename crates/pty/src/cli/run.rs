@@ -30,6 +30,9 @@ pub fn run(args: &[String]) -> CliResult {
     let mut lifecycle_tag: Option<String> = None;
     let mut operation_fd: Option<String> = None;
     let mut launch_operation: Option<String> = None;
+    let mut publication_operation: Option<String> = None;
+    let mut publication_digest: Option<String> = None;
+    let mut publication_root_id: Option<String> = None;
     let mut i = 0;
     let mut command: Vec<String> = Vec::new();
     while i < args.len() {
@@ -93,6 +96,22 @@ pub fn run(args: &[String]) -> CliResult {
             }
             "--launch-operation" => {
                 launch_operation = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--publication-operation" | "--publication-binding" | "--publication-root-id" => {
+                let slot = match args[i].as_str() {
+                    "--publication-operation" => &mut publication_operation,
+                    "--publication-binding" => &mut publication_digest,
+                    _ => &mut publication_root_id,
+                };
+                let Some(value) = args.get(i + 1).filter(|value| !value.starts_with("--")) else {
+                    eprintln!("pty run: {} requires one value", args[i]);
+                    return Ok(64);
+                };
+                if slot.replace(value.clone()).is_some() {
+                    eprintln!("pty run: {} may be supplied only once", args[i]);
+                    return Ok(64);
+                }
                 i += 2;
             }
             "--tag" => {
@@ -177,6 +196,22 @@ pub fn run(args: &[String]) -> CliResult {
         );
         return Ok(1);
     }
+    let publication_binding = match (publication_operation, publication_digest, &publication_root_id) {
+        (None, None, None) => None,
+        (Some(operation), Some(digest), Some(root)) if !root.is_empty()
+            && background && !attach_existing && id.as_ref().is_some_and(|id| !id.is_empty()) => {
+            let binding = registry::revocation::PublicationBinding { operation, digest };
+            if let Err(error) = binding.validate() {
+                eprintln!("pty run: {error}");
+                return Ok(64);
+            }
+            Some(binding)
+        }
+        _ => {
+            eprintln!("pty run: publication operation, binding and root identity require each other, --id and -d; -a is not supported");
+            return Ok(64);
+        }
+    };
     let operation = if operation_fd.is_some() || launch_operation.is_some() {
         match operation_arguments(
             operation_fd.as_deref(),
@@ -293,6 +328,8 @@ pub fn run(args: &[String]) -> CliResult {
     }
     params.ephemeral = ephemeral;
     params.tags = tags;
+    params.publication_binding = publication_binding;
+    params.publication_root_id = publication_root_id;
     params.display_name = display_name;
     params.isolate_env = isolate_env;
     params.extra_env = extra_env;
@@ -488,6 +525,10 @@ fn create_or_attach(
         .filter(|s| s.is_gone())
         .and_then(|s| s.metadata.clone());
     if let Some(previous) = &gone {
+        if params.publication_binding.is_none() && previous.publication_binding.is_some() {
+            eprintln!("pty run: recreating a managed session requires a new explicit publication binding");
+            return Ok(1);
+        }
         if !explicit_cwd && !previous.cwd.is_empty() {
             params.cwd = previous.cwd.clone();
         }
@@ -509,6 +550,10 @@ fn create_or_attach(
         {
             params.unset_env = previous_unset.clone();
         }
+    }
+    if let Err(error) = pty_lifecycle::config_for(&params).check_publication() {
+        eprintln!("pty run: {error}");
+        return Ok(1);
     }
     if gone.is_some() && !inherited_creation_lock {
         registry::cleanup_all_while_locked(name);

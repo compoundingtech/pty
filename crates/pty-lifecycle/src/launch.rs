@@ -41,6 +41,8 @@ pub struct SpawnParams {
     pub ephemeral: bool,
     /// Written to the config only when non-empty.
     pub tags: TagMap,
+    pub publication_binding: Option<registry::revocation::PublicationBinding>,
+    pub publication_root_id: Option<String>,
     pub display_name: Option<String>,
     pub isolate_env: bool,
     /// Written only when non-empty.
@@ -92,6 +94,8 @@ impl SpawnParams {
 ///
 /// node: src/cli.ts:3874-3884 (`persistedLaunchOptions`)
 pub fn apply_persisted_launch_options(params: &mut SpawnParams, meta: &registry::SessionMetadata) {
+    params.publication_binding = meta.publication_binding.clone();
+    params.publication_root_id = meta.publication_root_id.clone();
     if let Some(rows) = meta.rows {
         params.rows = rows;
     }
@@ -200,6 +204,8 @@ pub fn config_for(params: &SpawnParams) -> DaemonConfig {
         cols: Some(params.cols),
         ephemeral: params.ephemeral,
         tags: (!params.tags.is_empty()).then(|| params.tags.clone()),
+        publication_binding: params.publication_binding.clone(),
+        publication_root_id: params.publication_root_id.clone(),
         display_name: params.display_name.clone().filter(|d| !d.is_empty()),
         isolate_env: params.isolate_env.then_some(true),
         extra_env: (!params.extra_env.is_empty()).then(|| params.extra_env.clone()),
@@ -649,7 +655,11 @@ fn start_daemon_process(
     if params.bind_to_spawner_lifetime {
         cmd.env("PTY_SPAWNER_PID", std::process::id().to_string());
     }
-    match params.creation_lock_owner_pid {
+    let creation_owner = params.creation_lock_owner_pid.or_else(|| {
+        registry::is_lock_owned_by_pid(&params.name, std::process::id() as i32)
+            .then_some(std::process::id() as i32)
+    });
+    match creation_owner {
         Some(pid) => {
             cmd.env("PTY_CREATION_LOCK_OWNER_PID", pid.to_string());
         }

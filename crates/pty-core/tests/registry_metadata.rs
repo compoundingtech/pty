@@ -294,6 +294,244 @@ fn mutate_statuses() {
     assert!(!root.join(format!("{name}.lock")).exists());
 }
 
+#[test]
+fn generic_mutation_rejects_flattened_publication_provenance_without_writes() {
+    let _ = root();
+    for managed in [false, true] {
+        for (key, value) in [
+            ("publicationBinding", json!({"operation": "forged", "digest": "b".repeat(64)})),
+            ("publicationRootId", json!("forged-root")),
+            ("publicationCapability", json!(2)),
+            ("tags", json!({"st3.start-operation": "forged"})),
+        ] {
+            let name = unique_name("extra-forge");
+            let mut metadata = base_metadata();
+            if managed {
+                metadata.publication_binding = Some(registry::PublicationBinding {
+                    operation: "original".into(),
+                    digest: "a".repeat(64),
+                });
+                metadata.publication_root_id = Some("original-root".into());
+                metadata.publication_capability = Some(1);
+                metadata.tags = Some(tags(&[("st3.start-operation", "original")]));
+            }
+            metadata.extra.insert("futureField".into(), json!({"keep": true}));
+            registry::write_metadata_publication(&name, &metadata).unwrap();
+            EventWriter::new(&name).append(Event::new(&name, "session_start"));
+            let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
+            let events_before = std::fs::read(registry::events_path(&name)).unwrap();
+
+            let status = registry::mutate_metadata_under_lock_with(
+                &name,
+                |after| {
+                    after.extra.insert(key.into(), value);
+                    after.display_name = Some("must not persist".into());
+                    true
+                },
+                &MutateOptions::default(),
+                |_| panic!("rejected provenance mutation must not publish"),
+            );
+
+            assert_eq!(status, MutateStatus::GenerationMismatch, "{key}, managed={managed}");
+            assert_eq!(
+                std::fs::read(registry::metadata_path(&name)).unwrap(),
+                metadata_before,
+                "{key}, managed={managed}"
+            );
+            assert_eq!(
+                std::fs::read(registry::events_path(&name)).unwrap(),
+                events_before,
+                "{key}, managed={managed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_mutation_rejects_typed_publication_provenance_without_writes() {
+    let _ = root();
+    for key in ["publicationBinding", "publicationRootId", "publicationCapability", "st3.start-operation"] {
+        let name = unique_name("typed-forge");
+        let mut metadata = base_metadata();
+        metadata.publication_binding = Some(registry::PublicationBinding {
+            operation: "original".into(),
+            digest: "a".repeat(64),
+        });
+        metadata.publication_root_id = Some("original-root".into());
+        metadata.publication_capability = Some(1);
+        metadata.tags = Some(tags(&[("st3.start-operation", "original")]));
+        registry::write_metadata_publication(&name, &metadata).unwrap();
+        EventWriter::new(&name).append(Event::new(&name, "session_start"));
+        let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
+        let events_before = std::fs::read(registry::events_path(&name)).unwrap();
+
+        let status = registry::mutate_metadata_under_lock_with(
+            &name,
+            |after| {
+                match key {
+                    "publicationBinding" => after.publication_binding = None,
+                    "publicationRootId" => after.publication_root_id = None,
+                    "publicationCapability" => after.publication_capability = None,
+                    "st3.start-operation" => after.tags = None,
+                    _ => unreachable!(),
+                }
+                true
+            },
+            &MutateOptions::default(),
+            |_| panic!("rejected provenance mutation must not publish"),
+        );
+
+        assert_eq!(status, MutateStatus::GenerationMismatch, "{key}");
+        assert_eq!(
+            std::fs::read(registry::metadata_path(&name)).unwrap(),
+            metadata_before,
+            "{key}"
+        );
+        assert_eq!(
+            std::fs::read(registry::events_path(&name)).unwrap(),
+            events_before,
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn generic_mutation_preserves_and_updates_unrelated_extras() {
+    let _ = root();
+    let name = unique_name("extra-keep");
+    let mut metadata = base_metadata();
+    metadata.extra.insert("futureField".into(), json!({"keep": true}));
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+
+    let status = registry::mutate_metadata_under_lock(
+        &name,
+        |after| {
+            after.extra.insert("anotherFutureField".into(), json!([1, 2, 3]));
+            true
+        },
+        &MutateOptions::default(),
+    );
+
+    assert!(matches!(status, MutateStatus::Changed(_)));
+    let persisted = registry::read_metadata(&name).unwrap();
+    assert_eq!(persisted.extra["futureField"], json!({"keep": true}));
+    assert_eq!(persisted.extra["anotherFutureField"], json!([1, 2, 3]));
+}
+
+#[test]
+fn generic_mutation_preserves_bound_launch_inputs_and_legacy_mutability() {
+    let _ = root();
+    for managed in [false, true] {
+        for flattened in [false, true] {
+            for (key, value) in [
+                ("command", json!("/bin/false")),
+                ("args", json!(["--forged"])),
+                ("cwd", json!("/")),
+                ("isolateEnv", json!(true)),
+                ("extraEnv", json!({"FORGED": "yes"})),
+                ("sessionEnv", json!({"FORGED": "yes"})),
+                ("unsetEnv", json!(["PATH"])),
+                ("env", json!({"FORGED": "yes"})),
+            ] {
+                let name = unique_name("launch-forge");
+                let mut metadata = base_metadata();
+                if managed {
+                    metadata.publication_binding = Some(registry::PublicationBinding {
+                        operation: "original".into(),
+                        digest: "a".repeat(64),
+                    });
+                }
+                registry::write_metadata_publication(&name, &metadata).unwrap();
+                EventWriter::new(&name).append(Event::new(&name, "session_start"));
+                let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
+                let events_before = std::fs::read(registry::events_path(&name)).unwrap();
+
+                let status = registry::mutate_metadata_under_lock_with(
+                    &name,
+                    |after| {
+                        if flattened {
+                            after.extra.insert(key.into(), value.clone());
+                        } else {
+                            match key {
+                                "command" => after.command = "/bin/false".into(),
+                                "args" => after.args = vec!["--forged".into()],
+                                "cwd" => after.cwd = "/".into(),
+                                "isolateEnv" => after.isolate_env = Some(true),
+                                "extraEnv" => after.extra_env = Some(tags(&[("FORGED", "yes")])),
+                                "sessionEnv" => after.session_env = Some(tags(&[("FORGED", "yes")])),
+                                "unsetEnv" => after.unset_env = Some(vec!["PATH".into()]),
+                                "env" => after.env = Some(tags(&[("FORGED", "yes")])),
+                                _ => unreachable!(),
+                            }
+                        }
+                        true
+                    },
+                    &MutateOptions::default(),
+                    |_| assert!(!managed, "bound launch mutation must not publish"),
+                );
+
+                if managed {
+                    assert_eq!(status, MutateStatus::GenerationMismatch, "{key}, flattened={flattened}");
+                    assert_eq!(
+                        std::fs::read(registry::metadata_path(&name)).unwrap(),
+                        metadata_before,
+                        "{key}, flattened={flattened}"
+                    );
+                } else {
+                    assert!(matches!(status, MutateStatus::Changed(_)));
+                    assert_eq!(registry::read_metadata_map(&name).unwrap()[key], value);
+                }
+                assert_eq!(
+                    std::fs::read(registry::events_path(&name)).unwrap(),
+                    events_before,
+                    "{key}, flattened={flattened}, managed={managed}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_mutation_allows_bound_presentation_and_lifecycle_updates() {
+    let _ = root();
+    let name = unique_name("bound-edit");
+    let mut metadata = base_metadata();
+    metadata.publication_binding = Some(registry::PublicationBinding {
+        operation: "original".into(),
+        digest: "a".repeat(64),
+    });
+    metadata.extra.insert("futureField".into(), json!({"keep": true}));
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+
+    let status = registry::mutate_metadata_under_lock(
+        &name,
+        |after| {
+            after.display_name = Some("Friendly name".into());
+            after.display_command = "friendly command".into();
+            after.rows = Some(40);
+            after.cols = Some(100);
+            after.exit_code = Some(0);
+            after.exited_at = Some("2026-04-05T10:17:00.000Z".into());
+            after.extra.insert("anotherFutureField".into(), json!(true));
+            true
+        },
+        &MutateOptions::default(),
+    );
+
+    assert!(matches!(status, MutateStatus::Changed(_)));
+    let persisted = registry::read_metadata(&name).unwrap();
+    assert_eq!(persisted.publication_binding, metadata.publication_binding);
+    assert_eq!(persisted.command, metadata.command);
+    assert_eq!(persisted.display_name.as_deref(), Some("Friendly name"));
+    assert_eq!(persisted.display_command, "friendly command");
+    assert_eq!(persisted.rows, Some(40));
+    assert_eq!(persisted.cols, Some(100));
+    assert_eq!(persisted.exit_code, Some(0));
+    assert_eq!(persisted.exited_at.as_deref(), Some("2026-04-05T10:17:00.000Z"));
+    assert_eq!(persisted.extra["futureField"], json!({"keep": true}));
+    assert_eq!(persisted.extra["anotherFutureField"], json!(true));
+}
+
 /// Legacy records without a generation compare structurally.
 ///
 /// node: src/sessions.ts:740-752

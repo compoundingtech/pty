@@ -25,6 +25,7 @@ pub mod help;
 pub mod list;
 pub mod metadata;
 pub mod operation;
+pub mod publication_revocation;
 pub mod readiness;
 pub mod remote_serve;
 pub mod rename;
@@ -278,6 +279,7 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
         "evidence" => evidence::run(rest),
         "capabilities" => capabilities::run(rest),
         "operation" => operation::run(rest),
+        "publication-revocation" => publication_revocation::run(rest),
         "rm" | "remove" => rm::run(rest),
         "test" => deferred::run("test"),
         "completions" => Ok(completions::run(rest)),

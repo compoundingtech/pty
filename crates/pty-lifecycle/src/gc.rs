@@ -637,6 +637,9 @@ fn reconcile_permanent(
     }
 
     let (mut params, ptyfile_reread) = respawn_params(name, &current);
+    if let Err(error) = crate::config_for(&params).check_publication() {
+        return PermanentOutcome::Failed(error);
+    }
     let now_ms = now_epoch_ms();
     let decision = classify_flapping(
         &current,

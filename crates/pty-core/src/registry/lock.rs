@@ -163,6 +163,57 @@ fn same_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+/// Pins the name's creation claim through a daemon's final publication.
+///
+/// A launcher may own the PID claim while its daemon publishes. Pinning its
+/// inode prevents stale recovery (or the launcher's release) from admitting a
+/// revocation or replacement if that launcher exits during publication.
+pub struct PublicationLock {
+    // File drops first, releasing flock before an independently acquired claim.
+    _inode: std::fs::File,
+    _claim: Option<LockGuard>,
+}
+
+pub fn pin_publication(name: &str, delegated_owner: Option<i32>) -> std::io::Result<PublicationLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = lock_path(name);
+    let me = std::process::id() as i32;
+    let existing_owner = if is_lock_owned_by_pid(name, me) {
+        Some(me)
+    } else {
+        delegated_owner.filter(|pid| is_lock_owned_by_pid(name, *pid))
+    };
+    let claim = if existing_owner.is_none() {
+        Some(try_acquire_file_lock(&path)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "publication creation lock is busy")
+        })?)
+    } else {
+        None
+    };
+    let expected = existing_owner.unwrap_or(me);
+    let mut inode = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    if !try_lock_exclusive(&inode)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock, "publication creation lock is pinned",
+        ));
+    }
+    let opened = inode.metadata()?;
+    let current = std::fs::symlink_metadata(&path)?;
+    let mut owner = String::new();
+    inode.read_to_string(&mut owner)?;
+    if !opened.is_file() || !same_inode(&opened, &current)
+        || owner.trim().parse::<i32>().ok() != Some(expected)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied, "publication creation ownership changed",
+        ));
+    }
+    Ok(PublicationLock { _inode: inode, _claim: claim })
+}
+
 fn holder_is_alive(file: &std::fs::File) -> bool {
     let mut contents = String::new();
     let mut reader = file;
@@ -319,7 +370,25 @@ pub fn take_metadata_lock(name: &str) -> Result<LockGuard, String> {
 ///
 /// node: src/sessions.ts:2374-2378
 pub fn release_file_lock(lock_path: &Path) {
-    let _ = std::fs::remove_file(lock_path);
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(inode) = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(lock_path) else {
+        return;
+    };
+    loop {
+        // SAFETY: inode is open; a final publisher may still pin this claim.
+        if unsafe { libc::flock(inode.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+    if let (Ok(opened), Ok(current)) = (inode.metadata(), std::fs::symlink_metadata(lock_path))
+        && same_inode(&opened, &current)
+    {
+        let _ = std::fs::remove_file(lock_path);
+    }
 }
 
 /// `parseInt(s, 10)`: leading integer, `None` when there is none.

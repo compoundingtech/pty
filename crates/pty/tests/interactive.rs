@@ -217,3 +217,84 @@ fn return_attaches_and_detach_comes_back_to_the_list() {
     run_pty(&root, &["kill", "shellish"]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn revoked_restart_preserves_stopped_predecessor_without_launching() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+
+    let _serial = serial();
+    let root = unique_root();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = Command::new(pty_bin())
+        .args(["publication-revocation", "identity", "--json"])
+        .env("PTY_ROOT", &root)
+        .env_remove("PTY_SESSION")
+        .output()
+        .unwrap();
+    assert!(identity.status.success(), "{}", String::from_utf8_lossy(&identity.stderr));
+    let identity: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
+    let root_id = identity["root_id"].as_str().unwrap();
+    let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let intent = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    run_pty(&root, &[
+        "publication-revocation", "install", "--id", "stopped",
+        "--operation", "revoked-start", "--binding", digest,
+        "--intent", intent, "--root-id", root_id, "--json",
+    ]);
+
+    let marker = root.join("child-ran");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let now = pty_core::registry::iso8601_from_epoch_ms(now_ms);
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "generation": "stopped-generation",
+        "command": "/bin/sh",
+        "args": ["-c", "printf ran > \"$1\"", "sh", marker],
+        "displayCommand": "stopped command",
+        "cwd": root,
+        "rows": 24,
+        "cols": 80,
+        "createdAt": now,
+        "exitedAt": now,
+        "exitCode": 0,
+        "tags": {"keep": "true", "st3.start-operation": "revoked-start"},
+        "publicationBinding": {"operation": "revoked-start", "digest": digest},
+        "publicationRootId": root_id,
+        "publicationCapability": 1
+    })).unwrap();
+    let events = b"{\"type\":\"fixture-predecessor\"}\n";
+    let pid = b"2147483647\n";
+    std::fs::write(root.join("stopped.json"), &metadata).unwrap();
+    std::fs::write(root.join("stopped.events.jsonl"), events).unwrap();
+    std::fs::write(root.join("stopped.pid"), pid).unwrap();
+    // Retain a real stale socket, not a regular-file stand-in.
+    drop(UnixListener::bind(root.join("stopped.sock")).unwrap());
+    let socket = std::fs::metadata(root.join("stopped.sock")).unwrap();
+
+    let mut picker = open_picker(&root);
+    picker.wait_for_text("stopped", 8000).expect("stopped predecessor listed");
+    picker.type_str("\r");
+    picker.wait_for_text("operation-revoked", 8000)
+        .expect("restart refused by the persisted publication fence");
+
+    assert_eq!(std::fs::read(root.join("stopped.json")).unwrap(), metadata);
+    assert_eq!(std::fs::read(root.join("stopped.events.jsonl")).unwrap(), events);
+    assert_eq!(std::fs::read(root.join("stopped.pid")).unwrap(), pid);
+    let after = std::fs::metadata(root.join("stopped.sock")).unwrap();
+    assert_eq!((after.dev(), after.ino()), (socket.dev(), socket.ino()));
+    assert!(!marker.exists(), "a rejected restart launched its command");
+
+    // Replaying installation while the picker is alive also proves the
+    // creation claim was released on refusal.
+    run_pty(&root, &[
+        "publication-revocation", "install", "--id", "stopped",
+        "--operation", "revoked-start", "--binding", digest,
+        "--intent", intent, "--root-id", root_id, "--json",
+    ]);
+    picker.type_str("q");
+    picker.close();
+    let _ = std::fs::remove_dir_all(&root);
+}

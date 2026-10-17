@@ -287,3 +287,229 @@ fn returned_generation_belongs_to_the_publication_matched_with_the_returned_pid(
     spawn_across_publication_mutation(PublicationMutation::Remove);
     spawn_across_publication_mutation(PublicationMutation::Replace);
 }
+
+fn managed_params(
+    name: &str,
+    operation: &str,
+    digest: &str,
+    root: &str,
+    marker: &Path,
+) -> SpawnParams {
+    let mut params = SpawnParams::new(name, "/bin/sh", &[
+        "-c".into(),
+        "printf ran > \"$1\"; exec cat".into(),
+        "sh".into(),
+        marker.to_string_lossy().into_owned(),
+    ]);
+    params.cwd = ROOT.to_string_lossy().into_owned();
+    params.publication_binding = Some(registry::revocation::PublicationBinding {
+        operation: operation.into(),
+        digest: digest.into(),
+    });
+    params.publication_root_id = Some(root.into());
+    params.tags.insert("st3.start-operation".into(), operation.into());
+    params.tags.insert("keep".into(), "true".into());
+    params
+}
+
+fn wait_for_marker(marker: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "child did not create {}", marker.display());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn library_managed_launch_rejects_revoked_binding_without_touching_live_survivor() {
+    use std::os::unix::fs::MetadataExt;
+
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let name = unique_name("library-revocation");
+    let root = registry::revocation::root_id().unwrap();
+    let old_marker = ROOT.join(format!("{name}-old-ran"));
+    let survivor_marker = ROOT.join(format!("{name}-survivor-ran"));
+    let old = managed_params(&name, "revoked-library-start", &"a".repeat(64), &root, &old_marker);
+    registry::revocation::install(
+        &name, old.publication_binding.as_ref().unwrap(), &"b".repeat(64), &root,
+    ).unwrap();
+    let refused = spawn_daemon(Path::new(pty_bin()), old.clone());
+    assert!(refused.is_err(), "library admitted revoked managed launch");
+    assert!(refused.unwrap_err().to_string().contains("operation-revoked"));
+    assert!(!old_marker.exists());
+    assert!(artifact_snapshot(&name).iter().all(Option::is_none));
+
+    let replacement = managed_params(
+        &name, "replacement-library-start", &"c".repeat(64), &root, &survivor_marker,
+    );
+    let survivor = spawn_daemon(Path::new(pty_bin()), replacement.clone()).unwrap();
+    wait_for_marker(&survivor_marker);
+    let metadata = registry::read_metadata(&name).unwrap();
+    assert_eq!(metadata.publication_binding, replacement.publication_binding);
+    assert_eq!(metadata.publication_root_id.as_deref(), Some(root.as_str()));
+    assert_eq!(metadata.generation.as_deref(), Some(survivor.generation.as_str()));
+    let before = artifact_snapshot(&name);
+    let socket = std::fs::metadata(registry::socket_path(&name)).unwrap();
+    let refused = spawn_daemon(Path::new(pty_bin()), old).unwrap_err();
+    assert!(refused.to_string().contains("operation-revoked"), "{refused}");
+    assert!(!old_marker.exists());
+    assert_eq!(artifact_snapshot(&name), before);
+    let after = std::fs::metadata(registry::socket_path(&name)).unwrap();
+    assert_eq!((after.dev(), after.ino()), (socket.dev(), socket.ino()));
+    assert!(registry::pid_alive(survivor.pid as i32));
+    assert!(std::os::unix::net::UnixStream::connect(registry::socket_path(&name)).is_ok());
+    stop_daemon(&name, &survivor);
+}
+
+#[test]
+fn library_gc_retains_revoked_desired_state_and_respawns_distinct_managed_binding() {
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let name = unique_name("library-gc-revocation");
+    let root = registry::revocation::root_id().unwrap();
+    let old_marker = ROOT.join(format!("{name}-old-ran"));
+    let replacement_marker = ROOT.join(format!("{name}-replacement-ran"));
+    let old = managed_params(&name, "revoked-gc-start", &"a".repeat(64), &root, &old_marker);
+    registry::revocation::install(
+        &name, old.publication_binding.as_ref().unwrap(), &"b".repeat(64), &root,
+    ).unwrap();
+    let mut tags = old.tags.clone();
+    tags.insert("strategy".into(), "permanent".into());
+    let metadata = SessionMetadata {
+        generation: Some("ended-managed-generation".into()),
+        daemon_pid: Some(DEAD_PID),
+        command: old.command.clone(),
+        args: old.args.clone(),
+        display_command: old.display_command.clone(),
+        cwd: old.cwd.clone(),
+        created_at: registry::now_iso8601(),
+        tags: Some(tags),
+        publication_binding: old.publication_binding.clone(),
+        publication_root_id: old.publication_root_id.clone(),
+        publication_capability: Some(1),
+        ..Default::default()
+    };
+    registry::write_metadata_publication(&name, &metadata).unwrap();
+    registry::write_pid(&name, DEAD_PID as u32).unwrap();
+    std::fs::write(registry::events_path(&name), b"retained predecessor evidence\n").unwrap();
+    let before = artifact_snapshot(&name);
+    for _ in 0..2 {
+        let result = gc(GcOptions {
+            daemon_executable: Some(PathBuf::from(pty_bin())),
+            ..Default::default()
+        });
+        let failed = result.respawn_failed.iter().find(|entry| entry.name == name)
+            .expect("revoked permanent session must report failed respawn");
+        assert!(failed.error.contains("operation-revoked"), "{}", failed.error);
+        assert!(!result.respawned.iter().any(|entry| entry.name == name));
+        assert_eq!(artifact_snapshot(&name), before);
+        assert!(!old_marker.exists());
+    }
+    assert!(registry::revocation::read(&name, "revoked-gc-start").unwrap().is_some());
+
+    // A new desired launch is a new immutable operation, never an unrevocation.
+    let replacement = managed_params(
+        &name, "replacement-gc-start", &"c".repeat(64), &root, &replacement_marker,
+    );
+    let mut replacement_meta = metadata;
+    replacement_meta.args = replacement.args;
+    replacement_meta.publication_binding = replacement.publication_binding.clone();
+    replacement_meta.tags.as_mut().unwrap().insert(
+        "st3.start-operation".into(), "replacement-gc-start".into(),
+    );
+    registry::write_metadata_publication(&name, &replacement_meta).unwrap();
+    let result = gc(GcOptions {
+        daemon_executable: Some(PathBuf::from(pty_bin())),
+        ..Default::default()
+    });
+    assert!(result.respawned.iter().any(|entry| entry.name == name));
+    wait_for_marker(&replacement_marker);
+    assert!(!old_marker.exists());
+    let published = registry::read_metadata(&name).unwrap();
+    assert_eq!(published.publication_binding, replacement.publication_binding);
+    assert_eq!(published.publication_root_id.as_deref(), Some(root.as_str()));
+    assert_ne!(published.generation, replacement_meta.generation);
+    let events = std::fs::read_to_string(registry::events_path(&name)).unwrap();
+    assert!(events.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] == "session_respawn"
+    }));
+    stop_daemon(&name, &SpawnedDaemon {
+        pid: published.daemon_pid.unwrap() as u32,
+        generation: published.generation.unwrap(),
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Command, Stdio};
+
+    struct HeldDaemon {
+        child: std::process::Child,
+        release: PathBuf,
+    }
+    impl Drop for HeldDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, "");
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let name = unique_name("library-child-pin");
+    let root = registry::revocation::root_id().unwrap();
+    let marker = ROOT.join(format!("{name}-child-ran"));
+    let params = managed_params(&name, "ordinary-child-pin", &"f".repeat(64), &root, &marker);
+    let barriers = ROOT.join(format!("{name}-barriers"));
+    std::fs::create_dir(&barriers).unwrap();
+    std::fs::write(barriers.join("published-before-child-fork.hold"), "").unwrap();
+    let mut daemon = HeldDaemon {
+        child: Command::new(pty_bin())
+            .arg("__daemon")
+            .env("PTY_SERVER_CONFIG", serde_json::to_string(&pty_lifecycle::config_for(&params)).unwrap())
+            .env("PTY_TEST_OPERATION_BARRIERS", &barriers)
+            .env_remove("PTY_CREATION_LOCK_OWNER_PID")
+            .env_remove("PTY_SPAWNER_PID")
+            .env_remove("PTY_DAEMON_READY_FD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn().unwrap(),
+        release: barriers.join("published-before-child-fork.release"),
+    };
+    wait_for_marker(&barriers.join("published-before-child-fork.reached"));
+    assert!(!marker.exists());
+    let before = artifact_snapshot(&name);
+    let busy = registry::revocation::install(
+        &name, params.publication_binding.as_ref().unwrap(), &"e".repeat(64), &root,
+    ).unwrap_err();
+    assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(artifact_snapshot(&name), before);
+    assert!(daemon.child.try_wait().unwrap().is_none());
+    assert!(!marker.exists(), "child ran while publication barrier was held");
+    std::fs::write(&daemon.release, "").unwrap();
+    wait_for_marker(&marker);
+    let before = artifact_snapshot(&name);
+    let socket = std::fs::metadata(registry::socket_path(&name)).unwrap();
+    let installed = registry::revocation::install(
+        &name, params.publication_binding.as_ref().unwrap(), &"e".repeat(64), &root,
+    ).unwrap();
+    assert_eq!(installed.occupancy["entries"][0]["status"], "running");
+    assert_eq!(artifact_snapshot(&name), before);
+    let after = std::fs::metadata(registry::socket_path(&name)).unwrap();
+    assert_eq!((after.dev(), after.ino()), (socket.dev(), socket.ino()));
+    assert!(daemon.child.try_wait().unwrap().is_none(), "revocation killed serving daemon");
+    assert!(std::os::unix::net::UnixStream::connect(registry::socket_path(&name)).is_ok());
+    let metadata = registry::read_metadata(&name).unwrap();
+    stop_daemon(&name, &SpawnedDaemon {
+        pid: daemon.child.id(),
+        generation: metadata.generation.unwrap(),
+    });
+}

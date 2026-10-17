@@ -341,6 +341,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     let pair = pty_spawn::open(rows, cols)
         .map_err(|e| format!("Failed to open a PTY for session \"{name}\": {e}"))?;
 
+    let publication_lock = prepare_publication(&cfg)?;
     let (listener, metadata) = publish_session(&Publication {
         cfg: &cfg,
         generation: &generation,
@@ -349,6 +350,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         child_env: &child_env,
         events: &events,
         marker: None,
+        creation_lock: &publication_lock,
     })?;
     let socket_path = registry::socket_path(&name);
 
@@ -360,6 +362,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     for (k, v) in &child_env {
         command.env(k, v);
     }
+    pty_core::operation::barrier::barrier("published-before-child-fork");
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => {
@@ -382,6 +385,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
+    drop(publication_lock);
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
@@ -437,6 +441,31 @@ pub(crate) struct Publication<'a> {
     pub(crate) events: &'a EventWriter,
     /// The launch-operation marker, `{"digest":<h>,"phase":"startup"}`.
     pub(crate) marker: Option<serde_json::Value>,
+    /// Pins the exact name claim through all publication effects.
+    pub(crate) creation_lock: &'a registry::lock::PublicationLock,
+}
+
+/// Final admission, shared by ordinary, library, respawn and operation launches.
+/// The inode pin outlives every effect, even if a delegating launcher dies.
+pub(crate) fn prepare_publication(
+    cfg: &DaemonConfig,
+) -> Result<registry::lock::PublicationLock, String> {
+    pty_core::operation::barrier::barrier("publication-before-lock");
+    let owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok()
+        .and_then(|pid| pid.parse().ok());
+    let guard = registry::lock::pin_publication(&cfg.name, owner)
+        .map_err(|error| error.to_string())?;
+    cfg.check_publication()?;
+    let observed = registry::observe_session_strict_in(
+        &registry::session_dir(), &cfg.name, &registry::ListOptions::default(),
+    );
+    if !observed.complete {
+        return Err("publication occupancy is unreadable".into());
+    }
+    if observed.entries.iter().any(|session| session.is_running()) {
+        return Err(format!("Session id \"{}\" is already in use.", cfg.name));
+    }
+    Ok(guard)
 }
 
 /// Publication before the child spawns: dir → clear events → stale socket →
@@ -453,6 +482,9 @@ pub(crate) fn publish_session(
 ) -> Result<(UnixListener, SessionMetadata), String> {
     let cfg = p.cfg;
     let name = &cfg.name;
+    // The caller must keep this pin from admission through the last effect.
+    pty_core::operation::barrier::barrier("publication-before-effects");
+    let _creation_lock = p.creation_lock;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
     pty_core::events::clear_events(name)?;
     let socket_path = registry::socket_path(name);
@@ -485,6 +517,9 @@ pub(crate) fn publish_session(
         created_at: p.created_at.clone(),
         display_name: cfg.display_name().map(str::to_string),
         tags: (!p.published_tags.is_empty()).then(|| p.published_tags.clone()),
+        publication_binding: cfg.publication_binding.clone(),
+        publication_root_id: cfg.publication_root_id.clone(),
+        publication_capability: cfg.publication_binding.as_ref().map(|_| 1),
         isolate_env: cfg.isolate_env().then_some(true),
         extra_env: cfg.extra_env().cloned(),
         session_env: permanent_respawn_env(cfg, p.published_tags, p.child_env),
