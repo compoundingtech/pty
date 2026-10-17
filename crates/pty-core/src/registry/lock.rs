@@ -139,6 +139,10 @@ impl LockGuard {
             if release_file_lock_checked_nonce(&self.path, Some(delegate.owner_pid as u32), expected_nonce) {
                 let _ = std::fs::remove_file(claim_token(&self.path, &delegate.nonce));
             }
+        } else if delegate.nonce.starts_with("legacy:") {
+            // The restored PID-only record cannot carry this nonce again.
+            // Legacy coordinators release by pathname, not by token.
+            let _ = std::fs::remove_file(claim_token(&self.path, &delegate.nonce));
         }
         Ok(())
     }
@@ -625,6 +629,28 @@ mod tests {
             std::process::id().to_string()
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_legacy_hand_back_removes_its_unreferenced_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-legacy-return-{}-{}", std::process::id(),
+            super::super::atomic::random_hex16()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("legacy.lock");
+        let delegate = CreationClaimDelegate {
+            owner_pid: std::process::id() as i32,
+            nonce: format!("legacy:{}", super::super::atomic::random_hex16()),
+        };
+        std::fs::write(&path, format!("{} {}", delegate.owner_pid, delegate.nonce)).unwrap();
+        activate_claim(&path, &delegate.nonce).unwrap();
+        let token = claim_token(&path, &delegate.nonce);
+        let publication = pin_claim(&path, &delegate, None, true).unwrap();
+        publication.into_daemon_claim().unwrap().hand_back(&delegate).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), delegate.owner_pid.to_string());
+        assert!(!token.exists(), "PID-only return must not strand its old capability");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

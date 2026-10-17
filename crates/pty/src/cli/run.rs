@@ -563,13 +563,18 @@ fn create_or_attach(
             return Ok(1);
         }
     };
+    params.creation_lock_delegate = match delegated_owner {
+        Some(delegate) => Some(delegate),
+        None => creation_lock.as_ref()
+            .map(registry::LockGuard::delegate)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+    };
     if gone.is_some() && !inherited_creation_lock {
         registry::cleanup_all_while_locked(name);
     }
     event_lock.take().map(registry::LockGuard::release);
 
-    params.creation_lock_delegate = delegated_owner
-        .or_else(|| creation_lock.as_ref().map(registry::LockGuard::delegate));
     let spawned = publisher.spawn(params);
     drop(creation_lock);
     if let Err(msg) = spawned {

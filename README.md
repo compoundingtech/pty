@@ -542,6 +542,7 @@ The CLI alone upgrades the legacy external `PTY_CREATION_LOCK_OWNER_PID`
 contract to nonce delegation and restores a PID-only coordinator's original
 encoding after ordinary child spawn. Daemon nonce/owner control values are
 not inherited by the session command.
+Successful PID-only hand-back removes its now-unreferenced legacy token.
 
 Version-1 records live at
 `$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,
