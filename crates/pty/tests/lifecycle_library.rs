@@ -570,9 +570,12 @@ fn library_gc_requires_new_binding_for_changed_manifest_launch_inputs() {
     let before = artifact_snapshot(&name);
     // An unchanged managed task still cannot be handed to an older/native
     // publisher without revocation support, even though it is executable.
+    // The native test executable exists on NixOS too, unlike /bin/false,
+    // and rejects the PTY capability handshake rather than implementing it.
+    let unsupported_publisher = std::env::current_exe().unwrap();
     for _ in 0..2 {
         let result = gc(GcOptions {
-            daemon_executable: Some(PathBuf::from("/bin/false")),
+            daemon_executable: Some(unsupported_publisher.clone()),
             ..Default::default()
         });
         let failed = result.respawn_failed.iter().find(|entry| entry.name == name)
@@ -585,7 +588,7 @@ fn library_gc_requires_new_binding_for_changed_manifest_launch_inputs() {
     }
     // Legacy launchers need not implement the managed capability protocol.
     let legacy = SpawnParams::new("legacy-publisher", "/bin/true", &[]);
-    assert!(pty_lifecycle::prepare_daemon(Path::new("/bin/false"), &legacy).is_ok());
+    assert!(pty_lifecycle::prepare_daemon(&unsupported_publisher, &legacy).is_ok());
 
     let changed_command = format!(
         "[sessions.worker]\ncommand = 'printf ran > \"{}\"; exec cat'\n",
