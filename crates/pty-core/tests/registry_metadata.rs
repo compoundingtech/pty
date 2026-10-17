@@ -44,6 +44,12 @@ fn plant(name: &str) -> SessionMetadata {
     meta
 }
 
+fn seed_session_start(name: &str) {
+    let writer = EventWriter::new(name);
+    writer.append(Event::new(name, "session_start"));
+    writer.close();
+}
+
 fn keys_of(name: &str) -> Vec<String> {
     registry::read_metadata_map(name)
         .unwrap()
@@ -317,7 +323,7 @@ fn generic_mutation_rejects_flattened_publication_provenance_without_writes() {
             }
             metadata.extra.insert("futureField".into(), json!({"keep": true}));
             registry::write_metadata_publication(&name, &metadata).unwrap();
-            EventWriter::new(&name).append(Event::new(&name, "session_start"));
+            seed_session_start(&name);
             let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
             let events_before = std::fs::read(registry::events_path(&name)).unwrap();
 
@@ -371,7 +377,7 @@ fn generic_mutation_rejects_typed_publication_provenance_without_writes() {
         metadata.publication_capability = Some(1);
         metadata.tags = Some(tags(&[("st3.start-operation", "original")]));
         registry::write_metadata_publication(&name, &metadata).unwrap();
-        EventWriter::new(&name).append(Event::new(&name, "session_start"));
+        seed_session_start(&name);
         let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
         let events_before = std::fs::read(registry::events_path(&name)).unwrap();
 
@@ -442,7 +448,7 @@ fn managed_operation_tags_cannot_be_replaced_or_removed_through_tag_apis() {
     });
     metadata.tags = Some(tags(&[("st3.start-operation", "original")]));
     registry::write_metadata_publication(&name, &metadata).unwrap();
-    EventWriter::new(&name).append(Event::new(&name, "session_start"));
+    seed_session_start(&name);
     let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
     let events_before = std::fs::read(registry::events_path(&name)).unwrap();
     assert!(registry::update_tags(&name, &tags(&[("st3.start-operation", "replacement")]), &[]).is_err());
@@ -498,7 +504,7 @@ fn generic_mutation_preserves_bound_launch_inputs_and_legacy_mutability() {
                     });
                 }
                 registry::write_metadata_publication(&name, &metadata).unwrap();
-                EventWriter::new(&name).append(Event::new(&name, "session_start"));
+                seed_session_start(&name);
                 let metadata_before = std::fs::read(registry::metadata_path(&name)).unwrap();
                 let events_before = std::fs::read(registry::events_path(&name)).unwrap();
 

@@ -312,6 +312,23 @@ fn managed_params(
     params
 }
 
+struct DaemonCleanup<'a> {
+    name: &'a str,
+    started: &'a SpawnedDaemon,
+}
+
+impl Drop for DaemonCleanup<'_> {
+    fn drop(&mut self) {
+        if registry::read_metadata(self.name).is_some_and(|metadata| {
+            metadata.generation.as_deref() == Some(self.started.generation.as_str())
+                && registry::read_signal_target_with(self.name, Some(&metadata))
+                    == Some(self.started.pid as i32)
+        }) {
+            stop_daemon(self.name, self.started);
+        }
+    }
+}
+
 fn wait_for_marker(marker: &Path) {
     let deadline = Instant::now() + Duration::from_secs(8);
     while !marker.exists() {
@@ -345,6 +362,7 @@ fn library_managed_launch_rejects_revoked_binding_without_touching_live_survivor
         &name, "replacement-library-start", &"c".repeat(64), &root, &survivor_marker,
     );
     let survivor = spawn_daemon(Path::new(pty_bin()), replacement.clone()).unwrap();
+    let _cleanup = DaemonCleanup { name: &name, started: &survivor };
     wait_for_marker(&survivor_marker);
     let metadata = registry::read_metadata(&name).unwrap();
     assert_eq!(metadata.publication_binding, replacement.publication_binding);
@@ -360,7 +378,6 @@ fn library_managed_launch_rejects_revoked_binding_without_touching_live_survivor
     assert_eq!((after.dev(), after.ino()), (socket.dev(), socket.ino()));
     assert!(registry::pid_alive(survivor.pid as i32));
     assert!(std::os::unix::net::UnixStream::connect(registry::socket_path(&name)).is_ok());
-    stop_daemon(&name, &survivor);
 }
 
 #[test]
@@ -425,10 +442,15 @@ fn library_gc_retains_revoked_desired_state_and_respawns_distinct_managed_bindin
         daemon_executable: Some(PathBuf::from(pty_bin())),
         ..Default::default()
     });
+    let published = registry::read_metadata(&name).unwrap();
+    let started = SpawnedDaemon {
+        pid: published.daemon_pid.unwrap() as u32,
+        generation: published.generation.clone().unwrap(),
+    };
+    let _cleanup = DaemonCleanup { name: &name, started: &started };
     assert!(result.respawned.iter().any(|entry| entry.name == name));
     wait_for_marker(&replacement_marker);
     assert!(!old_marker.exists());
-    let published = registry::read_metadata(&name).unwrap();
     assert_eq!(published.publication_binding, replacement.publication_binding);
     assert_eq!(published.publication_root_id.as_deref(), Some(root.as_str()));
     assert_ne!(published.generation, replacement_meta.generation);
@@ -436,10 +458,6 @@ fn library_gc_retains_revoked_desired_state_and_respawns_distinct_managed_bindin
     assert!(events.lines().any(|line| {
         serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] == "session_respawn"
     }));
-    stop_daemon(&name, &SpawnedDaemon {
-        pid: published.daemon_pid.unwrap() as u32,
-        generation: published.generation.unwrap(),
-    });
 }
 
 #[test]
@@ -536,19 +554,21 @@ fn library_gc_requires_new_binding_for_changed_manifest_launch_inputs() {
         daemon_executable: Some(PathBuf::from(pty_bin())),
         ..Default::default()
     });
+    let published = registry::read_metadata(&name).unwrap();
+    let started = SpawnedDaemon {
+        pid: published.daemon_pid.unwrap() as u32,
+        generation: published.generation.clone().unwrap(),
+    };
+    let cleanup = DaemonCleanup { name: &name, started: &started };
     assert!(result.respawned.iter().any(|entry| entry.name == name));
     wait_for_marker(&marker);
     assert!(!unrelated_marker.exists());
-    let published = registry::read_metadata(&name).unwrap();
     assert_eq!(published.command, metadata.command);
     assert_eq!(published.args, metadata.args);
     assert_eq!(published.cwd, metadata.cwd);
     assert_eq!(published.publication_binding, Some(binding));
     assert_eq!(published.publication_root_id.as_deref(), Some(root.as_str()));
-    stop_daemon(&name, &SpawnedDaemon {
-        pid: published.daemon_pid.unwrap() as u32,
-        generation: published.generation.unwrap(),
-    });
+    drop(cleanup);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -564,8 +584,20 @@ fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
     }
     impl Drop for HeldDaemon {
         fn drop(&mut self) {
-            let _ = std::fs::write(&self.release, "");
-            let _ = self.child.kill();
+            // Signal before releasing the pre-fork barrier: cleanup must not
+            // race the daemon into creating a child, and a serving daemon
+            // must get its normal graceful child teardown.
+            if matches!(self.child.try_wait(), Ok(None)) {
+                // SAFETY: try_wait observed a live, unreaped direct child.
+                // It cannot have its pid reused before this Child reaps it.
+                unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+                let _ = std::fs::write(&self.release, "");
+                if !wait_for_process_exit(self.child.id() as i32, Duration::from_secs(8)) {
+                    let _ = self.child.kill();
+                }
+            } else {
+                let _ = std::fs::write(&self.release, "");
+            }
             let _ = self.child.wait();
         }
     }
@@ -606,6 +638,15 @@ fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
     assert!(!marker.exists(), "child ran while publication barrier was held");
     std::fs::write(&daemon.release, "").unwrap();
     wait_for_marker(&marker);
+    // The child's marker can precede the parent's release of the publication
+    // pin. A STATUS response proves that the daemon has entered its serving
+    // loop, after dropping that pin; merely connecting to its socket does not.
+    let socket_path = registry::socket_path(&name);
+    let mut conn = daemon_support::Conn::connect(
+        socket_path.parent().unwrap(),
+        socket_path.file_stem().unwrap().to_str().unwrap(),
+    );
+    conn.query_status();
     let before = artifact_snapshot(&name);
     let socket = std::fs::metadata(registry::socket_path(&name)).unwrap();
     let installed = registry::revocation::install(

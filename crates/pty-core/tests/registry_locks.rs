@@ -9,6 +9,14 @@ use std::time::Duration;
 use pty_core::registry::{self, LockBusy};
 use registry_support::{DEAD_PID, root, unique_name};
 
+static PUBLICATION_ROOT_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let _ = root();
+    // These tests race per-name locks, not initial registry enrollment.
+    // Finish the shared root's no-replace identity publication once before
+    // parallel tests inspect its strictly validated immutable record.
+    registry::revocation::root_id().expect("enroll isolated root")
+});
+
 /// node: tests/security-fixes.test.ts:47-52
 #[test]
 fn first_caller_wins_second_refused_while_holder_alive() {
@@ -288,7 +296,7 @@ fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     use pty_core::registry::revocation::{self, PublicationBinding};
 
     let _ = root();
-    let root_id = revocation::root_id().expect("enroll isolated root");
+    let root_id = PUBLICATION_ROOT_ID.as_str();
     let binding = PublicationBinding {
         operation: "publication-lock-order".to_string(),
         digest: "a".repeat(64),
@@ -298,16 +306,16 @@ fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
     let pin = registry::lock::pin_publication(&name, None).expect("publisher wins");
     revocation::check(&name, Some(&binding), Some(&binding.operation)).expect("not revoked");
     assert_eq!(
-        revocation::install(&name, &binding, &intent, &root_id).unwrap_err().kind(),
+        revocation::install(&name, &binding, &intent, root_id).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "a revoker cannot enter the publisher's critical section"
     );
     assert!(revocation::read(&name, &binding.operation).unwrap().is_none());
     drop(pin);
-    revocation::install(&name, &binding, &intent, &root_id).expect("revoker enters after publication");
+    revocation::install(&name, &binding, &intent, root_id).expect("revoker enters after publication");
 
     let name = unique_name("revoke-first");
-    let receipt = revocation::install(&name, &binding, &intent, &root_id).expect("revoker wins");
+    let receipt = revocation::install(&name, &binding, &intent, root_id).expect("revoker wins");
     let pin = registry::lock::pin_publication(&name, None).expect("late publisher pins");
     let rejection = revocation::check(&name, Some(&binding), Some(&binding.operation)).unwrap_err();
     assert_eq!(rejection.to_string(), "operation-revoked");
@@ -409,7 +417,7 @@ fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
     use pty_core::registry::revocation::{self, PublicationBinding};
 
     let root = root();
-    let root_id = revocation::root_id().expect("enroll isolated root");
+    let root_id = PUBLICATION_ROOT_ID.as_str();
     let name = unique_name("pub-death");
     let path = root.join(format!("{name}.lock"));
     let mut owner = PublicationClaimOwner::spawn(&name);
@@ -424,7 +432,7 @@ fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
         digest: "c".repeat(64),
     };
     assert_eq!(
-        revocation::install(&name, &binding, &"d".repeat(64), &root_id).unwrap_err().kind(),
+        revocation::install(&name, &binding, &"d".repeat(64), root_id).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "revocation cannot enter after owner death while publication is pinned"
     );
@@ -434,7 +442,7 @@ fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
     drop(pin);
     let next = registry::acquire_lock(&name).expect("stale claim is stealable after publication");
     next.release();
-    revocation::install(&name, &binding, &"d".repeat(64), &root_id).expect("revocation enters after publication");
+    revocation::install(&name, &binding, &"d".repeat(64), root_id).expect("revocation enters after publication");
 }
 
 // Linux exposes blocked flock requests, so this proves that release reached

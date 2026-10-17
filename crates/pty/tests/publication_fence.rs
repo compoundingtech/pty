@@ -271,6 +271,11 @@ fn publisher_holding_final_effects_lock_wins_without_revocation_killing_it() {
     assert!(!rig.scratch.join("child-ran").exists());
     std::fs::write(barriers.join("publication-before-effects.release"), "").unwrap();
     wait_until("winning publication child", || rig.scratch.join("child-ran").exists());
+    // The child can create its marker before the daemon drops the final
+    // publication lock. A stats round trip runs on the serving loop, after
+    // that lock is released; socket connect alone only reaches the backlog.
+    let stats = rig.ok(&["stats", "--json", "winner"]).json();
+    assert_eq!(stats["process"]["alive"], true);
     let installed = rig.ok(&install_args("winner", &root)).json();
     assert_eq!(installed["occupancy"]["entries"][0]["status"], "running");
     assert!(daemon.0.try_wait().unwrap().is_none());
