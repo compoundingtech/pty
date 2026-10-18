@@ -202,6 +202,70 @@ fn up_and_down_from_a_manifest() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+/// `pty restart` waits for the stopped daemon to exit before it starts the
+/// new one. A child that ignores SIGHUP keeps the old daemon in its graceful
+/// shutdown for its hangup grace (2 s), far past the 200 ms restart used to
+/// sleep before cleaning up and spawning, so the new daemon raced a daemon that
+/// still held the event log. The old daemon must be gone by the time restart
+/// returns, and the new one running.
+#[test]
+fn restart_waits_for_the_old_daemon_to_exit() {
+    let _serial = serial();
+    let root = unique_root();
+    let (out, e, code) = run_pty(
+        &root,
+        &[
+            "run",
+            "-d",
+            "--id",
+            "slow",
+            "--",
+            "sh",
+            "-c",
+            "trap '' HUP; while :; do sleep 1; done",
+        ],
+    );
+    assert_eq!(code, 0, "run failed: {e}");
+    assert_eq!(created_id(&out), "slow");
+    let pid_path = root.join("slow.pid");
+    let daemon_pid = |other_than: i32| -> i32 {
+        let start = Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+                && pid != other_than
+            {
+                return pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "pid file never settled"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let old = daemon_pid(0);
+
+    let (_o, e, code) = run_pty_env(
+        &root,
+        &["restart", "-y", "slow"],
+        &[("PTY_SESSION", "outer")],
+    );
+    assert_eq!(code, 0, "restart failed: {e}");
+    // A zombie counts as gone: a reaped-later daemon holds no locks or files.
+    assert!(
+        pty_core::registry::has_process_exited_for_reap(old),
+        "restart returned while the old daemon {old} was still shutting down"
+    );
+    let new = daemon_pid(old);
+    assert_ne!(new, old, "restart should start a new daemon");
+
+    let (_o, _e, code) = run_pty(&root, &["kill", "slow"]);
+    assert_eq!(code, 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn restart_rename_rm() {
     let _serial = serial();
