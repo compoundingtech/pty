@@ -81,7 +81,7 @@ impl SessionRef {
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> &str { &self.id }
     pub fn generation(&self) -> &str { &self.generation }
-    pub fn socket_path(&self) -> PathBuf { self.root.join(format!("{}.sock", self.id)) }
+    pub fn socket_path(&self) -> PathBuf { pty_core::registry::socket_path_in(&self.root, &self.id) }
 }
 
 /// The only lifecycle outcomes a client can observe from the substrate.
@@ -511,6 +511,29 @@ pub fn external_owned_pair_attached_with_capacity(
         child,
         Some(Arc::clone(&queue)),
     )?;
+    let client = SessionClient {
+        session,
+        tx: owner.inner.tx.clone(),
+    };
+    Ok((owner, client, AttachStream { queue }))
+}
+
+/// [`external_owned_pair_attached`] for a caller that keeps the slave.
+///
+/// A child that opens the slave by its path itself, rather than inheriting
+/// it from `spawn_command`, must find it still open: on Linux a master whose
+/// last slave descriptor has closed reads as end of file. So the caller keeps
+/// its slave until the child holds the terminal, and drops it then.
+pub fn external_owned_master_attached(
+    session: SessionRef,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+) -> io::Result<(SessionOwner, SessionClient, AttachStream)> {
+    let queue = Queue::new(
+        DEFAULT_ATTACHMENT_CAPACITY.max(MIN_ATTACHMENT_CAPACITY),
+        OnFull::HoldReader,
+    );
+    let owner = start_owner(session.clone(), master, child, Some(Arc::clone(&queue)))?;
     let client = SessionClient {
         session,
         tx: owner.inner.tx.clone(),

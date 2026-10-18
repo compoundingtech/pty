@@ -15,7 +15,9 @@ pub mod clients;
 pub mod env;
 pub mod events;
 pub mod geometry;
+mod held;
 pub mod lifecycle;
+mod operation;
 mod ownership;
 pub mod status;
 
@@ -44,7 +46,14 @@ pub(crate) use daemon_warn;
 /// `PTY_SERVER_CONFIG`), then the daemon. Returns the process exit status.
 ///
 /// node: src/server.ts:1458-1478
-pub fn daemon_main() -> i32 {
+pub fn daemon_main(args: &[String]) -> i32 {
+    // A launch operation's daemon carries its birth marker in its argv.
+    if let [flag, digest] = args
+        && flag == "--launch-operation"
+        && pty_core::operation::is_digest(digest)
+    {
+        return operation::main(digest);
+    }
     set_process_title("pty-daemon");
     let cfg = match DaemonConfig::from_process() {
         Ok(cfg) => cfg,

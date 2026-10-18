@@ -38,7 +38,7 @@ pub fn query_stats_in_with_timeout(
     name: &str,
     timeout: Duration,
 ) -> Result<StatsResult, ClientError> {
-    query_stats_at(&root.join(format!("{name}.sock")), name, timeout)
+    query_stats_at(&registry::socket_path_in(root, name), name, timeout)
 }
 
 fn query_stats_at(
@@ -69,7 +69,7 @@ pub fn query_stats_batch_in(
     let mut queries: Vec<BatchQuery> = names
         .iter()
         .map(|name| BatchQuery {
-            path: root.join(format!("{name}.sock")),
+            path: registry::socket_path_in(root, name),
             step: Step::Connect(start),
         })
         .collect();

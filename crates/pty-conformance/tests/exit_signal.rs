@@ -13,8 +13,27 @@ fn events(rig: &Rig, id: &str) -> Vec<Value> {
     raw.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
+/// **Wait for the event; one read after `wait_for_exit` races it.** The exit
+/// metadata and the `session_exit` event are two writes, and nothing orders
+/// the event first. Both daemons queue the event to an async writer and then
+/// save the metadata synchronously (`finalize_exit`; node:
+/// src/server.ts:593-610). Measured 2026-10-14 with the test sharing one busy
+/// core: the single read found no `session_exit` in 29 runs of 30 against
+/// Node and 20 of 30 against Rust, so either side can lose and the gate
+/// reports whichever one did as a divergence. Waiting: 0 of 30 on each.
 fn session_exit(rig: &Rig, id: &str) -> Value {
-    events(rig, id).into_iter().find(|e| e["type"] == "session_exit").expect("session_exit event")
+    let path = rig.root().join(format!("{id}.events.jsonl"));
+    wait_until(&format!("{id} session_exit event"), || {
+        std::fs::read_to_string(&path).is_ok_and(|raw| {
+            raw.lines().any(|l| {
+                serde_json::from_str::<Value>(l).is_ok_and(|e| e["type"] == "session_exit")
+            })
+        })
+    });
+    events(rig, id)
+        .into_iter()
+        .find(|e| e["type"] == "session_exit")
+        .expect("session_exit event")
 }
 
 fn first_child(pid: i32) -> i32 {

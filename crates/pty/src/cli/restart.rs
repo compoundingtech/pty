@@ -4,7 +4,7 @@
 //! node: src/cli.ts:1358-1382 (dispatch), 3850-3857 (`statefulAgentReason`),
 //! 3886-3963 (`cmdRestart`)
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pty_core::registry::{self, SessionMetadata, SessionStatus};
 
@@ -13,6 +13,26 @@ use super::{
 };
 
 const USAGE: &str = "Usage: pty restart [-y] [--force] <name>";
+
+/// How long restart waits for the stopped daemon to exit. Its graceful
+/// shutdown is bounded by its own deadline (`PTY_SHUTDOWN_DEADLINE_MS`, 5 s by
+/// default), after which it forces its exit; this allows margin over that.
+const OLD_DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
+const OLD_DAEMON_EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// Wait until `pid` has exited (a zombie counts), or `within` has passed.
+fn wait_for_exit(pid: i32, within: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if registry::has_process_exited_for_reap(pid) {
+            return true;
+        }
+        if start.elapsed() >= within {
+            return false;
+        }
+        std::thread::sleep(OLD_DAEMON_EXIT_POLL);
+    }
+}
 
 /// Why this session should not be blindly re-run. `pty restart` repeats the
 /// stored argv, which is fine for a daemon and a footgun for an interactive
@@ -99,33 +119,56 @@ pub fn run(args: &[String]) -> CliResult {
     }
 
     if session.status == SessionStatus::Running
-        && let Some(pid) = session.pid
-    {
-        if !yes && ask::declined(&ask::ask(&format!(
+        && !yes && ask::declined(&ask::ask(&format!(
             "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        ))) {
-            return Ok(0);
-        }
-        // SAFETY: kill(2) with a pid read from the registry; an error only
-        // means the process is already gone, which is the wanted state.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        registry::cleanup_socket(&name);
-        std::thread::sleep(Duration::from_millis(200));
+        )))
+    {
+        return Ok(0);
     }
-
-    let _ = registry::cleanup_all(&name);
-
+    let mut event_guard = registry::take_event_lock(&name)?;
+    let creation_guard = registry::take_metadata_lock(&name)?;
+    let current = registry::read_metadata(&name)
+        .ok_or_else(|| format!("Session \"{name}\" metadata became unreadable."))?;
+    if !registry::metadata_matches_observation(&meta, &current) {
+        return Err(format!("Session \"{name}\" changed before restart.").into());
+    }
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
-    // An operator restarting by hand is saying "try again", so drop any
-    // flapping mark that would make gc skip the fresh spawn.
+    // An explicit retry drops flapping bookkeeping, never launch provenance.
     params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    if let Err(e) = super::spawn_daemon(&params) {
-        eprintln!("pty restart: {e}");
+    pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
+    params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+    if session.status == SessionStatus::Running
+        && let Some(pid) = session.pid
+    {
+        // SAFETY: the exact observed generation remains under name ownership.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        // The stopping daemon still writes its exit events under the event
+        // lock and owns its pid and socket until it exits. Starting the new
+        // daemon before then finds the event log busy, so let go of the event
+        // lock, wait for the old pid to be gone, and take the lock back. The
+        // creation lock, and so name ownership, stays held throughout.
+        event_guard.release();
+        if !wait_for_exit(pid, OLD_DAEMON_EXIT_WAIT) {
+            eprintln!(
+                "pty restart: session \"{name}\" (pid {pid}) did not exit within {}s of SIGTERM; nothing was restarted. Stop it with `pty kill {name}` and retry.",
+                OLD_DAEMON_EXIT_WAIT.as_secs()
+            );
+            return Ok(1);
+        }
+        event_guard = registry::wait_for_event_lock(&name, registry::lock::EVENT_LOCK_WAIT)?;
+    }
+    registry::cleanup_all_while_locked(&name);
+    event_guard.release();
+    let spawned = publisher.spawn(params);
+    creation_guard.release();
+    if let Err(error) = spawned {
+        eprintln!("pty restart: {error}");
         return Ok(1);
     }
     println!("Session \"{name}\" restarted.");

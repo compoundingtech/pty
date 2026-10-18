@@ -39,28 +39,18 @@ fn validate_name_messages_in_order() {
         Err("Invalid session name \"has space\". Names may only contain letters, numbers, dots, hyphens, and underscores.".into())
     );
 
-    // Socket path limit, computed against the live root.
+    // IDs beyond the readable socket budget use a bounded transport address.
     let long = "a".repeat(100);
-    let err = registry::validate_name(&long).unwrap_err();
-    let bytes = root.join(format!("{long}.sock")).as_os_str().len();
-    assert_eq!(
-        err,
-        format!(
-            "Session name \"{long}\" produces a socket path of {bytes} bytes, which exceeds the {}-byte kernel limit by {}. Shorten the name or set PTY_SESSION_DIR to a shorter path.",
-            registry::SUN_PATH_MAX,
-            bytes - registry::SUN_PATH_MAX
-        )
-    );
-    // Exactly +1 over the limit is rejected; exactly at the limit passes.
+    assert_eq!(registry::validate_name(&long), Ok(()));
+    assert!(registry::socket_path(&long).as_os_str().len() <= registry::SUN_PATH_MAX);
     let overhead = root.join(".sock").as_os_str().len();
-    let overshoot = "a".repeat((registry::SUN_PATH_MAX - overhead + 1).max(1));
-    assert!(
-        registry::validate_name(&overshoot)
-            .unwrap_err()
-            .contains("socket path")
-    );
     let fits = "a".repeat(registry::SUN_PATH_MAX - overhead);
     assert_eq!(registry::validate_name(&fits), Ok(()));
+    assert_eq!(registry::socket_path(&fits), root.join(format!("{fits}.sock")));
+    let overshoot = format!("{fits}a");
+    assert_eq!(registry::validate_name(&overshoot), Ok(()));
+    assert!(registry::socket_path(&overshoot).file_name().unwrap().to_string_lossy().starts_with('@'));
+
 }
 
 /// node: tests/display-name.test.ts:184-211; tests/metadata-events.test.ts:339-357

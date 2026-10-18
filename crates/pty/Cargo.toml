@@ -31,3 +31,4 @@ signal-hook = "0.3.18"
 pty-testkit.workspace = true
 regex.workspace = true
 serde_json.workspace = true
+sha2.workspace = true

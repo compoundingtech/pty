@@ -27,6 +27,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+pub mod argv;
+
 /// How long `ps` gets before the table is declared unreadable. Under contention
 /// `ps` is exactly the thing that goes quiet, so this bound is the point rather
 /// than a formality.
@@ -120,6 +122,14 @@ impl LiveIdentity {
     pub fn new(value: impl Into<String>) -> Self {
         LiveIdentity(value.into())
     }
+
+    /// The text, for a record that is only ever compared with another
+    /// reading from this same module on the same boot. The launch-operation
+    /// record stores it next to the boot identity for exactly that reason;
+    /// it is still never compared with `recovery.processStartToken`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl From<&str> for LiveIdentity {
@@ -183,8 +193,23 @@ pub struct Row {
 impl Row {
     /// A zombie is a dead process that still has a row, still has a process
     /// group, and still answers `kill(pid, 0)`.
+    ///
+    /// **On Linux that includes `X` (dead).** A process being reaped reads
+    /// as `X` for a moment before its row disappears, and its exit is as
+    /// final as a zombie's. A pidfd announces the exit before that moment
+    /// ends, so a waiter that reads the row at once can see `X`: read as
+    /// live, a process that a SIGKILL had already ended was reported live.
     pub fn is_zombie(&self) -> bool {
-        self.state.starts_with('Z')
+        self.state.starts_with('Z') || self.state.starts_with('X')
+    }
+
+    /// A process whose exit is under way and that is not yet a zombie
+    /// (`E`, macOS's `P_WEXIT`). It returns to no user code, but it is
+    /// **not** an exit: a system call already under way in one of its
+    /// threads may still finish (see `kinfo_exiting`). A caller that needs
+    /// proof the process is gone waits for the zombie.
+    pub fn is_exiting(&self) -> bool {
+        self.state.starts_with('E')
     }
 
     /// Stopped by a signal (`T`) or by a tracer (`t`). A stopped process runs
@@ -227,30 +252,18 @@ impl ProcTable {
     /// is every fact the callers ask for.
     #[cfg(target_os = "macos")]
     fn read_libproc() -> Self {
-        // <sys/proc_info.h>: PROC_ALL_PIDS. Not exported by the libc crate.
-        const PROC_ALL_PIDS: u32 = 1;
         // <sys/proc.h>: SZOMB. A zombie is a corpse that still has a row.
         const SZOMB: u32 = 5;
 
-        // SAFETY: a zero buffer asks for the size in bytes.
-        let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-        if bytes <= 0 {
+        // A listing cut short by processes that appeared since its size was
+        // asked for is not every process.
+        let Some((pids, listed_whole)) = list_all_pids() else {
             return Self::unreadable();
-        }
-        let mut pids = vec![0i32; (bytes as usize / size_of::<i32>()) + 64];
-        let cap = (pids.len() * size_of::<i32>()) as i32;
-        // SAFETY: the buffer and its length agree.
-        let written = unsafe {
-            libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr() as *mut libc::c_void, cap)
         };
-        if written <= 0 {
-            return Self::unreadable();
-        }
-        pids.truncate(written as usize / size_of::<i32>());
 
         let _ = SZOMB;
         let mut rows = Vec::with_capacity(pids.len());
-        let mut complete = true;
+        let mut complete = listed_whole;
         for pid in pids.into_iter().filter(|&p| p > 0) {
             if let Some(row) = read_bsdinfo(pid) {
                 rows.push(row);
@@ -449,6 +462,65 @@ impl ProcTable {
     }
 }
 
+/// Read a pid listing whose size can grow between asking for it and reading
+/// it. A read that fills its buffer may have been cut short, so it is read
+/// again with more room; a listing still full after the retries is returned
+/// with `false`: every pid in it is real, but it is not every pid.
+///
+/// `size` returns the byte count the listing needs, `read` fills the buffer
+/// and returns the bytes written; either answers 0 or less on failure.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn list_pids_with_slack(
+    mut size: impl FnMut() -> i32,
+    mut read: impl FnMut(&mut [i32]) -> i32,
+) -> Option<(Vec<i32>, bool)> {
+    let mut slack = 64usize;
+    let mut last = Vec::new();
+    for _ in 0..4 {
+        let bytes = size();
+        if bytes <= 0 {
+            return None;
+        }
+        let mut pids = vec![0i32; bytes as usize / size_of::<i32>() + slack];
+        let written = read(&mut pids);
+        if written <= 0 {
+            return None;
+        }
+        let count = (written as usize / size_of::<i32>()).min(pids.len());
+        if count < pids.len() {
+            pids.truncate(count);
+            return Some((pids, true));
+        }
+        last = pids;
+        slack *= 8;
+    }
+    Some((last, false))
+}
+
+/// Every pid on the machine, from `proc_listpids`, and whether the listing
+/// is known to be whole.
+#[cfg(target_os = "macos")]
+pub(crate) fn list_all_pids() -> Option<(Vec<i32>, bool)> {
+    // <sys/proc_info.h>: PROC_ALL_PIDS. Not exported by the libc crate.
+    const PROC_ALL_PIDS: u32 = 1;
+    list_pids_with_slack(
+        // SAFETY: a zero buffer asks for the size in bytes.
+        || unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) },
+        |buffer| {
+            let cap = std::mem::size_of_val(buffer) as i32;
+            // SAFETY: the buffer and its length agree.
+            unsafe {
+                libc::proc_listpids(
+                    PROC_ALL_PIDS,
+                    0,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    cap,
+                )
+            }
+        },
+    )
+}
+
 /// One process, without reading the whole table.
 ///
 /// A poll loop asking about a single pid should not pay for every process on
@@ -460,15 +532,7 @@ pub fn process(pid: i32) -> Answer<Row> {
     }
     #[cfg(target_os = "linux")]
     {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => match parse_proc_stat(pid, &stat) {
-                Some(row) => Answer::Known(row),
-                None => Answer::Unknown(Unknown::FieldUnparsable),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Answer::NotPresent,
-            // Permission denied, or /proc not mounted. We did not find out.
-            Err(_) => Answer::Unknown(Unknown::TableUnreadable),
-        }
+        stat_answer(pid, std::fs::read_to_string(format!("/proc/{pid}/stat")))
     }
     #[cfg(target_os = "macos")]
     {
@@ -495,6 +559,27 @@ pub fn process(pid: i32) -> Answer<Row> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         ProcTable::read().row(pid).map(|r| r.clone())
+    }
+}
+
+/// One `/proc/<pid>/stat` read as an answer. A process reaped between the
+/// open and the read fails the read with `ESRCH`: it is as gone as a
+/// missing file, the same answer the table reader gives.
+#[cfg(any(target_os = "linux", test))]
+fn stat_answer(pid: i32, read: std::io::Result<String>) -> Answer<Row> {
+    match read {
+        Ok(stat) => match parse_proc_stat(pid, &stat) {
+            Some(row) => Answer::Known(row),
+            None => Answer::Unknown(Unknown::FieldUnparsable),
+        },
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Answer::NotPresent
+        }
+        // Permission denied, or /proc not mounted. We did not find out.
+        Err(_) => Answer::Unknown(Unknown::TableUnreadable),
     }
 }
 
@@ -603,23 +688,162 @@ fn page_size_kb() -> u64 {
 /// p_stat = 36 (1 byte)       p_pid = 40 (4 bytes, signed)
 /// e_ppid = 560 (4 bytes)     e_pgid = 564 (4 bytes)
 /// ```
+///
+/// and the two credentials, measured with `offsetof` on macOS 27 (arm64) on
+/// 2026-10-14:
+///
+/// ```text
+/// kp_eproc.e_pcred.p_ruid = 392   kp_eproc.e_ucred.cr_uid = 420 (4 bytes)
+/// kp_proc.p_flag = 32 (4 bytes)
+/// ```
 #[cfg(target_os = "macos")]
 mod kinfo {
-    pub const SIZE: usize = 648;
-    pub const START_SEC: usize = 0;
-    pub const START_USEC: usize = 8;
-    pub const P_STAT: usize = 36;
-    pub const P_PID: usize = super::P_PID_OFFSET;
-    pub const E_PPID: usize = 560;
-    pub const E_PGID: usize = 564;
-    /// `SZOMB` from `<sys/proc.h>`.
-    pub const SZOMB: u8 = 5;
+    pub const SIZE: usize = super::KINFO_SIZE;
     /// `SSTOP` from `<sys/proc.h>`.
     pub const SSTOP: u8 = 4;
 }
 
+/// Where each field this module reads sits in `kinfo_proc`. Kept outside the
+/// `macos` module, like [`P_PID_OFFSET`], so the check that refuses a wrong
+/// one is compiled and tested everywhere.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct KinfoLayout {
+    start_sec: usize,
+    start_usec: usize,
+    p_stat: usize,
+    p_flag: usize,
+    p_pid: usize,
+    e_ppid: usize,
+    e_pgid: usize,
+    ruid: usize,
+    euid: usize,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const KINFO_SIZE: usize = 648;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const KINFO: KinfoLayout = KinfoLayout {
+    start_sec: 0,
+    start_usec: 8,
+    p_stat: 36,
+    p_flag: 32,
+    p_pid: P_PID_OFFSET,
+    e_ppid: 560,
+    e_pgid: 564,
+    ruid: 392,
+    euid: 420,
+};
+
+/// `SRUN` from `<sys/proc.h>`: the state of a process that is neither
+/// stopped nor a zombie, which a process reading its own row always is.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SRUN: u8 = 2;
+
+/// `SZOMB` from `<sys/proc.h>`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SZOMB: u8 = 5;
+
+/// `<sys/proc.h>` `p_flag` bits: a 64-bit process, which every process
+/// reading its own row is, and one whose exit is under way.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const P_LP64: u32 = 0x4;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const P_WEXIT: u32 = 0x2000;
+
+/// Is the process a `kinfo_proc` row describes exiting, not yet a zombie?
+///
+/// **Its state still says running.** Between the start of its exit and
+/// `SZOMB`, `p_stat` reads `SRUN`, while `proc_pidinfo` already refuses the
+/// process as it refuses a zombie, so this row is the one read. Measured on
+/// macOS 27 (2026-10-14, a loaded host), reading right after an exit was
+/// seen: `p_stat` was still `SRUN` in 1,265 of 2,400 rounds, `P_WEXIT` was
+/// set in all 2,400, and in none of 2,400 running children.
+///
+/// **Exiting is not exited.** In the published XNU source
+/// (xnu-12377.121.6), `P_WEXIT` reports `P_LEXIT`, which `exit_with_reason`
+/// sets once the other threads are held; a thread inside a system call can
+/// still finish it. Only `SZOMB`, set after the last thread has gone, is.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn kinfo_exiting(buf: &[u8], layout: &KinfoLayout) -> bool {
+    buf[layout.p_stat] != SZOMB && read_i32(buf, layout.p_flag) as u32 & P_WEXIT != 0
+}
+
+/// What a process knows about itself without `kinfo_proc`: its own system
+/// calls and its own `proc_pidinfo` row.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct OwnFacts {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    ruid: u32,
+    euid: u32,
+    start_sec: u64,
+    start_usec: u32,
+}
+
+/// Does this process's own `kinfo_proc`, read through `layout`, say back
+/// every fact the process knows about itself?
+///
+/// [`layout_finds_itself`] proves only the pid's offset. Every other field
+/// is read from a constant a Mac measured, and a wrong one would not fail:
+/// it would read some other field. For the uids that is the false-closure
+/// direction. A participant whose uid was misread would fall outside the
+/// argv scan's domain, and the scan would report no marker while one was
+/// live. So before any field is believed, each must read back this
+/// process's own value: the uids from `getuid`/`geteuid`, the parent and
+/// group from `getppid`/`getpgrp`, the start time from `proc_pidinfo`, the
+/// state as running, and the flags as a 64-bit process not exiting.
+///
+/// Its limit: a field that reads a neighbour holding the same value for
+/// this process passes. That is the real and saved uid, say, which the
+/// domain check then compares with the same uid anyway.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn layout_reads_itself(buf: &[u8], layout: &KinfoLayout, own: &OwnFacts) -> bool {
+    let fits = |at: usize, width: usize| at.checked_add(width).is_some_and(|end| end <= buf.len());
+    if !(fits(layout.start_sec, 8)
+        && fits(layout.start_usec, 4)
+        && fits(layout.p_stat, 1)
+        && [
+            layout.p_flag,
+            layout.p_pid,
+            layout.e_ppid,
+            layout.e_pgid,
+            layout.ruid,
+            layout.euid,
+        ]
+        .iter()
+        .all(|&at| fits(at, 4)))
+    {
+        return false;
+    }
+    let sec = u64::from_ne_bytes(
+        buf[layout.start_sec..layout.start_sec + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let usec = u32::from_ne_bytes(
+        buf[layout.start_usec..layout.start_usec + 4]
+            .try_into()
+            .unwrap(),
+    );
+    read_i32(buf, layout.p_pid) == own.pid
+        && read_i32(buf, layout.e_ppid) == own.ppid
+        && read_i32(buf, layout.e_pgid) == own.pgid
+        && read_i32(buf, layout.ruid) as u32 == own.ruid
+        && read_i32(buf, layout.euid) as u32 == own.euid
+        && sec == own.start_sec
+        && usec == own.start_usec
+        && buf[layout.p_stat] == SRUN
+        && read_i32(buf, layout.p_flag) as u32 & (P_LP64 | P_WEXIT) == P_LP64
+}
+
+/// One `KERN_PROC_PID` read: the raw row, refused when it does not contain
+/// the pid it was asked for.
 #[cfg(target_os = "macos")]
-fn sysctl_proc(pid: i32) -> Answer<Row> {
+fn kinfo_row(pid: i32) -> Answer<[u8; KINFO_SIZE]> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
     let mut buf = [0u8; kinfo::SIZE];
     let mut len = buf.len();
@@ -657,24 +881,131 @@ fn sysctl_proc(pid: i32) -> Answer<Row> {
     if !layout_finds_itself(&buf, pid) {
         return Answer::Unknown(Unknown::TableUnreadable);
     }
+    Answer::Known(buf)
+}
 
-    let sec = u64::from_ne_bytes(buf[kinfo::START_SEC..kinfo::START_SEC + 8].try_into().unwrap());
-    let usec = u32::from_ne_bytes(buf[kinfo::START_USEC..kinfo::START_USEC + 4].try_into().unwrap());
-    Some(Row {
+/// This process's facts from calls that do not use the layout. `None` when
+/// the parent changed while they were read (a parent that exits re-parents
+/// its child), or when its own `proc_pidinfo` row cannot be read.
+#[cfg(target_os = "macos")]
+fn own_facts_and_row() -> Option<(OwnFacts, [u8; KINFO_SIZE])> {
+    // SAFETY: none of these calls has a precondition.
+    let (pid, ppid_before, pgid, ruid, euid) = unsafe {
+        (
+            libc::getpid(),
+            libc::getppid(),
+            libc::getpgrp(),
+            libc::getuid(),
+            libc::geteuid(),
+        )
+    };
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let want = size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is the struct `PROC_PIDTBSDINFO` fills.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            want,
+        )
+    };
+    let row = kinfo_row(pid).known();
+    // SAFETY: as above.
+    let ppid_after = unsafe { libc::getppid() };
+    if got != want || ppid_before != ppid_after {
+        return None;
+    }
+    let own = OwnFacts {
         pid,
-        ppid: read_i32(&buf, kinfo::E_PPID),
-        pgid: read_i32(&buf, kinfo::E_PGID),
-        state: match buf[kinfo::P_STAT] {
-            kinfo::SZOMB => "Z".into(),
-            kinfo::SSTOP => "T".into(),
-            _ => "S".into(),
+        ppid: ppid_before,
+        pgid,
+        ruid,
+        euid,
+        start_sec: info.pbi_start_tvsec,
+        start_usec: info.pbi_start_tvusec as u32,
+    };
+    Some((own, row?))
+}
+
+/// Does the measured layout read this process's own row back, every field?
+/// Asked once per process: the layout cannot change under a running
+/// process. A parent that exits mid-read is asked about again, twice; a
+/// read that never settles is an unverified layout.
+#[cfg(target_os = "macos")]
+fn layout_verified() -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        (0..3)
+            .find_map(|_| own_facts_and_row())
+            .is_some_and(|(own, row)| layout_reads_itself(&row, &KINFO, &own))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_proc(pid: i32) -> Answer<Row> {
+    if !layout_verified() {
+        return Answer::Unknown(Unknown::TableUnreadable);
+    }
+    let buf = match kinfo_row(pid) {
+        Answer::Known(buf) => buf,
+        Answer::NotPresent => return Answer::NotPresent,
+        Answer::Unknown(why) => return Answer::Unknown(why),
+    };
+    let sec = u64::from_ne_bytes(
+        buf[KINFO.start_sec..KINFO.start_sec + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let usec = u32::from_ne_bytes(
+        buf[KINFO.start_usec..KINFO.start_usec + 4]
+            .try_into()
+            .unwrap(),
+    );
+    Answer::Known(Row {
+        pid,
+        ppid: read_i32(&buf, KINFO.e_ppid),
+        pgid: read_i32(&buf, KINFO.e_pgid),
+        state: if buf[KINFO.p_stat] == SZOMB {
+            "Z".into()
+        } else if kinfo_exiting(&buf, &KINFO) {
+            "E".into()
+        } else if buf[KINFO.p_stat] == kinfo::SSTOP {
+            "T".into()
+        } else {
+            "S".into()
         },
         rss_kb: None,
         cpu_percent: None,
         identity: Some(LiveIdentity::new(format!("darwin:{sec}.{usec:06}"))),
     })
-    .map(Answer::Known)
-    .unwrap_or(Answer::Unknown(Unknown::TableUnreadable))
+}
+
+/// A process's real and effective uid, and whether it is a zombie, from
+/// `KERN_PROC_PID`: the call that still answers when `proc_pidinfo` refuses,
+/// as it does for a setuid process such as `login` (measured on macOS 27:
+/// 236 of 800 processes, none of them with both uids those of the caller).
+/// Unknown unless the layout read this process's own row back.
+#[cfg(target_os = "macos")]
+pub(crate) fn kinfo_owner(pid: i32) -> Answer<(u32, u32, bool)> {
+    kinfo_owner_checked(pid, layout_verified())
+}
+
+#[cfg(target_os = "macos")]
+fn kinfo_owner_checked(pid: i32, verified: bool) -> Answer<(u32, u32, bool)> {
+    if !verified {
+        return Answer::Unknown(Unknown::TableUnreadable);
+    }
+    match kinfo_row(pid) {
+        Answer::Known(buf) => Answer::Known((
+            read_i32(&buf, KINFO.ruid) as u32,
+            read_i32(&buf, KINFO.euid) as u32,
+            buf[KINFO.p_stat] == SZOMB,
+        )),
+        Answer::NotPresent => Answer::NotPresent,
+        Answer::Unknown(why) => Answer::Unknown(why),
+    }
 }
 
 fn read_i32(buf: &[u8], at: usize) -> i32 {
@@ -819,6 +1150,71 @@ pub(crate) fn run_ps_program(program: &str, timeout: Duration) -> Option<String>
 }
 
 #[cfg(test)]
+mod listing_tests {
+    use super::list_pids_with_slack;
+
+    #[test]
+    fn a_listing_with_slack_is_whole() {
+        let (pids, whole) =
+            list_pids_with_slack(|| 12, |buffer| {
+                buffer[..3].copy_from_slice(&[1, 2, 3]);
+                12
+            })
+            .unwrap();
+        assert_eq!((pids, whole), (vec![1, 2, 3], true));
+    }
+
+    /// The population grows between the size query and the read, every
+    /// time: the read always fills the buffer, so it never proves itself
+    /// whole, and it says so rather than calling the truncated list complete.
+    #[test]
+    fn a_listing_that_always_fills_its_buffer_is_not_whole() {
+        let mut reads = 0;
+        let (pids, whole) = list_pids_with_slack(
+            || 400,
+            |buffer| {
+                reads += 1;
+                for (i, slot) in buffer.iter_mut().enumerate() {
+                    *slot = i as i32 + 1;
+                }
+                std::mem::size_of_val(buffer) as i32
+            },
+        )
+        .unwrap();
+        assert!(!whole);
+        assert_eq!(reads, 4);
+        assert!(!pids.is_empty());
+    }
+
+    /// One burst of growth: the second, larger read has room and is whole.
+    #[test]
+    fn a_listing_retries_with_more_room() {
+        let mut reads = 0;
+        let (pids, whole) = list_pids_with_slack(
+            || 40,
+            |buffer| {
+                reads += 1;
+                let n = if reads == 1 { buffer.len() } else { 20 };
+                for (i, slot) in buffer[..n].iter_mut().enumerate() {
+                    *slot = i as i32 + 1;
+                }
+                (n * 4) as i32
+            },
+        )
+        .unwrap();
+        assert!(whole);
+        assert_eq!(reads, 2);
+        assert_eq!(pids.len(), 20);
+    }
+
+    #[test]
+    fn a_failed_listing_is_unreadable() {
+        assert!(list_pids_with_slack(|| 0, |_| 4).is_none());
+        assert!(list_pids_with_slack(|| 8, |_| -1).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -939,6 +1335,47 @@ mod tests {
         assert!(with(|| Err(std::io::Error::from_raw_os_error(libc::ESRCH))).is_complete());
     }
 
+    /// A reaped process can be read as `X` (dead) before its row is gone.
+    /// That is an exit, like a zombie, and nothing else is.
+    #[test]
+    fn a_dead_row_reads_as_exited_like_a_zombie() {
+        for (state, exited) in [
+            ("Z", true),
+            ("X", true),
+            ("S", false),
+            ("R", false),
+            ("D", false),
+            ("T", false),
+            ("t", false),
+        ] {
+            let row = parse_proc_stat(9, &stat(9, 1, state)).unwrap();
+            assert_eq!(row.is_zombie(), exited, "state {state}");
+        }
+    }
+
+    /// Reaped between the open and the read: `ESRCH` is a process that is
+    /// not there, as `ENOENT` is. A refused read is still not an answer.
+    #[test]
+    fn a_process_reaped_between_the_open_and_the_read_is_not_present() {
+        let error = |e: std::io::Error| stat_answer(9, Err(e));
+        assert!(matches!(
+            error(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            Answer::NotPresent
+        ));
+        assert!(matches!(
+            error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            Answer::NotPresent
+        ));
+        assert!(matches!(
+            error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Answer::Unknown(Unknown::TableUnreadable)
+        ));
+        assert!(matches!(
+            stat_answer(9, Ok(stat(9, 1, "S"))),
+            Answer::Known(row) if row.pid == 9
+        ));
+    }
+
     #[test]
     fn a_stopped_row_reads_as_stopped() {
         for (state, stopped) in [
@@ -1042,6 +1479,166 @@ mod tests {
     fn a_short_buffer_is_refused_rather_than_indexed() {
         assert!(!layout_finds_itself(&[0u8; 8], 1));
         assert!(!layout_finds_itself(&[], 1));
+    }
+
+    /// A row written through `layout`, holding `own`.
+    fn own_row(layout: &KinfoLayout, own: &OwnFacts) -> Vec<u8> {
+        let mut buf = vec![0u8; KINFO_SIZE];
+        buf[layout.start_sec..layout.start_sec + 8].copy_from_slice(&own.start_sec.to_ne_bytes());
+        buf[layout.start_usec..layout.start_usec + 4]
+            .copy_from_slice(&own.start_usec.to_ne_bytes());
+        buf[layout.p_stat] = SRUN;
+        // A 64-bit process that has exec'd (`P_EXEC`), as a reader is.
+        buf[layout.p_flag..layout.p_flag + 4].copy_from_slice(&(P_LP64 | 0x4000).to_ne_bytes());
+        for (at, value) in [
+            (layout.p_pid, own.pid),
+            (layout.e_ppid, own.ppid),
+            (layout.e_pgid, own.pgid),
+            (layout.ruid, own.ruid as i32),
+            (layout.euid, own.euid as i32),
+        ] {
+            buf[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        buf
+    }
+
+    /// **Every offset has to read back the caller's own value, not only the
+    /// pid's.** Each field in turn is given a deliberately wrong offset, one
+    /// field out, and the layout is refused. Distinct values throughout, so
+    /// a field that reads its neighbour cannot pass by coincidence.
+    #[test]
+    fn a_layout_with_any_wrong_offset_is_refused() {
+        let own = OwnFacts {
+            pid: 4242,
+            ppid: 4141,
+            pgid: 4040,
+            ruid: 501,
+            euid: 502,
+            start_sec: 1_790_000_000,
+            start_usec: 123_456,
+        };
+        let row = own_row(&KINFO, &own);
+        assert!(
+            layout_reads_itself(&row, &KINFO, &own),
+            "the control: the right layout passes"
+        );
+
+        let wrong: [(&str, fn(&mut KinfoLayout)); 9] = [
+            ("start_sec", |l| l.start_sec += 4),
+            ("start_usec", |l| l.start_usec += 4),
+            ("p_stat", |l| l.p_stat += 1),
+            ("p_flag", |l| l.p_flag -= 4),
+            ("p_pid", |l| l.p_pid += 4),
+            ("e_ppid", |l| l.e_ppid += 4),
+            ("e_pgid", |l| l.e_pgid -= 4),
+            ("ruid", |l| l.ruid += 4),
+            ("euid", |l| l.euid += 4),
+        ];
+        for (field, shift) in wrong {
+            let mut layout = KINFO;
+            shift(&mut layout);
+            assert!(
+                !layout_reads_itself(&row, &layout, &own),
+                "a wrong {field} offset must not be believed"
+            );
+        }
+
+        let mut zombie = row.clone();
+        zombie[KINFO.p_stat] = 5;
+        assert!(
+            !layout_reads_itself(&zombie, &KINFO, &own),
+            "a reader is running, never a zombie"
+        );
+        let mut exiting = row.clone();
+        let flags = read_i32(&row, KINFO.p_flag) as u32 | P_WEXIT;
+        exiting[KINFO.p_flag..KINFO.p_flag + 4].copy_from_slice(&flags.to_ne_bytes());
+        assert!(!layout_reads_itself(&exiting, &KINFO, &own), "nor exiting");
+
+        let mut beyond = KINFO;
+        beyond.euid = KINFO_SIZE - 2;
+        assert!(
+            !layout_reads_itself(&row, &beyond, &own),
+            "an offset past the row is refused, not indexed"
+        );
+        assert!(
+            !layout_reads_itself(&row[..400], &KINFO, &own),
+            "so is a short row"
+        );
+    }
+
+    /// **A process whose exit is under way is exiting, not a zombie.** Its
+    /// `p_stat` still reads `SRUN`; `P_WEXIT` is the kernel's word that the
+    /// exit has begun, and only `SZOMB` that it is done.
+    #[test]
+    fn an_exiting_process_reads_as_exiting_not_exited() {
+        let own = OwnFacts {
+            pid: 4242,
+            ppid: 4141,
+            pgid: 4040,
+            ruid: 501,
+            euid: 501,
+            start_sec: 1_790_000_000,
+            start_usec: 123_456,
+        };
+        let row = |stat: u8, flags: u32| {
+            let mut buf = own_row(&KINFO, &own);
+            buf[KINFO.p_stat] = stat;
+            buf[KINFO.p_flag..KINFO.p_flag + 4].copy_from_slice(&flags.to_ne_bytes());
+            buf
+        };
+        const SSTOP: u8 = 4;
+        assert!(!kinfo_exiting(&row(SRUN, P_LP64), &KINFO), "running");
+        assert!(!kinfo_exiting(&row(SSTOP, P_LP64), &KINFO), "stopped");
+        assert!(
+            !kinfo_exiting(&row(SZOMB, P_LP64 | P_WEXIT), &KINFO),
+            "a zombie is past exiting"
+        );
+        assert!(
+            kinfo_exiting(&row(SRUN, P_LP64 | P_WEXIT), &KINFO),
+            "exiting, while its state still says running"
+        );
+        assert!(
+            kinfo_exiting(&row(SSTOP, P_LP64 | P_WEXIT), &KINFO),
+            "killed while stopped"
+        );
+        let exiting = Row {
+            pid: 1,
+            ppid: 0,
+            pgid: 1,
+            state: "E".into(),
+            rss_kb: None,
+            cpu_percent: None,
+            identity: None,
+        };
+        assert!(exiting.is_exiting() && !exiting.is_zombie());
+    }
+
+    /// The measured layout, on the kernel this runs on: it reads this
+    /// process back, and a deliberately wrong uid offset on the same row
+    /// does not. Unverified, the owner reader answers unknown.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_measured_layout_reads_this_process_back() {
+        let (own, row) = own_facts_and_row().expect("this process's own rows");
+        assert!(layout_reads_itself(&row, &KINFO, &own));
+        assert!(layout_verified());
+
+        // The pid's field read as the real uid: a wrong offset whose value
+        // is not this process's uid.
+        assert_ne!(
+            own.pid as u32, own.ruid,
+            "the wrong field must hold another value"
+        );
+        let mut wrong = KINFO;
+        wrong.ruid = KINFO.p_pid;
+        assert!(!layout_reads_itself(&row, &wrong, &own));
+
+        let me = std::process::id() as i32;
+        assert!(kinfo_owner_checked(me, false).is_unknown());
+        assert_eq!(
+            kinfo_owner_checked(me, true).known(),
+            Some((own.ruid, own.euid, false))
+        );
     }
 
     // ---- a ps that is slow, silent or truncated -------------------------

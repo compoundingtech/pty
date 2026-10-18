@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::atomic::is_tmp_name;
 use super::lock::parse_leading_int;
 use super::metadata::{SessionMetadata, read_metadata_at};
-use super::root::{metadata_path, pid_path, session_dir};
+use super::root::{metadata_path, pid_path, session_dir, socket_path_in};
 use crate::unix_connect::{self, Connect};
 
 /// `running` / `exited` / `vanished`.
@@ -304,7 +304,7 @@ pub fn read_process_start_token(pid: i32) -> Option<String> {
         // poll loop, and a failure here already means "cannot confirm" rather
         // than "gone". `proctable::LiveIdentity` exists so the cheap identity
         // used by the teardown can never be confused with this one.
-        let out = std::process::Command::new("ps")
+        let out = std::process::Command::new("/bin/ps")
             .args(["-o", "lstart=", "-p", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -608,7 +608,7 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false).entries
+    scan_sessions(root, options, false, None).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
@@ -619,10 +619,22 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 /// is omitted. Strict PID validation requires a complete, positive decimal i32;
 /// classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true)
+    scan_sessions(root, options, true, None)
 }
 
-fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory {
+/// [`list_sessions_strict_in`] for one session id: that id's companions are
+/// read and classified exactly as a whole-root strict scan would classify
+/// them, and no other entry is touched.
+pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
+    scan_sessions(root, options, true, Some(name))
+}
+
+fn scan_sessions(
+    root: &Path,
+    options: &ListOptions,
+    strict: bool,
+    only: Option<&str>,
+) -> Inventory {
     let mut scanner = Scanner {
         strict,
         errors: Vec::new(),
@@ -659,17 +671,83 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
             Err(error) => scanner.error(root, InventoryErrorKind::EntryUnreadable, error),
         }
     }
+    if let Some(only) = only {
+        let companions = [
+            socket_path_in(root, only)
+                .file_name()
+                .expect("session socket has a filename")
+                .to_string_lossy()
+                .into_owned(),
+            format!("{only}.json"),
+            format!("{only}.pid"),
+        ];
+        entries.retain(|entry| companions.contains(entry));
+    }
+    entries.retain(|entry| {
+        if entry.starts_with('@') && (entry.ends_with(".json") || entry.ends_with(".pid")) {
+            scanner.error(
+                &root.join(entry),
+                InventoryErrorKind::EntryUnreadable,
+                "registry companion uses the reserved socket digest namespace",
+            );
+            false
+        } else {
+            true
+        }
+    });
     entries.sort();
+
+    // A bounded transport filename carries no logical id. Resolve it from
+    // the registry's id-named companions, never invent an id from the digest.
+    let socket_names: HashMap<String, &str> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry.strip_suffix(".json").or_else(|| entry.strip_suffix(".pid"))
+        })
+        .map(|name| {
+            let path = socket_path_in(root, name);
+            let filename = path.file_name().expect("session socket has a filename");
+            (filename.to_string_lossy().into_owned(), name)
+        })
+        .collect();
+    let sockets: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let stem = entry.strip_suffix(".sock")?;
+            let name = if let Some(name) = socket_names.get(entry) {
+                *name
+            } else if stem.starts_with('@') {
+                scanner.error(
+                    &root.join(entry),
+                    InventoryErrorKind::EntryUnreadable,
+                    "bounded socket has no id-named registry companion",
+                );
+                return None;
+            } else {
+                stem
+            };
+            if socket_path_in(root, name).file_name() != Some(std::ffi::OsStr::new(entry)) {
+                scanner.error(
+                    &root.join(entry),
+                    InventoryErrorKind::EntryUnreadable,
+                    "socket filename is not the canonical address for its logical id",
+                );
+                return None;
+            }
+            Some((name, entry.as_str()))
+        })
+        .collect();
+    let socket_ids: BTreeSet<&str> = sockets.iter().map(|(name, _)| *name).collect();
 
     // Read each companion once; strict also validates pid-only records.
     let names: BTreeSet<&str> = entries
         .iter()
         .filter_map(|entry| {
             entry
-                .strip_suffix(".sock")
-                .or_else(|| entry.strip_suffix(".json"))
+                .strip_suffix(".json")
                 .or_else(|| strict.then(|| entry.strip_suffix(".pid")).flatten())
         })
+        .chain(socket_ids.iter().copied())
         .collect();
     let mut records = HashMap::new();
     for name in names {
@@ -683,7 +761,7 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         // their PID companion, which may be a blocking special file.
         if !strict
             && metadata.is_none()
-            && entries.binary_search(&format!("{name}.sock")).is_err()
+            && !socket_ids.contains(name)
         {
             records.insert(name, (None, None));
             continue;
@@ -712,14 +790,13 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         pid_alive: bool,
         metadata: Option<SessionMetadata>,
     }
-    let candidates: Vec<Candidate> = entries
+    let candidates: Vec<Candidate> = sockets
         .iter()
-        .filter_map(|e| e.strip_suffix(".sock"))
-        .map(|name| {
-            let (metadata, pid) = records.remove(name).expect("socket record was observed");
+        .map(|(name, _filename)| {
+            let (metadata, pid) = records.remove(*name).expect("socket record was observed");
             Candidate {
                 name: name.to_string(),
-                socket_path: root.join(format!("{name}.sock")),
+                socket_path: socket_path_in(root, name),
                 pid,
                 pid_alive: pid.is_some_and(pid_alive),
                 metadata,
@@ -831,7 +908,7 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         {
             sessions.push(SessionInfo {
                 name: name.to_string(),
-                socket_path: root.join(format!("{name}.sock")),
+                socket_path: socket_path_in(root, name),
                 pid: Some(pid),
                 status: if metadata.has_exited() {
                     SessionStatus::Exited
@@ -845,7 +922,7 @@ fn scan_sessions(root: &Path, options: &ListOptions, strict: bool) -> Inventory 
         let vanished = metadata.exited_at.is_none() && metadata.exit_code.is_none();
         sessions.push(SessionInfo {
             name: name.to_string(),
-            socket_path: root.join(format!("{name}.sock")),
+            socket_path: socket_path_in(root, name),
             pid: None,
             status: if vanished {
                 SessionStatus::Vanished

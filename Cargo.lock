@@ -1185,6 +1185,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
 ]
 
@@ -1224,6 +1225,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
@@ -1245,6 +1247,7 @@ version = "0.13.0-rust"
 dependencies = [
  "libc",
  "portable-pty",
+ "pty-core",
 ]
 
 [[package]]

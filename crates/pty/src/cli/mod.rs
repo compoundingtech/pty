@@ -13,6 +13,7 @@
 
 pub mod argv;
 pub mod ask;
+pub mod capabilities;
 pub mod completions;
 pub mod deferred;
 pub mod down;
@@ -23,6 +24,8 @@ pub mod gc;
 pub mod help;
 pub mod list;
 pub mod metadata;
+pub mod operation;
+pub mod publication_revocation;
 pub mod readiness;
 pub mod remote_serve;
 pub mod rename;
@@ -40,6 +43,7 @@ pub mod kill;
 pub mod peek;
 pub mod restart;
 pub mod run;
+pub mod run_operation;
 pub mod send;
 pub mod stats;
 
@@ -249,7 +253,7 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
     // `dispatch_args`, as Node does.
     let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
     let result = match command.as_str() {
-        "__daemon" => Ok(crate::daemon::daemon_main()),
+        "__daemon" => Ok(crate::daemon::daemon_main(rest)),
         "interactive" | "i" => interactive(interactive_opts),
         "run" => run::run(rest),
         "attach" | "a" => attach::run(rest),
@@ -273,6 +277,9 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
         "metadata" => metadata::run(rest),
         "readiness" => readiness::run(rest),
         "evidence" => evidence::run(rest),
+        "capabilities" => capabilities::run(rest),
+        "operation" => operation::run(rest),
+        "publication-revocation" => publication_revocation::run(rest),
         "rm" | "remove" => rm::run(rest),
         "test" => deferred::run("test"),
         "completions" => Ok(completions::run(rest)),
@@ -355,24 +362,32 @@ pub use pty_lifecycle::{SpawnParams, apply_persisted_launch_options};
 /// node: src/spawn.ts:372-393, 164-243
 pub fn spawn_daemon(p: &SpawnParams) -> Result<(), String> {
     let mut params = p.clone();
-    params.command = pty_core::spawn::resolve_command(&p.command)?;
+    prepare_daemon(&mut params)?.spawn(params)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Select and pin the publisher before a restart/recreation cleans its row.
+pub fn prepare_daemon(params: &mut SpawnParams) -> Result<pty_lifecycle::PreparedDaemon, String> {
+    params.command = pty_core::spawn::resolve_command(&params.command)?;
+    let executable = daemon_executable()?;
+    pty_lifecycle::prepare_daemon(&executable, params).map_err(|error| error.to_string())
+}
+
+/// The executable that implements `__daemon`: this one, or its replacement
+/// at the same install path.
+pub fn daemon_executable() -> Result<std::path::PathBuf, String> {
     let executable =
         std::env::current_exe().map_err(|e| format!("cannot find own executable: {e}"))?;
     // A long-lived picker can outlive an atomic package upgrade. On Linux
     // `/proc/self/exe` then names the old, unlinked inode with ` (deleted)`
     // appended. Start new daemons from the replacement at its install path.
-    let executable = if executable.exists() {
-        executable
-    } else {
-        let path = executable.to_string_lossy();
-        let replacement = path
-            .strip_suffix(" (deleted)")
-            .map(std::path::PathBuf::from)
-            .filter(|candidate| candidate.is_file())
-            .ok_or_else(|| format!("cannot find a replacement for own executable: {path}"))?;
-        replacement
-    };
-    pty_lifecycle::spawn_daemon(&executable, params)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    if executable.exists() {
+        return Ok(executable);
+    }
+    let path = executable.to_string_lossy();
+    path.strip_suffix(" (deleted)")
+        .map(std::path::PathBuf::from)
+        .filter(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("cannot find a replacement for own executable: {path}"))
 }

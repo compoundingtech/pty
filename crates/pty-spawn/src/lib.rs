@@ -1,8 +1,8 @@
 //! Allocate a pseudo-terminal and start a child process in it.
 //!
 //! **This crate is deliberately small, and deliberately free of the terminal
-//! emulator.** It depends on `portable-pty` and nothing else, so it builds with
-//! plain `cargo` on any platform the toolchain supports.
+//! emulator.** It uses `portable-pty` and the emulator-free `pty-core` registry
+//! helpers, so it builds with plain `cargo` on supported platforms.
 //!
 //! That matters more than it looks. The rest of this workspace builds
 //! `libghostty` from source with Zig, pinned at 0.15.2, and that Zig cannot
@@ -67,8 +67,8 @@ pub mod substrate;
 pub use substrate::{
     AttachStream, DEFAULT_ATTACHMENT_CAPACITY, EXIT_OUTPUT_DRAIN, ExitStatus, Lifecycle,
     MIN_ATTACHMENT_CAPACITY, SessionClient, SessionError, SessionEvent, SessionOwner, SessionRef,
-    external_owned, external_owned_pair, external_owned_pair_attached,
-    external_owned_pair_attached_with_capacity,
+    external_owned, external_owned_master_attached, external_owned_pair,
+    external_owned_pair_attached, external_owned_pair_attached_with_capacity,
 };
 
 #[cfg(test)]

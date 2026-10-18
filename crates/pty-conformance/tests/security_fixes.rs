@@ -29,28 +29,31 @@ fn accepts_ordinary_names() {
     assert!(rig.socket_path("myserver").exists());
 }
 
-/// node: tests/security-fixes.test.ts:28
+/// Rust extension to node: tests/security-fixes.test.ts:28
 #[test]
-fn rejects_names_that_overflow_the_socket_path_limit() {
+fn bounds_names_that_overflow_the_readable_socket_path() {
     let rig = Rig::new();
     let long = "a".repeat(100);
-    let out = rig.pty(&["run", "-d", "--id", &long, "--", "cat"]);
-    expect_failure(&out);
-    expect_regex(&out.stderr(), "socket path.*exceeds");
-    expect_regex(&out.stderr(), "10[34]-byte kernel limit");
-    assert!(root_entries(&rig, "aaaa").is_empty());
+    let daemon = rig.daemon(&long, &["cat"], DaemonOpts::no_display_name().ephemeral());
+    assert!(rig.socket_path(&long).exists());
+    assert!(rig.socket_path(&long).as_os_str().len() <= pty_core::registry::SUN_PATH_MAX);
+    let pid = daemon.pid();
+    expect_status(&rig.pty(&["kill", &long]), 0);
+    wait_for_process_gone(pid);
 }
 
-/// node: tests/security-fixes.test.ts:34
+/// The root itself must still leave room for a bounded transport filename.
 #[test]
-fn rejects_names_whose_path_hits_the_limit_plus_one() {
+fn rejects_a_registry_root_above_the_kernel_budget() {
     let rig = Rig::new();
-    let overhead = rig.root().join(".sock").to_string_lossy().len();
-    let overshoot = "a".repeat((104 - overhead + 1).max(1));
-    let out = rig.pty(&["run", "-d", "--id", &overshoot, "--", "cat"]);
+    let root = rig.tmp().join("r".repeat(110));
+    std::fs::create_dir(&root).unwrap();
+    let mut command = rig.command(&["run", "-d", "--id", "a", "--", "cat"]);
+    command.env("PTY_ROOT", &root);
+    let out = rig.run(command, None);
     expect_failure(&out);
-    expect_regex(&out.stderr(), "socket path");
-    assert!(root_entries(&rig, "aaaa").is_empty());
+    expect_regex(&out.stderr(), "(?i)root.*too long|socket path.*exceeds");
+    assert!(std::fs::read_dir(root).unwrap().next().is_none());
 }
 
 /// node: tests/security-fixes.test.ts:41

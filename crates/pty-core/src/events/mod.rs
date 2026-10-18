@@ -519,8 +519,18 @@ pub fn emit_user_event(
 ///
 /// node: src/events.ts:392-402
 pub fn clear_events(name: &str) -> Result<(), String> {
+    clear_events_with_wait(name, std::time::Duration::ZERO)
+}
+
+/// Clear a publisher's log after waiting out a predecessor's event append.
+/// A zero budget preserves [`clear_events`]'s fail-fast behavior.
+pub fn clear_events_with_wait(name: &str, wait: std::time::Duration) -> Result<(), String> {
     ensure_session_dir().map_err(|e| e.to_string())?;
-    let _lock = take_event_lock(name)?;
+    let _lock = if wait.is_zero() {
+        take_event_lock(name)?
+    } else {
+        wait_for_event_lock(name, wait)?
+    };
     let _ = atomic_write(&events_path(name), b"");
     Ok(())
 }

@@ -1,8 +1,9 @@
 //! Session registry: the on-disk layout under `$PTY_ROOT`, byte-compatible
 //! with the Node project's `src/sessions.ts` so Rust and Node daemons and
-//! CLIs can share one root.
+//! CLIs can share one root. IDs whose readable socket address would exceed
+//! the kernel limit use a bounded Rust extension; see [`socket_path_in`].
 //!
-//! Per session: `<name>.json` (metadata), `<name>.sock`, `<name>.pid`,
+//! Per session: `<name>.json` (metadata), a socket from [`socket_path_in`], `<name>.pid`,
 //! `<name>.events.jsonl`, `<name>.lock`, `<name>.events.lock`,
 //! `.recovery/<name>.revision.json`, and the Rust daemon's output-activity
 //! sidecar `.activity/<name>.json` ([`activity`]). Atomic writes go through
@@ -24,6 +25,7 @@ pub mod metadata;
 pub mod mutate;
 pub mod names;
 pub mod root;
+pub mod revocation;
 pub mod tags;
 pub mod time;
 
@@ -46,16 +48,18 @@ pub use list::{
     DEFAULT_SOCKET_PROBE_BUDGET, Inventory, InventoryError, InventoryErrorKind, ListOptions,
     SessionInfo, SessionStatus, all_session_names, ambiguous_reference_message, get_session,
     get_session_by_name, has_process_exited_for_reap, list_sessions, list_sessions_in,
-    list_sessions_strict_in, list_sessions_with, pid_alive, probe_sockets_within_budget, read_pid,
-    read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
-    resolve_ref, session_exists, socket_reachable, wait_for_process_exit,
+    list_sessions_strict_in, list_sessions_with, observe_session_strict_in, pid_alive,
+    probe_sockets_within_budget, read_pid, read_pid_with, read_process_start_token,
+    read_session_pid, read_signal_target_with, resolve_ref, session_exists, socket_reachable,
+    wait_for_process_exit,
 };
 pub use lock::{
     EVENT_LOCK_WAIT, LockBusy, LockGuard, LockRefusal, METADATA_PATCH_LOCK_WAIT,
     acquire_event_lock, acquire_file_lock, acquire_lock, event_busy_message, is_creation_lock_held,
     is_lock_owned_by_pid, lock_or_refusal, metadata_busy_message, release_event_lock,
-    release_file_lock, release_lock, take_event_lock, take_metadata_lock, try_acquire_file_lock,
-    wait_for_event_lock, wait_for_metadata_lock, with_both_locks,
+    release_file_lock, release_file_lock_owned_by, release_lock, take_event_lock,
+    take_metadata_lock, try_acquire_file_lock, wait_for_event_lock, wait_for_metadata_lock,
+    with_both_locks,
 };
 pub use metadata::{
     EnvMap, SESSION_EXIT_LAST_LINES_LIMIT, SessionMetadata, TagMap, apply_metadata_diff,
@@ -77,8 +81,9 @@ pub use names::{
 pub use root::{
     SUN_PATH_MAX, RootSource, default_session_dir, ensure_session_dir, event_lock_path, events_path, lock_path,
     metadata_path, output_activity_path, pid_path, recovery_revision_path, root_length_check,
-    resolve_session_dir, session_dir, socket_path, with_root,
+    resolve_session_dir, session_dir, socket_path, socket_path_in, with_root,
 };
+pub use revocation::{PublicationBinding, PublicationRevocation, RevocationInstall};
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,
     extract_filter_tags, is_keep_expired, is_keep_requested, is_reserved_tag_key, matches_all_tags,

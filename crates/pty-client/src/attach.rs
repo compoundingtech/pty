@@ -391,7 +391,9 @@ impl Attach<'_> {
         if self.machine.is_some() {
             self.stderr(line.as_bytes());
         } else {
-            self.stdout(line.as_bytes());
+            // Nothing can answer paste events until the session is back.
+            // Its replay turns them on again if the program still wants them.
+            self.stdout(format!("\x1b[?5522l{line}").as_bytes());
         }
         self.phase = Phase::Reconnecting {
             attempt: 0,
