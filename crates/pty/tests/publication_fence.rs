@@ -343,9 +343,9 @@ fn lifecycle_publication_waits_for_the_real_event_lock_before_clearing() {
             return;
         }
         if Instant::now() >= deadline {
-            // SAFETY: the unreaped direct child leads the private group we
-            // created, so this group ID cannot have been recycled.
-            unsafe { libc::kill(-(fixture.id() as i32), libc::SIGKILL); }
+            // The unreaped direct child leads the private group we created,
+            // so this group ID cannot have been recycled.
+            let _ = pty_core::kill::group(fixture.id() as i32, libc::SIGKILL);
             let reap_deadline = Instant::now() + Duration::from_secs(5);
             while fixture.try_wait().unwrap().is_none() {
                 assert!(Instant::now() < reap_deadline, "event-wait fixture was not reaped");

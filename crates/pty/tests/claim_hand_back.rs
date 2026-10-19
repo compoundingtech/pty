@@ -45,8 +45,8 @@ fn failed_claim_hand_back_keeps_the_successfully_spawned_session_serving() {
     assert!(restart.0.wait().unwrap().success());
     std::fs::remove_dir(&lock).unwrap();
     assert!(std::os::unix::net::UnixStream::connect(rig.path("return-failure.sock")).is_ok());
-    // SAFETY: signal zero only probes the exact daemon from the new metadata.
-    assert_eq!(unsafe { libc::kill(daemon_pid, 0) }, 0);
+    // Signal zero only probes the exact daemon from the new metadata.
+    pty_core::kill::process(daemon_pid, 0).unwrap();
     wait_until("spawned child output remains available", || {
         let peek = rig.run(&["peek", "return-failure"]);
         peek.code == 0 && peek.stdout.contains("serving")

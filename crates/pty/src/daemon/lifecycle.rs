@@ -322,8 +322,8 @@ fn install_ordinary_child_test_hook() -> Result<(), String> {
         return Ok(());
     }
     unsafe extern "C" fn stop_child() {
-        // SAFETY: both calls are async-signal-safe in the post-fork child.
-        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+        // Both calls are async-signal-safe in the post-fork child.
+        let _ = pty_core::kill::process(unsafe { libc::getpid() }, libc::SIGSTOP);
     }
     // SAFETY: the child callback uses only async-signal-safe operations and
     // remains valid for the process lifetime. Register just before spawn.

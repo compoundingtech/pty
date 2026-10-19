@@ -117,8 +117,8 @@ fn gc_dry_run_reports_without_mutating_then_applies_the_same_cleanup() {
 }
 
 fn stop_daemon(name: &str, started: &SpawnedDaemon) {
-    // SAFETY: signal the exact daemon pid returned by `spawn_daemon`.
-    let _ = unsafe { libc::kill(started.pid as i32, libc::SIGTERM) };
+    // Signal the exact daemon pid returned by `spawn_daemon`.
+    let _ = pty_core::kill::process(started.pid as i32, libc::SIGTERM);
     let _ = wait_for_process_exit(started.pid as i32, Duration::from_secs(8));
     let _ = cleanup_owned_all(
         name,
@@ -274,8 +274,8 @@ fn spawn_across_publication_mutation(mutation: PublicationMutation) {
     );
     assert!(!started.generation.is_empty());
 
-    // SAFETY: the fake launcher execs sleep without changing its pid.
-    let _ = unsafe { libc::kill(started.pid as i32, libc::SIGTERM) };
+    // The fake launcher execs sleep without changing its pid.
+    let _ = pty_core::kill::process(started.pid as i32, libc::SIGTERM);
     registry::cleanup(&name);
     let _ = std::fs::remove_file(launcher);
 }
@@ -654,9 +654,9 @@ fn ordinary_daemon_retains_publication_pin_until_child_spawn() {
             // race the daemon into creating a child, and a serving daemon
             // must get its normal graceful child teardown.
             if matches!(self.child.try_wait(), Ok(None)) {
-                // SAFETY: try_wait observed a live, unreaped direct child.
-                // It cannot have its pid reused before this Child reaps it.
-                unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+                // try_wait observed a live, unreaped direct child. It
+                // cannot have its pid reused before this Child reaps it.
+                let _ = pty_core::kill::process(self.child.id() as i32, libc::SIGTERM);
                 let _ = std::fs::write(&self.release, "");
                 if !wait_for_process_exit(self.child.id() as i32, Duration::from_secs(8)) {
                     let _ = self.child.kill();

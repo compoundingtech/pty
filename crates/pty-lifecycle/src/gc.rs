@@ -1053,10 +1053,9 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
             let Some(pid) = current_pid else {
                 return Err("pid-unavailable");
             };
-            // SAFETY: signalling a live pid validated against lock-held
-            // metadata and its process-start token.
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc == 0 {
+            // Signalling a live pid validated against lock-held metadata and
+            // its process-start token.
+            if pty_core::kill::process(pid, libc::SIGTERM).is_ok() {
                 signalled_pid = Some(pid);
             } else if pid_alive(pid) {
                 return Err("signal-failed");

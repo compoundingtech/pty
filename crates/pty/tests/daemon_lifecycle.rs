@@ -235,9 +235,7 @@ fn a_sigkilled_child_is_recorded_as_137_with_signal_9() {
         PRESERVE,
     );
     let leaf = d.child_pid();
-    unsafe {
-        libc::kill(leaf, libc::SIGKILL);
-    }
+    let _ = pty_core::kill::process(leaf, libc::SIGKILL);
     let meta = wait_exited(&d);
     assert_eq!(meta["exitCode"], 137);
     let exits = d.events("session_exit");
@@ -1009,7 +1007,7 @@ fn read_pid(path: &std::path::Path) -> i32 {
 
 fn kill_if_alive(pid: i32) {
     if pid_alive(pid) {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = pty_core::kill::process(pid, libc::SIGKILL);
     }
 }
 

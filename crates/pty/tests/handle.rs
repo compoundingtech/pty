@@ -106,8 +106,8 @@ fn close_kills_the_spawned_childs_process_group() {
         assert!(Instant::now() < deadline, "the background job never started");
         std::thread::sleep(Duration::from_millis(10));
     };
-    // SAFETY: signal 0 only checks that the pid exists.
-    let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+    // Signal 0 only checks that the pid exists.
+    let alive = |pid| pty_core::kill::process(pid, 0).is_ok();
     assert!(alive(job));
     h.close();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -116,8 +116,8 @@ fn close_kills_the_spawned_childs_process_group() {
     }
     let survived = alive(job);
     if survived {
-        // SAFETY: the job this test started, not reaped while it is alive.
-        unsafe { libc::kill(job, libc::SIGKILL) };
+        // The job this test started, not reaped while it is alive.
+        let _ = pty_core::kill::process(job, libc::SIGKILL);
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!survived, "background job {job} outlived the closed handle");
