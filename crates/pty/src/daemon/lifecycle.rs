@@ -135,6 +135,9 @@ pub(crate) struct Daemon {
     /// The substrate owner is the sole PTY master reader/writer/reaper.
     _owner: SessionOwner,
     pub(crate) session: pty_spawn::substrate::SessionClient,
+    /// Input for the child, written in order by [`spawn_input_writer`]'s
+    /// thread. `None` when that thread could not start.
+    input: Option<Sender<Vec<u8>>>,
     pub(crate) child_pid: i32,
     child_identity: Option<ProcessIdentity>,
     pub(crate) clients: BTreeMap<u64, Client>,
@@ -645,6 +648,32 @@ fn terminal_actor(rows: u16, cols: u16) -> TerminalActor {
     actor
 }
 
+/// Write the child's input on a thread of its own, in the order the actor
+/// sends it.
+///
+/// `SessionClient::input` returns once the kernel has taken every byte, so
+/// it waits on the child whenever the PTY's input buffer is full. The actor
+/// must never wait there: one large paste into a program that is not
+/// reading would stop the daemon serving every client, STATUS included,
+/// until the program read it or exited.
+fn spawn_input_writer(session: pty_spawn::substrate::SessionClient) -> Option<Sender<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let spawned = std::thread::Builder::new()
+        .name("pty-input".into())
+        .spawn(move || {
+            for bytes in rx {
+                let _ = session.input(bytes);
+            }
+        });
+    match spawned {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            daemon_warn!("pty daemon: cannot start input writer thread: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let mut exited = false;
@@ -894,6 +923,7 @@ impl Daemon {
             cfg,
             actor: terminal_actor(rows, cols),
             _owner: owner,
+            input: spawn_input_writer(session.clone()),
             session,
             child_pid,
             child_identity,
@@ -946,7 +976,14 @@ impl Daemon {
         if bytes.is_empty() || self.child_status.is_some() {
             return;
         }
-        let _ = self.session.input(bytes.to_vec());
+        match &self.input {
+            Some(input) => {
+                let _ = input.send(bytes.to_vec());
+            }
+            None => {
+                let _ = self.session.input(bytes.to_vec());
+            }
+        }
     }
 
     /// The serving loop, then the shutdown. Returns the process exit status.
