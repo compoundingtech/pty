@@ -69,12 +69,12 @@ fn id_with_name_pins_both() {
 
 /// node: tests/display-name.test.ts:134
 #[test]
-fn rejects_an_id_whose_sock_path_exceeds_the_kernel_limit() {
+fn rejects_an_id_above_the_logical_id_limit() {
     let rig = Rig::new();
-    let long_id = "x".repeat(120);
+    let long_id = "x".repeat(256);
     let out = rig.pty(&["run", "-d", "--id", &long_id, "--", "cat"]);
     expect_failure(&out);
-    expect_regex(&out.stderr(), "(?i)exceeds the.*byte kernel limit|too long");
+    expect_regex(&out.stderr(), "(?i)too long.*255");
 }
 
 /// node: tests/display-name.test.ts:142

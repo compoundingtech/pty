@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use pty_core::protocol::{MessageType, PacketReader, decode_exit, encode_peek};
+use pty_core::protocol::{MessageType, PacketReader, decode_connection_error, decode_exit, encode_peek};
 use pty_core::registry;
 
 use super::connection::{PeekScreenOptions, peek_screen};
@@ -133,13 +133,20 @@ pub fn peek(mut params: PeekParams, io: &ClientIo) -> Result<PeekOutcome, Client
 ///
 /// node: client.ts:88-103, :139-157
 pub fn follow(mut params: PeekParams, io: &ClientIo) -> Result<PeekOutcome, ClientError> {
-    let (mut socket, remote) = open(&mut params)?;
+    let mut socket = open(&mut params)?.0;
     let name = params.name;
     let path = registry::socket_path(name);
     let mut out = FdWriter(io.stdout);
-    socket
-        .write_all(&encode_peek(params.plain, params.full))
-        .map_err(|e| map_io_error(name, remote, GoneSet::Broad, "write", Some(&path), &e))?;
+    if let Err(error) = socket.write_all(&encode_peek(params.plain, params.full)) {
+        let detail = super::node_error_message("write", Some(&path), &error);
+        let _ = writeln!(FdWriter(io.stderr), "Connection lost: {detail}");
+        if !params.plain {
+            let _ = out.write_all(TERMINAL_SANITIZE.as_bytes());
+            let _ = out.write_all(CURSOR_TO_BOTTOM.as_bytes());
+        }
+        let _ = out.write_all(trailer(&mut params, SessionEnd::ConnectionLost).as_bytes());
+        return Ok(PeekOutcome::Exited(1));
+    }
     let raw = RawMode::enable_if_tty(io.stdin);
     let mut reader = PacketReader::new();
     let mut buf = [0u8; 16384];
@@ -187,30 +194,48 @@ pub fn follow(mut params: PeekParams, io: &ClientIo) -> Result<PeekOutcome, Clie
             Ok(n) => n,
             Err(e) => {
                 drop(raw);
-                return Err(map_io_error(name, remote, GoneSet::Broad, "read", None, &e));
+                let detail = super::node_error_message("read", None, &e);
+                let _ = writeln!(FdWriter(io.stderr), "Connection lost: {detail}");
+                if !params.plain {
+                    let _ = out.write_all(TERMINAL_SANITIZE.as_bytes());
+                    let _ = out.write_all(CURSOR_TO_BOTTOM.as_bytes());
+                }
+                let _ = out.write_all(trailer(&mut params, SessionEnd::ConnectionLost).as_bytes());
+                return Ok(PeekOutcome::Exited(1));
             }
         };
         if n == 0 {
-            // The daemon went away without an EXIT (`pty kill`, a crash):
-            // say so, then end with code 0.
+            // Without EXIT, the child status is unknown.
             drop(raw);
             if !params.plain {
                 let _ = out.write_all(TERMINAL_SANITIZE.as_bytes());
                 let _ = out.write_all(CURSOR_TO_BOTTOM.as_bytes());
             }
-            let _ = out.write_all(trailer(&mut params, SessionEnd::Ended).as_bytes());
-            return Ok(PeekOutcome::Exited(0));
+            let _ = out.write_all(trailer(&mut params, SessionEnd::ConnectionLost).as_bytes());
+            return Ok(PeekOutcome::Exited(1));
         }
         let packets = match reader.feed(&buf[..n]) {
             Ok(p) => p,
             Err(e) => {
                 let _ = FdWriter(io.stderr).write_all(dropping_connection_line(&e).as_bytes());
                 drop(raw);
-                return Ok(PeekOutcome::Exited(0));
+                return Ok(PeekOutcome::Exited(1));
             }
         };
         for p in packets {
             match p.type_ {
+                MessageType::ConnectionError => {
+                    drop(raw);
+                    let reason = decode_connection_error(&p.payload)
+                        .map_or("server rejected the attachment", |reason| reason.message());
+                    let _ = writeln!(FdWriter(io.stderr), "Connection lost: {reason}");
+                    if !params.plain {
+                        let _ = out.write_all(TERMINAL_SANITIZE.as_bytes());
+                        let _ = out.write_all(CURSOR_TO_BOTTOM.as_bytes());
+                    }
+                    let _ = out.write_all(trailer(&mut params, SessionEnd::ConnectionLost).as_bytes());
+                    return Ok(PeekOutcome::Exited(1));
+                }
                 MessageType::Screen => {
                     let _ = out.write_all(&p.payload);
                 }

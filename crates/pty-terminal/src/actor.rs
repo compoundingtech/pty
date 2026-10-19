@@ -18,6 +18,7 @@ use std::rc::Rc;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{Options, Terminal};
 
+use crate::enhanced_paste::ReadRequest;
 use crate::graphics::{self, CellSize, GraphicsOptions, GraphicsState, ImageBytes};
 use crate::input::{self, KeyEvent, MouseEvent};
 use crate::queries;
@@ -96,6 +97,11 @@ pub enum TerminalEvent {
     FocusRequest,
     /// `CSI ? 25 h` while the cursor was hidden.
     CursorVisible,
+    /// `CSI ? 5522 h` / `l` turned enhanced paste on or off (a change only;
+    /// RIS turning it off counts).
+    EnhancedPasteMode(bool),
+    /// A valid OSC 5522 read request (see [`crate::enhanced_paste`]).
+    EnhancedPasteRead(ReadRequest),
 }
 
 /// The mode flags Node tracks itself, from the child's own escape sequences
@@ -128,6 +134,9 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// `?1004`.
     pub focus_events: bool,
+    /// `?5522` — paste events: the child wants each paste as an OSC 5522
+    /// listing of MIME types (see [`crate::enhanced_paste`]).
+    pub enhanced_paste: bool,
     /// `CSI > flags u` pushes, oldest first; `CSI < u` pops one.
     pub kitty_stack: Vec<u8>,
 }
@@ -170,6 +179,12 @@ impl Modes {
                 }
             }
             2004 => self.bracketed_paste = set,
+            5522 => {
+                if self.enhanced_paste != set {
+                    events.push(TerminalEvent::EnhancedPasteMode(set));
+                }
+                self.enhanced_paste = set;
+            }
             _ => {}
         }
     }
@@ -191,6 +206,10 @@ struct Shared {
     titles: Vec<String>,
 }
 
+/// Recover both keyboard stacks and mouse/paste/focus/keypad modes, retaining normal
+/// screen contents and scrollback. CAN/ST also cancel an unfinished control string.
+pub const RESET_INPUT_MODES: &[u8] = b"\x18\x1b\\\x1b[<99u\x1b[?1l\x1b[?66l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?2031l\x1b[?2048l\x1b[?5522l\x1b[?1007h\x1b[>4;0m\x1b[?25h";
+
 /// The owner of a libghostty terminal. See the [module docs](self).
 pub struct TerminalActor {
     term: Terminal<'static, 'static>,
@@ -199,7 +218,10 @@ pub struct TerminalActor {
     scanner: OutputScanner,
     /// Whether an attached terminal can answer OSC 52 clipboard reads.
     clipboard_client_available: bool,
+    /// Whether a client can answer OSC 5522 paste events.
+    enhanced_paste_available: bool,
     modes: Modes,
+    modify_other_keys: u16,
     /// Kitty keyboard stacks belong to their screen. This holds the stack
     /// for whichever screen is currently inactive.
     inactive_kitty_stack: Vec<u8>,
@@ -271,7 +293,9 @@ impl TerminalActor {
             shared,
             scanner: OutputScanner::new(),
             clipboard_client_available: false,
+            enhanced_paste_available: false,
             modes: Modes::default(),
+            modify_other_keys: 0,
             inactive_kitty_stack: Vec::new(),
             events: Vec::new(),
             last_title: None,
@@ -521,6 +545,12 @@ impl TerminalActor {
         self.clipboard_client_available = available;
     }
 
+    /// Let DECRQM report the paste-events mode (5522) as supported: only a
+    /// client that answers its listings and reads can make it work.
+    pub fn set_enhanced_paste_available(&mut self, available: bool) {
+        self.enhanced_paste_available = available;
+    }
+
     /// Feed the child's output. Returns the bytes to broadcast to attached
     /// clients: the input minus terminal queries (which are answered into
     /// [`TerminalActor::take_pty_replies`] instead). Mode flags, the kitty
@@ -552,7 +582,11 @@ impl TerminalActor {
                     if self.modes.cursor_hidden {
                         self.events.push(TerminalEvent::CursorVisible);
                     }
+                    if self.modes.enhanced_paste {
+                        self.events.push(TerminalEvent::EnhancedPasteMode(false));
+                    }
                     self.modes = Modes::default();
+                    self.modify_other_keys = 0;
                     self.normal_replay = None;
                     feed.extend_from_slice(b"\x1bc");
                     broadcast.extend_from_slice(b"\x1bc");
@@ -560,6 +594,41 @@ impl TerminalActor {
                 Token::Csi(c) => {
                     if c.final_byte == b'J' && c.prefix.is_none() && c.param(0, 0) == 3 {
                         self.history.invalidate();
+                    }
+                    if c.prefix == Some(b'>')
+                        && c.final_byte == b'm'
+                        && c.intermediates.is_empty()
+                        && c.params.first() == Some(&4)
+                    {
+                        self.modify_other_keys = c.params.get(1).copied().unwrap_or(0).min(2);
+                    }
+                    if c.prefix == Some(b'?')
+                        && c.final_byte == b'm'
+                        && c.intermediates.is_empty()
+                        && c.params == [4]
+                    {
+                        self.flush_feed(&mut feed);
+                        self.shared.borrow_mut().pty_replies.extend_from_slice(
+                            format!("\x1b[>4;{}m", self.modify_other_keys).as_bytes(),
+                        );
+                        continue;
+                    }
+                    if c.is_mode_query(5522) {
+                        // libghostty does not know the mode. Report it as
+                        // supported only while a client can answer paste
+                        // events.
+                        self.flush_feed(&mut feed);
+                        let state = match (self.enhanced_paste_available, self.modes.enhanced_paste)
+                        {
+                            (false, _) => 0,
+                            (true, true) => 1,
+                            (true, false) => 2,
+                        };
+                        self.shared
+                            .borrow_mut()
+                            .pty_replies
+                            .extend_from_slice(format!("\x1b[?5522;{state}$y").as_bytes());
+                        continue;
                     }
                     if let Some(query) = c.size_query() {
                         self.flush_feed(&mut feed);
@@ -569,6 +638,7 @@ impl TerminalActor {
                             14 => format!("\x1b[4;{};{}t", rows * cell.height, cols * cell.width),
                             16 => format!("\x1b[6;{};{}t", cell.height, cell.width),
                             18 => format!("\x1b[8;{rows};{cols}t"),
+                            19 => format!("\x1b[9;{rows};{cols}t"),
                             _ => unreachable!(),
                         };
                         self.shared
@@ -587,7 +657,10 @@ impl TerminalActor {
                     if let Some(flags) = c.kitty_push() {
                         self.modes.kitty_stack.push(flags);
                     } else if c.is_kitty_pop() {
-                        self.modes.kitty_stack.pop();
+                        let count = usize::from(c.params.first().copied().unwrap_or(1).max(1));
+                        self.modes
+                            .kitty_stack
+                            .truncate(self.modes.kitty_stack.len().saturating_sub(count));
                     } else if let Some((params, set)) = c.dec_modes() {
                         let was_alt = self.modes.alt_screen;
                         for &p in params {
@@ -649,6 +722,9 @@ impl TerminalActor {
                             }
                         }
                         continue;
+                    }
+                    if let Some(request) = o.enhanced_paste_read() {
+                        self.events.push(TerminalEvent::EnhancedPasteRead(request));
                     }
                     self.tap_notification(&o);
                     feed.extend_from_slice(&o.raw);
@@ -745,14 +821,50 @@ impl TerminalActor {
             .resize(cols.max(1), rows.max(1), cell.width, cell.height);
     }
 
+    /// Recover input without erasing the normal screen or history. A writable surface
+    /// invokes this explicitly; reset bytes are output to clients, never input to the child.
+    pub fn reset_input_modes(&mut self) -> Vec<u8> {
+        self.scanner = OutputScanner::default();
+        self.term.vt_write(b"\x18\x1b\\");
+        let mut output = Vec::new();
+        if self.modes.alt_screen {
+            output.extend(self.write(b"\x1b[<99u\x1b[?1049l"));
+        }
+        output.extend(self.write(RESET_INPUT_MODES));
+        self.modes.kitty_stack.clear();
+        self.inactive_kitty_stack.clear();
+        self.take_pty_replies();
+        output
+    }
+
+    /// The stream feeding this terminal has ended or is being replaced: the
+    /// child exited, or the client lost or dropped its connection. A partial
+    /// sequence can no longer be finished, so it is forgotten, and paste
+    /// events are turned off, as an event, because nothing on this stream
+    /// can answer them now. The screen and every other mode stay as they
+    /// are.
+    pub fn end_stream(&mut self) {
+        self.scanner.reset();
+        if self.modes.enhanced_paste {
+            self.modes.enhanced_paste = false;
+            self.events.push(TerminalEvent::EnhancedPasteMode(false));
+        }
+    }
+
     /// Full reset (RIS): screen, scrollback, modes, title. The tracked mode
     /// flags and any partial sequence in the scanner are cleared too. Used
-    /// before replaying a SCREEN.
+    /// before replaying a SCREEN. Turning paste events off is an event, so a
+    /// replay that does not set them again leaves no listener believing they
+    /// are on.
     pub fn reset(&mut self) {
         self.history.invalidate();
         self.term.reset();
         self.scanner.reset();
+        if self.modes.enhanced_paste {
+            self.events.push(TerminalEvent::EnhancedPasteMode(false));
+        }
         self.modes = Modes::default();
+        self.modify_other_keys = 0;
         self.inactive_kitty_stack.clear();
         self.cursor_shape_replay = None;
         self.cursor_color_replay = None;

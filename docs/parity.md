@@ -19,16 +19,32 @@ same JSON shapes. It uses the same exit codes. It writes the same files under
 `$PTY_ROOT`. It speaks the same socket protocol. A program that works with the
 Node `pty` works with the Rust `pty` without a change.
 
+**Transport-failure exception (2026-10-08).** PTY.TRL-R11 keeps banners,
+successful detach and received-EXIT trailers byte-identical. EOF without EXIT
+reports connection loss and exits 1 instead of claiming the session ended.
+Frame 12 optionally supplies the server's rejection reason; older readers
+ignore it. See [the trailer requirements](vrs/02-session-trailers/requirements.md)
+and [the close-path contract](architecture.md). This exception follows
+PTY.TRL-R08: a lost attachment is not a child-exit observation.
+
 **Wanted, not required: mixed fleet.** A Node client talks to a Rust daemon
 and a Rust client talks to a Node daemon, on the same `$PTY_ROOT`. Section 11
 lists what this costs beyond drop-in.
+
+**Socket pathname extension.** For a logical id whose `<root>/<id>.sock`
+address exceeds the platform limit, Rust uses a bounded digest filename.
+Node rejects those ids. Addresses accepted by Node retain their exact paths;
+the persisted metadata, pid and event names do not change. Rust listing and
+lookup map bounded sockets through their id-named registry companions.
+Rust rejects IDs above 209 ASCII characters before launch so id-based sidecars
+and their atomic temporary filenames stay within the filesystem component limit.
 
 **Three surfaces.** The Node package has three parts. The parity rule differs
 per part:
 
 | Surface | Parity rule |
 |---|---|
-| CLI, daemon, protocol, registry, remote | Drop-in. Same behavior, same bytes on disk and on the wire. |
+| CLI, daemon, protocol, registry, remote | Drop-in except the explicit transport-failure contract above. Same persisted state and existing normal-operation wire bytes. |
 | Testing library (`pty/testing`) | Same capabilities. A Rust crate and a TypeScript package. The API does not need to match the Node API. |
 | TUI framework (`pty/tui`) | Same capabilities. May be replaced by a new Rust TUI library. The interactive session manager is rebuilt on it. |
 
@@ -82,7 +98,7 @@ Two facts from this table shape the plan:
 | `list` / `ls` | partial (M) | Missing `tags` in JSON, `--tags`, `--filter-tag`, `--status`, `--older-than`, `--newer-than`, `--summary`, `--remote [<peer>]`, sort by display name, the whole text layout with sections, colors, `[permanent]`/`[flapping]`, `~` paths, `timeAgo`. |
 | `remote-serve` | missing (M) | `--stdio` control protocol (`{"op":"list"}`, `{"op":"route"}`). The `--socket <path>` form is dropped. |
 | `stats` | partial (S) | Text output missing (Rust always prints JSON). JSON: add `clients.connections[]`, remove `geometryNeutral` or record it as a decision. Gone-session text. `--all` layout. |
-| `restart` | partial (M) | Missing `-y`, `--force`, running prompt, stateful-agent guard, gc bookkeeping tag strip, persisted `rows/cols/env` reuse, `ST_AGENT`/`ST_ROOT` scrub, `Session "<n>" restarted.`, nested note, attach after restart. |
+| `restart` | partial (M) | Missing `-y`, `--force`, running prompt, stateful-agent guard, gc bookkeeping tag strip, persisted `rows/cols/env` reuse, ambient `ST_AGENT`/`ST_ROOT`/`AGENT_TRACE_FILE` scrub (explicit `--env` values are preserved), `Session "<n>" restarted.`, nested note, attach after restart. |
 | `kill` | partial (S) | Exit 1 when not running (`not running` / `not found`), strip `strategy` on permanent, 7 s wait text, `Session "<n>" killed.`, ptyfile note. |
 | `recover` | deferred | Full authenticated rebind of a live daemon. Documented as absent. Section 12. |
 | `rm` / `remove` | partial (S) | Refuse when running, 7 s wait, generation check, `Session "<n>" removed.` / `not found`. |
@@ -129,9 +145,11 @@ gap is in what the daemon does with the frames.
 |---|---|---|
 | Frame `[type u8][len u32 BE][payload]`, 32 MiB cap, unknown types tolerated | have | |
 | Message types 0–7 | have | |
+| Embedded mode recovery (Rust extension) | have | Empty writable-only frame 11; output-side reset retains history. [Decision 0016](decisions/0016-embedded-surfaces-can-recover-input-modes.md). |
+| Attachment rejection (Rust extension) | have | Best-effort frame 12, reason `[0]` for memory-budget overflow. EOF or a truncated reason reports connection loss and exit 1; not a child EXIT. |
 | `GEOMETRY` (10) after every `ATTACH`/`PEEK` and on every effective resize | missing | Node clients wait for it in machine mode. `deskset` and the TS testing library read it. |
 | Order per attach: `GEOMETRY → SCREEN → DATA* → EXIT?`; ordered cut with `terminal.write("", cb)`; settling/cutting/live phases; a newer `ATTACH`/`PEEK` supersedes a pending one | missing | Rust sends `SCREEN` at once. Node folds output that arrives during the cut into `SCREEN`. |
-| 80 ms redraw settle after a resize before the cut; `nudgeRedraw` (`cols-1` then back) when the attach size differs | missing | |
+| 80 ms redraw settle after a resize before the cut; `nudgeRedraw` (`cols-1` then back) when the attach size differs | have, narrowed | Rust nudges only when the cut lands inside the settle of the last resize. A resizing attach already waited the settle out, and an attach that min-wins leaves unchanged never resized the child, so the child sees one SIGWINCH per resizing attach instead of three. |
 | Client roles: command (no `ATTACH`), writable-attached, readonly (`PEEK`); roles replace each other on one socket | missing | Rust writes `DATA` and applies `RESIZE` from any socket. |
 | Effective geometry = per-axis minimum over writable-attached clients; readonly never constrains; last geometry sticks with zero writers | missing | Rust: last non-neutral attach wins. Rust extra: `ATTACH` flag byte `0x01` geometry-neutral. Record as a decision or drop. |
 | Mode prefix before `SCREEN`: `?1049h` (attach only), mouse `1000/1002/1003/1006`, `?25l`, kitty stack | partial | Rust replays modes and cursor through libghostty. Exact bytes to verify. |
@@ -343,6 +361,8 @@ Decided on 2026-08-29. Each row records the decision.
 | Rust `ATTACH` geometry-neutral flag and `stats.clients.geometryNeutral` | S | Dropped. Node's readonly role covers `peek -f`. |
 | Rust-only `<name>.screen` file | S | Dropped once `lastLines` matches. |
 | Rust `run --rows/--cols` | S | Kept as an extension. Node persists rows/cols anyway. |
+| Rust `run --env KEY` (name only) | S | Kept as an extension. The value is read from the launching environment, so it never appears on the command line a supervisor or service manager records. The `KEY=VALUE` form still works but places the value on the command line; prefer `KEY` for anything sensitive. A name with no inherited value is a loud refusal. |
+| Registry files written owner-only (0600), temp files created 0600 at open | S | Kept as an extension. Records persist `extraEnv`/`sessionEnv` values; the file mode is set by the creating open (no create-then-chmod window). An existing session root keeps the mode its owner gave it — even a symlinked one — while a root this code creates is 0700. |
 | `up`/`down` and `pty.toml` | S | Kept. Already ported; the binding rule needs the tag pair. |
 | `queryStats` waiting out its 2 s timeout on a daemon that closes without STATUS, and `peek -f` hanging on a plain close | S | Not reproduced, on purpose. Both end promptly instead. Deliberate improvements, not gaps — accepted, decision 0006. |
 

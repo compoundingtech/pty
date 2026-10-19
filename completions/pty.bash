@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata readiness evidence up down test remote-serve"
+  commands="run attach a exec peek send events list ls root stats restart kill recover rm remove gc tag tag-multi emit rename metadata readiness evidence publication-revocation up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -24,7 +24,7 @@ _pty() {
 
   case "${COMP_WORDS[1]}" in
     run)
-      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force --startup-timeout-ms --lifecycle-tag" -- "${cur}"))
+      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force --startup-timeout-ms --lifecycle-tag --publication-operation --publication-binding --publication-root-id" -- "${cur}"))
       ;;
     attach|a)
       if [[ "${prev}" == "--attach-stream-fd-v1" ]]; then
@@ -61,7 +61,10 @@ _pty() {
       fi
       ;;
     list|ls)
-      COMPREPLY=($(compgen -W "--json --clients --tags --filter-tag --remote --status --older-than --newer-than --summary" -- "${cur}"))
+      COMPREPLY=($(compgen -W "--json --strict --clients --tags --filter-tag --remote --status --older-than --newer-than --summary" -- "${cur}"))
+      ;;
+    root)
+      COMPREPLY=($(compgen -W "--json" -- "${cur}"))
       ;;
     stats)
       if [[ "${cur}" == -* ]]; then
@@ -143,6 +146,13 @@ _pty() {
           fi
           ;;
       esac
+      ;;
+    publication-revocation)
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "identity install read" -- "${cur}"))
+      else
+        COMPREPLY=($(compgen -W "--id --operation --binding --intent --root-id --json" -- "${cur}"))
+      fi
       ;;
     evidence)
       if [[ ${COMP_CWORD} -eq 2 ]]; then

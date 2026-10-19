@@ -36,6 +36,7 @@
 //! - [`screenshot`]: the testkit's [`Screenshot`] capture.
 
 pub mod actor;
+pub mod enhanced_paste;
 pub mod graphics;
 pub mod input;
 pub mod history;

@@ -77,3 +77,63 @@ waited through the grace period before TERM. The foreground job should get \
 a chance to handle terminal hangup before the stronger termination signal. \
 Remove this entry if Node adopts the same grace period.
 """
+
+[[divergence]]
+test = "restart_env_scrub::restart_does_not_leak_the_restarters_identity"
+side = "node"
+kind = "node-defect"
+reason = """
+The pinned Node reference f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 predates \
+AGENT_TRACE_FILE scrubbing. In CI, its restarted child inherits the \
+restarter's trace path. Rust removes the ambient path, as it removes \
+ST_AGENT and ST_ROOT, so the new process can use its own provenance file. \
+Explicit persisted --env values remain unchanged. Remove this entry when \
+Node removes the same ambient trace path on restart.
+"""
+
+[[divergence]]
+test = "security_fixes::bounds_names_that_overflow_the_readable_socket_path"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0018 (docs/decisions/0018-logical-session-ids-outlive-the-socket-budget.md) \
+separates logical IDs from transport paths. Against pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in Linux CI run \
+38629683921, the 100-character ID exits 1 because its readable socket path \
+exceeds the limit. Rust starts the session with a bounded socket name, then \
+kills it successfully. This is an intentional Rust extension, not a reason \
+to restore rejection or change the Node reference here. Remove this entry \
+when Node supports bounded socket names or Rust removes the extension.
+"""
+
+[[divergence]]
+test = "socket_path_boundary::logical_id_longer_than_socket_budget_can_list_attach_query_and_stop"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0018 (docs/decisions/0018-logical-session-ids-outlive-the-socket-budget.md) \
+keeps the full logical ID while bounding its socket address. Against pinned \
+Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in Linux CI run \
+38629683921, creation of the 120-character ID exits 1 with a socket path \
+length error. Rust passes list, stats, protocol attach, kill and sidecar \
+cleanup for that ID. The Node rejection is expected for this intentional \
+Rust extension, so the reference is not changed here. Remove this entry \
+when Node supports the same logical-ID behavior or Rust removes it.
+"""
+
+[[divergence]]
+test = "socket_path_boundary::registry_sidecar_limit_accepts_boundary_and_rejects_overflow"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0018 (docs/decisions/0018-logical-session-ids-outlive-the-socket-budget.md) \
+uses the registry sidecar limit, not the readable socket path, to bound IDs. \
+Against pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in \
+Linux CI run 38629683921, creation of the 209-character boundary ID exits 1 \
+with a socket path length error, before the overflow assertion is reached. \
+Rust starts and kills that session, then rejects 210 characters with the \
+registry-sidecar diagnostic and no metadata. This is the deliberate Rust \
+boundary, not an assertion that Node accepted the overflow. The reference \
+is not changed for this extension. Remove this entry when Node supports \
+the same boundary behavior or Rust removes it.
+"""

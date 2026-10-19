@@ -202,6 +202,70 @@ fn up_and_down_from_a_manifest() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+/// `pty restart` waits for the stopped daemon to exit before it starts the
+/// new one. A child that ignores SIGHUP keeps the old daemon in its graceful
+/// shutdown for its hangup grace (2 s), far past the 200 ms restart used to
+/// sleep before cleaning up and spawning, so the new daemon raced a daemon that
+/// still held the event log. The old daemon must be gone by the time restart
+/// returns, and the new one running.
+#[test]
+fn restart_waits_for_the_old_daemon_to_exit() {
+    let _serial = serial();
+    let root = unique_root();
+    let (out, e, code) = run_pty(
+        &root,
+        &[
+            "run",
+            "-d",
+            "--id",
+            "slow",
+            "--",
+            "sh",
+            "-c",
+            "trap '' HUP; while :; do sleep 1; done",
+        ],
+    );
+    assert_eq!(code, 0, "run failed: {e}");
+    assert_eq!(created_id(&out), "slow");
+    let pid_path = root.join("slow.pid");
+    let daemon_pid = |other_than: i32| -> i32 {
+        let start = Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+                && pid != other_than
+            {
+                return pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "pid file never settled"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let old = daemon_pid(0);
+
+    let (_o, e, code) = run_pty_env(
+        &root,
+        &["restart", "-y", "slow"],
+        &[("PTY_SESSION", "outer")],
+    );
+    assert_eq!(code, 0, "restart failed: {e}");
+    // A zombie counts as gone: a reaped-later daemon holds no locks or files.
+    assert!(
+        pty_core::registry::has_process_exited_for_reap(old),
+        "restart returned while the old daemon {old} was still shutting down"
+    );
+    let new = daemon_pid(old);
+    assert_ne!(new, old, "restart should start a new daemon");
+
+    let (_o, _e, code) = run_pty(&root, &["kill", "slow"]);
+    assert_eq!(code, 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn restart_rename_rm() {
     let _serial = serial();
@@ -677,6 +741,113 @@ fn run_force_creates_nested_session() {
 
     let _ = run_pty(&root, &["kill", "fc"]);
     let _ = run_pty(&root, &["kill", "fd"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--env KEY` (name only) resolves the value from the launcher's
+/// environment, so the value never appears on the `pty run` command line —
+/// the argv a supervisor or a service manager records — while the session
+/// still receives it and the daemon still persists it for restart. The
+/// registry record that carries the resolved value stays owner-only, and a
+/// name with no inherited value is a loud refusal, never a silent drop.
+#[test]
+fn run_env_name_only_keeps_values_off_the_command_line() {
+    let _serial = serial();
+    let root = unique_root();
+    const SECRET: &str = "synthetic-seat-secret-4f2a";
+
+    let (out, err, code) = run_pty_env(
+        &root,
+        &[
+            "run",
+            "-d",
+            "--id",
+            "envn",
+            "--env",
+            "SEAT_TOKEN",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$SEAT_TOKEN\" > \"$PTY_ROOT/envn.out\"; cat",
+        ],
+        &[("SEAT_TOKEN", SECRET)],
+    );
+    assert_eq!(code, 0, "run failed: {err}");
+    assert!(!out.contains(SECRET), "the value must not echo back: {out}");
+
+    // The session child received the value.
+    let marker = root.join("envn.out");
+    let mut seen = false;
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&marker)
+            && text == SECRET
+        {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen, "the session child never received SEAT_TOKEN");
+
+    // No live process of the session carries the value on its command line:
+    // neither the daemon (which received it in its config) nor the session
+    // child (which received it in its environment).
+    #[cfg(target_os = "linux")]
+    {
+        let daemon: u32 = std::fs::read_to_string(root.join("envn.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut cmdlines = vec![std::fs::read(format!("/proc/{daemon}/cmdline")).unwrap()];
+        if let Ok(children) =
+            std::fs::read_to_string(format!("/proc/{daemon}/task/{daemon}/children"))
+        {
+            for child in children.split_whitespace() {
+                if let Ok(cmdline) = std::fs::read(format!("/proc/{child}/cmdline")) {
+                    cmdlines.push(cmdline);
+                }
+            }
+        }
+        assert!(
+            cmdlines.len() > 1,
+            "the session child was not found under the daemon"
+        );
+        for cmdline in &cmdlines {
+            let text = String::from_utf8_lossy(cmdline).replace('\0', " ");
+            assert!(
+                !text.contains(SECRET),
+                "a session process carries the value on its command line: {text}"
+            );
+        }
+    }
+
+    // The daemon persists the resolved value so a restart reproduces the
+    // same environment — and that record is owner-only.
+    let record_path = root.join("envn.json");
+    let record = std::fs::read_to_string(&record_path).unwrap();
+    assert!(record.contains("SEAT_TOKEN"), "record:\n{record}");
+    assert!(record.contains(SECRET), "record:\n{record}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&record_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the record persists environment values and must stay owner-only"
+        );
+    }
+
+    // A name with no inherited value refuses loudly instead of dropping it.
+    let (_out2, err2, code2) = run_pty_env(
+        &root,
+        &["run", "-d", "--id", "envx", "--env", "SEAT_ABSENT", "--", "cat"],
+        &[],
+    );
+    assert_eq!(code2, 1);
+    assert!(err2.contains("--env SEAT_ABSENT names no value"), "{err2}");
+
+    let _ = run_pty(&root, &["kill", "envn"]);
     let _ = std::fs::remove_dir_all(&root);
 }
 

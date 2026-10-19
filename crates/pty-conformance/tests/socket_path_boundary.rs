@@ -61,3 +61,89 @@ fn longest_platform_socket_path_starts_and_serves_a_session() {
         &mut || !rig.meta_path(&id).exists() && !socket.exists() && !rig.pid_path(&id).exists(),
     );
 }
+
+#[test]
+fn logical_id_longer_than_socket_budget_can_list_attach_query_and_stop() {
+    let rig = Rig::new();
+    let id = "n".repeat(120);
+    let socket = rig.socket_path(&id);
+    assert!(socket.as_os_str().len() <= SOCKET_PATH_LIMIT);
+    assert!(
+        socket
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('@')
+    );
+    let daemon = rig.daemon(&id, &["cat"], DaemonOpts::no_display_name().ephemeral());
+    let pid = daemon.pid();
+
+    let listed = rig.pty(&["list", "--json"]);
+    expect_status(&listed, 0);
+    let entries = expect_json(&listed);
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == id)
+    );
+    let stats = rig.pty(&["stats", &id, "--json"]);
+    expect_status(&stats, 0);
+    let mut client = rig.connect(&id);
+    client.attach(24, 80);
+    assert!(
+        client
+            .wait_for(MessageType::Screen, operation_budget())
+            .is_some()
+    );
+    client.detach();
+    drop(client);
+
+    let stopped = rig.pty(&["kill", &id]);
+    expect_status(&stopped, 0);
+    wait_for_process_gone(pid);
+    wait_until_for("bounded socket cleanup", operation_budget(), &mut || {
+        !rig.meta_path(&id).exists() && !socket.exists() && !rig.pid_path(&id).exists()
+    });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_daemon_records_start_identity_without_ps_on_path() {
+    let rig = Rig::new();
+    let id = "no-ps-on-path";
+    let daemon = rig.daemon(
+        id,
+        &["/bin/cat"],
+        DaemonOpts::no_display_name()
+            .ephemeral()
+            .invoke_env("PATH", "/nonexistent"),
+    );
+    let pid = daemon.pid();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.meta_path(id)).unwrap()).unwrap();
+    assert!(
+        metadata["daemonStartToken"]
+            .as_str()
+            .is_some_and(|token| token.starts_with("darwin:"))
+    );
+    let stopped = rig.pty(&["kill", id]);
+    expect_status(&stopped, 0);
+    wait_for_process_gone(pid);
+}
+
+#[test]
+fn registry_sidecar_limit_accepts_boundary_and_rejects_overflow() {
+    let rig = Rig::new();
+    let id = "s".repeat(209);
+    let daemon = rig.daemon(&id, &["cat"], DaemonOpts::no_display_name().ephemeral());
+    let pid = daemon.pid();
+    expect_status(&rig.pty(&["kill", &id]), 0);
+    wait_for_process_gone(pid);
+    let overflow = "s".repeat(210);
+    let out = rig.pty(&["run", "-d", "--id", &overflow, "--", "cat"]);
+    expect_failure(&out);
+    expect_contains(&out.stderr(), "registry sidecars (max 209 characters)");
+    assert!(!rig.meta_path(&overflow).exists());
+}

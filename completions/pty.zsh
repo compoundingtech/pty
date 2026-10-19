@@ -23,6 +23,7 @@ _pty() {
     'events:Follow event log'
     'list:List sessions'
     'ls:Alias for list'
+    'root:Report effective and native default registry roots'
     'stats:Live CPU / memory / PIDs'
     'restart:SIGTERM + respawn'
     'kill:SIGTERM a running session'
@@ -37,6 +38,7 @@ _pty() {
     'metadata:Filesystem metadata mutations by stable id'
     'readiness:Exact socket ownership and lifecycle compare-and-set'
     'evidence:Read or remove exact-generation retained exit evidence'
+    'publication-revocation:Durable exact-operation publication fence'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
     'test:Run the pty test suite (vitest)'
@@ -71,7 +73,10 @@ _pty() {
             '--isolate-env[Scrub env to a safe allow-list]' \
             '--force[Create even from inside another pty]' \
             '--startup-timeout-ms[Daemon-owned startup deadline in milliseconds]:milliseconds:' \
-            '--lifecycle-tag[Generation-fenced lifecycle tag key]:key:'
+            '--lifecycle-tag[Generation-fenced lifecycle tag key]:key:' \
+            '--publication-operation[Immutable managed operation]:operation:' \
+            '--publication-binding[Managed binding digest]:digest:' \
+            '--publication-root-id[Enrolled private root identity]:identity:'
           ;;
         attach|a)
           _arguments \
@@ -117,6 +122,7 @@ _pty() {
         list|ls)
           _arguments \
             '--json[Emit JSON]' \
+            '--strict[With --json, emit per-root inventory; exit 3 if incomplete]' \
             '--clients[With --json, include attached clients]' \
             '--tags[Include internal bookkeeping tags]' \
             '--filter-tag[Filter to k=v (repeatable, ALL match)]' \
@@ -125,6 +131,9 @@ _pty() {
             '--older-than[Only sessions older than a duration]' \
             '--newer-than[Only sessions newer than a duration]' \
             '--summary[One-line count summary instead of the list]'
+          ;;
+        root)
+          _arguments '--json[Emit root resolution as JSON]'
           ;;
         stats)
           _arguments \
@@ -201,6 +210,19 @@ _pty() {
                   '--id[Exact stable session id]:id:'
                 ;;
             esac
+          fi
+          ;;
+        publication-revocation)
+          if (( CURRENT == 3 )); then
+            _values 'action' identity install read
+          else
+            _arguments \
+              '--id[Exact stable session id]:id:' \
+              '--operation[Exact operation identity]:operation:' \
+              '--binding[Launch binding digest]:digest:' \
+              '--intent[Repair intent digest]:digest:' \
+              '--root-id[Expected enrolled registry identity]:identity:' \
+              '--json[Required structured output]'
           fi
           ;;
         evidence)

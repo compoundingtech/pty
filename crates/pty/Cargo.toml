@@ -13,6 +13,7 @@ name = "pty"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap.workspace = true
 pty-spawn = { path = "../pty-spawn" }
 libc.workspace = true
 libghostty-vt.workspace = true
@@ -30,3 +31,4 @@ signal-hook = "0.3.18"
 pty-testkit.workspace = true
 regex.workspace = true
 serde_json.workspace = true
+sha2.workspace = true

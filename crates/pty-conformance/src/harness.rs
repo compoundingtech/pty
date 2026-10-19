@@ -359,7 +359,7 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join(format!("{}.sock", self.id))
+        pty_core::registry::socket_path_in(&self.root, &self.id)
     }
 
     pub fn meta_path(&self) -> PathBuf {
@@ -800,7 +800,7 @@ impl Rig {
 
     /// Path helpers for a session id in this rig's root.
     pub fn socket_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.sock"))
+        pty_core::registry::socket_path_in(&self.root, id)
     }
 
     pub fn meta_path(&self, id: &str) -> PathBuf {
@@ -1366,6 +1366,8 @@ pub fn type_name(t: MessageType) -> &'static str {
         MessageType::AcceptedSocketOwnership => "ACCEPTED_SOCKET_OWNERSHIP",
         MessageType::LifecycleCas => "LIFECYCLE_CAS",
         MessageType::Geometry => "GEOMETRY",
+        MessageType::ResetInputModes => "RESET_INPUT_MODES",
+        MessageType::ConnectionError => "CONNECTION_ERROR",
         MessageType::History => "HISTORY",
         MessageType::Unknown(_) => "UNKNOWN",
     }

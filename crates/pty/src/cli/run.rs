@@ -9,7 +9,7 @@ use pty_core::registry::{self, EnvMap, TagMap};
 use super::{CliResult, SpawnParams};
 use pty_lifecycle::StartupLeaseOptions;
 
-/// `pty run [--id X] [--name X] [--cwd D] [--tag k=v] [--env K=V]
+/// `pty run [--id X] [--name X] [--cwd D] [--tag k=v] [--env K=V | K]
 /// [--unset-env K] [--isolate-env] [--rows R] [--cols C] -- <cmd...>`
 pub fn run(args: &[String]) -> CliResult {
     let mut id: Option<String> = None;
@@ -28,6 +28,11 @@ pub fn run(args: &[String]) -> CliResult {
     let mut unset_env: Vec<String> = Vec::new();
     let mut startup_timeout_ms: Option<u64> = None;
     let mut lifecycle_tag: Option<String> = None;
+    let mut operation_fd: Option<String> = None;
+    let mut launch_operation: Option<String> = None;
+    let mut publication_operation: Option<String> = None;
+    let mut publication_digest: Option<String> = None;
+    let mut publication_root_id: Option<String> = None;
     let mut i = 0;
     let mut command: Vec<String> = Vec::new();
     while i < args.len() {
@@ -83,6 +88,32 @@ pub fn run(args: &[String]) -> CliResult {
                 lifecycle_tag = Some(value.clone());
                 i += 2;
             }
+            // A launch operation (`pty operation`): the owner's control
+            // socket and the operation's digest, its birth marker.
+            "--operation-fd" => {
+                operation_fd = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--launch-operation" => {
+                launch_operation = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--publication-operation" | "--publication-binding" | "--publication-root-id" => {
+                let slot = match args[i].as_str() {
+                    "--publication-operation" => &mut publication_operation,
+                    "--publication-binding" => &mut publication_digest,
+                    _ => &mut publication_root_id,
+                };
+                let Some(value) = args.get(i + 1).filter(|value| !value.starts_with("--")) else {
+                    eprintln!("pty run: {} requires one value", args[i]);
+                    return Ok(64);
+                };
+                if slot.replace(value.clone()).is_some() {
+                    eprintln!("pty run: {} may be supplied only once", args[i]);
+                    return Ok(64);
+                }
+                i += 2;
+            }
             "--tag" => {
                 match args.get(i + 1).and_then(|kv| kv.split_once('=')) {
                     Some((k, v)) => {
@@ -98,19 +129,19 @@ pub fn run(args: &[String]) -> CliResult {
             }
             // An assignment whose `=` is missing or leading is rejected;
             // `KEY=` with an empty value is accepted. A repeated key keeps
-            // its first position and takes the last value.
+            // its first position and takes the last value. A bare `KEY` is
+            // the Rust-only form that reads the value from this process's
+            // environment, so a launcher can name a variable without putting
+            // its value on a command line.
             //
-            // node: src/cli.ts:811-814
+            // node: src/cli.ts:811-814 (assignment form only)
             "--env" => {
                 let tok = args.get(i + 1).cloned().unwrap_or_default();
-                match tok.find('=') {
-                    Some(eq) if eq > 0 => {
-                        extra_env.insert(tok[..eq].to_string(), tok[eq + 1..].to_string());
-                    }
-                    _ => {
-                        eprintln!("Invalid env format: \"{tok}\". Use --env KEY=VALUE");
-                        return Ok(1);
-                    }
+                if let Err(message) =
+                    insert_env_token(&mut extra_env, &tok, &|name| std::env::var_os(name))
+                {
+                    eprintln!("{message}");
+                    return Ok(1);
                 }
                 i += 2;
             }
@@ -165,6 +196,40 @@ pub fn run(args: &[String]) -> CliResult {
         );
         return Ok(1);
     }
+    let publication_binding = match (publication_operation, publication_digest, &publication_root_id) {
+        (None, None, None) => None,
+        (Some(operation), Some(digest), Some(root)) if !root.is_empty()
+            && background && !attach_existing && id.as_ref().is_some_and(|id| !id.is_empty()) => {
+            let binding = registry::revocation::PublicationBinding { operation, digest };
+            if let Err(error) = binding.validate() {
+                eprintln!("pty run: {error}");
+                return Ok(64);
+            }
+            Some(binding)
+        }
+        _ => {
+            eprintln!("pty run: publication operation, binding and root identity require each other, --id and -d; -a is not supported");
+            return Ok(64);
+        }
+    };
+    let operation = if operation_fd.is_some() || launch_operation.is_some() {
+        match operation_arguments(
+            operation_fd.as_deref(),
+            launch_operation.as_deref(),
+            id.as_deref(),
+            background,
+            attach_existing,
+            lifecycle_tag.is_some(),
+        ) {
+            Ok(operation) => Some(operation),
+            Err(message) => {
+                eprintln!("pty run: {message}");
+                return Ok(64);
+            }
+        }
+    } else {
+        None
+    };
 
     // Nesting prevention: running `pty run` from inside a pty session would
     // create a session-inside-a-session. Run the command directly unless
@@ -220,11 +285,16 @@ pub fn run(args: &[String]) -> CliResult {
     let name = id.clone().unwrap_or_else(registry::generate_id);
     if let Err(e) = registry::validate_name(&name) {
         eprintln!("{e}");
-        return Ok(1);
+        return Ok(if operation.is_some() { 64 } else { 1 });
     }
     // Under `-a` a collision with an existing session is the expected path,
-    // so the uniqueness check is left to the create step below.
-    if !attach_existing && registry::session_exists(&name) && client::is_alive(&name) {
+    // so the uniqueness check is left to the create step below. A launch
+    // operation records its own occupancy decision instead.
+    if operation.is_none()
+        && !attach_existing
+        && registry::session_exists(&name)
+        && client::is_alive(&name)
+    {
         eprintln!("Session id \"{name}\" is already in use.");
         return Ok(1);
     }
@@ -258,6 +328,8 @@ pub fn run(args: &[String]) -> CliResult {
     }
     params.ephemeral = ephemeral;
     params.tags = tags;
+    params.publication_binding = publication_binding;
+    params.publication_root_id = publication_root_id;
     params.display_name = display_name;
     params.isolate_env = isolate_env;
     params.extra_env = extra_env;
@@ -267,7 +339,48 @@ pub fn run(args: &[String]) -> CliResult {
         lifecycle_tag,
     });
 
+    if let Some((fd, digest)) = operation {
+        return super::run_operation::launch(&name, params, fd, &digest);
+    }
     create_or_attach(&name, params, cwd.is_some(), background, attach_existing)
+}
+
+/// Validate the launch-operation arguments before anything is read from the
+/// owner's descriptor. Operation mode is detached, names its session
+/// explicitly, and leaves startup to the owner's transfer, so `-a` and the
+/// startup lease do not apply.
+fn operation_arguments(
+    fd: Option<&str>,
+    digest: Option<&str>,
+    id: Option<&str>,
+    detached: bool,
+    attach: bool,
+    lifecycle_tag: bool,
+) -> Result<(i32, String), String> {
+    let (Some(fd), Some(digest)) = (fd, digest) else {
+        return Err("--operation-fd and --launch-operation are required together.".into());
+    };
+    let fd = fd
+        .parse::<i32>()
+        .ok()
+        .filter(|fd| *fd >= 3)
+        .ok_or("--operation-fd requires a descriptor number of 3 or above.")?;
+    if !pty_core::operation::is_digest(digest) {
+        return Err("--launch-operation requires 64 lowercase hex characters.".into());
+    }
+    if id.is_none_or(str::is_empty) {
+        return Err("a launch operation requires --id.".into());
+    }
+    if !detached {
+        return Err("a launch operation requires -d.".into());
+    }
+    if attach {
+        return Err("a launch operation cannot take -a.".into());
+    }
+    if lifecycle_tag {
+        return Err("a launch operation cannot take --lifecycle-tag.".into());
+    }
+    Ok((fd, digest.to_string()))
 }
 
 /// A label built from the working directory and the command, the way Node
@@ -341,16 +454,17 @@ fn create_or_attach(
     detach: bool,
     attach_existing: bool,
 ) -> CliResult {
-    // A caller that already holds the creation lock for us (the bundled
-    // library's CLI fallback) passes its pid. It is a one-hop control value,
-    // never session environment.
-    let delegated_owner: Option<i32> = std::env::var("PTY_CREATION_LOCK_OWNER_PID")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    let inherited_creation_lock =
-        delegated_owner.is_some_and(|pid| registry::is_lock_owned_by_pid(name, pid));
-    // SAFETY: single-threaded at this point.
-    unsafe { std::env::remove_var("PTY_CREATION_LOCK_OWNER_PID") };
+    // Only this CLI boundary supports the legacy external coordinator PID.
+    // The generic library and daemon require an explicit individual claim.
+    let delegated_owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(|pid| registry::lock::delegate_external_claim(name, pid).ok());
+    let inherited_creation_lock = delegated_owner.is_some();
+    // SAFETY: single-threaded at this point; these are one-hop control values.
+    unsafe {
+        std::env::remove_var("PTY_CREATION_LOCK_OWNER_PID");
+        std::env::remove_var("PTY_CREATION_LOCK_NONCE");
+    };
 
     let mut session = registry::get_session_by_name(name);
     let mut event_lock = None;
@@ -412,6 +526,10 @@ fn create_or_attach(
         .filter(|s| s.is_gone())
         .and_then(|s| s.metadata.clone());
     if let Some(previous) = &gone {
+        if params.publication_binding.is_none() && previous.publication_binding.is_some() {
+            eprintln!("pty run: recreating a managed session requires a new explicit publication binding");
+            return Ok(1);
+        }
         if !explicit_cwd && !previous.cwd.is_empty() {
             params.cwd = previous.cwd.clone();
         }
@@ -434,16 +552,30 @@ fn create_or_attach(
             params.unset_env = previous_unset.clone();
         }
     }
+    if let Err(error) = pty_lifecycle::config_for(&params).check_publication() {
+        eprintln!("pty run: {error}");
+        return Ok(1);
+    }
+    let publisher = match super::prepare_daemon(&mut params) {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            eprintln!("pty run: {error}");
+            return Ok(1);
+        }
+    };
+    params.creation_lock_delegate = match delegated_owner {
+        Some(delegate) => Some(delegate),
+        None => creation_lock.as_ref()
+            .map(registry::LockGuard::delegate)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+    };
     if gone.is_some() && !inherited_creation_lock {
         registry::cleanup_all_while_locked(name);
     }
     event_lock.take().map(registry::LockGuard::release);
 
-    params.creation_lock_owner_pid = Some(match delegated_owner {
-        Some(pid) if inherited_creation_lock => pid,
-        _ => std::process::id() as i32,
-    });
-    let spawned = super::spawn_daemon(&params);
+    let spawned = publisher.spawn(params);
     drop(creation_lock);
     if let Err(msg) = spawned {
         eprintln!("pty run: {msg}");
@@ -455,4 +587,101 @@ fn create_or_attach(
         return Ok(0);
     }
     Ok(super::attach::do_attach(name, None))
+}
+
+/// Fold one `--env` token into `extra_env`. `KEY=VALUE` assigns the value
+/// verbatim; `KEY` alone resolves the value through `inherited`, so the value
+/// travels in the process environment instead of on the command line. A key
+/// that names no inherited value is a loud refusal — never a silently dropped
+/// variable.
+fn insert_env_token(
+    extra_env: &mut EnvMap,
+    token: &str,
+    inherited: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), String> {
+    if let Some(eq) = token.find('=') {
+        if eq == 0 {
+            return Err(format!(
+                "Invalid env format: \"{token}\". Use --env KEY=VALUE or --env KEY"
+            ));
+        }
+        extra_env.insert(token[..eq].to_string(), token[eq + 1..].to_string());
+        return Ok(());
+    }
+    if token.is_empty() {
+        return Err(format!(
+            "Invalid env format: \"{token}\". Use --env KEY=VALUE or --env KEY"
+        ));
+    }
+    match inherited(token) {
+        Some(value) => {
+            extra_env.insert(token.to_string(), value.to_string_lossy().into_owned());
+            Ok(())
+        }
+        None => Err(format!(
+            "pty run: --env {token} names no value in the inherited environment; \
+             pass --env {token}=VALUE"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn an_assignment_token_sets_the_value_verbatim() {
+        let mut env = EnvMap::new();
+        insert_env_token(&mut env, "PORT=3000", &resolve(&[])).unwrap();
+        insert_env_token(&mut env, "EMPTY=", &resolve(&[])).unwrap();
+        insert_env_token(&mut env, "PORT=4000", &resolve(&[])).unwrap();
+        assert_eq!(env.get("PORT").map(String::as_str), Some("4000"));
+        assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn a_name_only_token_reads_the_inherited_value() {
+        let mut env = EnvMap::new();
+        insert_env_token(
+            &mut env,
+            "SEAT_TOKEN",
+            &resolve(&[("SEAT_TOKEN", "kept-off-argv")]),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get("SEAT_TOKEN").map(String::as_str),
+            Some("kept-off-argv")
+        );
+    }
+
+    #[test]
+    fn a_name_only_token_without_an_inherited_value_refuses_loudly() {
+        let mut env = EnvMap::new();
+        let error = insert_env_token(&mut env, "SEAT_ABSENT", &resolve(&[])).unwrap_err();
+        assert!(
+            error.contains("--env SEAT_ABSENT names no value"),
+            "{error}"
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn malformed_tokens_are_rejected() {
+        let mut env = EnvMap::new();
+        for token in ["", "=VALUE"] {
+            assert!(insert_env_token(&mut env, token, &resolve(&[])).is_err());
+        }
+        assert!(env.is_empty());
+    }
 }

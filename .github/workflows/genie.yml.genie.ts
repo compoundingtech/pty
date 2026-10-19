@@ -5,10 +5,11 @@ import {
   nixDevelopStep,
   plainFlakeJob,
 } from '../../repos/effect-utils/genie/external.ts'
-import { linuxRunner, nixSetupOptions } from './shared.ts'
+import { linuxRunner, nixSetupOptions, pullRequestConcurrency } from './shared.ts'
 
 export default githubWorkflow({
   name: 'Genie',
+  concurrency: pullRequestConcurrency,
   on: {
     pull_request: githubWorkflowEvent.all,
     push: { branches: ['main'] },
@@ -25,7 +26,7 @@ export default githubWorkflow({
       step: nixDevelopStep({
         name: 'Check generated files',
         flake: '.#genie',
-        command: ['genie', '--check'],
+        command: ['sh', '-c', 'genie --check && python3 scripts/check-workflow-policy.py'],
       }),
     }),
   },

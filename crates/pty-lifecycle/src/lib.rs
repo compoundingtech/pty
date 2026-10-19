@@ -6,6 +6,8 @@
 
 mod config;
 mod gc;
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod image_ancestry;
 mod launch;
 mod startup;
 
@@ -15,8 +17,10 @@ pub use gc::{
     Respawned, gc, prune_orphan_layout_tags,
 };
 pub use launch::{
-    DEFAULT_START_TIMEOUT, READY_FD_ENV, ReadyNotifier, SpawnError, SpawnParams, SpawnedDaemon,
-    apply_persisted_launch_options, set_process_title, spawn_daemon,
+    DEFAULT_START_TIMEOUT, GATE_FD_ENV, GatedDaemon, OPERATION_FD_ENV, OperationLaunch,
+    READY_FD_ENV, ReadyNotifier, SpawnError, SpawnParams, SpawnedDaemon,
+    PreparedDaemon, apply_persisted_launch_options, config_for, prepare_daemon, set_process_title,
+    spawn_daemon, spawn_gated_daemon,
 };
 pub use pty_core::registry::{
     LockBusy, SessionGenerationOwner, cleanup_all, cleanup_owned_all, cleanup_owned_socket,

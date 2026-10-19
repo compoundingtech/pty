@@ -272,6 +272,17 @@ impl SessionConnection {
         }
     }
 
+    /// Explicitly recover input modes after a program exits without cleaning them up.
+    /// Older daemons ignore the extension; it never writes escape bytes to the child.
+    pub fn reset_input_modes(&mut self) {
+        if let Some(socket) = self.socket.as_mut() {
+            let _ = socket.write_all(&pty_core::protocol::encode_packet(
+                pty_core::protocol::MessageType::ResetInputModes,
+                &[],
+            ));
+        }
+    }
+
     /// Send a named key (`ctrl+c`, `return`, …; see [`pty_core::keys`]).
     pub fn press(&mut self, key: &str) -> Result<(), KeyError> {
         let bytes = resolve_key(key)?;
@@ -414,7 +425,7 @@ pub fn peek_screen_bytes_in(
     name: &str,
     opts: PeekScreenOptions,
 ) -> Result<Vec<u8>, ClientError> {
-    match peek_screen_bytes_at(&root.join(format!("{name}.sock")), name, opts) {
+    match peek_screen_bytes_at(&registry::socket_path_in(root, name), name, opts) {
         Err(PeekScreenReadError::Client(
             error @ (ClientError::NotReachable { .. } | ClientError::ClosedBeforeScreen { .. }),
         )) if opts.full => retained_screen_bytes_in(root, name).ok_or(error),

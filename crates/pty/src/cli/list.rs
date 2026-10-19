@@ -125,6 +125,7 @@ fn relay_peers() -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 pub struct ListOptions {
     pub json: bool,
+    pub strict: bool,
     pub show_tags: bool,
     pub remote: bool,
     pub remote_peer: Option<String>,
@@ -211,6 +212,7 @@ pub fn run(args: &[String]) -> CliResult {
         .map(|(_, a)| a.as_str())
         .collect();
     opts.json = remaining.contains(&"--json");
+    opts.strict = remaining.contains(&"--strict");
     opts.show_tags = remaining.contains(&"--tags");
     opts.summary = remaining.contains(&"--summary");
     opts.clients = remaining.contains(&"--clients");
@@ -240,7 +242,10 @@ fn created_at(s: &SessionInfo) -> Option<&str> {
 
 /// The filtered, sorted sessions.
 fn select(opts: &ListOptions) -> Vec<SessionInfo> {
-    let mut sessions = registry::list_sessions();
+    select_sessions(registry::list_sessions(), opts)
+}
+
+fn select_sessions(mut sessions: Vec<SessionInfo>, opts: &ListOptions) -> Vec<SessionInfo> {
     if !opts.filter_tags.is_empty() {
         sessions.retain(|s| {
             matches_all_tags(
@@ -374,9 +379,10 @@ fn build_summary(sessions: &[SessionInfo]) -> Summary {
 
 /// One `list --json` element, keys in Node's order. `clients` is `None`
 /// unless `--clients` asked for it; an unknown set renders as `null`.
+/// Strict inventories additionally expose recorded generation/start identities.
 ///
 /// node: src/cli.ts:2292-2306
-fn session_json(s: &SessionInfo, clients: Option<&ClientSet>) -> Value {
+fn session_json(s: &SessionInfo, clients: Option<&ClientSet>, strict: bool) -> Value {
     let meta = s.metadata.as_ref();
     let mut m = Map::new();
     m.insert("name".into(), Value::from(s.name.as_str()));
@@ -421,6 +427,17 @@ fn session_json(s: &SessionInfo, clients: Option<&ClientSet>) -> Value {
     }
     if let Some(dn) = display_name(s) {
         m.insert("displayName".into(), Value::from(dn));
+    }
+    if strict && let Some(meta) = meta {
+        if let Some(generation) = &meta.generation {
+            m.insert("generation".into(), Value::from(generation.as_str()));
+        }
+        if let Some(token) = &meta.daemon_start_token {
+            m.insert("daemonStartToken".into(), Value::from(token.as_str()));
+        }
+        if let Some(token) = meta.process_start_token() {
+            m.insert("processStartToken".into(), Value::from(token));
+        }
     }
     Value::Object(m)
 }
@@ -476,7 +493,27 @@ fn remote_host_json(h: &RemoteHost) -> Value {
 ///
 /// node: src/cli.ts:2165-2446
 pub fn cmd_list(opts: &ListOptions) -> CliResult {
-    let sessions = select(opts);
+    if opts.strict && !opts.json {
+        return Err(CliError("--strict requires --json".to_string()));
+    }
+    if opts.strict && (opts.summary || opts.remote || opts.remote_peer.is_some()) {
+        return Err(CliError(
+            "--strict is incompatible with --summary and --remote".to_string(),
+        ));
+    }
+    let inventory = opts.strict.then(|| {
+        registry::list_sessions_strict_in(
+            &registry::session_dir(),
+            &registry::ListOptions::default(),
+        )
+    });
+    let (inventory, sessions) = match inventory {
+        Some(mut inventory) => {
+            let sessions = select_sessions(std::mem::take(&mut inventory.entries), opts);
+            (Some(inventory), sessions)
+        }
+        None => (None, select(opts)),
+    };
     let remote_hosts = if opts.remote_peer.is_some() || opts.remote {
         remote_list_hosts(opts.remote_peer.as_deref())
     } else {
@@ -513,9 +550,20 @@ pub fn cmd_list(opts: &ListOptions) -> CliResult {
             sessions
                 .iter()
                 .enumerate()
-                .map(|(i, s)| session_json(s, clients.get(i)))
+                .map(|(i, s)| session_json(s, clients.get(i), opts.strict))
                 .collect(),
         );
+        if let Some(inventory) = inventory {
+            let complete = inventory.complete;
+            let envelope = serde_json::json!({
+                "root": inventory.root.to_string_lossy(),
+                "complete": complete,
+                "entries": local,
+                "errors": inventory.errors,
+            });
+            println!("{envelope}");
+            return Ok(if complete { 0 } else { 3 });
+        }
         if opts.remote && !remote_hosts.is_empty() {
             let mut m = Map::new();
             m.insert("local".into(), local);
@@ -728,21 +776,21 @@ mod tests {
         }]);
         let running = session(SessionStatus::Running);
 
-        let json = session_json(&running, Some(&known));
+        let json = session_json(&running, Some(&known), false);
         assert_eq!(
             json["clients"],
             serde_json::json!([{"pid": 123, "tty": "/dev/pts/3", "attachedAt": "2026-09-25T12:00:00.000Z"}])
         );
         assert_eq!(
-            session_json(&running, Some(&ClientSet::Known(Vec::new())))["clients"],
+            session_json(&running, Some(&ClientSet::Known(Vec::new())), false)["clients"],
             serde_json::json!([])
         );
-        let unknown = session_json(&running, Some(&ClientSet::Unknown));
+        let unknown = session_json(&running, Some(&ClientSet::Unknown), false);
         assert!(unknown.get("clients").is_some_and(Value::is_null), "{unknown}");
         // Not requested: no key, exactly as without --clients.
-        assert!(session_json(&running, None).get("clients").is_none());
+        assert!(session_json(&running, None, false).get("clients").is_none());
         for status in [SessionStatus::Exited, SessionStatus::Vanished] {
-            assert!(session_json(&session(status), Some(&known)).get("clients").is_none());
+            assert!(session_json(&session(status), Some(&known), false).get("clients").is_none());
         }
     }
 }

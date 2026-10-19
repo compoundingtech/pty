@@ -9,6 +9,278 @@ mod cli_common;
 use cli_common::{DEAD_PID, Rig, iso_now};
 use serde_json::json;
 
+#[test]
+fn strict_requires_json_and_rejects_other_inventory_views() {
+    let rig = Rig::new();
+    for args in [
+        vec!["list", "--strict"],
+        vec!["ls", "--strict", "--clients"],
+    ] {
+        let out = rig.run(&args);
+        assert_eq!(out.code, 1);
+        assert_eq!(out.stderr, "--strict requires --json\n");
+        assert!(out.stdout.is_empty());
+    }
+    for flag in ["--summary", "--remote"] {
+        let out = rig.run(&["list", "--json", "--strict", flag]);
+        assert_eq!(out.code, 1);
+        assert_eq!(
+            out.stderr,
+            "--strict is incompatible with --summary and --remote\n"
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let out = rig.run(&["list", "--json", "--strict", "--remote", "peer"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn strict_preserves_entry_serialization_and_filters() {
+    let rig = Rig::new();
+    rig.write_meta(
+        "old",
+        json!({"createdAt": iso_now(-7_200_000), "tags": {"env": "prod"}}),
+    );
+    rig.write_meta("recent", json!({"exitCode": 0, "exitedAt": iso_now(0)}));
+    let filters = [
+        "--status",
+        "vanished",
+        "--older-than",
+        "1h",
+        "--filter-tag",
+        "env=prod",
+    ];
+    let mut ordinary = vec!["list", "--json"];
+    ordinary.extend(filters);
+    let expected = rig.ok(&ordinary).json();
+    let mut strict = vec!["ls", "--json", "--strict"];
+    strict.extend(filters);
+    let out = rig.ok(&strict);
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(rig.root));
+    assert_eq!(inventory["complete"], true);
+    assert_eq!(inventory["entries"], expected);
+    assert_eq!(inventory["errors"], json!([]));
+    assert_eq!(out.stdout.lines().count(), 1);
+}
+
+#[test]
+fn strict_retains_lifecycle_tags_and_projects_recorded_identity_only() {
+    let rig = Rig::new();
+    let rows = [
+        ("a-starting", "starting", false, Some("rust-start"), None),
+        ("b-ready", "ready", false, None, Some("node-start")),
+        ("c-terminal", "terminal", true, Some("rust-end"), Some("node-end")),
+    ];
+    let mut expected = Vec::new();
+    for (name, lifecycle, exited, daemon_token, recovery_token) in rows {
+        let generation = format!("generation-{name}");
+        let tags = json!({
+            "run.lifecycle": json!({"_tag": lifecycle, "generation": generation}).to_string(),
+            "keep": "true",
+            "team": "consumer"
+        });
+        let mut fields = json!({
+            "generation": generation,
+            "displayName": name,
+            "tags": tags,
+        });
+        if let Some(token) = daemon_token {
+            fields["daemonStartToken"] = json!(token);
+        }
+        if let Some(token) = recovery_token {
+            fields["recovery"] = json!({"processStartToken": token});
+        }
+        if exited {
+            fields["exitCode"] = json!(0);
+            fields["exitedAt"] = json!("2026-10-01T00:00:00.000Z");
+        }
+        let meta = rig.write_meta(name, fields);
+        expected.push(json!({
+            "name": name,
+            "status": if exited { "exited" } else { "vanished" },
+            "pid": null,
+            "command": meta["displayCommand"],
+            "cwd": meta["cwd"],
+            "createdAt": meta["createdAt"],
+            "exitCode": meta.get("exitCode").cloned().unwrap_or(serde_json::Value::Null),
+            "exitedAt": meta.get("exitedAt").cloned().unwrap_or(serde_json::Value::Null),
+            "tags": tags,
+            "displayName": name,
+        }));
+    }
+    let ordinary = rig.ok(&["list", "--json"]);
+    assert_eq!(
+        ordinary.stdout,
+        format!("{}\n", serde_json::to_string(&expected).unwrap())
+    );
+    let inventory = rig.ok(&["list", "--json", "--strict"]).json();
+    assert_eq!(inventory["complete"], true);
+    assert_eq!(inventory["errors"], json!([]));
+    let mut entries = inventory["entries"].as_array().unwrap().clone();
+    for (entry, (name, _, _, daemon_token, recovery_token)) in entries.iter_mut().zip(rows) {
+        let entry = entry.as_object_mut().unwrap();
+        assert_eq!(entry.shift_remove("generation"), Some(json!(format!("generation-{name}"))));
+        assert_eq!(entry.shift_remove("daemonStartToken"), daemon_token.map(|token| json!(token)));
+        assert_eq!(entry.shift_remove("processStartToken"), recovery_token.map(|token| json!(token)));
+    }
+    assert_eq!(entries, expected);
+    assert_eq!(rig.ok(&["list", "--json"]).stdout, ordinary.stdout);
+}
+
+#[test]
+fn strict_reports_full_scan_errors_even_when_entries_are_filtered_out() {
+    let rig = Rig::new();
+    rig.write_meta("good", json!({"exitCode": 0}));
+    std::fs::write(rig.path("bad.json"), "{").unwrap();
+    let out = rig.run(&["list", "--json", "--strict", "--status", "running"]);
+    assert_eq!(out.code, 3);
+    assert!(out.stderr.is_empty());
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(rig.root));
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["entries"], json!([]));
+    assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
+        error["path"] == json!(rig.path("bad.json")) && error["kind"] == "metadata-malformed"
+    }));
+    assert_eq!(
+        rig.ok(&["list", "--json", "--status", "exited"]).json()[0]["name"],
+        "good"
+    );
+}
+
+#[test]
+fn strict_missing_root_uses_global_root_and_returns_an_envelope() {
+    let rig = Rig::new();
+    let missing = rig.scratch.join("missing");
+    let out = rig.run(&[
+        "list",
+        "--json",
+        "--strict",
+        "--root",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, 3);
+    assert!(out.stderr.is_empty());
+    assert!(!missing.exists());
+    let inventory = out.json();
+    assert_eq!(inventory["root"], json!(missing));
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["entries"], json!([]));
+    assert_eq!(inventory["errors"][0]["path"], json!(missing));
+    assert_eq!(inventory["errors"][0]["kind"], "root-missing");
+}
+
+#[test]
+fn strict_refused_socket_requires_dead_pid_before_cleanup_is_allowed() {
+    let rig = Rig::new();
+    drop(std::os::unix::net::UnixListener::bind(rig.path("unknown.sock")).unwrap());
+    let out = rig.run(&["list", "--json", "--strict"]);
+    assert_eq!(out.code, 3);
+    let inventory = out.json();
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["errors"][0]["kind"], "entry-unreadable");
+    assert_eq!(inventory["entries"][0]["status"], "running");
+    assert_eq!(rig.ok(&["list", "--json"]).json()[0]["status"], "running");
+    std::fs::write(rig.path("unknown.pid"), DEAD_PID.to_string()).unwrap();
+    let inventory = rig.ok(&["list", "--json", "--strict"]).json();
+    assert_eq!(inventory["complete"], true);
+    assert_eq!(inventory["errors"], json!([]));
+    assert_eq!(inventory["entries"][0]["name"], "unknown");
+    assert_eq!(inventory["entries"][0]["status"], "vanished");
+}
+
+#[test]
+fn strict_fifo_companions_return_an_incomplete_envelope_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let rig = Rig::new();
+    // Rig's daemon teardown reads PID files. Remove these special fixtures
+    // before that teardown, even when an assertion fails.
+    struct FifoCleanup(Vec<std::path::PathBuf>);
+    impl Drop for FifoCleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let _cleanup = FifoCleanup(vec![rig.path("orphan.pid"), rig.path("record.json")]);
+    for name in ["orphan.pid", "record.json"] {
+        let path = std::ffi::CString::new(rig.path(name).as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a valid NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let mut child = rig.cmd(&["list", "--json", "--strict"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("strict list blocked on writerless FIFO companions");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stderr.is_empty());
+    let inventory: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(inventory["complete"], false);
+    assert_eq!(inventory["entries"], json!([]));
+    for (name, kind) in [("orphan.pid", "pid-unreadable"), ("record.json", "metadata-unreadable")] {
+        assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
+            error["path"] == json!(rig.path(name)) && error["kind"] == kind
+        }));
+    }
+}
+
+#[test]
+fn ordinary_list_skips_invalid_metadata_before_reading_an_orphan_pid_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let rig = Rig::new();
+    struct FifoCleanup(std::path::PathBuf);
+    impl Drop for FifoCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    std::fs::write(rig.path("bad.json"), "{").unwrap();
+    let _cleanup = FifoCleanup(rig.path("bad.pid"));
+    let path = std::ffi::CString::new(rig.path("bad.pid").as_os_str().as_bytes()).unwrap();
+    // SAFETY: the path is a valid NUL-terminated string.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    for args in [vec!["list"], vec!["list", "--json"]] {
+        let mut child = rig.cmd(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("ordinary list blocked on an orphan PID FIFO");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        if args.contains(&"--json") {
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(), json!([]));
+        }
+    }
+}
+
 /// node: tests/list-filters.test.ts:119-159, 193-210
 #[test]
 fn json_status_and_key_order() {

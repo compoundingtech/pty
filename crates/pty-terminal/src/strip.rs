@@ -14,7 +14,10 @@
 //! untouched as [`Token::Raw`]. A chunk that ends inside a candidate sequence
 //! keeps the partial bytes until the next chunk completes it (bounded: a CSI
 //! longer than [`MAX_CSI`] bytes or an OSC longer than [`MAX_OSC`] bytes is
-//! given up on and passed through).
+//! given up on and passed through). An OSC 5522 may hold up to
+//! [`crate::enhanced_paste::MAX_METADATA`] bytes, the enhanced-paste limit on
+//! request and listing metadata; while it is held, the output behind it waits
+//! too, so an unterminated `ESC ] 5522 ;` can delay up to 64 KiB of output.
 
 /// Longest CSI sequence the scanner will hold back while waiting for its
 /// final byte. Everything Node strips or tracks is far shorter.
@@ -90,7 +93,7 @@ impl Csi {
     pub fn size_query(&self) -> Option<u16> {
         if self.final_byte == b't' && self.prefix.is_none() && self.intermediates.is_empty() {
             match self.params.as_slice() {
-                [14] | [16] | [18] => Some(self.params[0]),
+                [14] | [16] | [18] | [19] => Some(self.params[0]),
                 _ => None,
             }
         } else {
@@ -109,7 +112,11 @@ impl Csi {
     /// state query, which libghostty also answers locally, and to the geometry
     /// queries answered from the session's size.
     pub fn is_stripped_query(&self) -> bool {
-        self.is_da1_query()
+        (self.prefix == Some(b'?')
+            && self.final_byte == b'm'
+            && self.intermediates.is_empty()
+            && self.params == [4])
+            || self.is_da1_query()
             || self.is_da2_query()
             || self.is_dsr_query()
             || self.is_xtversion_query()
@@ -126,6 +133,14 @@ impl Csi {
                 && self.intermediates.is_empty()
                 && self.params.is_empty())
             || self.size_query().is_some()
+    }
+
+    /// DECRQM for one DEC private mode: `CSI ? mode $ p`.
+    pub fn is_mode_query(&self, mode: u16) -> bool {
+        self.final_byte == b'p'
+            && self.prefix == Some(b'?')
+            && self.intermediates == [b'$']
+            && self.params == [mode]
     }
 
     /// Kitty keyboard push `CSI > flags u` → the pushed flags
@@ -193,6 +208,11 @@ impl Osc {
             && selection.len() <= 16
             && selection.iter().all(u8::is_ascii_alphanumeric))
         .then_some(selection)
+    }
+
+    /// A valid OSC 5522 read request (see [`crate::enhanced_paste`]).
+    pub fn enhanced_paste_read(&self) -> Option<crate::enhanced_paste::ReadRequest> {
+        crate::enhanced_paste::ReadRequest::parse(&self.payload)
     }
 
     /// The colour queries in this OSC, if any. OSC 4 can request several
@@ -397,7 +417,7 @@ impl OutputScanner {
                     }
                     _ => {
                         self.seq.push(b);
-                        if self.seq.len() > MAX_OSC + 2 {
+                        if self.seq.len() > osc_limit(&self.seq) + 2 {
                             raw.extend_from_slice(&self.seq);
                             self.seq.clear();
                             self.state = State::Ground;
@@ -429,6 +449,16 @@ impl OutputScanner {
         }
         flush_raw(&mut raw, &mut out);
         out
+    }
+}
+
+/// How long an OSC may grow before it is given up on: [`MAX_OSC`], or the
+/// enhanced-paste metadata limit for OSC 5522.
+fn osc_limit(seq: &[u8]) -> usize {
+    if seq.starts_with(b"\x1b]5522;") {
+        crate::enhanced_paste::MAX_METADATA
+    } else {
+        MAX_OSC
     }
 }
 

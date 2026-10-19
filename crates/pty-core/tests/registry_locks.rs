@@ -9,6 +9,18 @@ use std::time::Duration;
 use pty_core::registry::{self, LockBusy};
 use registry_support::{DEAD_PID, root, unique_name};
 
+static PUBLICATION_ROOT_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let _ = root();
+    // These tests race per-name locks, not initial registry enrollment.
+    // Finish the shared root's no-replace identity publication once before
+    // parallel tests inspect its strictly validated immutable record.
+    registry::revocation::root_id().expect("enroll isolated root")
+});
+
+fn claim_pid(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap().split_whitespace().next().unwrap().to_owned()
+}
+
 /// node: tests/security-fixes.test.ts:47-52
 #[test]
 fn first_caller_wins_second_refused_while_holder_alive() {
@@ -36,11 +48,7 @@ fn steals_a_stale_lock_whose_holder_is_dead() {
     std::fs::write(&lock_path, "1").unwrap();
     std::fs::write(&lock_path, DEAD_PID.to_string()).unwrap();
     let guard = registry::acquire_lock(&name).expect("stale lock must be stolen");
-    let holder: u32 = std::fs::read_to_string(&lock_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let holder: u32 = claim_pid(&lock_path).parse().unwrap();
     assert_eq!(
         holder,
         std::process::id(),
@@ -65,7 +73,7 @@ fn steals_a_read_only_stale_lock() {
 
     let guard = registry::acquire_lock(&name).expect("read-only stale lock must be stolen");
     assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
+        claim_pid(&lock_path),
         std::process::id().to_string()
     );
     drop(guard);
@@ -101,7 +109,7 @@ fn only_one_of_two_sequential_steals_wins() {
     assert_eq!(a.is_some() as u8 + b.is_some() as u8, 1);
 }
 
-/// The atomically published file is `0600` and holds only the decimal pid.
+/// The atomically published file is `0600`, with a decimal PID and claim nonce.
 ///
 /// node: src/sessions.ts:2298-2310
 #[test]
@@ -114,9 +122,13 @@ fn lock_file_mode_and_content() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
+        claim_pid(&path),
         std::process::id().to_string()
     );
+    let record = std::fs::read_to_string(&path).unwrap();
+    let nonce = record.split_whitespace().nth(1).unwrap();
+    assert_eq!(nonce.len(), 16);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
 }
 
 /// node: src/sessions.ts:2273-2281; tests/gc-generation-guard.test.ts:181-207
@@ -255,4 +267,491 @@ fn with_both_locks_takes_events_then_metadata_and_releases() {
     assert_eq!(out, 42);
     assert!(!event_lock.exists());
     assert!(!meta_lock.exists());
+}
+
+#[test]
+fn publication_pin_releases_its_own_acquired_claim() {
+    let root = root();
+    let name = unique_name("pub-own");
+    let path = root.join(format!("{name}.lock"));
+    let pin = registry::lock::pin_publication(&name, None).expect("pin acquires claim");
+    assert!(path.exists());
+    assert!(registry::acquire_lock(&name).is_none());
+    drop(pin);
+    assert!(!path.exists(), "dropping the pin releases its acquired claim");
+    let _next = registry::acquire_lock(&name).expect("next contender enters");
+}
+
+#[test]
+fn publication_pin_preserves_an_existing_owned_claim() {
+    let _ = root();
+    let name = unique_name("pub-held");
+    let claim = registry::acquire_lock(&name).expect("launcher claim");
+    let pin = claim.pin().expect("pin explicitly owned claim");
+    drop(pin);
+    assert!(claim.path().exists(), "the caller still owns its claim");
+    assert!(registry::acquire_lock(&name).is_none());
+    claim.release();
+    let _next = registry::acquire_lock(&name).expect("claim released");
+}
+
+#[test]
+fn publication_never_borrows_an_ambient_same_pid_claim() {
+    let _ = root();
+    let name = unique_name("pub-ambient");
+    let claim = registry::acquire_lock(&name).unwrap();
+    assert_eq!(registry::lock::pin_publication(&name, None).err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock);
+    assert!(registry::lock::delegate_external_claim(&name, std::process::id() as i32).is_err());
+    let mut wrong = claim.delegate().unwrap();
+    wrong.nonce.push('0');
+    assert_eq!(registry::lock::pin_publication(&name, Some(&wrong)).err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied);
+    let pin = claim.pin().unwrap();
+    assert_eq!(claim.pin().err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(registry::lock::pin_publication(&name, Some(&claim.delegate().unwrap())).err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock);
+    drop(pin);
+    let delegate = claim.delegate().unwrap();
+    claim.release();
+    let next = registry::acquire_lock(&name).unwrap();
+    assert_ne!(delegate.nonce, next.delegate().unwrap().nonce);
+    assert!(registry::lock::pin_publication(&name, Some(&delegate)).is_err());
+}
+
+#[test]
+fn an_old_guard_cannot_release_a_new_claim_with_the_same_pid() {
+    let _ = root();
+    let name = unique_name("same-pid-replaced");
+    let old = registry::acquire_lock(&name).unwrap();
+    registry::release_lock(&name);
+    let current = registry::acquire_lock(&name).unwrap();
+    assert_ne!(old.delegate().unwrap().nonce, current.delegate().unwrap().nonce);
+    drop(old);
+    assert!(current.path().exists(), "old nonce must not release the new owner");
+    let pin = current.pin().unwrap();
+    drop(pin);
+    current.release();
+}
+
+// Use a separately opened description: flock on a duplicated descriptor would
+// share the publication pin and could not prove that its lock was released.
+fn assert_publication_inode_unpinned(inode: std::fs::File) {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: `inode` owns this descriptor throughout the call. Dropping
+        // it on return also releases the test's successfully acquired flock.
+        if unsafe { libc::flock(inode.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "daemon claim must not retain a publication flock: {error}"
+        );
+    }
+}
+
+#[test]
+fn acquired_publication_pin_transfers_to_descriptor_free_daemon_claim() {
+    let root = root();
+    let name = unique_name("pub-own-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let pin = registry::lock::pin_publication(&name, None).expect("pin acquires its own claim");
+    let old_inode = std::fs::File::open(&path).expect("open pinned inode independently");
+    assert!(registry::acquire_lock(&name).is_none(), "publication owns the name");
+
+    let claim = pin.into_daemon_claim().expect("transfer publication to daemon");
+    assert_eq!(claim.path(), path.as_path());
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "transfer keeps the name claimed");
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    drop(claim);
+    assert!(!path.exists(), "dropping the daemon claim releases its name");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after daemon claim drop");
+}
+
+#[test]
+fn publication_transfer_unlocks_while_an_unrelated_fork_is_still_pre_exec() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let root = root();
+    let name = unique_name("pub-fork-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let pin = registry::lock::pin_publication(&name, None).unwrap();
+    let old_inode = std::fs::File::open(&path).unwrap();
+    let (mut control, child_control) = std::os::unix::net::UnixStream::pair().unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let spawning = std::thread::spawn(move || {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.arg("--list").stdout(std::process::Stdio::null());
+        // SAFETY: the child only uses async-signal-safe libc I/O before exec.
+        // It deliberately holds every inherited CLOEXEC descriptor until the
+        // parent releases this gate, reproducing concurrent Command::spawn.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = child_control.as_raw_fd();
+                let ready = b'F';
+                if libc::write(fd, (&raw const ready).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = 0_u8;
+                if libc::read(fd, (&raw mut release).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("exec after fork gate")
+    });
+    let mut ready = [0];
+    control.read_exact(&mut ready).expect("child reached pre-exec gate");
+    assert_eq!(ready, *b"F");
+    // SAFETY: old_inode owns this separately opened descriptor. A live pin
+    // must remain exclusive even after an unrelated child inherits its fd.
+    assert_eq!(unsafe {
+        libc::flock(old_inode.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    }, -1);
+    assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+    let claim = pin.into_daemon_claim().unwrap();
+    // No waiting or WouldBlock retry: the child still holds the inherited
+    // open file description, but the owner's lease has ended.
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+    control.write_all(b"X").unwrap();
+    assert!(spawning.join().unwrap().wait().unwrap().success());
+    drop(claim);
+    assert!(!path.exists());
+}
+
+#[test]
+fn revocation_and_publication_use_the_same_name_serialization_in_both_orders() {
+    use pty_core::registry::revocation::{self, PublicationBinding};
+
+    let _ = root();
+    let root_id = PUBLICATION_ROOT_ID.as_str();
+    let binding = PublicationBinding {
+        operation: "publication-lock-order".to_string(),
+        digest: "a".repeat(64),
+    };
+    let intent = "b".repeat(64);
+    let name = unique_name("pub-first");
+    let pin = registry::lock::pin_publication(&name, None).expect("publisher wins");
+    revocation::check(&name, Some(&binding), Some(&binding.operation)).expect("not revoked");
+    assert_eq!(
+        revocation::install(&name, &binding, &intent, root_id).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a revoker cannot enter the publisher's critical section"
+    );
+    assert!(revocation::read(&name, &binding.operation).unwrap().is_none());
+    drop(pin);
+    revocation::install(&name, &binding, &intent, root_id).expect("revoker enters after publication");
+
+    let name = unique_name("revoke-first");
+    let receipt = revocation::install(&name, &binding, &intent, root_id).expect("revoker wins");
+    let pin = registry::lock::pin_publication(&name, None).expect("late publisher pins");
+    let rejection = revocation::check(&name, Some(&binding), Some(&binding.operation)).unwrap_err();
+    assert_eq!(rejection.to_string(), "operation-revoked");
+    assert_eq!(
+        rejection.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the final check rejects the late publisher while it holds serialization"
+    );
+    assert_eq!(revocation::read(&name, &binding.operation).unwrap(), Some(receipt.record));
+    drop(pin);
+}
+
+// The owner runs in a separate process so killing and reaping it really makes
+// the PID record stale, unlike a synthetic dead-PID rewrite of a live claim.
+struct PublicationClaimOwner {
+    child: std::process::Child,
+    control: Option<std::os::unix::net::UnixStream>,
+    socket: std::path::PathBuf,
+}
+
+impl PublicationClaimOwner {
+    fn spawn(name: &str) -> Self {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let socket = root().join(unique_name("pubctl"));
+        let listener = UnixListener::bind(&socket).expect("bind owner control");
+        listener.set_nonblocking(true).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "publication_claim_owner_subprocess", "--nocapture"])
+            .env("PTY_PUBLICATION_TEST_NAME", name)
+            .env("PTY_PUBLICATION_TEST_CONTROL", &socket)
+            .env("PTY_PUBLICATION_KEEP_RELEASED_OWNER", "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn claim owner");
+        // Construct the cleanup guard before any bounded handshake can fail.
+        let mut owner = Self { child, control: None, socket };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let control = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(owner.child.try_wait().unwrap().is_none(), "owner exited before connecting");
+                    assert!(std::time::Instant::now() < deadline, "owner connection timed out");
+                    // Polling only; readiness is established by the control message.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept owner control: {error}"),
+            }
+        };
+        // BSD accepted sockets inherit the listener's O_NONBLOCK flag.
+        control.set_nonblocking(false).unwrap();
+        control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        owner.control = Some(control);
+        let mut ready = [0];
+        owner.control().read_exact(&mut ready).expect("owner acquired claim");
+        assert_eq!(ready, [b'L']);
+        owner
+    }
+
+    fn control(&mut self) -> &mut std::os::unix::net::UnixStream {
+        self.control.as_mut().expect("connected owner control")
+    }
+}
+
+impl Drop for PublicationClaimOwner {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+#[test]
+#[ignore = "subprocess helper, invoked explicitly by publication lock tests"]
+fn publication_claim_owner_subprocess() {
+    use std::io::{Read, Write};
+
+    // Deliberately do not call root(): this subprocess uses the isolated root
+    // inherited from its test parent rather than creating another registry.
+    let name = std::env::var("PTY_PUBLICATION_TEST_NAME").expect("owner name");
+    let mut control = std::os::unix::net::UnixStream::connect(
+        std::env::var_os("PTY_PUBLICATION_TEST_CONTROL").expect("owner control"),
+    ).unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let claim = registry::acquire_lock(&name).expect("subprocess acquires claim");
+    control.write_all(b"L").unwrap();
+    let mut command = [0];
+    control.read_exact(&mut command).expect("release command");
+    assert_eq!(command, [b'R']);
+    control.write_all(b"A").unwrap();
+    claim.release();
+    control.write_all(b"D").unwrap();
+    if std::env::var_os("PTY_PUBLICATION_KEEP_RELEASED_OWNER").is_some() {
+        control.read_exact(&mut command).expect("coordinator exit command");
+        assert_eq!(command, [b'X']);
+    }
+}
+
+#[test]
+fn delegated_publication_transfer_survives_old_owner_release() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let root = root();
+    let name = unique_name("pub-delegated-transfer");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let pin = registry::lock::pin_publication(&name, Some(&registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap()))
+        .expect("pin delegated owner's claim");
+    let old_inode = std::fs::File::open(&path).expect("open launcher inode independently");
+    let before = old_inode.metadata().unwrap();
+    assert_eq!(claim_pid(&path), owner.child.id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "launcher claim excludes contenders");
+
+    // Start launcher cleanup while publication still pins its inode. Cleanup
+    // must recheck both inode and expected owner after the transfer unblocks it.
+    owner.control().write_all(b"R").unwrap();
+    let mut message = [0];
+    owner.control().read_exact(&mut message).expect("owner starts release");
+    assert_eq!(message, [b'A']);
+    let claim = pin.into_daemon_claim().expect("transfer launcher claim to daemon");
+    assert_eq!(claim.path(), path.as_path());
+    let after = std::fs::metadata(&path).expect("daemon claim remains published");
+    assert_ne!(
+        (after.dev(), after.ino()),
+        (before.dev(), before.ino()),
+        "handover atomically replaces the launcher inode"
+    );
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "daemon claim excludes contenders");
+
+    owner.control().read_exact(&mut message).expect("old owner release completes");
+    assert_eq!(message, [b'D']);
+    owner.control().write_all(b"X").unwrap();
+    assert!(owner.child.wait().expect("reap released launcher").success());
+    assert_eq!(
+        claim_pid(&path),
+        std::process::id().to_string()
+    );
+    assert!(registry::acquire_lock(&name).is_none(), "old release cannot admit a contender");
+    assert_publication_inode_unpinned(old_inode);
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    drop(claim);
+    assert!(!path.exists(), "only the daemon claim releases the transferred name");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after daemon claim drop");
+}
+
+#[test]
+fn delegated_publication_claim_can_return_to_its_original_coordinator() {
+    use std::io::{Read, Write};
+
+    let root = root();
+    let name = unique_name("pub-delegated-return");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let pid = owner.child.id();
+    let delegate = registry::lock::delegate_external_claim(&name, pid as i32).unwrap();
+    let pin = registry::lock::pin_publication(&name, Some(&delegate)).unwrap();
+    assert_eq!(pin.delegate().unwrap().owner_pid, pid as i32);
+    let claim = pin.into_daemon_claim().unwrap();
+    assert_eq!(claim_pid(&path), std::process::id().to_string());
+    claim.hand_back(&delegate).expect("restore coordinator after child spawn");
+    assert_eq!(claim_pid(&path), pid.to_string());
+    assert!(registry::acquire_lock(&name).is_none(), "coordinator still owns the name");
+    assert_publication_inode_unpinned(std::fs::File::open(&path).unwrap());
+
+    owner.control().write_all(b"R").unwrap();
+    let mut messages = [0; 2];
+    owner.control().read_exact(&mut messages).unwrap();
+    assert_eq!(messages, *b"AD");
+    owner.control().write_all(b"X").unwrap();
+    assert!(owner.child.wait().unwrap().success());
+    assert!(!path.exists(), "original coordinator can release its restored claim");
+    let _next = registry::acquire_lock(&name).expect("next owner enters after coordinator release");
+}
+
+#[test]
+fn delegated_publication_pin_prevents_stale_steal_after_owner_exit() {
+    use std::os::unix::fs::MetadataExt;
+    use pty_core::registry::revocation::{self, PublicationBinding};
+
+    let root = root();
+    let root_id = PUBLICATION_ROOT_ID.as_str();
+    let name = unique_name("pub-death");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let pin = registry::lock::pin_publication(&name, Some(&registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap()))
+        .expect("pin live delegated owner's inode");
+    let before = std::fs::metadata(&path).unwrap();
+    owner.child.kill().unwrap();
+    owner.child.wait().expect("reap owner before stale recovery");
+    assert!(registry::acquire_lock(&name).is_none(), "stale stealing must respect the pin");
+    let binding = PublicationBinding {
+        operation: "owner-exit-publication".to_string(),
+        digest: "c".repeat(64),
+    };
+    assert_eq!(
+        revocation::install(&name, &binding, &"d".repeat(64), root_id).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "revocation cannot enter after owner death while publication is pinned"
+    );
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(claim_pid(&path), owner.child.id().to_string());
+    drop(pin);
+    let next = registry::acquire_lock(&name).expect("stale claim is stealable after publication");
+    next.release();
+    revocation::install(&name, &binding, &"d".repeat(64), root_id).expect("revocation enters after publication");
+}
+
+#[test]
+fn delegated_owner_release_returns_while_publication_remains_pinned() {
+    use std::io::{Read, Write};
+
+    let root = root();
+    let name = unique_name("pub-release");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let delegate = registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap();
+    let pin = registry::lock::pin_publication(&name, Some(&delegate)).unwrap();
+    owner.control().write_all(b"R").unwrap();
+    let mut messages = [0; 2];
+    owner.control().read_exact(&mut messages).expect("release completes without unpinning");
+    assert_eq!(messages, *b"AD");
+    assert!(owner.child.try_wait().unwrap().is_none(), "release is complete while coordinator stays alive");
+    assert_eq!(
+        registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "an external bridge must not reactivate the withdrawn delegation"
+    );
+    assert!(path.exists(), "pin retains serialization until cleanup");
+    assert!(registry::acquire_lock(&name).is_none());
+    drop(pin);
+    assert!(!path.exists(), "dropping pin finishes withdrawn claim cleanup");
+    let _next = registry::acquire_lock(&name).expect("withdrawn live-PID claim is not abandoned");
+}
+
+#[test]
+fn completed_release_cannot_resurrect_a_live_coordinators_claim_on_hand_back() {
+    use std::io::{Read, Write};
+
+    let root = root();
+    let name = unique_name("pub-released-return");
+    let path = root.join(format!("{name}.lock"));
+    let mut owner = PublicationClaimOwner::spawn(&name);
+    let delegate = registry::lock::delegate_external_claim(&name, owner.child.id() as i32).unwrap();
+    let pin = registry::lock::pin_publication(&name, Some(&delegate)).unwrap();
+    let claim = pin.into_daemon_claim().unwrap();
+    owner.control().write_all(b"R").unwrap();
+    let mut messages = [0; 2];
+    owner.control().read_exact(&mut messages).expect("coordinator release completed");
+    assert_eq!(messages, *b"AD");
+    assert!(owner.child.try_wait().unwrap().is_none(), "released coordinator stays alive");
+    claim.hand_back(&delegate).expect("complete hand-back after release");
+    assert!(!path.exists(), "return must not resurrect the released live-PID claim");
+    let next = registry::acquire_lock(&name).expect("name is immediately available");
+    assert!(owner.child.try_wait().unwrap().is_none(), "availability is not PID stale recovery");
+    next.release();
+    owner.control().write_all(b"X").unwrap();
+    assert!(owner.child.wait().unwrap().success());
+}
+
+#[test]
+fn local_guard_release_is_nonblocking_and_pin_drop_finishes_cleanup() {
+    let _ = root();
+    let name = unique_name("pub-local-release");
+    let claim = registry::acquire_lock(&name).unwrap();
+    let path = claim.path().to_owned();
+    let pin = claim.pin().unwrap();
+    claim.release();
+    assert!(path.exists());
+    drop(pin);
+    assert!(!path.exists());
+    let _next = registry::acquire_lock(&name).unwrap();
+}
+
+#[test]
+fn hand_back_does_not_replace_a_concurrently_pinned_daemon_claim() {
+    let _ = root();
+    let name = unique_name("pub-return-busy");
+    let coordinator = registry::acquire_lock(&name).unwrap();
+    let delegate = coordinator.delegate().unwrap();
+    let publication = registry::lock::pin_publication(&name, Some(&delegate)).unwrap();
+    let daemon = publication.into_daemon_claim().unwrap();
+    let path = daemon.path().to_owned();
+    let contender = daemon.pin().unwrap();
+    assert_eq!(daemon.hand_back(&delegate).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock);
+    assert!(path.exists(), "the competing pin retains serialization");
+    drop(contender);
+    assert!(!path.exists(), "the competing pin finishes failed-return cleanup");
+    coordinator.release();
+    let _next = registry::acquire_lock(&name).expect("failed return cannot leave a busy claim");
 }

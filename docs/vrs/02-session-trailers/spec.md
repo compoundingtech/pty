@@ -39,14 +39,16 @@ Example:
 | Ctrl+\ | attach | `[detached from <id>]` | `reattach: <attach>` |
 | Ctrl+\ | peek -f | `[detached from <id>]` | `reattach: pty peek -f [--remote <peer>] <id>` |
 | EXIT packet | attach, peek -f | `[<id> exited with code <N> after <age>]` | `restart: pty attach <id>` — local only, and only when the entry outlives the exit |
-| Clean close without EXIT | attach, peek -f | `[<id> session ended]` | none |
-| Remote route refused | attach | `[<id> session ended]` | none |
-| Remote reconnect budget exhausted | attach | `[connection lost to <id>]` | `reconnect: pty attach --remote <peer> <id>` |
+| Close without EXIT, including a truncated final frame | attach, peek -f | `[connection lost to <id>]` | `reconnect: <attach>`; exit 1 |
+| Server rejection (frame 12, payload `[0]`) | attach, peek -f | `[connection lost to <id>]` plus stderr `client too slow` reason | `reconnect: <attach>`; exit 1 |
+| Remote route refused | attach | `[connection lost to <id>]` | `reconnect: <attach>`; exit 1 |
+| Remote reconnect budget exhausted | attach | `[connection lost to <id>]` | `reconnect: <attach>`; exit 1 |
 
 - `<age>` is `format_duration(now − createdAt)` (`2h14m`, `5s`). When `createdAt` is unknown or does not parse, ` after <age>` is omitted.
 - "Outlives the exit" is `!should_reap_at_exit(tags, ephemeral, reap_on_exit_default())`: a `keep` tag, `strategy=permanent`, or `PTY_REAP_ON_EXIT` turned off (`PTY.TRL-C02`).
-- `peek -f --plain` strips ANSI from every trailer line. It omits SAN on exit and on clean close, and keeps SAN on detach.
-- A remote route refused after a malformed frame still reports `session ended`: the refusal says the session is gone.
+- `peek -f --plain` strips ANSI from every trailer line. It omits SAN on exit and on connection loss, and keeps SAN on detach.
+- A remote route refusal does not provide a child EXIT status. It reports connection loss, including after a malformed frame.
+- PTY.TRL-R11 preserves cross-runtime bytes for banners, successful detach, and received EXIT. Transport-loss diagnostics above follow the 2026-10-08 decision and PTY.TRL-R08 rather than the reference runtime's session-end wording.
 
 ## Summary line
 
@@ -86,8 +88,8 @@ remote  dial ──► list over the control path ──► row (or none) ──
 ## Ordering and suppression
 
 1. The client stops reading input and restores the tty before it writes a trailer (`PTY.TRL-R06`). In pty-rust `trailer()` calls `clean_exit()` first.
-2. After the client itself drops a connection for a malformed frame, it prints `pty client: dropping connection — …` on stderr and no `session ended` trailer (`PTY.TRL-R08`). A successful reconnect clears that state.
-3. Machine mode (`PTY.TRL-R07`): detach and EXIT print nothing extra. The remote status lines print only their header plus `\n` on stderr (`[<id> session ended]`, `[connection lost to <id>]`). A close without EXIT still reports `machine stream truncated before EXIT: connection closed`.
+2. After the client itself drops a connection for a malformed frame, it prints `pty client: dropping connection — …` on stderr and exits 1 without a session-end trailer (`PTY.TRL-R08`). A successful reconnect clears that state.
+3. Machine mode (`PTY.TRL-R07`): detach and EXIT print nothing extra. Remote status lines print only `[connection lost to <id>]\n` on stderr. A close without EXIT still reports `machine stream truncated before EXIT: connection closed`.
 
 ## Module map
 

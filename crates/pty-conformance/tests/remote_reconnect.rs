@@ -92,8 +92,9 @@ fn attach_remote_survives_a_long_outage_and_reconnects_when_the_peer_returns() {
 }
 
 /// node: tests/remote-reconnect.test.ts:215
+/// PTY.TRL-R11 (2026-10-08) excludes transport failures from cross-runtime parity.
 #[test]
-fn attach_remote_gives_up_cleanly_when_the_session_is_gone() {
+fn attach_remote_reports_the_runtime_transport_failure_contract() {
     let rig = Rig::new();
     let bridge = remote_with_shell(&rig);
     let sid = unique_id("gone-");
@@ -111,9 +112,14 @@ fn attach_remote_gives_up_cleanly_when_the_session_is_gone() {
     expect_status(&k, 0);
     std::thread::sleep(Duration::from_millis(400));
     bridge.drop_tunnels();
-    assert!(t.wait_for_text("session ended", Duration::from_secs(12)), "{:?}", t.output_str());
+    let (header, status) = if is_rust() {
+        (format!("[connection lost to {sid}]"), 1)
+    } else {
+        (format!("[{sid} session ended]"), 0)
+    };
+    assert!(t.wait_for_text(&header, Duration::from_secs(12)), "{:?}", t.output_str());
     let code = t.wait_exit(Duration::from_secs(5));
     let out = t.output_str();
-    expect_contains(&out, &format!("[{sid} session ended]"));
-    assert_eq!(code, Some(0), "attach --remote exits 0 on a refused route: {out:?}");
+    expect_contains(&out, &header);
+    assert_eq!(code, Some(status), "transport failure contract: {out:?}");
 }

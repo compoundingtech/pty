@@ -205,9 +205,7 @@ pub enum SessionEnd {
     PeekDetached,
     /// The session exited with this code.
     Exited(i32),
-    /// A remote host refused the route: the session is gone.
-    Ended,
-    /// The reconnect budget for a remote session ran out.
+    /// The attachment lost its transport without a child EXIT.
     ConnectionLost,
 }
 
@@ -238,7 +236,6 @@ pub fn trailer_header(end: SessionEnd, target: &TrailerTarget, now_ms: i64) -> S
             Some(age) => format!("[{id} exited with code {code} after {age}]"),
             None => format!("[{id} exited with code {code}]"),
         },
-        SessionEnd::Ended => format!("[{id} session ended]"),
         SessionEnd::ConnectionLost => format!("[connection lost to {id}]"),
     }
 }
@@ -254,7 +251,6 @@ fn trailer_hint(end: SessionEnd, target: &TrailerTarget) -> Option<String> {
         SessionEnd::Exited(_) => (target.peer.is_none()
             && target.summary.is_some_and(SessionSummary::kept_at_exit))
         .then(|| format!("restart: {}", target.attach_command())),
-        SessionEnd::Ended => None,
         SessionEnd::ConnectionLost => Some(format!("reconnect: {}", target.attach_command())),
     }
 }
@@ -337,10 +333,6 @@ mod tests {
         assert_eq!(
             render_trailer(SessionEnd::ConnectionLost, &target, 0),
             "\r\n[connection lost to w]\r\n  reconnect: pty attach --remote box w\r\n"
-        );
-        assert_eq!(
-            render_trailer(SessionEnd::Ended, &target, 0),
-            "\r\n[w session ended]\r\n"
         );
     }
 

@@ -18,5 +18,7 @@
 pub mod handle;
 
 pub use handle::{
-    AttachOptions, AttemptId, HandleEvent, SessionRef, SpawnOptions, TerminalHandle,
+    AttachOptions, AttemptId, Frame, FrameObserver, HandleEvent, PasteReadId, PasteRefusal,
+    PasteTarget, ReadyOutcome, SessionRef, SpawnOptions, TerminalHandle,
 };
+pub use pty_terminal::enhanced_paste::{Location, PastePacket, ReadError, ReadRequest};

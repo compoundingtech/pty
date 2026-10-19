@@ -14,9 +14,12 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
 
 use portable_pty::{CommandBuilder, MasterPty};
 use pty_spawn::PtySize;
@@ -25,17 +28,40 @@ use pty_core::protocol::{
     encode_attach_with_cell, encode_data, encode_detach, encode_peek, encode_resize,
     encode_resize_with_cell,
 };
+use pty_terminal::enhanced_paste::{
+    MAX_ANSWER, MAX_TRANSACTION, PacketError, PastePacket, ReadError, ReadRequest,
+};
 use pty_terminal::{
     CellGrid, CellSize, GraphicsOptions, GraphicsState, ImageBytes, KeyEvent, Modes,
     MouseEvent, Notification, Range, SerializeOpts, TerminalActor, TerminalEvent,
 };
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The most input one DATA packet carries.
+const INPUT_PACKET: usize = 1024 * 1024;
 
 /// Identifies one connection attempt (or the spawned child). Bumped by
 /// [`TerminalHandle::reconnect`]; frames tagged with an older id are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttemptId(pub u64);
 
-/// A session daemon to attach to: `<root>/<id>.sock`.
+/// How [`TerminalHandle::wait_ready_outcome`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadyOutcome {
+    /// The first SCREEN of the current attempt was parsed (or the session
+    /// reported EXIT); a spawned child is ready at once.
+    Ready,
+    /// The handle was closed or killed before it was ready.
+    Closed,
+    /// The current attempt's stream went away before it was ready, and no
+    /// reconnect is in flight.
+    Disconnected,
+    /// Neither happened within the timeout.
+    TimedOut,
+}
+
+/// A session daemon to attach to within a registry root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     /// The registry root (`$PTY_ROOT`).
@@ -45,9 +71,9 @@ pub struct SessionRef {
 }
 
 impl SessionRef {
-    /// `<root>/<id>.sock`.
+    /// The registry's transport address for this session id.
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join(format!("{}.sock", self.id))
+        pty_core::registry::socket_path_in(&self.root, &self.id)
     }
 }
 
@@ -113,10 +139,56 @@ impl Default for AttachOptions {
     }
 }
 
+/// One immutable, internally consistent terminal update.
+///
+/// [`TerminalHandle::frame`] reads the observed live viewport; an explicit
+/// [`TerminalHandle::request_frame`] captures a window into history. Retaining
+/// this value keeps its cells and pixels valid even when the actor replaces or
+/// deletes an image. Renderer-specific clipping and texture policy stay with
+/// the consumer.
+#[derive(Debug, Default)]
+pub struct Frame {
+    /// The actor revision this frame was captured from.
+    pub rev: u64,
+    /// Cells, cursor, geometry and buffer coordinates for this window.
+    pub grid: CellGrid,
+    /// Input and display modes from the same actor update.
+    pub modes: Modes,
+    /// Image descriptions and placement geometry for this window.
+    pub graphics: GraphicsState,
+    /// Owned pixels matching `graphics.images`, shared across unchanged
+    /// generations. Only images with placements are captured.
+    pub images: Vec<Arc<ImageBytes>>,
+}
+
+impl Frame {
+    /// Pixels for `id` from this frame, never from a newer actor generation.
+    pub fn image_bytes(&self, id: u32) -> Option<&Arc<ImageBytes>> {
+        self.images.iter().find(|image| image.desc.id == id)
+    }
+}
+
+/// An opt-in lease for automatic live frame publication.
+///
+/// Keep it while a surface needs live frames. Lifecycle subscriptions alone
+/// do not capture cells or pixels. Dropping the last lease stops future
+/// automatic captures; an already-running capture may still finish.
+#[must_use = "dropping the observer disables automatic frame publication"]
+pub struct FrameObserver {
+    shared: Arc<Shared>,
+}
+
+impl Drop for FrameObserver {
+    fn drop(&mut self) {
+        self.shared.observers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// What a subscriber hears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleEvent {
-    /// The screen changed; the new revision.
+    /// Applied terminal updates, coalesced at queue drain or the observed
+    /// publication interval. Observed frame publication precedes this event.
     Dirty(u64),
     /// The title changed (deduplicated).
     Title(String),
@@ -142,6 +214,66 @@ pub enum HandleEvent {
     /// [`TerminalHandle::reconnect`]. The screen follows as the attempt's
     /// first SCREEN, so `Connected` means "reattached", not "ready".
     Connected(AttemptId),
+    /// The child turned paste events (`?5522`, enhanced paste) on or off, as
+    /// this attempt's stream says. A SCREEN restates the mode, so a reattach
+    /// hears the program's current state. They also go off, under the
+    /// attempt that had them on, when the child exits, the stream is lost or
+    /// a reconnect replaces it: before `Exited`, `Disconnected` or
+    /// `Connected`. [`TerminalHandle::enhanced_paste`] reads the current
+    /// state.
+    EnhancedPasteMode { attempt: AttemptId, enabled: bool },
+    /// The child asked to read clipboard types. Answer it with
+    /// [`TerminalHandle::write_enhanced_paste`] under the same attempt and
+    /// [`PasteTarget::Read`] with this `read`: one read is open at a time,
+    /// and the child hears `EBUSY` for any other until this one is answered.
+    EnhancedPasteRequest {
+        attempt: AttemptId,
+        read: PasteReadId,
+        request: ReadRequest,
+    },
+}
+
+/// Names one published read. Never reused by a handle, so an answer meant
+/// for a read that has since closed can never be taken for a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PasteReadId(u64);
+
+/// What a [`TerminalHandle::write_enhanced_paste`] packet answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteTarget {
+    /// A paste the user made: a [`PastePacket::Listing`].
+    Paste,
+    /// The read published with this id: its `ReadOk`, `ReadData`,
+    /// `ReadDone` or `ReadError`.
+    Read(PasteReadId),
+}
+
+/// Why [`TerminalHandle::write_enhanced_paste`] sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteRefusal {
+    /// Not the handle's current attempt: the stream it was meant for is gone.
+    StaleAttempt,
+    /// A read-only attach writes nothing.
+    ReadOnly,
+    /// No stream to write to: disconnected, reconnecting, or the child exited.
+    Disconnected,
+    /// The handle was closed.
+    Closed,
+    /// The child has not turned paste events on.
+    ModeDisabled,
+    /// The read this answers is not the open one: it was answered, refused,
+    /// or closed by a reset, a disconnect or a reconnect.
+    StaleRead,
+    /// Data or `ReadDone` before `ReadOk`, or a second `ReadOk`.
+    OutOfOrder,
+    /// A MIME type, id or password the protocol cannot carry, an empty
+    /// listing, or a packet sent to the wrong kind of target.
+    Invalid,
+    /// Over 64 KiB of listing or 1 MiB of data in one packet.
+    PacketTooLarge,
+    /// The answer passed 32 MiB of data, or 48 MiB encoded. It was dropped
+    /// whole, and the child heard `EBUSY` in place of it.
+    TransactionTooLarge,
 }
 
 enum Msg {
@@ -152,6 +284,8 @@ enum Msg {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     Snapshot { offset: usize, reply: Sender<(u64, CellGrid)> },
+    CaptureFrame { offset: usize, reply: Sender<Arc<Frame>> },
+    ObserveFrames,
     Plain { range: Range, reply: Sender<String> },
     Serialize { opts: SerializeOpts, reply: Sender<String> },
     Graphics { offset: usize, reply: Sender<GraphicsState> },
@@ -171,7 +305,15 @@ enum Msg {
         reply: Sender<Option<Vec<u8>>>,
     },
     SetPalette(Vec<(u8, u8, u8)>),
-    Reconnect { reply: Sender<io::Result<()>> },
+    Reconnect {
+        reply: Sender<io::Result<()>>,
+    },
+    EnhancedPaste {
+        attempt: AttemptId,
+        target: PasteTarget,
+        packet: PastePacket,
+        reply: Sender<Result<(), PasteRefusal>>,
+    },
     Close,
 }
 
@@ -180,6 +322,9 @@ struct State {
     rev: u64,
     ready: bool,
     connected: bool,
+    /// A reconnect is between dropping the old stream and attaching the new
+    /// one; `connected` is false but the attempt can still become ready.
+    connecting: bool,
     closed: bool,
     exit_code: Option<i32>,
     attempt: u64,
@@ -201,6 +346,8 @@ struct Shared {
     state: Mutex<State>,
     cv: Condvar,
     subs: Mutex<Vec<Sender<HandleEvent>>>,
+    frame: ArcSwap<Frame>,
+    observers: AtomicUsize,
 }
 
 impl Shared {
@@ -228,6 +375,32 @@ struct Core {
     attempt: AttemptId,
     shared: Arc<Shared>,
     backend: Backend,
+    dirty: bool,
+    last_publish: Instant,
+    paste: PasteRead,
+    /// The last [`PasteReadId`] handed out.
+    paste_reads: u64,
+    /// The paste-events mode as of the event being published: a read is
+    /// admitted only while it is on, in stream order.
+    paste_mode: bool,
+}
+
+/// The current attempt's open read. Its answer is held until `ReadDone`,
+/// so the child never receives part of one: an answer that fails is
+/// dropped whole and replaced by an error status.
+#[derive(Default)]
+struct PasteRead {
+    open: Option<OpenRead>,
+    /// `ReadOk` and the data so far, encoded.
+    answer: Option<Vec<u8>>,
+    /// Data bytes in `answer`.
+    data: usize,
+}
+
+struct OpenRead {
+    read: PasteReadId,
+    /// The request's own `id`, echoed in every answer.
+    id: Option<String>,
 }
 
 impl Core {
@@ -239,12 +412,32 @@ impl Core {
             .rev
     }
 
-    /// Publish the actor's state to the handle side, bump the revision, and
-    /// fan out events.
+    fn capture_frame(&self, rev: u64, offset: usize) -> Frame {
+        let previous = self.shared.frame.load();
+        let graphics = self.actor.graphics_state(offset);
+        let images = graphics.images.iter().filter_map(|desc| {
+            if let Some(image) = previous.image_bytes(desc.id)
+                && image.desc == *desc
+            {
+                return Some(Arc::clone(image));
+            }
+            self.actor.image_bytes(desc.id).map(Arc::new)
+        }).collect();
+        Frame {
+            rev,
+            grid: self.actor.snapshot(offset),
+            modes: self.actor.modes(),
+            graphics,
+            images,
+        }
+    }
+
+    /// Publish cheap actor metadata, bump the revision, and fan out events.
+    /// Cell/pixel capture is separate and coalesced at the end of a burst.
     fn publish(&mut self) {
         let events = self.actor.take_events();
         let generation = self.actor.graphics_generation();
-        let (rev, graphics_changed) = {
+        let graphics_changed = {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.rev += 1;
             st.snap_cache = None;
@@ -257,7 +450,7 @@ impl Core {
             st.len = self.actor.buffer_length();
             let changed = st.graphics_generation != generation;
             st.graphics_generation = generation;
-            (st.rev, changed)
+            changed
         };
         self.shared.cv.notify_all();
         for ev in events {
@@ -266,13 +459,74 @@ impl Core {
                 TerminalEvent::TitleChange(t) => HandleEvent::Title(t),
                 TerminalEvent::Notification(n) => HandleEvent::Notification(n),
                 TerminalEvent::FocusRequest | TerminalEvent::CursorVisible => continue,
+                TerminalEvent::EnhancedPasteMode(enabled) => {
+                    if !enabled {
+                        self.paste = PasteRead::default();
+                    }
+                    self.paste_mode = enabled;
+                    HandleEvent::EnhancedPasteMode {
+                        attempt: self.attempt,
+                        enabled,
+                    }
+                }
+                TerminalEvent::EnhancedPasteRead(request) => {
+                    // Only a read made while paste events are on is ours to
+                    // answer: with the mode off nothing can be written to
+                    // it, so it must not hold the one read slot.
+                    if !self.paste_mode {
+                        continue;
+                    }
+                    if self.paste.open.is_some() {
+                        // One read at a time, as the protocol asks of
+                        // multiplexers: any other is refused now.
+                        self.refuse_read(request.id.as_deref());
+                        continue;
+                    }
+                    self.paste_reads += 1;
+                    let read = PasteReadId(self.paste_reads);
+                    self.paste.open = Some(OpenRead {
+                        read,
+                        id: request.id.clone(),
+                    });
+                    HandleEvent::EnhancedPasteRequest {
+                        attempt: self.attempt,
+                        read,
+                        request,
+                    }
+                }
             };
             self.shared.emit(ev);
         }
         if graphics_changed {
             self.shared.emit(HandleEvent::Graphics(generation));
         }
+        self.dirty = true;
+    }
+
+    /// Capture at the end of a queued burst, only for active readers or an
+    /// explicit barrier. No terminal reads or allocations while idle.
+    fn flush_frame(&mut self, force: bool) {
+        if !self.dirty && !force {
+            return;
+        }
+        let rev = self.rev();
+        if force || self.shared.observers.load(Ordering::Acquire) > 0 {
+            self.shared.frame.store(Arc::new(self.capture_frame(rev, 0)));
+            self.last_publish = Instant::now();
+        }
+        self.dirty = false;
         self.shared.emit(HandleEvent::Dirty(rev));
+    }
+
+    /// Bound observed progress while more input remains queued. The clock is
+    /// untouched for unobserved terminals and idle/unchanged batches.
+    fn flush_due(&mut self) {
+        if self.dirty
+            && self.shared.observers.load(Ordering::Acquire) > 0
+            && self.last_publish.elapsed() >= FRAME_INTERVAL
+        {
+            self.flush_frame(false);
+        }
     }
 
     fn on_output(&mut self, bytes: Vec<u8>) {
@@ -295,11 +549,13 @@ impl Core {
                 // The daemon's own terminal answers queries; a second answer
                 // from here would reach the child twice.
                 let _ = self.actor.take_pty_replies();
+                self.publish();
+                self.flush_frame(false);
                 {
                     let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.ready = true;
                 }
-                self.publish();
+                self.shared.cv.notify_all();
             }
             MessageType::Data => {
                 self.actor.write(&packet.payload);
@@ -321,16 +577,22 @@ impl Core {
     }
 
     fn on_exit(&mut self, code: i32) {
+        self.end_stream();
+        self.publish();
+        self.flush_frame(false);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.exit_code = Some(code);
             st.ready = true;
         }
-        self.publish();
+        self.shared.cv.notify_all();
         self.shared.emit(HandleEvent::Exited(code));
     }
 
     fn on_disconnected(&mut self) {
+        if self.end_stream() {
+            self.publish();
+        }
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.connected = false;
@@ -340,6 +602,135 @@ impl Core {
         }
         self.shared.cv.notify_all();
         self.shared.emit(HandleEvent::Disconnected);
+    }
+
+    /// This attempt's stream is over: the child exited, or the connection
+    /// was lost or is being replaced. Its open read can't be answered, a
+    /// partial sequence can't be finished, and paste events go off under
+    /// this attempt, so the mode reads as off until a replay restates it.
+    /// Returns whether they went off: a change for the caller to publish.
+    fn end_stream(&mut self) -> bool {
+        self.paste = PasteRead::default();
+        let enhanced_paste = self.actor.modes().enhanced_paste;
+        self.actor.end_stream();
+        enhanced_paste
+    }
+
+    /// Check a paste packet against this attempt, the stream and the mode,
+    /// here in dispatch where none of them can change underneath it.
+    fn write_paste(
+        &mut self,
+        attempt: AttemptId,
+        target: PasteTarget,
+        packet: PastePacket,
+    ) -> Result<(), PasteRefusal> {
+        if attempt != self.attempt {
+            return Err(PasteRefusal::StaleAttempt);
+        }
+        match &self.backend {
+            Backend::Attach { opts, .. } if opts.readonly => return Err(PasteRefusal::ReadOnly),
+            Backend::Attach { stream: None, .. } => return Err(PasteRefusal::Disconnected),
+            _ => {}
+        }
+        if self.state_exited() {
+            return Err(PasteRefusal::Disconnected);
+        }
+        if !self.actor.modes().enhanced_paste {
+            return Err(PasteRefusal::ModeDisabled);
+        }
+        match (target, &packet) {
+            (PasteTarget::Paste, PastePacket::Listing { .. }) => {}
+            (PasteTarget::Read(read), packet) if !matches!(packet, PastePacket::Listing { .. }) => {
+                if self
+                    .paste
+                    .open
+                    .as_ref()
+                    .is_none_or(|open| open.read != read)
+                {
+                    return Err(PasteRefusal::StaleRead);
+                }
+            }
+            _ => return Err(PasteRefusal::Invalid),
+        }
+        let id = self.paste.open.as_ref().and_then(|open| open.id.clone());
+        let encode = |packet: &PastePacket| {
+            packet.encode(id.as_deref()).map_err(|error| match error {
+                PacketError::Invalid => PasteRefusal::Invalid,
+                PacketError::TooLarge => PasteRefusal::PacketTooLarge,
+            })
+        };
+        match &packet {
+            PastePacket::Listing { .. } => {
+                let bytes = encode(&packet)?;
+                self.input(&bytes);
+            }
+            PastePacket::ReadOk => {
+                if self.paste.answer.is_some() {
+                    return Err(PasteRefusal::OutOfOrder);
+                }
+                self.paste.answer = Some(encode(&packet)?);
+            }
+            PastePacket::ReadData { data, .. } => {
+                if self.paste.answer.is_none() {
+                    return Err(PasteRefusal::OutOfOrder);
+                }
+                let held = self.paste.answer.as_ref().map_or(0, Vec::len);
+                let bytes = match encode(&packet) {
+                    Ok(bytes)
+                        if self.paste.data + data.len() <= MAX_TRANSACTION
+                            && held + bytes.len() <= MAX_ANSWER =>
+                    {
+                        bytes
+                    }
+                    Ok(_) => {
+                        self.refuse_open_read();
+                        return Err(PasteRefusal::TransactionTooLarge);
+                    }
+                    Err(refusal) => {
+                        self.refuse_open_read();
+                        return Err(refusal);
+                    }
+                };
+                self.paste.data += data.len();
+                if let Some(answer) = &mut self.paste.answer {
+                    answer.extend_from_slice(&bytes);
+                }
+            }
+            PastePacket::ReadDone => {
+                let Some(mut answer) = self.paste.answer.take() else {
+                    return Err(PasteRefusal::OutOfOrder);
+                };
+                answer.extend_from_slice(&encode(&packet)?);
+                self.paste = PasteRead::default();
+                self.input(&answer);
+            }
+            PastePacket::ReadError(_) => {
+                // Nothing of a held answer has been sent, so an error can
+                // still stand in place of its `ReadOk`.
+                let bytes = encode(&packet)?;
+                self.paste = PasteRead::default();
+                self.input(&bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the open read's answer whole and tell the child `EBUSY`.
+    fn refuse_open_read(&mut self) {
+        let id = self.paste.open.as_ref().and_then(|open| open.id.clone());
+        self.paste = PasteRead::default();
+        self.refuse_read(id.as_deref());
+    }
+
+    fn refuse_read(&mut self, id: Option<&str>) {
+        if let Ok(bytes) = PastePacket::ReadError(ReadError::Busy).encode(id) {
+            self.input(&bytes);
+        }
+    }
+
+    fn state_exited(&self) -> bool {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed || st.exit_code.is_some()
     }
 
     fn input(&mut self, data: &[u8]) {
@@ -352,7 +743,13 @@ impl Core {
                 if !opts.readonly
                     && let Some(s) = stream
                 {
-                    let _ = s.write_all(&encode_data(data));
+                    // A paste answer can outgrow one packet; the daemon
+                    // writes DATA to the child in order, so split it.
+                    for chunk in data.chunks(INPUT_PACKET) {
+                        if s.write_all(&encode_data(chunk)).is_err() {
+                            break;
+                        }
+                    }
                     let _ = s.flush();
                 }
             }
@@ -396,6 +793,16 @@ impl Core {
     }
 
     fn reconnect(&mut self) -> io::Result<()> {
+        let Backend::Attach { stream, .. } = &mut self.backend else {
+            return Err(io::Error::other("reconnect is only for attached handles"));
+        };
+        if let Some(old) = stream.take() {
+            let _ = (&old).write_all(&encode_detach());
+            let _ = old.shutdown(std::net::Shutdown::Both);
+        }
+        if self.end_stream() {
+            self.publish();
+        }
         let Backend::Attach {
             connector,
             opts,
@@ -403,27 +810,25 @@ impl Core {
             tx,
         } = &mut self.backend
         else {
-            return Err(io::Error::other("reconnect is only for attached handles"));
+            unreachable!("an attached handle, checked above");
         };
-        if let Some(old) = stream.take() {
-            let _ = (&old).write_all(&encode_detach());
-            let _ = old.shutdown(std::net::Shutdown::Both);
-        }
         self.attempt = AttemptId(self.attempt.0 + 1);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.ready = false;
             st.connected = false;
+            st.connecting = true;
             st.exit_code = None;
             st.attempt = self.attempt.0;
         }
-        let new_stream = connect_and_attach(connector.as_ref(), opts, self.attempt, tx.clone())?;
-        *stream = Some(new_stream);
+        let attached = connect_and_attach(connector.as_ref(), opts, self.attempt, tx.clone());
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.connected = true;
+            st.connecting = false;
+            st.connected = attached.is_ok();
         }
         self.shared.cv.notify_all();
+        *stream = Some(attached?);
         self.shared.emit(HandleEvent::Connected(self.attempt));
         Ok(())
     }
@@ -454,6 +859,20 @@ impl Core {
             Msg::Resize { cols, rows } => self.resize(cols, rows),
             Msg::Snapshot { offset, reply } => {
                 let _ = reply.send((self.rev(), self.actor.snapshot(offset)));
+            }
+            Msg::CaptureFrame { offset, reply } => {
+                let frame = if offset == 0 {
+                    self.flush_frame(true);
+                    self.shared.frame.load_full()
+                } else {
+                    Arc::new(self.capture_frame(self.rev(), offset))
+                };
+                let _ = reply.send(frame);
+            }
+            Msg::ObserveFrames => {
+                if self.shared.observers.load(Ordering::Acquire) > 0 {
+                    self.dirty = true;
+                }
             }
             Msg::Plain { range, reply } => {
                 let _ = reply.send(self.actor.plain(range));
@@ -527,6 +946,14 @@ impl Core {
                 self.actor.set_palette(&colors);
                 self.publish();
             }
+            Msg::EnhancedPaste {
+                attempt,
+                target,
+                packet,
+                reply,
+            } => {
+                let _ = reply.send(self.write_paste(attempt, target, packet));
+            }
             Msg::Reconnect { reply } => {
                 let r = self.reconnect();
                 let _ = reply.send(r);
@@ -546,6 +973,9 @@ impl Core {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.closed = true;
         st.connected = false;
+        // Keep registration and shutdown ordered by state, and disconnect
+        // subscribers before a waiter can observe that close has completed.
+        self.shared.subs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         drop(st);
         self.shared.cv.notify_all();
     }
@@ -553,11 +983,21 @@ impl Core {
 
 fn run(mut core: Core, rx: Receiver<Msg>) {
     core.publish();
-    while let Ok(msg) = rx.recv() {
+    core.flush_frame(false);
+    'actor: while let Ok(msg) = rx.recv() {
         if !core.dispatch(msg) {
             break;
         }
+        core.flush_due();
+        while let Ok(msg) = rx.try_recv() {
+            if !core.dispatch(msg) {
+                break 'actor;
+            }
+            core.flush_due();
+        }
+        core.flush_frame(false);
     }
+    core.flush_frame(false);
     core.shutdown();
 }
 
@@ -689,6 +1129,8 @@ impl TerminalHandle {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let attempt = AttemptId(1);
 
@@ -731,6 +1173,11 @@ impl TerminalHandle {
                 attempt,
                 shared: core_shared,
                 backend: Backend::Spawn { master, writer },
+                dirty: false,
+                last_publish: Instant::now(),
+                paste: PasteRead::default(),
+                paste_reads: 0,
+                paste_mode: false,
             };
             run(core, rx);
         });
@@ -776,6 +1223,8 @@ impl TerminalHandle {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let core_shared = shared.clone();
         let core_tx = tx.clone();
@@ -790,6 +1239,11 @@ impl TerminalHandle {
                     stream: Some(stream),
                     tx: core_tx,
                 },
+                dirty: false,
+                last_publish: Instant::now(),
+                paste: PasteRead::default(),
+                paste_reads: 0,
+                paste_mode: false,
             };
             run(core, rx);
         });
@@ -802,8 +1256,8 @@ impl TerminalHandle {
         Ok(handle)
     }
 
-    /// The actor thread publishes once before it reads any input; reads
-    /// made after construction see the terminal, not the placeholder.
+    /// Publish cheap metadata before construction returns. Frame capture is
+    /// separately opt-in and can remain at its initial revision-zero value.
     fn wait_first_publish(&self) {
         self.wait_state(Duration::from_secs(5), |st| st.rev >= 1 || st.closed);
     }
@@ -835,9 +1289,30 @@ impl TerminalHandle {
 
     /// Block until the handle is ready: a spawned child immediately; an
     /// attach once the first SCREEN of the current attempt has been parsed
-    /// (or the session reported EXIT). Returns false on timeout or close.
+    /// (or the session reported EXIT). Returns false on timeout, close or
+    /// disconnect; [`TerminalHandle::wait_ready_outcome`] says which.
     pub fn wait_ready(&self, timeout: Duration) -> bool {
-        self.wait_state(timeout, |st| st.ready) && !self.state(|st| st.closed)
+        self.wait_ready_outcome(timeout) == ReadyOutcome::Ready
+    }
+
+    /// [`TerminalHandle::wait_ready`], telling a close or a lost stream
+    /// apart from a timeout. Neither can produce a SCREEN any more, so both
+    /// return as soon as they happen instead of sleeping out `timeout`.
+    pub fn wait_ready_outcome(&self, timeout: Duration) -> ReadyOutcome {
+        let mut outcome = ReadyOutcome::TimedOut;
+        self.wait_state(timeout, |st| {
+            outcome = if st.closed {
+                ReadyOutcome::Closed
+            } else if st.ready {
+                ReadyOutcome::Ready
+            } else if !st.connected && !st.connecting {
+                ReadyOutcome::Disconnected
+            } else {
+                return false;
+            };
+            true
+        });
+        outcome
     }
 
     /// Whether the first SCREEN of the current attempt has been parsed.
@@ -885,8 +1360,57 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Resize { cols, rows });
     }
 
+    /// The last published live viewport, without asking or locking the actor.
+    ///
+    /// Keep a [`TerminalHandle::observe_frames`] lease for automatic updates.
+    /// With no observer this can be stale; before any capture it is an empty
+    /// revision-zero frame. Acquiring a lease wakes the actor, but does not
+    /// wait for its first capture. Use [`TerminalHandle::request_frame`] at
+    /// zero offset for explicit asynchronous initial/admission readiness.
+    ///
+    /// Observed updates are captured when the input queue drains, or after an
+    /// applied batch once 16 ms has elapsed since publication, before
+    /// [`HandleEvent::Dirty`]. This also advances frames during a sustained
+    /// backlog, without a timer thread. A single batch and its capture can
+    /// extend that interval; this is not a hard realtime deadline.
+    /// Slow readers can skip revisions; held frames stay valid.
+    /// Subscribe before observing to avoid missing the first notification.
+    pub fn frame(&self) -> Arc<Frame> {
+        self.shared.frame.load_full()
+    }
+
+    /// Opt in to automatic live frames until this lease is dropped.
+    ///
+    /// Lifecycle [`TerminalHandle::subscribe`] receivers do not opt in. The
+    /// first lease queues a wake-up so an idle terminal gets an initial frame.
+    /// Neither acquiring nor dropping the lease waits for the actor.
+    /// An already-buffered unobserved `Dirty` is not initial-frame readiness;
+    /// use [`TerminalHandle::request_frame`] at zero offset for that barrier.
+    pub fn observe_frames(&self) -> FrameObserver {
+        if self.shared.observers.fetch_add(1, Ordering::AcqRel) == 0 {
+            let _ = self.tx.send(Msg::ObserveFrames);
+        }
+        FrameObserver { shared: Arc::clone(&self.shared) }
+    }
+
+    /// Request one consistent viewport-sized window into history.
+    ///
+    /// This queues an actor read and returns immediately. Wait on the receiver
+    /// in a worker, or use `try_recv` from a UI. The revision and buffer
+    /// coordinates belong to the moment the actor processes the request, not
+    /// when it was queued. Zero offset forces and publishes a live capture
+    /// after messages queued before this request, even without an observer.
+    /// Closing the actor disconnects any requests it has not processed.
+    pub fn request_frame(&self, scroll_offset: usize) -> Receiver<Arc<Frame>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::CaptureFrame { offset: scroll_offset, reply });
+        rx
+    }
+
     /// The cell grid `scroll_offset` rows back into history (0 = live). The
-    /// live grid is cached per revision.
+    /// live grid is cached per revision. This explicit read can wait for the
+    /// actor; use [`TerminalHandle::frame`] with an observer for nonblocking
+    /// rendering, or [`TerminalHandle::request_frame`] for async history.
     pub fn snapshot(&self, scroll_offset: usize) -> CellGrid {
         if scroll_offset == 0 {
             let cached = self.state(|st| {
@@ -900,14 +1424,7 @@ impl TerminalHandle {
             }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::Snapshot {
-                offset: scroll_offset,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
+        if self.tx.send(Msg::Snapshot { offset: scroll_offset, reply: reply_tx }).is_err() {
             return CellGrid::default();
         }
         match reply_rx.recv() {
@@ -956,6 +1473,9 @@ impl TerminalHandle {
     ///
     /// Empty (and `enabled: false`) when the handle was built without
     /// [`SpawnOptions::graphics`] / [`AttachOptions::graphics`].
+    /// This explicit read waits for the actor.
+    /// For grid, modes and pixels from the same update, use
+    /// [`TerminalHandle::frame`] or [`TerminalHandle::request_frame`].
     pub fn graphics(&self, scroll_offset: usize) -> GraphicsState {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
@@ -1039,6 +1559,45 @@ impl TerminalHandle {
         let _ = self.tx.send(Msg::Focus(gained));
     }
 
+    /// Answer the child's paste events (`?5522`): offer a paste's MIME types
+    /// with [`PastePacket::Listing`] to [`PasteTarget::Paste`], or answer an
+    /// [`HandleEvent::EnhancedPasteRequest`] with `ReadOk`, `ReadData`...,
+    /// `ReadDone`, or a `ReadError` to [`PasteTarget::Read`] with its `read`.
+    ///
+    /// Checked in the terminal actor, in order with everything else: the
+    /// attempt must be current, the stream connected and writable, the mode
+    /// on, and the read still the open one. A read's answer is held until
+    /// `ReadDone` and sent whole; one that fails is dropped and the child
+    /// hears `EBUSY`. Nothing is ever truncated or sent as plain input.
+    ///
+    /// A read stays open until it is answered: there is no timeout, and the
+    /// child hears `EBUSY` for any other read meanwhile. A consumer that
+    /// will not serve a read (no clipboard, the user declined, the pane is
+    /// not focused) answers it with a `ReadError`; which clipboard to offer
+    /// and whether to ask the user are its decisions.
+    ///
+    /// The answer is written on the terminal actor's thread, like all
+    /// input. A child that stops reading its input holds the handle until
+    /// the write completes; an answer can be up to 32 MiB (about 44 MiB on
+    /// the wire).
+    pub fn write_enhanced_paste(
+        &self,
+        attempt: AttemptId,
+        target: PasteTarget,
+        packet: PastePacket,
+    ) -> Result<(), PasteRefusal> {
+        let (reply, answer) = mpsc::channel();
+        self.tx
+            .send(Msg::EnhancedPaste {
+                attempt,
+                target,
+                packet,
+                reply,
+            })
+            .map_err(|_| PasteRefusal::Closed)?;
+        answer.recv().unwrap_or(Err(PasteRefusal::Closed))
+    }
+
     /// Paste text, bracketed when the child asked for it. Check
     /// [`pty_terminal::input::paste_is_safe`] first if the surface wants to confirm
     /// a multi-line paste.
@@ -1048,37 +1607,49 @@ impl TerminalHandle {
 
     /// The bytes [`TerminalHandle::send_key`] would write, without writing
     /// them. Empty for an event the child should not see.
+    ///
+    /// This waits for the terminal actor with no bound. Use
+    /// [`TerminalHandle::request_encode_key`] where the wait must be
+    /// abandoned, for example when the surface is detached during a stall.
     pub fn encode_key(&self, ev: &KeyEvent) -> Vec<u8> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::EncodeKey {
-                ev: ev.clone(),
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return Vec::new();
-        }
-        reply_rx.recv().unwrap_or_default()
+        self.request_encode_key(ev).recv().unwrap_or_default()
+    }
+
+    /// Queue a key encoding and return immediately.
+    ///
+    /// The receiver yields what [`TerminalHandle::encode_key`] would return,
+    /// computed from the modes the actor holds when it processes the request,
+    /// after messages queued before it. Wait with `recv_timeout` or poll with
+    /// `try_recv`, and drop the receiver to abandon the wait. Closing the actor
+    /// disconnects a request it has not processed, so a disconnected receiver
+    /// means no encoding, the same as an empty `encode_key`.
+    pub fn request_encode_key(&self, ev: &KeyEvent) -> Receiver<Vec<u8>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::EncodeKey { ev: ev.clone(), reply });
+        rx
     }
 
     /// The bytes [`TerminalHandle::send_mouse`] would write, or `None` when
     /// the child's mode does not report this event — which is how a surface
     /// learns it may keep the wheel for its own scrolling.
+    ///
+    /// This waits for the terminal actor with no bound. Use
+    /// [`TerminalHandle::request_encode_mouse`] where the wait must be
+    /// abandoned.
     pub fn encode_mouse(&self, ev: &MouseEvent) -> Option<Vec<u8>> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Msg::EncodeMouse {
-                ev: *ev,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.recv().unwrap_or(None)
+        self.request_encode_mouse(ev).recv().unwrap_or(None)
+    }
+
+    /// Queue a mouse encoding and return immediately.
+    ///
+    /// The receiver yields what [`TerminalHandle::encode_mouse`] would return,
+    /// under the same ordering as [`TerminalHandle::request_encode_key`]. A
+    /// disconnected receiver (the actor closed first) is distinct from
+    /// `Ok(None)`, which means the child's mode does not report the event.
+    pub fn request_encode_mouse(&self, ev: &MouseEvent) -> Receiver<Option<Vec<u8>>> {
+        let (reply, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::EncodeMouse { ev: *ev, reply });
+        rx
     }
 
     /// The current revision; bumps on every change.
@@ -1087,13 +1658,19 @@ impl TerminalHandle {
     }
 
     /// Receive events. Each subscriber gets its own channel.
+    /// Closing disconnects every subscriber after any queued events are read,
+    /// even while the handle is retained. Subscribing after close returns an
+    /// already-disconnected receiver.
     pub fn subscribe(&self) -> Receiver<HandleEvent> {
         let (tx, rx) = mpsc::channel();
-        self.shared
-            .subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(tx);
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.closed {
+            self.shared
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tx);
+        }
         rx
     }
 
@@ -1156,6 +1733,16 @@ impl TerminalHandle {
     /// The current attempt id.
     pub fn attempt(&self) -> AttemptId {
         AttemptId(self.state(|st| st.attempt))
+    }
+
+    /// Whether paste events (`?5522`) are on, and the attempt that says so,
+    /// read together. Subscribe first, then read this: each later change
+    /// arrives as a [`HandleEvent::EnhancedPasteMode`]. A mode the child set
+    /// before this handle attached is on once the first SCREEN is in. It is
+    /// off once the child exits or the stream is lost, and from a reconnect
+    /// until the new SCREEN restates it.
+    pub fn enhanced_paste(&self) -> (AttemptId, bool) {
+        self.state(|st| (AttemptId(st.attempt), st.modes.enhanced_paste))
     }
 
     /// Override the first `colors.len()` palette entries (a theme).
@@ -1257,6 +1844,8 @@ mod tests {
             }),
             cv: Condvar::new(),
             subs: Mutex::new(Vec::new()),
+            frame: ArcSwap::from_pointee(Frame::default()),
+            observers: AtomicUsize::new(0),
         });
         let core = Core {
             actor: TerminalActor::new(5, 20, 0),
@@ -1268,6 +1857,11 @@ mod tests {
                 stream: None,
                 tx: tx.clone(),
             },
+            dirty: false,
+            last_publish: Instant::now(),
+            paste: PasteRead::default(),
+            paste_reads: 0,
+            paste_mode: false,
         };
         (core, tx)
     }
@@ -1335,4 +1929,42 @@ mod tests {
         assert!(core.actor.modes().cursor_hidden);
         assert_eq!(core.actor.modes().kitty_stack, vec![7]);
     }
+
+    #[test]
+    fn pending_updates_capture_on_interval_without_a_queue_drain() {
+        let (mut core, _tx) = detached_core();
+        core.shared.observers.store(1, Ordering::Release);
+        core.publish();
+        core.flush_frame(false);
+        let initial = core.shared.frame.load_full();
+        // Control the clock boundary, not thread scheduling or correctness
+        // sleeps: no interval expires during this deliberately pending burst.
+        core.last_publish = Instant::now() + Duration::from_secs(60);
+        for n in 0..1000 {
+            let mode = if n % 2 == 0 { 'l' } else { 'h' };
+            core.dispatch(Msg::Output {
+                attempt: AttemptId(1),
+                bytes: format!("\x1b[2J\x1b[H{n}\x1b[?1006{mode}").into_bytes(),
+            });
+            core.flush_due();
+            assert!(Arc::ptr_eq(&initial, &core.shared.frame.load_full()));
+        }
+        // Input has not drained; expiry alone must publish the applied tail.
+        core.last_publish = Instant::now() - FRAME_INTERVAL;
+        core.flush_due();
+        let frame = core.shared.frame.load_full();
+        assert_eq!(frame.rev, initial.rev + 1000);
+        assert_eq!(frame.grid.rows[0][..3].iter()
+            .map(|cell| cell.text.as_str()).collect::<String>(), "999");
+        assert!(frame.modes.sgr_mouse);
+        assert!(!Arc::ptr_eq(&initial, &frame));
+    }
 }
+
+#[cfg(test)]
+#[path = "frame_bench.rs"]
+mod frame_bench;
+
+#[cfg(test)]
+#[path = "handle_paste_tests.rs"]
+mod paste_tests;

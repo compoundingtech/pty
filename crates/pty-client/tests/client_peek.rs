@@ -147,6 +147,39 @@ fn follow_streams_data_and_prints_the_exit_line() {
     h.join().unwrap();
 }
 
+#[test]
+fn follow_reports_transport_loss_without_claiming_a_child_exit() {
+    // Encode tag 12 generically so the same regression compiles against the
+    // previous client, which preserves this as an unknown extension.
+    let rejection = pty_core::protocol::encode_packet(MessageType::Unknown(12), &[0]);
+    for (suffix, has_reason) in [
+        (Vec::new(), false),
+        (rejection[..3].to_vec(), false),
+        (rejection, true),
+    ] {
+        for plain in [false, true] {
+            let suffix = suffix.clone();
+            let (d, h) = daemon(move |mut socket, _| {
+                use std::io::Write;
+                socket.write_all(&encode_screen(b"live")).unwrap();
+                socket.write_all(&suffix).unwrap();
+            });
+            let name = d.name.clone();
+            let (result, out, err) = with_io(None, move |io| {
+                let mut params = PeekParams::new(&name);
+                params.plain = plain;
+                follow(params, io)
+            });
+            assert_eq!(result.unwrap(), PeekOutcome::Exited(1));
+            let out = String::from_utf8_lossy(&out);
+            assert!(out.contains("connection lost"), "{out:?}");
+            assert!(!out.contains("session ended"), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&err).contains("client too slow"), has_reason);
+            h.join().unwrap();
+        }
+    }
+}
+
 /// node: client.ts:90-103 — Ctrl+\ (one tap) detaches follow mode.
 #[test]
 fn follow_detaches_on_ctrl_backslash() {

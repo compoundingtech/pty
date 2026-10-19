@@ -247,6 +247,13 @@ pub fn mouse(term: &Terminal, modes: &Modes, ev: &MouseEvent, cell: CellSize) ->
 
     let mut encoder = mouse::Encoder::new().ok()?;
     encoder.set_options_from_terminal(term);
+    // This Ghostty revision marks every 1003 report as motion, including a wheel
+    // or button press. Normal tracking has the same press/release eligibility;
+    // use it for those events, while retaining 1003 for actual motion.
+    if ev.action != MouseAction::Motion && modes.mouse_tracking() {
+        encoder.set_tracking_mode(mouse::TrackingMode::Normal);
+    }
+
     encoder
         .set_size(mouse::EncoderSize {
             screen_width: cols * cell.width,

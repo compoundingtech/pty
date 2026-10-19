@@ -210,3 +210,28 @@ fn a_multi_line_paste_is_flagged_unsafe() {
         "a forged bracketed-paste end escapes the brackets"
     );
 }
+
+#[test]
+fn all_motion_tracking_keeps_presses_and_wheel_reports_distinct_from_motion() {
+    let mut a = actor();
+    a.write(b"\x1b[?1003h\x1b[?1006h");
+    assert_eq!(
+        a.encode_mouse(&MouseEvent::press(MouseButton::Left, 3, 4)),
+        Some(b"\x1b[<0;4;5M".to_vec())
+    );
+    assert_eq!(
+        a.encode_mouse(&MouseEvent::wheel(true, 3, 4)),
+        Some(b"\x1b[<64;4;5M".to_vec())
+    );
+    assert_eq!(
+        a.encode_mouse(&MouseEvent {
+            action: MouseAction::Motion,
+            button: None,
+            mods: Mods::empty(),
+            col: 3,
+            row: 4,
+            any_button_pressed: false
+        }),
+        Some(b"\x1b[<35;4;5M".to_vec())
+    );
+}

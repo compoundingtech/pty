@@ -11,7 +11,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pty::{AttachOptions, HandleEvent, SessionRef, SpawnOptions, TerminalHandle};
+use pty::{
+    AttachOptions, HandleEvent, Location, PastePacket, PasteRefusal, PasteTarget, ReadError,
+    SessionRef, SpawnOptions, TerminalHandle,
+};
 use pty_terminal::graphics::PLACEHOLDER;
 use pty_terminal::input::{Key, KeyEvent, MouseButton, MouseEvent};
 use pty_terminal::{GraphicsOptions, PlacementPosition, Range};
@@ -355,6 +358,125 @@ fn readonly_connector_peeks_and_prohibits_input_and_resize() {
     assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Detach);
 }
 
+/// A readiness wait ends when the handle can no longer become ready: a
+/// caller that supersedes a pending PEEK by closing it must not leave a
+/// waiter sleeping out the whole timeout for a SCREEN that will never be
+/// parsed.
+#[test]
+fn wait_ready_returns_when_the_handle_closes_before_the_first_screen() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let h = Arc::new(TerminalHandle::attach_with_connector(
+        move || client.try_clone(),
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector"));
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+    // The daemon never answers; the caller gives up on this PEEK at 100 ms.
+    let closer = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            h.close();
+        })
+    };
+    let started = Instant::now();
+    let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+    let waited = started.elapsed();
+    closer.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Closed);
+    assert!(waited < Duration::from_secs(2), "waited {waited:?} after close");
+    assert!(!h.wait_ready(Duration::from_secs(10)), "a closed handle is never ready");
+    assert_eq!(h.wait_ready_outcome(Duration::from_secs(10)), ReadyOutcome::Closed);
+}
+
+#[test]
+fn wait_ready_returns_when_the_daemon_hangs_up_before_the_first_screen() {
+    use std::os::unix::net::UnixStream;
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let h = TerminalHandle::attach_with_connector(
+        move || client.try_clone(),
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector");
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+    let hangup = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(daemon);
+    });
+    let started = Instant::now();
+    let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+    let waited = started.elapsed();
+    hangup.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Disconnected);
+    assert!(waited < Duration::from_secs(2), "waited {waited:?} after hang-up");
+    assert!(!h.is_ready());
+}
+
+/// A reconnect in flight is not a disconnect: its new attempt can still
+/// become ready. Once that reconnect fails, the waiter learns it at once.
+#[test]
+fn wait_ready_holds_through_a_reconnect_and_returns_when_it_fails() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc, Arc};
+    use pty::ReadyOutcome;
+    use pty_core::protocol::MessageType;
+
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let calls = AtomicUsize::new(0);
+    let h = Arc::new(TerminalHandle::attach_with_connector(
+        move || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return client.try_clone();
+            }
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            Err(std::io::Error::other("daemon is gone"))
+        },
+        AttachOptions { readonly: true, ..Default::default() },
+    ).expect("readonly connector"));
+    assert_eq!(read_protocol_packet(&mut daemon).type_, MessageType::Peek);
+
+    let reconnect = {
+        let h = h.clone();
+        std::thread::spawn(move || h.reconnect())
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).expect("reconnect reached the connector");
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let waiter = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            let outcome = h.wait_ready_outcome(Duration::from_secs(10));
+            outcome_tx.send((outcome, Instant::now())).unwrap();
+        })
+    };
+    assert!(
+        outcome_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a reconnect in flight must not end the wait"
+    );
+
+    let failed_at = Instant::now();
+    release_tx.send(()).unwrap();
+    assert!(reconnect.join().unwrap().is_err());
+    let (outcome, returned_at) = outcome_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a failed reconnect wakes the waiter");
+    waiter.join().unwrap();
+    assert_eq!(outcome, ReadyOutcome::Disconnected);
+    assert!(returned_at >= failed_at);
+}
+
 /// node-daemon-protocol-disk.md §1.12 / conformance fixture "attach identity
 /// with a replacement under the same id": `--id a`, exit, `--id a` again — a
 /// reconnect reaches the replacement, and nothing from the old daemon (its
@@ -622,6 +744,185 @@ fn attach_to_missing_session_is_an_error() {
         AttachOptions::default(),
     );
     assert!(r.is_err());
+}
+
+// ── enhanced paste against the Rust daemon ──
+
+/// `image/png text/plain`, base64.
+const PNG_AND_TEXT: &str = "aW1hZ2UvcG5nIHRleHQvcGxhaW4=";
+
+/// Wait for the daemon's own terminal to show `needle`, before any handle
+/// attaches: what the child printed by then can only reach a handle
+/// through the replay.
+fn wait_peek(rig: &Rig, id: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, out, _) = rig.pty(&["peek", "--plain", id]);
+        if out.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never showed {needle:?}: {out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Paste events the program turned on before this handle attached are on
+/// once the first SCREEN is in, under the first attempt.
+#[test]
+fn paste_events_set_before_the_attach_are_on_with_the_first_screen() {
+    let rig = Rig::new();
+    rig.run("p", "printf '\\033[?5522hREADY\\n'; exec sleep 60");
+    wait_peek(&rig, "p", "READY");
+    let h = TerminalHandle::attach(rig.session("p"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    assert_eq!(h.enhanced_paste(), (h.attempt(), true));
+    h.kill();
+    rig.kill("p");
+}
+
+/// A read the program made before this handle attached is history. It is
+/// not replayed, so the one read slot is free: the program's next read is
+/// published and answered, and the program hears that answer, not `EBUSY`.
+#[test]
+fn a_read_made_before_the_attach_is_never_delivered() {
+    let rig = Rig::new();
+    let answer = rig.root.join("answer");
+    let denied = PastePacket::ReadError(ReadError::Denied)
+        .encode(Some("new"))
+        .unwrap();
+    let script = format!(
+        "stty raw -echo; \
+         printf '\\033[?5522h\\033]5522;type=read:id=old;{PNG_AND_TEXT}\\033\\\\READY\\r\\n'; \
+         dd bs=1 count=1 >/dev/null 2>&1; \
+         printf '\\033]5522;type=read:id=new;{PNG_AND_TEXT}\\033\\\\'; \
+         dd bs=1 count={} of='{}' 2>/dev/null; exec sleep 60",
+        denied.len(),
+        answer.display()
+    );
+    rig.run("r", &script);
+    wait_peek(&rig, "r", "READY");
+    let h = TerminalHandle::attach(rig.session("r"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    let events = h.subscribe();
+    h.write(b"x");
+    let (attempt, read) = loop {
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(HandleEvent::EnhancedPasteRequest {
+                attempt,
+                read,
+                request,
+            }) => {
+                assert_eq!(request.id.as_deref(), Some("new"));
+                break (attempt, read);
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the program's new read was never published: {e}"),
+        }
+    };
+    h.write_enhanced_paste(
+        attempt,
+        PasteTarget::Read(read),
+        PastePacket::ReadError(ReadError::Denied),
+    )
+    .expect("answer the read");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::metadata(&answer).map_or(0, |m| m.len()) < denied.len() as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "the program never heard the answer"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read(&answer).unwrap(), denied);
+    h.kill();
+    rig.kill("r");
+}
+
+/// A reconnect turns paste events off under the old attempt, and the new
+/// attempt's SCREEN turns them on again; the old attempt can no longer
+/// write. Losing the session turns them off under the new attempt.
+#[test]
+fn a_reconnect_turns_paste_events_off_then_restates_them() {
+    let rig = Rig::new();
+    rig.run("c", "printf '\\033[?5522hREADY\\n'; exec sleep 60");
+    let h = TerminalHandle::attach(rig.session("c"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    wait_text(&h, "READY");
+    let first = h.attempt();
+    assert_eq!(h.enhanced_paste(), (first, true));
+    let events = h.subscribe();
+
+    h.reconnect().expect("reconnect");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    let second = h.attempt();
+    assert_ne!(first, second);
+    assert_eq!(h.enhanced_paste(), (second, true));
+    let paste_and_lifecycle =
+        |events: &std::sync::mpsc::Receiver<HandleEvent>| -> Vec<HandleEvent> {
+            events
+                .try_iter()
+                .filter(|ev| {
+                    matches!(
+                        ev,
+                        HandleEvent::EnhancedPasteMode { .. }
+                            | HandleEvent::Connected(_)
+                            | HandleEvent::Disconnected
+                            | HandleEvent::Exited(_)
+                    )
+                })
+                .collect()
+        };
+    assert_eq!(
+        paste_and_lifecycle(&events),
+        [
+            HandleEvent::EnhancedPasteMode {
+                attempt: first,
+                enabled: false
+            },
+            HandleEvent::Connected(second),
+            HandleEvent::EnhancedPasteMode {
+                attempt: second,
+                enabled: true
+            },
+        ]
+    );
+    let listing = PastePacket::Listing {
+        location: Location::Clipboard,
+        password: None,
+        mimes: vec!["text/plain".into()],
+    };
+    assert_eq!(
+        h.write_enhanced_paste(first, PasteTarget::Paste, listing),
+        Err(PasteRefusal::StaleAttempt)
+    );
+
+    rig.kill("c");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.connected() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(h.enhanced_paste(), (second, false));
+    let ended = paste_and_lifecycle(&events);
+    assert_eq!(
+        ended.first(),
+        Some(&HandleEvent::EnhancedPasteMode {
+            attempt: second,
+            enabled: false
+        }),
+        "off before the end is announced: {ended:?}"
+    );
+    assert_eq!(
+        ended
+            .iter()
+            .filter(|ev| matches!(ev, HandleEvent::EnhancedPasteMode { .. }))
+            .count(),
+        1,
+        "{ended:?}"
+    );
+    h.kill();
 }
 
 // ── input reaches the child ──

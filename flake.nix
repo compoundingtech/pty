@@ -48,9 +48,10 @@
         ghosttyRev = ghosttyContract.ghosttyRev;
         ghosttyShortRev = lib.substring 0 7 ghosttyRev;
 
-        ghosttySrc = pkgs.fetchgit {
+        ghosttySrc = pkgs.fetchFromGitHub {
           name = "ghostty-${ghosttyShortRev}-src";
-          url = "https://github.com/ghostty-org/ghostty.git";
+          owner = "ghostty-org";
+          repo = "ghostty";
           rev = ghosttyRev;
           hash = ghosttyContract.sourceHash;
         };

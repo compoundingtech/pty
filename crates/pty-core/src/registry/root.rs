@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sha2::{Digest, Sha256};
+
 /// Largest pathname, excluding its trailing NUL, that the supported platform
 /// can represent in `sockaddr_un.sun_path`.
 pub const SUN_PATH_MAX: usize = if cfg!(target_os = "macos") { 103 } else { 104 };
@@ -72,6 +74,28 @@ pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Where the effective registry root was selected. CLI `--root` provenance
+/// is tracked by the dispatcher, which exports its value as `PTY_ROOT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// An embedding application's thread-local [`with_root`] override.
+    Scoped,
+    PtyRoot,
+    PtySessionDir,
+    Default,
+}
+
+impl RootSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scoped => "scoped",
+            Self::PtyRoot => "PTY_ROOT",
+            Self::PtySessionDir => "PTY_SESSION_DIR",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// Resolve the session registry directory: the root of an enclosing
 /// [`with_root`] on this thread, else `$PTY_ROOT`, else the deprecated
 /// `$PTY_SESSION_DIR` (with a one-time notice on stderr unless
@@ -79,8 +103,14 @@ pub fn with_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
 ///
 /// node: src/sessions.ts:82-110
 pub fn session_dir() -> PathBuf {
+    resolve_session_dir().0
+}
+
+/// Resolve the effective registry path and its source without touching the
+/// registry. Paths are returned as selected, never canonicalized.
+pub fn resolve_session_dir() -> (PathBuf, RootSource) {
     if let Some(root) = SCOPED_ROOT.with(|scoped| scoped.borrow().clone()) {
-        return root;
+        return (root, RootSource::Scoped);
     }
     let root = env_non_empty("PTY_ROOT");
     let legacy = env_non_empty("PTY_SESSION_DIR");
@@ -95,7 +125,7 @@ pub fn session_dir() -> PathBuf {
                 "pty: both PTY_ROOT and PTY_SESSION_DIR are set — using PTY_ROOT ({root}); PTY_SESSION_DIR ({legacy}) is ignored (deprecated). For isolation, set PTY_ROOT."
             );
         }
-        return PathBuf::from(root);
+        return (PathBuf::from(root), RootSource::PtyRoot);
     }
     if let Some(legacy) = legacy {
         if !silent && !WARNED_LEGACY_ROOT_ENV.swap(true, Ordering::SeqCst) {
@@ -104,12 +134,18 @@ pub fn session_dir() -> PathBuf {
                 "pty: PTY_SESSION_DIR is deprecated; use PTY_ROOT (same shape, canonical name)."
             );
         }
-        return PathBuf::from(legacy);
+        return (PathBuf::from(legacy), RootSource::PtySessionDir);
     }
-    default_session_dir()
+    (default_session_dir(), RootSource::Default)
 }
 
 /// Create the session dir (mode 0700) if missing.
+///
+/// An existing root is left exactly as its owner set it — chmod would follow
+/// a symlinked root and change its target. The files under it are owner-only
+/// from their creating open ([`super::atomic::atomic_write`]), so a root
+/// someone deliberately shares stays shared while its records stay
+/// owner-only.
 ///
 /// node: src/sessions.ts:112-114
 pub fn ensure_session_dir() -> std::io::Result<PathBuf> {
@@ -122,9 +158,60 @@ pub fn ensure_session_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to a session's unix socket, `<root>/<name>.sock`.
+/// Path to a session's unix socket within the effective registry.
 pub fn socket_path(name: &str) -> PathBuf {
-    session_dir().join(format!("{name}.sock"))
+    socket_path_in(&session_dir(), name)
+}
+
+/// Preserve a published socket's filename across differently spelled registry
+/// roots. For a new session, preserve a readable address when it fits.
+/// `@` cannot occur in an id, so the digest namespace cannot alias a readable
+/// session's socket.
+pub fn socket_path_in(root: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::FileTypeExt;
+
+    let readable = root.join(format!("{name}.sock"));
+    let digest = Sha256::digest(name.as_bytes());
+    let mut filename = String::from("@");
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        write!(filename, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    filename.push_str(".sock");
+    let bounded = root.join(&filename);
+    // A registry can be reached through both a short path and a longer
+    // symlink. The listener, not the caller's root spelling, owns its basename.
+    // Ignore regular-file and symlink debris; never follow it as a socket.
+    let is_socket = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+    };
+    let published_bounded = is_socket(&bounded);
+    if published_bounded || is_socket(&readable) {
+        let path = if published_bounded { bounded } else { readable };
+        if path.as_os_str().len() > SUN_PATH_MAX {
+            // Try the explicit alias target before canonicalization: on some
+            // platforms a conventional short prefix is itself a symlink.
+            let target = std::fs::read_link(root).ok().map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    root.parent().unwrap_or(Path::new(".")).join(target)
+                }
+            });
+            for real_root in target.into_iter().chain(root.canonicalize().ok()) {
+                let real_path = real_root.join(path.file_name().expect("socket has a filename"));
+                if real_path.as_os_str().len() <= SUN_PATH_MAX {
+                    return real_path;
+                }
+            }
+        }
+        return path;
+    }
+    if readable.as_os_str().len() <= SUN_PATH_MAX {
+        readable
+    } else {
+        bounded
+    }
 }
 
 /// Path to a session's pid file, `<root>/<name>.pid`.
@@ -206,6 +293,86 @@ mod tests {
     }
 
     #[test]
+    fn bounded_socket_preserves_readable_paths_and_session_identity() {
+        let root = PathBuf::from(format!("/tmp/{}", "r".repeat(58)));
+        let id = "n".repeat(63);
+        let socket = socket_path_in(&root, &id);
+        assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
+        assert_eq!(socket, socket_path_in(&root, &id));
+        assert_ne!(socket, socket_path_in(&root, &format!("{id}.replacement")));
+        assert!(
+            socket.file_name().unwrap().to_string_lossy().starts_with('@')
+        );
+        assert_eq!(socket_path_in(&root, "short"), root.join("short.sock"));
+        with_root(&root, || {
+            assert!(super::super::names::validate_name(&id).is_ok());
+            assert!(
+                super::super::names::validate_name(socket.file_stem().unwrap().to_str().unwrap())
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn published_socket_survives_differently_sized_root_aliases() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let base = PathBuf::from(format!(
+            "/tmp/pty-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("r");
+        let alias = base.join("long-registry-alias");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        let id = "a".repeat(SUN_PATH_MAX - real.as_os_str().len() - 6);
+        let bounded = socket_path_in(&alias, &id);
+        assert!(bounded.file_name().unwrap().to_str().unwrap().starts_with('@'));
+        let listener = UnixListener::bind(&bounded).unwrap();
+        let from_real = socket_path_in(&real, &id);
+        assert_eq!(from_real.file_name(), bounded.file_name());
+        let stream = UnixStream::connect(&from_real).unwrap();
+        drop(stream);
+        let pid_file = real.join(format!("{id}.pid"));
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let inventory = super::super::list_sessions_strict_in(
+            &real,
+            &super::super::ListOptions::default(),
+        );
+        assert!(inventory.complete, "{:?}", inventory.errors);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].socket_path, from_real);
+        std::fs::remove_file(pid_file).unwrap();
+        drop(listener);
+        std::fs::remove_file(&bounded).unwrap();
+
+        let readable = socket_path_in(&real, &id);
+        assert_eq!(readable.file_name().unwrap(), format!("{id}.sock").as_str());
+        let listener = UnixListener::bind(&readable).unwrap();
+        let from_alias = socket_path_in(&alias, &id);
+        assert_eq!(from_alias.file_name(), readable.file_name());
+        assert!(from_alias.as_os_str().len() <= SUN_PATH_MAX);
+        let stream = UnixStream::connect(&from_alias).unwrap();
+        drop(stream);
+        let inventory = super::super::list_sessions_strict_in(
+            &alias,
+            &super::super::ListOptions::default(),
+        );
+        assert!(inventory.complete, "{:?}", inventory.errors);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].socket_path, from_alias);
+        let stream = UnixStream::connect(&inventory.entries[0].socket_path).unwrap();
+        drop(stream);
+        drop(listener);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn shared_home_default_child() {
         let Ok(home) = std::env::var("PTY_TEST_SHARED_HOME_DEFAULT") else {
             return;
@@ -268,5 +435,35 @@ mod tests {
         let scoped = Path::new("/tmp/pty-scoped-root-thread");
         let elsewhere = with_root(scoped, || std::thread::spawn(session_dir).join().unwrap());
         assert_ne!(elsewhere, scoped);
+    }
+
+    /// An existing root is never chmod'd — tightening would follow a symlinked
+    /// root and change its target. Owner-only records come from the creating
+    /// open, not from the directory.
+    #[test]
+    fn an_existing_root_keeps_its_mode_even_through_a_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!(
+                "pty-existing-root-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let target = base.join("target");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            with_root(&link, || {
+                ensure_session_dir().unwrap();
+            });
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "the symlinked root's target must keep its mode");
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

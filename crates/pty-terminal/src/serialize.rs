@@ -25,9 +25,10 @@ use crate::graphics::{self, CellSize};
 /// What a replay should carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerializeOpts {
-    /// Prefix `ESC[?1049h` when the child is in the alternate screen. Node
-    /// does this for ATTACH only, never for PEEK (a one-shot peek printed to
-    /// the caller's shell must not switch buffers).
+    /// Prefix `ESC[?1049h` when the child is in the alternate screen, and
+    /// carry paste events (`?5522h`) when the child set them. Node does this
+    /// for ATTACH only, never for PEEK (a one-shot peek printed to the
+    /// caller's shell must not switch buffers or change how it pastes).
     pub include_alt_screen_prefix: bool,
     /// Include scrollback rows (ATTACH and `peek --full`) or only the
     /// viewport (plain `peek`, `serialize({scrollback: 0})`).
@@ -105,6 +106,12 @@ pub fn mode_prefix(modes: &Modes, include_alt_screen: bool) -> String {
 pub fn serialize_for_replay(actor: &TerminalActor, opts: SerializeOpts) -> String {
     let modes = actor.modes();
     let mut out = mode_prefix(&modes, opts.include_alt_screen_prefix);
+    // Paste events, which Node never tracked, for ATTACH only: like the
+    // alternate screen, a peek printed to the caller's shell must not change
+    // how that terminal pastes.
+    if opts.include_alt_screen_prefix && modes.enhanced_paste {
+        out.push_str("\x1b[?5522h");
+    }
     out.push_str(&dynamic_color_prefix(actor.terminal()));
     if let Some(normal) = actor.normal_replay() {
         if opts.include_alt_screen_prefix && modes.alt_screen {
@@ -458,11 +465,13 @@ mod tests {
             bracketed_paste: true,
             focus_events: true,
             kitty_stack: vec![7, 1],
-            // Neither of these reaches the prefix: Node does not track them,
+            // None of these reaches the prefix: Node does not track them,
             // and a replay must not tell the client's terminal to turn a mode
-            // on that the daemon's own prefix never carried.
+            // on that the daemon's own prefix never carried. Paste events
+            // follow the prefix in an ATTACH replay only.
             mouse_9: true,
             app_cursor: true,
+            enhanced_paste: true,
         };
         assert_eq!(
             mode_prefix(&m, true),

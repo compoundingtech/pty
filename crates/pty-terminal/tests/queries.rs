@@ -130,3 +130,58 @@ fn clipboard_read_reaches_an_attached_terminal() {
     assert_eq!(a.write(b"\x1b]52;c;?\x07"), b"\x1b]52;c;?\x07");
     assert!(a.take_pty_replies().is_empty());
 }
+
+#[test]
+fn screen_cell_query_reports_the_virtual_surface_without_leaking_to_clients() {
+    let mut a = actor();
+    assert_eq!(a.write(b"\x1b[19t"), b"");
+    assert_eq!(a.take_pty_replies(), b"\x1b[9;24;80t");
+}
+
+#[test]
+fn input_recovery_retains_history_and_clears_both_screen_keyboard_stacks() {
+    let mut a = actor();
+    a.write(b"copper history\r\n\x1b[>27u\x1b[?1049h\x1b[>31u\x1b[?1003h\x1b[?1016h\x1b[?2004h\x1b[>4;2m");
+    let output = a.reset_input_modes();
+    assert!(!output.is_empty());
+    assert!(!a.modes().mouse_reporting());
+    assert!(!a.modes().bracketed_paste);
+    assert_eq!(a.kitty_flags(), 0);
+    assert!(a.modes().kitty_stack.is_empty());
+    assert!(a.plain(Range::Full).contains("copper history"));
+    a.write(b"\x1b[?1049h");
+    assert_eq!(a.kitty_flags(), 0, "inactive screen stack is also reset");
+    a.write(b"\x1b[?1049l\x1b[?u\x1b[?1003$p");
+    assert_eq!(a.take_pty_replies(), b"\x1b[?0u\x1b[?1003;2$y");
+    assert_eq!(
+        a.encode_key(&pty_terminal::KeyEvent::typed(
+            pty_terminal::Key::A,
+            "a",
+            Some('a')
+        )),
+        b"a"
+    );
+}
+
+#[test]
+fn modify_other_keys_query_answers_the_selected_level_in_stream_order() {
+    let mut a = actor();
+    assert_eq!(a.write(b"\x1b[?4m"), b"");
+    assert_eq!(a.take_pty_replies(), b"\x1b[>4;0m");
+    a.write(b"\x1b[>4;2m\x1b[?4m\x1b[c");
+    assert_eq!(a.take_pty_replies(), b"\x1b[>4;2m\x1b[?62;22c");
+    a.reset_input_modes();
+    a.write(b"\x1b[?4m");
+    assert_eq!(a.take_pty_replies(), b"\x1b[>4;0m");
+}
+
+#[test]
+fn normal_screen_recovery_does_not_restore_an_unrelated_saved_cursor() {
+    let mut a = actor();
+    a.write(b"copper history\r\n\x1b[?1003h\x1b[>27u");
+    a.reset_input_modes();
+    a.write(b"after recovery\r\n");
+    let text = a.plain(Range::Full);
+    assert!(text.contains("copper history"), "{text:?}");
+    assert!(text.contains("after recovery"), "{text:?}");
+}
