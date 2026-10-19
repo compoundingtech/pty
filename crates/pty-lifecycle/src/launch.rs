@@ -543,10 +543,8 @@ fn spawn_prepared_daemon(
     if let Err(err) = &outcome
         && !matches!(err, SpawnError::DaemonExited { .. })
     {
-        // SAFETY: SIGTERM to the pid we spawned.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
+        // SIGTERM to the pid we spawned.
+        let _ = pty_core::kill::process(pid as i32, libc::SIGTERM);
     }
     // Keep a waiter alive for this direct child. Detaching changes its session,
     // not its parent; without waitpid an embedding process accumulates zombies.

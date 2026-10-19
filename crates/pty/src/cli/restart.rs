@@ -146,8 +146,8 @@ pub fn run(args: &[String]) -> CliResult {
     if session.status == SessionStatus::Running
         && let Some(pid) = session.pid
     {
-        // SAFETY: the exact observed generation remains under name ownership.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        // The exact observed generation remains under name ownership.
+        let _ = pty_core::kill::process(pid, libc::SIGTERM);
         // The stopping daemon still writes its exit events under the event
         // lock and owns its pid and socket until it exits. Starting the new
         // daemon before then finds the event log busy, so let go of the event

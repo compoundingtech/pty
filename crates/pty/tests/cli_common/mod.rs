@@ -190,9 +190,9 @@ impl Rig {
                 && let Ok(pid) = pid.trim().parse::<i32>()
                 && pid != std::process::id() as i32
             {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+                // A pid file holds whatever a test wrote into it; a -1 there
+                // must not become a SIGTERM to everything this user runs.
+                let _ = pty_core::kill::process(pid, libc::SIGTERM);
             }
         }
     }

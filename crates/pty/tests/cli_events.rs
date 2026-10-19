@@ -208,9 +208,7 @@ fn follow_exits_zero_on_sigint() {
     std::thread::sleep(Duration::from_millis(400));
     append_event(&rig, "f", r#"{"session":"f","type":"bell","ts":"2026-01-02T03:04:06.000Z"}"#);
     std::thread::sleep(Duration::from_millis(600));
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
-    }
+    let _ = pty_core::kill::process(child.id() as i32, libc::SIGINT);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).ends_with("] f: bell\n"));

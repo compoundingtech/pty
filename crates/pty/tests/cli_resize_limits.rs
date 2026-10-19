@@ -39,8 +39,8 @@ fn an_extreme_resize_cannot_stop_status_queries() {
         .trim()
         .parse::<i32>()
         .unwrap();
-    // SAFETY: this PID came from the private registry created for this test.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    // This PID came from the private registry created for this test.
+    let _ = pty_core::kill::process(pid, libc::SIGKILL);
     drop(client);
     let _ = std::fs::remove_dir_all(root);
     assert!(responsive, "an extreme size stalled the daemon's status query");

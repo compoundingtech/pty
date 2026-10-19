@@ -201,8 +201,8 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
     let before = snapshot_from_table(pid, &table);
     let groups = groups_in_tree(pid, &table);
 
-    // SAFETY: kill(2) with a pid from the registry.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+    // kill(2) with a pid from the registry.
+    if pty_core::kill::process(pid, libc::SIGTERM).is_err() {
         return Err(StopError::SignalFailed {
             name: name.to_string(),
         });

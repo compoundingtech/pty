@@ -609,9 +609,10 @@ impl Worker {
                         Err(error) => {
                             // Nothing owns the child: end it here, unreleased.
                             held::shut(&gate);
-                            // SAFETY: our own child, killed and reaped.
+                            // Our own child, killed and reaped.
+                            let _ = pty_core::kill::process(forked.pid, libc::SIGKILL);
+                            // SAFETY: waitpid on our own child.
                             unsafe {
-                                libc::kill(forked.pid, libc::SIGKILL);
                                 libc::waitpid(forked.pid, std::ptr::null_mut(), 0);
                             }
                             self.complete(ticket, Err(format!("the session substrate: {error}")));
