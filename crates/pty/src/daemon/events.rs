@@ -17,7 +17,7 @@ fn source(name: &str) -> Option<NotificationSource> {
 }
 
 impl Daemon {
-    /// Append every event the actor collected since the last call. The
+    /// Append durable events the actor collected since the last call. The
     /// writer serializes them under the event lock and applies the daemon
     /// retention rule (a line-count check every 100 appends).
     pub(crate) fn forward_terminal_events(&mut self) {
@@ -32,7 +32,8 @@ impl Daemon {
                     source(n.source),
                 ),
                 TerminalEvent::FocusRequest => Event::focus_request(&self.name),
-                TerminalEvent::CursorVisible => Event::cursor_visible(&self.name),
+                // Cursor visibility is redraw state for terminal snapshots, not history.
+                TerminalEvent::CursorVisible => continue,
             };
             self.events.append(event);
         }

@@ -74,6 +74,10 @@ cost. Publication coalesces queued updates and advances during sustained
 output at an inline 16 ms interval, not a hard realtime deadline. See
 [architecture.md](docs/architecture.md) for ownership and publication details.
 
+Cursor visibility changes are redraw state carried by terminal snapshots, not
+durable session events. Existing `cursor_visible` history remains readable and
+keeps its `cursor restored` formatting.
+
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
 the required behavior. Track the compatibility matrix, crate boundaries, and

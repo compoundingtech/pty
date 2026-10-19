@@ -246,13 +246,15 @@ fn formats_focus_request() {
     expect_contains(&recent_text(&rig, "fmtf"), "focus requested");
 }
 
-/// node: tests/events.test.ts:258
+/// Cursor redraw state must not become durable history.
 #[test]
-fn formats_cursor_visible() {
+fn cursor_visibility_redraws_do_not_append_events() {
     let rig = Rig::new();
-    emitting_session(&rig, "fmtc", "\\033[?25l'; sleep 0.1; printf '\\033[?25h");
-    wait_for_events(&rig, "fmtc", "cursor_visible", 1);
-    expect_contains(&recent_text(&rig, "fmtc"), "cursor restored");
+    let redraws = "\\033[?25l\\033[?25h".repeat(3);
+    emitting_session(&rig, "fmtc", &format!("{redraws}\\a"));
+    // The bell follows every redraw, so its persistence is the processing barrier.
+    wait_for_events(&rig, "fmtc", "bell", 1);
+    assert!(recent_json_of_type(&rig, "fmtc", "cursor_visible").is_empty());
 }
 
 /// node: tests/events.test.ts:267
