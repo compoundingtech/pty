@@ -60,6 +60,32 @@ fn next_dirty(events: &mpsc::Receiver<HandleEvent>, after: u64) -> u64 {
     }
 }
 
+#[test]
+fn close_disconnects_subscribers_while_handles_are_retained() {
+    let (client, mut daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let h = Arc::new(
+        TerminalHandle::attach_with_connector(move || client.try_clone(), options(false))
+            .expect("socketpair attach"),
+    );
+    read_attach(&mut daemon);
+    let retained = Arc::clone(&h);
+    let events = h.subscribe();
+    let (done_tx, done_rx) = mpsc::channel();
+    let subscriber = std::thread::spawn(move || {
+        // Drain anything queued before shutdown, then observe recv()'s error.
+        while events.recv().is_ok() {}
+        done_tx.send(()).unwrap();
+    });
+
+    h.close();
+    done_rx.recv_timeout(TIMEOUT).expect("close must wake the retained handle's subscriber");
+    subscriber.join().unwrap();
+    assert!(!retained.connected());
+    assert!(matches!(retained.subscribe().try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    assert!(retained.subscribe().recv().is_err());
+}
+
 fn unobserved(graphics: bool) -> (Arc<TerminalHandle>, UnixStream, mpsc::Receiver<HandleEvent>) {
     let (client, mut daemon) = UnixStream::pair().unwrap();
     daemon.set_read_timeout(Some(TIMEOUT)).unwrap();
