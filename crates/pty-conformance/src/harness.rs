@@ -29,6 +29,8 @@ pub const SCRUBBED_ENV: &[&str] = &[
     "PTY_SERVER_CONFIG",
     "ST_AGENT",
     "ST_ROOT",
+    "FRACTAL_AGENT",
+    "FRACTAL_ROOT",
     "NO_COLOR",
     "PTY_ROOT",
 ];

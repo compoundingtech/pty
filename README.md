@@ -424,6 +424,12 @@ and can mistake that for success, which is what happens if you forget
 `run` runs the command directly and `restart` restarts without attaching.
 Both did what was asked, so both exit 0.
 
+Restarted sessions do not inherit the restarter's `ST_AGENT`, `ST_ROOT`,
+`FRACTAL_AGENT`, `FRACTAL_ROOT`, or `AGENT_TRACE_FILE`. The CLI applies the
+same scrub to attach-triggered and picker-triggered restarts. Fresh `run`
+commands still inherit these variables. Explicit `--env` assignments survive
+restart in either namespace.
+
 ### Commands not in this build
 
 Two Node commands are deferred (see [docs/parity.md §12](docs/parity.md#12-candidates-to-leave-off)
