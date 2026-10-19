@@ -326,8 +326,21 @@ non-`Send` libghostty terminal. This is the same object as the TUI `PtyHandle`
 in section 9. One crate serves both. Proposed layout from issue #1:
 `pty-protocol`, `pty-client`, `pty-terminal`, `pty-testkit`, `pty` (the CLI).
 
-Status: missing (L). `deskset/crates/pty-wire` is a partial third copy of
-`pty-protocol` + `pty-client`.
+Status: have. `pty::handle::TerminalHandle` (`crates/pty/src/handle.rs`)
+has `spawn`, `attach` and `attach_with_connector` over one actor thread that
+owns the libghostty terminal. It offers typed snapshots, modes, cursor and
+scrollback reads, `subscribe()` events, and explicit readiness
+(`wait_ready_outcome`). Each connection attempt carries a private
+`AttemptId`, and frames from an older attempt are dropped. The protocol lives
+in `pty-core` rather than a separate `pty-protocol` crate. `pty-client`,
+`pty-terminal` and `pty-testkit` exist as proposed.
+
+Where it differs from the issue's sketch:
+- The API is synchronous: `subscribe()` returns an mpsc `Receiver`.
+- The CLI's `pty_client::attach` and the handle's own connection are still two
+  client attach paths.
+- Closing a spawned handle SIGKILLs the child pid, not its process group
+  (#162).
 
 ## 11. Mixed fleet: Node and Rust on one `$PTY_ROOT`
 
