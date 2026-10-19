@@ -147,9 +147,13 @@ fn a_widened_terminal_reports_the_history_it_can_still_hold() {
 }
 
 fn page(a: &mut TerminalActor, before: Option<String>) -> (Vec<String>, Option<String>) {
+    page_of(a, 2, before)
+}
+
+fn page_of(a: &mut TerminalActor, limit: u16, before: Option<String>) -> (Vec<String>, Option<String>) {
     use pty_core::protocol::{HistoryRequest, HistoryResponse};
     let HistoryResponse::Page { rows, next_before, .. } =
-        a.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before })
+        a.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit, before })
     else { panic!("expected history page") };
     let text = rows.into_iter().map(|row| {
         let mut replay = TerminalActor::new(2, 80, 0);
@@ -174,6 +178,105 @@ fn history_pages_remain_anchored_across_append_and_report_retention_loss() {
         actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }),
         HistoryResponse::CursorGap
     ));
+}
+
+/// The oldest retained row's `fill` label, read without issuing a cursor.
+fn oldest_label(a: &TerminalActor) -> usize {
+    a.plain(Range::Full)
+        .lines()
+        .next()
+        .and_then(|line| line.trim_end().strip_prefix('L'))
+        .and_then(|n| n.parse().ok())
+        .expect("a numbered oldest row")
+}
+
+/// Write numbered lines from `next` until retention prunes, and return the
+/// next unwritten number.
+fn write_until_pruned(a: &mut TerminalActor, mut next: usize) -> usize {
+    let before = oldest_label(a);
+    while oldest_label(a) == before {
+        assert!(next < 20_000, "retention never pruned");
+        a.write(format!("L{next}\r\n").as_bytes());
+        next += 1;
+    }
+    next
+}
+
+/// Retention can prune rows a cursor still owes its reader and keep the
+/// cursor's own row. The read that reaches the oldest retained row is then a
+/// gap, never a short page that looks like the end of history. Reported with
+/// 3x80, 1000 rows of scrollback and 200-row pages; libghostty evicts whole
+/// pages, so the cursor is placed from the prune size measured here.
+#[test]
+fn history_reports_rows_pruned_under_a_retained_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 1000);
+    fill(&mut actor, 1400);
+    let before = oldest_label(&actor);
+    let next = write_until_pruned(&mut actor, 1400);
+    let prune = oldest_label(&actor) - before;
+    // Leave the cursor's row `prune + 100` rows below the oldest: the next
+    // prune keeps it and takes all but 100 of the rows it owes.
+    let request = |limit, before| HistoryRequest { expected_generation: "owner-generation".into(), limit, before };
+    let HistoryResponse::Page { retained_rows, .. } = actor.history("owner-generation", &request(1, None)) else {
+        panic!("expected a page")
+    };
+    let above = prune + 100;
+    assert!(above < retained_rows, "a prune of {prune} rows leaves no room for a cursor");
+    let mut unread = retained_rows - above;
+    let mut cursor = None;
+    let mut anchor = String::new();
+    while unread > 0 {
+        let limit = unread.min(200);
+        let (rows, next_before) = page_of(&mut actor, limit as u16, cursor);
+        anchor = rows[0].clone();
+        cursor = next_before;
+        unread -= limit;
+    }
+    let anchor: usize = anchor[1..].parse().unwrap();
+    let owed_from = oldest_label(&actor);
+    write_until_pruned(&mut actor, next);
+    let oldest = oldest_label(&actor);
+    assert!(
+        oldest > owed_from && oldest <= anchor,
+        "the prune must take rows the cursor owes and keep its row L{anchor}; the oldest is L{oldest}"
+    );
+    match actor.history("owner-generation", &request(200, cursor)) {
+        HistoryResponse::CursorGap => {}
+        HistoryResponse::Page { rows, next_before, .. } => panic!(
+            "a {}-row page (next cursor: {}) after rows from L{owed_from} to L{} were pruned",
+            rows.len(),
+            next_before.is_some(),
+            oldest - 1
+        ),
+        _ => panic!("expected a gap"),
+    }
+}
+
+/// The loss travels along the cursor chain: whole pages above the pruning
+/// are still served, and the read that reaches the oldest retained row
+/// reports the gap.
+#[test]
+fn history_carries_pruned_rows_to_the_next_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 1000);
+    fill(&mut actor, 1400);
+    let (_, mut cursor) = page_of(&mut actor, 200, None);
+    write_until_pruned(&mut actor, 1400);
+    let mut whole = 0;
+    loop {
+        match actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 200, before: cursor }) {
+            HistoryResponse::Page { rows, next_before, .. } => {
+                assert!(next_before.is_some(), "a {}-row page ended history after pruning", rows.len());
+                assert_eq!(rows.len(), 200);
+                cursor = next_before;
+                whole += 1;
+            }
+            HistoryResponse::CursorGap => break,
+            _ => panic!("expected a page or a gap"),
+        }
+    }
+    assert!(whole > 0, "pages above the pruned rows are still served");
 }
 
 #[test]

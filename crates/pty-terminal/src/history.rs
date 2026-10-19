@@ -17,6 +17,10 @@ const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 struct Boundary {
     anchor: TrackedGridRef,
+    /// Rows above the anchor that a reader continuing from it is owed: those
+    /// retained when it was issued, plus any the boundary it continued had
+    /// already lost to retention.
+    owed: usize,
     expires: Instant,
 }
 
@@ -57,8 +61,8 @@ impl History {
         let Ok(columns) = term.cols() else {
             return HistoryResponse::Unavailable;
         };
-        let end = match &request.before {
-            None => retained_rows,
+        let (end, pruned) = match &request.before {
+            None => (retained_rows, 0),
             Some(cursor) => {
                 if cursor.split_once(':').map(|(owner, _)| owner) != Some(generation) {
                     return HistoryResponse::CursorGap;
@@ -66,13 +70,21 @@ impl History {
                 let Some(boundary) = self.boundaries.get(cursor) else {
                     return HistoryResponse::CursorGap;
                 };
-                match boundary.anchor.point(PointSpace::History) {
+                let end = match boundary.anchor.point(PointSpace::History) {
                     Ok(Some(point)) if point.x == 0 => point.y as usize,
                     _ => return HistoryResponse::CursorGap,
-                }
+                };
+                // Retention prunes the oldest rows first, so an anchor can
+                // survive the loss of rows above it.
+                (end, boundary.owed.saturating_sub(end))
             }
         };
         let start = end.saturating_sub(usize::from(request.limit));
+        // Reaching the oldest retained row after owed rows were pruned is a
+        // gap, not the end of history.
+        if start == 0 && pruned > 0 {
+            return HistoryResponse::CursorGap;
+        }
         let mut rows = Vec::with_capacity(end - start);
         let mut bytes = 0;
         for y in start..end {
@@ -105,7 +117,10 @@ impl History {
                 let oldest = self.boundaries.keys().next().cloned().expect("nonempty cursor table");
                 self.boundaries.remove(&oldest);
             }
-            self.boundaries.insert(token.clone(), Boundary { anchor, expires: now + CURSOR_LEASE });
+            self.boundaries.insert(
+                token.clone(),
+                Boundary { anchor, owed: start + pruned, expires: now + CURSOR_LEASE },
+            );
             Some(token)
         };
         HistoryResponse::Page { columns, retained_rows, rows, next_before }
