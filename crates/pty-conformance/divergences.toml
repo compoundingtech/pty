@@ -50,6 +50,24 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
+test = "events::cursor_redraws_do_not_fill_event_history"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust daemons no longer write `cursor_visible` records \
+(compoundingtech/pty#172). A TUI hides and restores the cursor on many \
+frames, the terminal snapshot already carries cursor visibility, and those \
+records evicted durable history from the retained log. Old records still \
+parse and format. The fixture hides and shows the cursor twice, rings the \
+bell, waits for the bell and then requires no `cursor_visible` record. \
+Against pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in \
+Linux CI run 39256826955, the Node daemon wrote them. The Node on-disk \
+layout lists `cursor_visible` among the tier-1 event types, so this is a \
+change to what the event log contains, not only to its volume. Remove this \
+entry when Node stops persisting cursor restoration, or if Rust resumes it.
+"""
+
+[[divergence]]
 test = "events::recent_type_filter_returns_every_retained_match_and_preserves_envelopes_order"
 side = "node"
 kind = "intended"
@@ -63,6 +81,24 @@ original chronological order. The fixture proves old matches remain visible \
 behind both 51 newer unrelated events and more than 50 newer matching events. \
 Remove this entry when Node supports the same exact all-retained-match and \
 empty-success semantics, or if Rust removes it.
+"""
+
+[[divergence]]
+test = "gc::removes_only_dead_writer_atomic_temporaries"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust `gc` removes atomic-write leftovers named \
+`<target>.tmp.<pid>.<16 lowercase hex>` whose writer PID is dead, in the \
+registry and its `.activity` and `.recovery` directories \
+(compoundingtech/pty#172). Live or reused PIDs, malformed names, \
+directories, symlinks and `gc --dry-run` leave them in place. Against \
+pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in Linux \
+CI run 39256826955, Node `gc` exited 0 and left the dead writer's \
+temporary behind. The Node on-disk layout gives these files no tier and \
+tells readers to ignore them, so collecting them changes nothing a reader \
+sees. Remove this entry when Node collects the same leftovers, or if Rust \
+stops.
 """
 
 [[divergence]]
