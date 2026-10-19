@@ -49,16 +49,31 @@ pub fn armed(name: &str) -> bool {
             return false;
         };
         let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(
-            dir.join(format!("{name}.reached")),
-            std::process::id().to_string(),
-        );
+        record_reached(&dir, name);
         dir.join(format!("{name}.hold")).exists()
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = name;
         false
+    }
+}
+
+/// Publish `<dir>/<name>.reached` holding this process's id. It is written
+/// aside and renamed into place, because tests read the pid as soon as the
+/// file exists, and `fs::write` shows an empty file between creating it and
+/// writing to it.
+#[cfg(debug_assertions)]
+fn record_reached(dir: &std::path::Path, name: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let staged = dir.join(format!(
+        "{name}.reached.{pid}.{}",
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&staged, pid.to_string()).is_ok() {
+        let _ = std::fs::rename(&staged, dir.join(format!("{name}.reached")));
     }
 }
 
@@ -87,10 +102,7 @@ pub fn barrier(name: &str) {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(
-            dir.join(format!("{name}.reached")),
-            std::process::id().to_string(),
-        );
+        record_reached(&dir, name);
         if !dir.join(format!("{name}.hold")).exists() {
             return;
         }
