@@ -180,6 +180,70 @@ fn event_writer_truncates_when_exceeding_max_lines() {
     assert_eq!(last["ts"], "2026-04-05T00:00:1049Z");
 }
 
+#[test]
+fn writer_publishes_within_one_window_without_explicit_flush() {
+    let _ = root();
+    let name = unique_name("window");
+    let writer = EventWriter::new(&name);
+    writer.append(Event::bell(&name));
+    assert!(registry_support::wait_for(
+        1000,
+        || events::read_all_events(&name).len() == 1
+    ));
+}
+
+#[test]
+fn writer_drop_and_close_flush_pending_records() {
+    let _ = root();
+    for close in [false, true] {
+        let name = unique_name("shutdown");
+        let writer = EventWriter::new(&name);
+        writer.append(Event::bell(&name));
+        if close {
+            writer.close();
+        } else {
+            drop(writer);
+        }
+        assert_eq!(events::read_all_events(&name).len(), 1);
+    }
+}
+
+#[test]
+fn writer_exit_flushes_without_waiting_for_window() {
+    let _ = root();
+    let name = unique_name("exitflush");
+    let writer = EventWriter::new(&name);
+    writer.append(Event::bell(&name));
+    writer.append(Event::session_exit(&name, 0, None));
+    assert!(registry_support::wait_for(200, || events::read_all_events(
+        &name
+    )
+    .len()
+        == 2));
+}
+
+#[test]
+fn pending_batch_waits_for_event_lock_and_keeps_external_record() {
+    let _ = root();
+    let name = unique_name("batchlock");
+    let lock = registry::lock::take_event_lock(&name).unwrap();
+    let writer = EventWriter::new(&name);
+    writer.append(Event::bell(&name));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(events::read_all_events(&name).is_empty());
+    assert_eq!(
+        events::append_event_sync(&name, &Event::bell(&name)).unwrap_err(),
+        registry::lock::event_busy_message(&name)
+    );
+    events::append_event_locked(&name, &Event::new(&name, "user.external")).unwrap();
+    drop(lock);
+    writer.flush();
+    let records = events::read_all_events(&name);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].r#type, "user.external");
+    assert_eq!(records[1].r#type, "bell");
+}
+
 /// A raw reader that opened the old log before a concurrent append keeps one
 /// complete snapshot while the current path advances to the retained suffix.
 /// Opening and pausing after the first bytes makes the overlap deterministic:
