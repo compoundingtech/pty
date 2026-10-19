@@ -458,12 +458,15 @@ fn append_batch(path: &Path, events: &[Event], append_count: &mut usize) -> std:
 fn publish_batch_snapshot(path: &Path, content: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     BATCH_WRITES.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    BATCH_BYTES.with(|bytes| bytes.set(bytes.get() + content.len()));
     atomic_write(path, content)
 }
 
 #[cfg(test)]
 thread_local! {
     static BATCH_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Append while the caller owns the session's event lock. Publication
@@ -935,6 +938,107 @@ mod batch_tests {
             EventWriter::run("short", rx);
             BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 1));
             assert_eq!(read_all_events("short").len(), 80);
+        });
+    }
+
+    /// The production shape: records arriving over time, not queued up
+    /// front. This bounds the replacement count; the byte work is measured
+    /// on its own below. The bound scales with the measured elapsed time, so
+    /// a slow runner widens it instead of failing.
+    #[test]
+    fn a_steady_stream_publishes_once_per_window_not_once_per_record() {
+        let root = TestRoot::new("stream");
+        crate::registry::root::with_root(root.path(), || {
+            let records = 60;
+            let (tx, rx) = channel();
+            let producer = std::thread::spawn(move || {
+                for _ in 0..records {
+                    tx.send(WriterMsg::Append(Event::bell("stream"))).unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            BATCH_WRITES.with(|writes| writes.set(0));
+            let started = Instant::now();
+            EventWriter::run("stream", rx);
+            let elapsed = started.elapsed();
+            producer.join().unwrap();
+            let windows = elapsed.as_millis() as usize / 250 + 2;
+            let writes = BATCH_WRITES.with(|writes| writes.get());
+            assert!(
+                writes <= windows,
+                "{writes} publications for {records} records over {elapsed:?}; at most {windows} windows"
+            );
+            assert_eq!(read_all_events("stream").len(), records);
+        });
+    }
+
+    /// Byte work, measured apart from the replacement count. Every
+    /// publication rewrites the whole retained log, so the cost of a record
+    /// is the log's size, not its own. Over a log already near its cap, and
+    /// across a retention check, a steady stream must rewrite about one log
+    /// per window (plus the separately published shrink), not one per record.
+    #[test]
+    fn a_steady_stream_over_a_full_log_rewrites_about_one_log_per_window() {
+        let root = TestRoot::new("stream-bytes");
+        crate::registry::root::with_root(root.path(), || {
+            let line = |ts: &str| format!("{}\n", Event::bell("bytes").with_ts(ts).to_json());
+            let seed: String = (0..950).map(|i| line(&format!("old-{i:04}"))).collect();
+            std::fs::write(events_path("bytes"), &seed).unwrap();
+            let records = 120;
+            let largest = seed.len() + records * line("new-0000").len();
+            let (tx, rx) = channel();
+            let producer = std::thread::spawn(move || {
+                for i in 0..records {
+                    let event = Event::bell("bytes").with_ts(&format!("new-{i:04}"));
+                    tx.send(WriterMsg::Append(event)).unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            BATCH_BYTES.with(|bytes| bytes.set(0));
+            let started = Instant::now();
+            EventWriter::run("bytes", rx);
+            let elapsed = started.elapsed();
+            producer.join().unwrap();
+            // One more publication than windows: the retention shrink.
+            let windows = elapsed.as_millis() as usize / 250 + 2;
+            let bytes = BATCH_BYTES.with(|bytes| bytes.get());
+            assert!(
+                bytes <= (windows + 1) * largest,
+                "{bytes} bytes rewritten for {records} records over {elapsed:?}; \
+                 at most {} logs of {largest} bytes",
+                windows + 1
+            );
+            // The retention check at the 100th record kept the newest 500.
+            assert_eq!(read_all_events("bytes").len(), 500 + (records - 100));
+        });
+    }
+
+    /// The window closes on the writer's own timer. With the channel held
+    /// open, no flush, exit record or disconnect can be what publishes the
+    /// record, so a daemon busy shutting down still gets earlier records to
+    /// disk before its shutdown deadline.
+    #[test]
+    fn an_open_window_publishes_on_its_own_timer() {
+        let root = TestRoot::new("timer");
+        crate::registry::root::with_root(root.path(), || {
+            let path = events_path("timer");
+            let (tx, rx) = channel();
+            let observer = std::thread::spawn(move || {
+                tx.send(WriterMsg::Append(Event::bell("timer"))).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if std::fs::read_to_string(&path).is_ok_and(|log| log.lines().count() == 1) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                false
+            });
+            EventWriter::run("timer", rx);
+            assert!(
+                observer.join().unwrap(),
+                "the open window was not published within 2 s while the writer stayed open"
+            );
         });
     }
 

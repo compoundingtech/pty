@@ -398,6 +398,36 @@ fn shutdown_backstop_force_exits_and_reaps_a_frozen_child() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// A record from just before a graceful shutdown reaches the log even when
+/// the backstop force-exits before the child's exit or the final flush: the
+/// writer closes its batch window on its own timer.
+#[test]
+fn a_record_from_before_shutdown_survives_the_backstop() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    let root = short_root();
+    let rang = root.join("rang");
+    let body = format!(
+        "#!/bin/bash\ntrap '' HUP TERM\nprintf '\\a'\ntouch '{}'\nwhile :; do sleep 1; done\n",
+        rang.display()
+    );
+    let frozen = script(&root, "ring.sh", &body);
+    // Under the 2 s child hangup wait, so the child's exit never flushes.
+    let mut d = Daemon::start_env(
+        &root,
+        config(&unique_name("ring"), frozen.to_str().unwrap(), &[]),
+        &[("PTY_SHUTDOWN_DEADLINE_MS", "1000")],
+    );
+    assert!(wait_until(T, || rang.exists()));
+    std::thread::sleep(Duration::from_millis(50));
+    let child = d.child_pid();
+    d.signal(libc::SIGTERM);
+    assert!(d.wait_exit(Duration::from_secs(4)).is_some(), "daemon still alive");
+    assert!(wait_dead(child, Duration::from_secs(4)), "child still alive");
+    assert!(d.events("session_exit").is_empty(), "the child's exit ended this shutdown, not the backstop");
+    assert_eq!(d.events("bell").len(), 1);
+}
+
 /// node: tests/spawner-pid-watchdog.test.ts:93-193
 #[test]
 fn spawner_pid_watchdog() {
