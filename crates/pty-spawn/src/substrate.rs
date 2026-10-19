@@ -971,21 +971,57 @@ fn reap_child(
     signals: Arc<ChildSignals>,
     tx: Sender<Command>,
 ) {
-    let status = match child.process_id() {
+    let status = reap_fenced(&mut *child, &signals);
+    let _ = tx.send(Command::Reaped(status.unwrap_or(ExitStatus {
+        code: None,
+        signal: None,
+    })));
+}
+
+/// Wait for the child to exit and collect it under `signals`' lock.
+fn reap_fenced(child: &mut (dyn Child + Send + Sync), signals: &ChildSignals) -> Option<ExitStatus> {
+    match child.process_id() {
         Some(pid) => {
             wait_until_exited(pid);
-            collect_fenced(pid, &signals)
+            collect_fenced(pid, signals)
         }
         None => {
             let status = child.wait().ok().map(ExitStatus::from_portable);
             *signals.lock() = true;
             status
         }
-    };
-    let _ = tx.send(Command::Reaped(status.unwrap_or(ExitStatus {
-        code: None,
-        signal: None,
-    })));
+    }
+}
+
+/// The same signal fence, for a child spawned outside a [`SessionOwner`]
+/// (an embedded terminal's own child). Every signal goes through it, and the
+/// child is collected only through [`ReapFence::reap`], under the same lock,
+/// so a signal reaches the child or its unreaped corpse and never a process
+/// that reused its pid or its process group id.
+pub struct ReapFence(ChildSignals);
+
+impl ReapFence {
+    /// A fence for the child with this pid. `None` (no pid) sends nothing.
+    pub fn new(pid: Option<u32>) -> Self {
+        Self(ChildSignals::new(pid))
+    }
+
+    /// Signal the child, unless it has been collected.
+    pub fn signal(&self, signal: i32) -> io::Result<()> {
+        self.0.signal(signal)
+    }
+
+    /// Signal the child's process group, unless the child has been
+    /// collected. A pty child leads its own group (`setsid`).
+    pub fn signal_group(&self, signal: i32) -> io::Result<()> {
+        self.0.signal_group(signal)
+    }
+
+    /// Wait for the child to exit, then collect it under the fence. Call it
+    /// once, from the thread that owns the child.
+    pub fn reap(&self, child: &mut (dyn Child + Send + Sync)) -> Option<ExitStatus> {
+        reap_fenced(child, &self.0)
+    }
 }
 
 /// Block until the child has exited, leaving it unreaped (`WNOWAIT`): its pid

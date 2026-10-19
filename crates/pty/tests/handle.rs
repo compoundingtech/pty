@@ -78,6 +78,51 @@ fn spawn_reports_exit_code() {
     h.kill();
 }
 
+/// Closing a spawned handle ends the child's process group, not just the
+/// child: a background job that ignores SIGHUP does not outlive it (#162).
+#[test]
+fn close_kills_the_spawned_childs_process_group() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "pty-handle-group-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pidfile = dir.join("job.pid");
+    let script = format!(
+        "trap '' HUP; sleep 1000 & echo $! > '{}'; wait",
+        pidfile.display()
+    );
+    let h = TerminalHandle::spawn("sh", &["-c", &script], SpawnOptions::default()).expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let job = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the background job never started");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: signal 0 only checks that the pid exists.
+    let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+    assert!(alive(job));
+    h.close();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(job) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(job);
+    if survived {
+        // SAFETY: the job this test started, not reaped while it is alive.
+        unsafe { libc::kill(job, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!survived, "background job {job} outlived the closed handle");
+}
+
 #[test]
 fn spawn_resize_changes_the_grid_and_emits_geometry() {
     let h = TerminalHandle::spawn("cat", &[], SpawnOptions::default()).expect("spawn");
