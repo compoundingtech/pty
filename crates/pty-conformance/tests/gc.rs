@@ -56,7 +56,9 @@ fn removes_only_dead_writer_atomic_temporaries() {
         format!("record.json.tmp.{dead_pid}.0123456789abcde"),
         format!("record.json.tmp.{dead_pid}.0123456789abcdef0"),
         format!("record.json.tmp.{dead_pid}.0123456789abcdeg"),
-        format!("record.json.tmp.{dead_pid}.0123456789ABCDEF"),
+        // Distinct basename avoids aliasing the valid lowercase fixture on
+        // case-insensitive filesystems.
+        format!("uppercase.json.tmp.{dead_pid}.0123456789ABCDEF"),
         format!("record.json.tmp.{dead_pid}.0123456789abcdef.extra"),
         "record.tmp.malformed.json".into(),
         "unrelated-file".into(),
@@ -86,7 +88,8 @@ fn removes_only_dead_writer_atomic_temporaries() {
     for directory in &directories {
         assert!(!directory.join(&dead).exists(), "dead writer temporary survived");
         for filename in &preserved {
-            assert_eq!(std::fs::read(directory.join(filename)).unwrap(), b"preserve");
+            let path = directory.join(filename);
+            assert_eq!(std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display())), b"preserve");
         }
     }
     assert!(directory_temp.is_dir());
