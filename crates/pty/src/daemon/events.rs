@@ -32,7 +32,9 @@ impl Daemon {
                     source(n.source),
                 ),
                 TerminalEvent::FocusRequest => Event::focus_request(&self.name),
-                TerminalEvent::CursorVisible => Event::cursor_visible(&self.name),
+                // Cursor restoration is redraw state, often toggled on every
+                // TUI frame; it belongs in terminal snapshots, not history.
+                TerminalEvent::CursorVisible => continue,
                 // Paste events belong to the attached client that answers
                 // them, never to the session's event log.
                 TerminalEvent::EnhancedPasteMode(_) | TerminalEvent::EnhancedPasteRead(_) => {

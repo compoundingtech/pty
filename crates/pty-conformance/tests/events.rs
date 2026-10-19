@@ -246,13 +246,13 @@ fn formats_focus_request() {
     expect_contains(&recent_text(&rig, "fmtf"), "focus requested");
 }
 
-/// node: tests/events.test.ts:258
+/// Cursor visibility is terminal state, not a durable event per TUI redraw.
 #[test]
-fn formats_cursor_visible() {
+fn cursor_redraws_do_not_fill_event_history() {
     let rig = Rig::new();
-    emitting_session(&rig, "fmtc", "\\033[?25l'; sleep 0.1; printf '\\033[?25h");
-    wait_for_events(&rig, "fmtc", "cursor_visible", 1);
-    expect_contains(&recent_text(&rig, "fmtc"), "cursor restored");
+    emitting_session(&rig, "fmtc", "\\033[?25l\\033[?25h\\033[?25l\\033[?25h\\007");
+    wait_for_events(&rig, "fmtc", "bell", 1);
+    assert!(recent_json(&rig, "fmtc").iter().all(|event| event["type"] != "cursor_visible"));
 }
 
 /// node: tests/events.test.ts:267

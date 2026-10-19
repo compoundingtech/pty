@@ -127,6 +127,17 @@ pub fn gc(options: GcOptions) -> GcResult {
     } = options;
     let mut result = GcResult::default();
 
+    if !dry_run {
+        let root = session_dir();
+        cleanup_dead_atomic_temps(&root);
+        for sidecar in [".activity", ".recovery"] {
+            let directory = root.join(sidecar);
+            if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+                cleanup_dead_atomic_temps(&directory);
+            }
+        }
+    }
+
     // Raw debris: runtime files whose metadata is missing or malformed.
     let raw_candidates = inventory_raw_cleanup_candidates(None);
     if dry_run {
@@ -825,6 +836,37 @@ fn parent_of(s: &SessionInfo) -> Option<String> {
         .cloned()
 }
 
+/// Reclaim only regular atomic-publication leftovers whose writer has exited.
+/// PID reuse conservatively retains a leftover; live writers never lose their
+/// temporary file. Malformed names and symlinks are not cleanup candidates.
+fn cleanup_dead_atomic_temps(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let filename = entry.file_name();
+        let Some(pid) = filename.to_str().and_then(atomic_temp_pid) else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) && !pid_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn atomic_temp_pid(filename: &str) -> Option<i32> {
+    let (_, suffix) = filename.rsplit_once(".tmp.")?;
+    let (pid, random) = suffix.split_once('.')?;
+    if !pid.starts_with(|c: char| c.is_ascii_digit() && c != '0')
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || random.len() != 16
+        || !random.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// Registry debris that `list_sessions` cannot represent: `.sock`/`.pid`
 /// with a dead pid and missing/malformed metadata (socket unreachable), or
 /// malformed metadata with no runtime files at all.
@@ -840,6 +882,9 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
         .collect();
     let mut names: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
+        if registry::is_tmp_name(entry) {
+            continue;
+        }
         let name = entry
             .strip_suffix(".events.jsonl")
             .or_else(|| entry.strip_suffix(".sock"))
