@@ -6,7 +6,7 @@
 //!
 //! Change detection is the `notify` crate on the registry directory plus a
 //! poll every 250 ms, so delivery is deterministic even when the watcher
-//! misses or coalesces an event.
+//! misses or coalesces an event, or is still starting.
 //!
 //! node: src/events.ts:430-546
 
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -71,14 +71,21 @@ impl EventFollower {
     /// Start following, delivering every new event to `on_event` from a
     /// background thread.
     ///
+    /// Returns once the thread has read where each existing log ends, as
+    /// Node's `start` does before it returns. An event appended after that
+    /// is delivered; one appended before it is history.
+    ///
     /// node: src/events.ts:441-449
     pub fn start(options: FollowerOptions, on_event: impl FnMut(Event) + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
+        let (ready_tx, ready_rx) = channel();
         let handle = std::thread::Builder::new()
             .name("events-follow".to_string())
-            .spawn(move || run(options, on_event, stop_flag))
+            .spawn(move || run(options, on_event, stop_flag, ready_tx))
             .ok();
+        // Disconnected when the thread could not start: nothing to wait for.
+        let _ = ready_rx.recv();
         EventFollower { stop, handle }
     }
 
@@ -131,7 +138,12 @@ fn name_of(file_name: &str) -> Option<&str> {
     file_name.strip_suffix(EVENTS_SUFFIX)
 }
 
-fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<AtomicBool>) {
+fn run(
+    options: FollowerOptions,
+    mut on_event: impl FnMut(Event),
+    stop: Arc<AtomicBool>,
+    ready: Sender<()>,
+) {
     let dir = session_dir();
     let mut tracked: BTreeMap<String, Tracked> = BTreeMap::new();
 
@@ -157,17 +169,31 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
             }
         }
     }
+    let _ = ready.send(());
 
     // Wake-ups from the watcher; the payload is irrelevant, every wake-up
-    // re-scans everything tracked.
+    // re-scans everything tracked. The watcher starts on its own thread:
+    // starting an FSEvents stream took 3.5 s on a busy macOS host, and the
+    // poll below has to keep delivering meanwhile. That thread holds the
+    // watcher until this function returns.
     let (wake_tx, wake_rx) = channel::<()>();
-    let mut watcher = notify::recommended_watcher(move |_res: notify::Result<notify::Event>| {
-        let _ = wake_tx.send(());
-    })
-    .ok();
-    if let Some(w) = watcher.as_mut() {
-        let _ = w.watch(&dir, RecursiveMode::NonRecursive);
-    }
+    let (release_tx, release_rx) = channel::<()>();
+    let watch_dir = dir.clone();
+    let _ = std::thread::Builder::new()
+        .name("events-follow-watch".to_string())
+        .spawn(move || {
+            let mut watcher =
+                notify::recommended_watcher(move |_res: notify::Result<notify::Event>| {
+                    let _ = wake_tx.send(());
+                })
+                .ok();
+            if let Some(w) = watcher.as_mut() {
+                let _ = w.watch(&watch_dir, RecursiveMode::NonRecursive);
+            }
+            // Disconnected when the follower stops.
+            let _ = release_rx.recv();
+            drop(watcher);
+        });
 
     let follow_all = options.names.is_none();
     while !stop.load(Ordering::SeqCst) {
@@ -188,7 +214,7 @@ fn run(options: FollowerOptions, mut on_event: impl FnMut(Event), stop: Arc<Atom
             }
         }
     }
-    drop(watcher);
+    drop(release_tx);
 }
 
 /// Newly created logs replay from offset 0.

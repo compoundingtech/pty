@@ -66,6 +66,28 @@ fn existing_files_start_at_eof() {
     assert_eq!(received[0].r#type, "title_change");
 }
 
+/// An event appended as soon as `start` returns is new, not history: the
+/// follower has its end-of-file baseline by then, as Node's does. When the
+/// thread took it later, a busy host turned these events into history and
+/// they were never delivered.
+#[test]
+fn an_event_appended_right_after_start_is_delivered() {
+    let _ = root();
+    for i in 0..50 {
+        let name = unique_name("start");
+        events::append_event_sync(&name, &Event::bell(&name)).unwrap();
+        let (mut follower, rx) = EventFollower::channel(FollowerOptions {
+            poll_interval: Duration::from_millis(10),
+            ..FollowerOptions::names(vec![name.clone()])
+        });
+        events::append_event_sync(&name, &Event::title_change(&name, "now")).unwrap();
+        let received = collect(&rx, 1, 10_000);
+        follower.stop();
+        assert_eq!(received.len(), 1, "iteration {i}: {received:?}");
+        assert_eq!(received[0].r#type, "title_change");
+    }
+}
+
 #[test]
 fn follower_sees_retained_new_records_when_a_batch_shrinks_and_regrows() {
     let _ = root();
