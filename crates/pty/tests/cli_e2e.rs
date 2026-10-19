@@ -620,8 +620,15 @@ fn default_reap_removes_session_on_self_exit() {
     let name = created_id(&name);
     assert_eq!(code, 0, "run failed: {_e}");
     assert_eq!(name, "rp");
-    // Give the daemon time to run + reap.
-    std::thread::sleep(Duration::from_millis(600));
+    // The daemon reaps after its exit grace, and under load that outlasts
+    // any fixed sleep. The reap removes the socket and then the metadata,
+    // so wait for the metadata to go.
+    let metadata = root.join("rp.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while metadata.exists() {
+        assert!(Instant::now() < deadline, "the daemon never reaped the session");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // peek fails (session gone).
     let (_o, _e, peek_code) = run_pty(&root, &["peek", "--plain", "rp"]);
     assert_ne!(peek_code, 0, "reaped session should not be peekable");
