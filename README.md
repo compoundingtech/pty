@@ -93,10 +93,12 @@ exact bytes and order; retention still checks every 100 daemon records and
 keeps the newest 500 at the 1000-line boundary. The Rust follower also checks
 the consumed prefix when snapshots change, covering coalesced retention
 and regrowth. Delivery takes up to one batch window plus the follower poll
-interval and event-lock wait. Session exit and orderly shutdown flush pending
-records; SIGKILL, abort, or writer panic can lose the current buffered window.
-One-shot writers (`pty emit` and metadata events) retain their existing
-event-lock behavior.
+interval and event-lock wait. Each window closes on its own timer, and session
+exit and orderly shutdown flush pending records; SIGKILL, abort, writer panic,
+or the forced exit at the shutdown deadline (`PTY_SHUTDOWN_DEADLINE_MS`) can
+lose the current buffered window. One-shot writers (`pty emit`, metadata, tags,
+display name, `pty exec`, and gc) retain their existing event-lock behavior, so
+their records can land before daemon records from up to one window earlier.
 
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
