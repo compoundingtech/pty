@@ -39,6 +39,63 @@ fn tags(rig: &Rig, id: &str) -> serde_json::Value {
     rig.meta(id).expect("metadata").get("tags").cloned().unwrap_or(serde_json::Value::Null)
 }
 
+#[test]
+fn removes_only_dead_writer_atomic_temporaries() {
+    let rig = Rig::new();
+    let dead_pid = find_dead_pid();
+    let live_pid = std::process::id();
+    let dead = format!("record.json.tmp.{dead_pid}.0123456789abcdef");
+    let live = format!("record.json.tmp.{live_pid}.0123456789abcdef");
+    let preserved = [
+        live,
+        "record.json.tmp.0.0123456789abcdef".into(),
+        "record.json.tmp.-1.0123456789abcdef".into(),
+        "record.json.tmp.+1.0123456789abcdef".into(),
+        "record.json.tmp.0001.0123456789abcdef".into(),
+        "record.json.tmp.2147483648.0123456789abcdef".into(),
+        format!("record.json.tmp.{dead_pid}.0123456789abcde"),
+        format!("record.json.tmp.{dead_pid}.0123456789abcdef0"),
+        format!("record.json.tmp.{dead_pid}.0123456789abcdeg"),
+        // Distinct basename avoids aliasing the valid lowercase fixture on
+        // case-insensitive filesystems.
+        format!("uppercase.json.tmp.{dead_pid}.0123456789ABCDEF"),
+        format!("record.json.tmp.{dead_pid}.0123456789abcdef.extra"),
+        "record.tmp.malformed.json".into(),
+        "unrelated-file".into(),
+    ];
+    let directories = [
+        rig.root().to_path_buf(),
+        rig.root().join(".activity"),
+        rig.root().join(".recovery"),
+    ];
+    for directory in &directories {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(&dead), b"incomplete").unwrap();
+        for filename in &preserved {
+            std::fs::write(directory.join(filename), b"preserve").unwrap();
+        }
+    }
+    let directory_temp = rig.root().join(format!("directory.tmp.{dead_pid}.0123456789abcdef"));
+    std::fs::create_dir(&directory_temp).unwrap();
+    let symlink_temp = rig.root().join(format!("symlink.tmp.{dead_pid}.0123456789abcdef"));
+    std::os::unix::fs::symlink(rig.root().join("unrelated-file"), &symlink_temp).unwrap();
+
+    expect_status(&rig.pty(&["gc", "--dry-run"]), 0);
+    for directory in &directories {
+        assert!(directory.join(&dead).exists(), "dry run removed a temporary");
+    }
+    expect_status(&rig.pty(&["gc"]), 0);
+    for directory in &directories {
+        assert!(!directory.join(&dead).exists(), "dead writer temporary survived");
+        for filename in &preserved {
+            let path = directory.join(filename);
+            assert_eq!(std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display())), b"preserve");
+        }
+    }
+    assert!(directory_temp.is_dir());
+    assert!(symlink_temp.is_symlink());
+}
+
 /// node: tests/gc.test.ts:121
 #[test]
 fn removes_vanished_sessions() {

@@ -100,6 +100,13 @@ lose the current buffered window. One-shot writers (`pty emit`, metadata, tags,
 display name, `pty exec`, and gc) retain their existing event-lock behavior, so
 their records can land before daemon records from up to one window earlier.
 
+Cursor visibility is terminal state, not durable event history: TUI redraws
+can toggle it dozens of times per second, so daemons do not persist
+`cursor_visible` transitions. Existing cursor-visible records remain readable
+and formattable. GC removes recognized atomic `.tmp.<pid>.<16hex>` files in
+the registry and activity/recovery directories only after their writer PID
+dies; live or reused PIDs, malformed names and symlinks are left alone.
+
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
 the required behavior. Track the compatibility matrix, crate boundaries, and
