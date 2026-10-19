@@ -411,6 +411,29 @@ on both.
 which of the two it is doing and pins the answer, rather than assuming the one
 it was written on.
 
+**A pty whose session leader exits, and a child whose output nobody has
+read.** Measured on 2026-10-19 with `forkpty` probes on macOS 27 (xnu-13432):
+
+| | Linux | macOS |
+|---|---|---|
+| the session leader exits while a descendant that ignores SIGHUP holds the terminal | the descendant keeps it open, and the master reads its later output | the master reads EOF within milliseconds, and the descendant cannot keep the terminal |
+| a shell that read input exits with output the master has not read | it is waitable at once, and the output stays readable | it is not waitable until the master reads; the output is kept (checked to 3 s) |
+
+**What it means:**
+- On macOS a session's output ends when its leader exits, so the substrate
+  publishes `OutputClosed` before the exit, and a backgrounded descendant's
+  later output is not captured.
+- A substrate reader parked by a full owner stream sees the child's exit only
+  once it reads again. The output is not lost.
+
+One more macOS case, not tied to `pty` yet: a child that writes and exits
+straight after `forkpty`, with nothing read or written on the master, becomes
+waitable after about 0.6 s, and its unread output is discarded.
+
+`pty-spawn`'s substrate tests assert each platform's behavior:
+`output_still_in_the_pty_when_the_child_is_reaped_is_delivered` and
+`an_exit_is_published_after_the_drain_bound_when_a_descendant_holds_the_pty`.
+
 ## 12d. Absent on macOS
 
 Measured on Apple silicon on 2026-09-02, by a machine that could run what this
