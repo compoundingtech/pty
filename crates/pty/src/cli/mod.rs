@@ -108,7 +108,8 @@ pub fn require_ref(args: &[String], usage: &str) -> Result<String, CliError> {
 /// `AGENT_TRACE_FILE` is a per-session provenance path: the new process needs its own, never the old one.
 ///
 /// node: src/cli.ts:3869
-pub const RESTART_SCRUBBED_ENV: [&str; 3] = ["ST_AGENT", "ST_ROOT", "AGENT_TRACE_FILE"];
+pub const RESTART_SCRUBBED_ENV: [&str; 5] =
+    ["ST_AGENT", "ST_ROOT", "FRACTAL_AGENT", "FRACTAL_ROOT", "AGENT_TRACE_FILE"];
 
 /// Refuse a command that would nest a client inside the current session.
 /// Returns `Some(1)` when it refused, having printed the reason and the
