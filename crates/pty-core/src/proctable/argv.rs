@@ -559,8 +559,8 @@ mod tests {
             .iter()
             .find(|row| row.pid == pid)
             .map(|row| row.argv.clone());
+        crate::kill::process(pid, libc::SIGKILL).unwrap();
         unsafe {
-            libc::kill(pid, libc::SIGKILL);
             libc::waitpid(pid, std::ptr::null_mut(), 0);
         }
         assert_eq!(found, Some(expected));

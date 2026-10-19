@@ -92,8 +92,10 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    match pty_core::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
+    }
 }
 
 pub fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
@@ -279,9 +281,7 @@ impl Daemon {
     }
 
     pub fn signal(&self, sig: i32) {
-        unsafe {
-            libc::kill(self.pid, sig);
-        }
+        let _ = pty_core::kill::process(self.pid, sig);
     }
 
     /// The session child's pid, from STATUS.

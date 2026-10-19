@@ -49,9 +49,8 @@ pub fn run(args: &[String]) -> CliResult {
         if existing_session.is_running()
             && let Some(pid) = existing_session.pid
         {
-            // SAFETY: signalling a pid we just read from the registry.
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc == 0 {
+            // Signalling a pid we just read from the registry.
+            if pty_core::kill::process(pid, libc::SIGTERM).is_ok() {
                 println!(
                     "  \u{25cb} {label} (stopped{})",
                     if was_permanent {

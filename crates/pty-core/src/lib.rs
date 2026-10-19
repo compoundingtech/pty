@@ -24,6 +24,7 @@ pub mod duration;
 pub mod events;
 pub mod input;
 pub mod keys;
+pub mod kill;
 pub mod operation;
 pub mod paste;
 pub mod process_tree;

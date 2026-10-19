@@ -422,7 +422,7 @@ unsafe fn fail(gate: RawFd, step: Step) -> ! {
 unsafe fn held_child(spec: &HeldSpec, gate: RawFd) -> ! {
     unsafe {
         if spec.stop_after_fork {
-            libc::kill(libc::getpid(), libc::SIGSTOP);
+            let _ = pty_core::kill::process(libc::getpid(), libc::SIGSTOP);
         }
         // 1. Dispositions as an exec would leave them, then an empty mask.
         for &(signal, handler) in &spec.dispositions {
@@ -470,7 +470,7 @@ unsafe fn held_child(spec: &HeldSpec, gate: RawFd) -> ! {
 
         // 6. Prepared.
         if spec.stop_before_ack {
-            libc::kill(libc::getpid(), libc::SIGSTOP);
+            let _ = pty_core::kill::process(libc::getpid(), libc::SIGSTOP);
         }
         if !write_all_raw(gate, &[PREPARED]) {
             libc::_exit(NOT_RELEASED);
@@ -593,12 +593,8 @@ pub struct HeldChild {
 
 impl portable_pty::ChildKiller for HeldChild {
     fn kill(&mut self) -> io::Result<()> {
-        // SAFETY: a signal to our own unreaped child.
-        if unsafe { libc::kill(self.pid as i32, libc::SIGKILL) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        // A signal to our own unreaped child.
+        pty_core::kill::process(self.pid as i32, libc::SIGKILL)
     }
 
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {

@@ -39,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, ExitStatus as PortableExitStatus, MasterPty, PtyPair, PtySize};
+use pty_core::kill::Target;
 
 /// How many undelivered bytes one attachment may hold. An attached stream
 /// that falls further behind than this is detached; the owner's own stream
@@ -903,14 +904,10 @@ fn read_master(
 struct ChildSignals {
     pid: Option<u32>,
     reaped: Mutex<bool>,
-    /// `kill(2)`. A seam, so a test can see exactly what was sent.
-    kill: fn(libc::pid_t, libc::c_int) -> libc::c_int,
-}
-
-fn os_kill(target: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-    // SAFETY: kill(2) has no memory-safety preconditions. Which process it
-    // may target is `ChildSignals::send`'s job.
-    unsafe { libc::kill(target, signal) }
+    /// `kill(2)` through `pty_core::kill`, which refuses a pid or group that
+    /// would reach more than the child. A seam, so a test can see exactly
+    /// what was sent.
+    kill: fn(Target, libc::c_int) -> io::Result<()>,
 }
 
 impl ChildSignals {
@@ -918,7 +915,7 @@ impl ChildSignals {
         Self {
             pid,
             reaped: Mutex::new(false),
-            kill: os_kill,
+            kill: pty_core::kill::send,
         }
     }
 
@@ -950,18 +947,17 @@ impl ChildSignals {
             return Ok(());
         }
         let target = if group {
-            -(pid as libc::pid_t)
+            Target::Group(pid as libc::pid_t)
         } else {
-            pid as libc::pid_t
+            Target::Process(pid as libc::pid_t)
         };
         // The child is unreaped while `reaped` is held and false, so its pid,
         // and a group id equal to it, cannot have been reused.
         let result = (self.kill)(target, signal);
         drop(reaped);
-        if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        match result {
+            Err(error) if error.raw_os_error() != Some(libc::ESRCH) => Err(error),
+            _ => Ok(()),
         }
     }
 }
@@ -2003,14 +1999,18 @@ mod tests {
 
     static SENT: Mutex<Vec<(libc::pid_t, libc::c_int)>> = Mutex::new(Vec::new());
 
-    fn record_kill(target: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-        SENT.lock().unwrap().push((target, signal));
-        0
+    fn record_kill(target: Target, signal: libc::c_int) -> io::Result<()> {
+        let raw = match target {
+            Target::Process(pid) => pid,
+            Target::Group(pgid) => -pgid,
+        };
+        SENT.lock().unwrap().push((raw, signal));
+        Ok(())
     }
 
     fn exists(pid: u32) -> bool {
-        // SAFETY: signal 0 only asks whether the pid names a process.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        // Signal 0 only asks whether the pid names a process.
+        pty_core::kill::process(pid as libc::pid_t, 0).is_ok()
     }
 
     /// PR #31 P1: the reaper must not release the child's pid while a signal

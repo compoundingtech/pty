@@ -128,13 +128,10 @@ pub fn sweep_groups(
     remaining
 }
 
-/// `kill(2)` on a whole process group.
+/// `kill(2)` on a whole process group. Group 1 and below are refused by
+/// [`crate::kill`].
 pub fn signal_group(pgid: i32, signal: i32) {
-    if pgid <= 1 {
-        return;
-    }
-    // SAFETY: a negative pid is the documented way to signal a process group.
-    unsafe { libc::kill(-pgid, signal) };
+    let _ = crate::kill::group(pgid, signal);
 }
 
 /// The caller's own process group.
@@ -428,11 +425,11 @@ pub fn group_exists(pgid: i32) -> bool {
     if pgid <= 1 {
         return false;
     }
-    // SAFETY: signal 0 to a process group only asks whether it has members.
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
-        return true;
+    // Signal 0 to a process group only asks whether it has members.
+    match crate::kill::group(pgid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The fallback when a complete descendant snapshot is unavailable: TERM the
@@ -508,8 +505,8 @@ pub fn signal_process_identities(ids: &[ProcessIdentity], signal: i32) -> Vec<i3
         if !is_same_process(id) {
             continue;
         }
-        // SAFETY: plain kill(2) on a pid we just re-verified.
-        if unsafe { libc::kill(id.pid, signal) } == 0 {
+        // A pid we just re-verified.
+        if crate::kill::process(id.pid, signal).is_ok() {
             signalled.push(id.pid);
         }
     }
@@ -887,8 +884,8 @@ mod real_group_tests {
     }
 
     fn registry_alive(pid: i32) -> bool {
-        // SAFETY: signal 0 only checks for existence.
-        unsafe { libc::kill(pid, 0) == 0 }
+        // Signal 0 only checks for existence.
+        crate::kill::process(pid, 0).is_ok()
     }
 }
 
@@ -1309,7 +1306,7 @@ mod containment_tests {
             root,
             || {
                 signal_group(root, libc::SIGSTOP);
-                unsafe { libc::kill(root, libc::SIGSTOP) == 0 }
+                crate::kill::process(root, libc::SIGSTOP).is_ok()
             },
             ProcTable::read,
             |identities| signal_process_identities(identities, libc::SIGSTOP),

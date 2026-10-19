@@ -226,12 +226,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: kill(2) with signal 0 only checks for existence/permission.
-    let r = unsafe { libc::kill(pid, 0) };
-    if r == 0 {
-        return true;
+    // Signal 0 only checks for existence/permission.
+    match pty_core::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Has `pid` exited? A zombie counts: it has finished and only waits for
@@ -270,12 +269,7 @@ pub fn wait_for_process_gone(pid: i32) {
 
 /// Send `sig` to `pid`, ignoring errors.
 pub fn kill_pid(pid: i32, sig: i32) {
-    if pid > 0 {
-        // SAFETY: plain kill(2).
-        unsafe {
-            libc::kill(pid, sig);
-        }
-    }
+    let _ = pty_core::kill::process(pid, sig);
 }
 
 fn mkdtemp(prefix: &str) -> PathBuf {

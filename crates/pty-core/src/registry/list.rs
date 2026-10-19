@@ -258,9 +258,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: signal 0 only checks for existence/permission.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Signal 0 only checks for existence/permission.
+    match crate::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
+    }
 }
 
 /// The sidecar `<name>.pid`, parsed like `parseInt(content.trim(), 10)`.

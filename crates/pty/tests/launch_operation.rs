@@ -553,11 +553,10 @@ fn a_process_caught_exiting_is_one_to_wait_for() {
     assert_eq!(named_processes(&writer), [21]);
 }
 
+/// A signal to a test-owned process. A pid read from a record is never
+/// trusted to be one: `pty_core::kill` refuses pid 1 and below.
 fn kill(pid: i32, signal: i32) {
-    // SAFETY: a signal to a test-owned process.
-    unsafe {
-        libc::kill(pid, signal);
-    }
+    let _ = pty_core::kill::process(pid, signal);
 }
 
 fn row_exists(rig: &Rig, name: &str) -> bool {
@@ -1484,7 +1483,7 @@ fn a_group_stop_reaches_the_prepared_child_and_cancel_still_retires_it() {
     let ready = owner.wait_for("ready");
     let child = ready["incarnation"]["child"]["pid"].as_i64().unwrap() as i32;
     // The prepared child leads its own process group.
-    kill(-child, libc::SIGSTOP);
+    pty_core::kill::group(child, libc::SIGSTOP).unwrap();
     wait_until(
         "the group to stop",
         || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
