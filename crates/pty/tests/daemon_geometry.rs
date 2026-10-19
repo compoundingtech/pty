@@ -16,17 +16,28 @@ const T: Duration = Duration::from_secs(5);
 
 /// A child that clears and prints `X` × (2 × cols) on every SIGWINCH.
 ///
+/// Until the script runs `trap`, SIGWINCH is ignored, and these tests resize
+/// within milliseconds of attaching. So wait for the script to say the trap
+/// is set: under load on macOS a resize that beat it left the child never
+/// redrawing.
+///
 /// node: tests/effective-geometry.test.ts:28-34
 fn width_daemon() -> Daemon {
     let root = short_root();
     let body = "#!/bin/bash\n\
         redraw() { c=$(stty size < /dev/tty | cut -d' ' -f2); printf '\\033[2J\\033[H'; i=0; while [ $i -lt $((c*2)) ]; do printf X; i=$((i+1)); done; }\n\
         trap redraw WINCH\n\
+        touch \"${0%/*}/trapped\"\n\
         while :; do sleep 0.02; done\n";
     let path = script(&root, "width.sh", body);
     let mut cfg = config(&unique_name("geo"), path.to_str().unwrap(), &[]);
     cfg["cols"] = json!(20);
-    Daemon::start(&root, cfg)
+    let d = Daemon::start(&root, cfg);
+    assert!(
+        wait_until(T, || root.join("trapped").exists()),
+        "the child never set its WINCH trap"
+    );
+    d
 }
 
 /// Wait for GEOMETRY(rows, cols) followed by at least one DATA.
