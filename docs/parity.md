@@ -339,8 +339,9 @@ Where it differs from the issue's sketch:
 - The API is synchronous: `subscribe()` returns an mpsc `Receiver`.
 - The CLI's `pty_client::attach` and the handle's own connection are still two
   client attach paths.
-- Closing a spawned handle SIGKILLs the child pid, not its process group
-  (#162).
+
+Closing a spawned handle SIGKILLs the child's process group and then the
+child, through the same reap fence as the daemon's substrate (#162).
 
 ## 11. Mixed fleet: Node and Rust on one `$PTY_ROOT`
 
