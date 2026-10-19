@@ -1565,6 +1565,12 @@ mod tests {
     /// stream is held full, so the reader parks before the child's last write
     /// and those bytes are provably still in the PTY when the child is
     /// reaped. Released afterwards, they must all arrive.
+    ///
+    /// **macOS cannot set this up.** There the child does not become waitable
+    /// while its pty output is unread: its exit waits for the master to read
+    /// (macOS 27, measured 2026-10-19; docs/parity.md §12c). So the test
+    /// checks what holds on macOS: no reap while the output is unread, and
+    /// once the reader is released, every byte before the exit.
     #[test]
     fn output_still_in_the_pty_when_the_child_is_reaped_is_delivered() {
         let (_owner, client, stream) = sh_attached(
@@ -1588,17 +1594,28 @@ mod tests {
         client.input(b"a\n".to_vec()).unwrap();
         wait_for_queued(&stream, b"a");
         client.input(b"b\n".to_vec()).unwrap();
-        assert!(
-            (0..500).any(|_| {
-                thread::sleep(Duration::from_millis(10));
-                matches!(client.lifecycle(), Ok(Lifecycle::Exited(_)))
-            }),
-            "the child was never reaped"
-        );
-        assert!(
-            !queued_data(&stream).ends_with(b"tail"),
-            "the tail was read before the reap, so this proves nothing"
-        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                (0..500).any(|_| {
+                    thread::sleep(Duration::from_millis(10));
+                    matches!(client.lifecycle(), Ok(Lifecycle::Exited(_)))
+                }),
+                "the child was never reaped"
+            );
+            assert!(
+                !queued_data(&stream).ends_with(b"tail"),
+                "the tail was read before the reap, so this proves nothing"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            thread::sleep(Duration::from_millis(1500));
+            assert!(
+                !matches!(client.lifecycle(), Ok(Lifecycle::Exited(_))),
+                "macOS reaped a child whose pty output was unread"
+            );
+        }
         {
             let mut state = stream.queue.lock();
             state.reserved = state.reserved.saturating_sub(held);
@@ -1609,6 +1626,19 @@ mod tests {
             data(&events).ends_with(b"tail"),
             "output unread at the reap was dropped: {events:?}"
         );
+        #[cfg(target_os = "macos")]
+        {
+            let exit = events
+                .iter()
+                .position(|event| matches!(event, SessionEvent::Lifecycle(Lifecycle::Exited(_))))
+                .unwrap();
+            assert!(
+                events[exit + 1..]
+                    .iter()
+                    .all(|event| !matches!(event, SessionEvent::Data(_))),
+                "output after the exit: {events:?}"
+            );
+        }
     }
 
     /// PR #32: the reviewer's reproduction, through the owner's pre-registered
@@ -1646,6 +1676,13 @@ mod tests {
 
     /// The exit still gets published when a descendant keeps the PTY open,
     /// and output keeps flowing after it until the PTY closes.
+    ///
+    /// **On macOS no descendant can keep it open.** The kernel closes the
+    /// terminal when its session leader exits, and the master reads EOF within
+    /// milliseconds although a SIGHUP-ignoring descendant still holds the slave
+    /// (macOS 27, measured 2026-10-19; docs/parity.md §12c). There the output
+    /// closes first, the exit follows promptly, and nothing written later
+    /// arrives.
     #[test]
     fn an_exit_is_published_after_the_drain_bound_when_a_descendant_holds_the_pty() {
         // The kernel hangs up the foreground group when the session leader
@@ -1661,20 +1698,32 @@ mod tests {
             SessionEvent::Lifecycle(Lifecycle::Running)
         );
         let started = Instant::now();
-        let exit = stream.recv_timeout(T).unwrap();
-        assert_eq!(
-            exit,
-            SessionEvent::Lifecycle(Lifecycle::Exited(ExitStatus {
-                code: Some(3),
-                signal: None
-            }))
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "the exit waited for the descendant"
-        );
-        let rest = until_closed_and_exited_after_exit(&stream);
-        assert_eq!(data(&rest), b"late");
+        let exited = SessionEvent::Lifecycle(Lifecycle::Exited(ExitStatus {
+            code: Some(3),
+            signal: None,
+        }));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let exit = stream.recv_timeout(T).unwrap();
+            assert_eq!(exit, exited);
+            assert!(
+                started.elapsed() < Duration::from_millis(900),
+                "the exit waited for the descendant"
+            );
+            let rest = until_closed_and_exited_after_exit(&stream);
+            assert_eq!(data(&rest), b"late");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let events = until_closed_and_exited(&stream);
+            assert!(
+                started.elapsed() < Duration::from_millis(900),
+                "the session waited for the descendant: {events:?}"
+            );
+            assert_eq!(events.first(), Some(&SessionEvent::OutputClosed), "{events:?}");
+            assert!(events.contains(&exited), "{events:?}");
+            assert!(data(&events).is_empty(), "{events:?}");
+        }
     }
 
     fn until_closed_and_exited_after_exit(stream: &AttachStream) -> Vec<SessionEvent> {
