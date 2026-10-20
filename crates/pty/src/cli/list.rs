@@ -32,6 +32,7 @@ pub struct RemoteHost {
 pub struct RemoteSession {
     pub name: String,
     pub status: String,
+    pub identity: Option<registry::DaemonIdentityCheck>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub tags: Option<TagMap>,
@@ -79,6 +80,7 @@ fn remote_session(row: client::remote::RemoteSessionRow) -> RemoteSession {
     RemoteSession {
         name: row.name,
         status: row.status,
+        identity: row.identity,
         command: row.command,
         cwd: row.cwd,
         tags: row.tags.map(|t| t.into_iter().collect()),
@@ -387,6 +389,7 @@ fn session_json(s: &SessionInfo, clients: Option<&ClientSet>, strict: bool) -> V
     let mut m = Map::new();
     m.insert("name".into(), Value::from(s.name.as_str()));
     m.insert("status".into(), Value::from(s.status.as_str()));
+    m.insert("identity".into(), Value::from(s.identity.as_str()));
     m.insert("pid".into(), s.pid.map(Value::from).unwrap_or(Value::Null));
     m.insert(
         "command".into(),
@@ -462,6 +465,9 @@ fn remote_host_json(h: &RemoteHost) -> Value {
                     let mut o = Map::new();
                     o.insert("name".into(), Value::from(s.name.as_str()));
                     o.insert("status".into(), Value::from(s.status.as_str()));
+                    if let Some(identity) = s.identity {
+                        o.insert("identity".into(), Value::from(identity.as_str()));
+                    }
                     if let Some(c) = &s.command {
                         o.insert("command".into(), Value::from(c.as_str()));
                     }
@@ -763,7 +769,20 @@ mod tests {
             socket_path: "/nonexistent/test.sock".into(),
             pid: Some(42),
             status,
+            identity: registry::DaemonIdentityCheck::Match,
             metadata: None,
+        }
+    }
+
+    #[test]
+    fn b1_json_preserves_unknown_identity_alongside_running_pid() {
+        let mut running = session(SessionStatus::Running);
+        running.identity = registry::DaemonIdentityCheck::Unknown;
+        for strict in [false, true] {
+            let row = session_json(&running, None, strict);
+            assert_eq!(row["status"], "running");
+            assert_eq!(row["pid"], 42);
+            assert_eq!(row["identity"], "unknown");
         }
     }
 

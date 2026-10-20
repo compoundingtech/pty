@@ -82,7 +82,7 @@ pub use remote::{
     RemoteDialer, RemoteError, RemoteSessionRow, RouteRefusedError, dial_and_route,
     fetch_remote_list,
 };
-pub use remove::{RemoveError, remove, remove_in};
+pub use remove::{RemoveError, remove, remove_in, wait_for_recorded_owner_loss};
 pub use sanitize::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};
 pub use send::{DEFAULT_SEQ_DELAY_MS, SendOptions, resolve_seq_delay_ms, send, send_in, send_over};
 pub use signal::{Delivery, SignalError, Signalled, signal, signal_in};
@@ -90,7 +90,9 @@ pub use stats::{
     STATS_TIMEOUT, query_stats, query_stats_batch_in, query_stats_in, query_stats_in_with_timeout,
     query_stats_with_timeout, query_status_json,
 };
-pub use stop::{Aftermath, SHUTDOWN_WAIT, StopError, Stopped, stop, stop_in};
+pub use stop::{
+    Aftermath, SHUTDOWN_WAIT, SignalledDaemon, StopError, Stopped, signal_daemon, stop, stop_in,
+};
 pub use stream::{parse_attach_stream_fd_token, validate_attach_stream_fd};
 
 use pty_core::registry;

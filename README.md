@@ -398,8 +398,10 @@ Repeated observers can retain a `pty_client::list::RegistryListCache` and call
 `cache.list(&root, &options)` instead. This explicit stateful API reuses parsed
 regular-file metadata only when path, device/inode, size, and nanosecond
 mtime/ctime match. Each call still opens metadata to check readability, lists
-the directory, reads PID sidecars, checks process identity/liveness, probes
-sockets with the same budget, and queries attached clients when requested.
+the directory, reads PID sidecars, checks exact process identity and lifecycle,
+and queries attached clients when requested. Ordinary listing does not probe
+sockets for liveness: Unknown identity conservatively retains the named PID,
+status and metadata, while socket reachability cannot rescue Gone or Mismatch.
 New, changed, and removed sessions are observed on the next call; read/parse
 failures are not cached. The existing stateless `list` API is unchanged.
 The handle is internally synchronized and `list` takes `&self`: share an

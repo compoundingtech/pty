@@ -219,6 +219,8 @@ fn install_reports_existing_live_occupancy_without_mutating_any_session_file() {
         let metadata = SessionMetadata {
             generation: Some("survivor-generation".into()),
             daemon_pid: Some(std::process::id() as i32),
+            daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
+            daemon_boot_id: registry::read_boot_id(),
             ..Default::default()
         };
         registry::write_metadata_publication("seat", &metadata).unwrap();

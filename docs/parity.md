@@ -179,7 +179,7 @@ gap is in what the daemon does with the frames.
 | Reap vs preserve precedence (`keep` > `ephemeral` > `permanent` > `PTY_REAP_ON_EXIT`) | have | Rust accepts only `keep=true`; Node accepts any value except `false/0/no/off`. |
 | On preserve: `exitCode`, `exitedAt`, `lastLines` (≤ 200) | partial | Rust keeps 50 lines and writes a Rust-only `<name>.screen` file. |
 | Scrollback 10000, `scrollbackCapacity = rows + 10000` | have | |
-| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | missing | |
+| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | partial | Rust writes all of these except `cursor_visible`, which is Node-only and optional. A TUI can toggle the cursor on every redraw, and those records filled the event history, so Rust daemons stopped writing them in #172. Node's `docs/disk-layout.md` still lists `cursor_visible` in its tier-1 `events.jsonl` table. A reader must not wait for it or filter on it to learn anything about a session. Rust still reads and formats existing `cursor_visible` records. |
 | Live recovery request handling (`.recovery/`) | deferred | |
 
 ## 5. Registry on disk (`$PTY_ROOT`)
@@ -215,9 +215,9 @@ gap is in what the daemon does with the frames.
 
 | Behavior | Rust status |
 |---|---|
-| `listSessions` never mutates; scans `.sock` then orphan `.json`; pid alive or socket reachable → running; probe budget 500 ms | partial |
-| `daemonPid` accepted only with a matching start token | missing |
-| Status `running` / `exited` / `vanished` | have |
+| `listSessions` never mutates; scans `.sock` then orphan `.json`; 500 ms transport probe budget | have; probes are diagnostics, never daemon liveness authority |
+| `daemonPid` grants authority only with matching recorded stable boot identity and start token | have; required on Linux and macOS, with thread-group leadership also required on Linux. A readable different start token proves Mismatch before boot is required. Missing/unreadable evidence is Unknown and makes strict inventory incomplete. Teardown pins exact owners through `Exact` (Linux pidfd / macOS audit token), never raw PID or group fallback |
+| Status `running` / `exited` / `vanished` | have; Unknown conservatively stays `running` with its named PID unless an explicit exit record says `exited`. Metadata without any named PID or PID/socket companion is Gone and removable. Additive `identity` in list JSON and remote rows is `match`, `mismatch`, `gone` or `unknown`; display status alone grants no signal, cleanup or replacement authority |
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |
 | Behavioral tags: `strategy=permanent`, `keep`, `parent`, `role=agent`, `strategy.*` bookkeeping, `:l<pid>-*` | partial (`keep`, `permanent` only) |

@@ -187,7 +187,6 @@ mod tests {
         use std::time::Duration;
         let root = Root::new();
         root.write("first", "label");
-        std::fs::write(root.0.join("first.pid"), "2147483647").unwrap();
         std::fs::write(super::super::socket_path_in(&root.0, "first"), []).unwrap();
         let cache = RegistryListCache::default();
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -198,7 +197,7 @@ mod tests {
             let cache = &cache;
             let first = scope.spawn(move || {
                 super::super::scan_sessions_with_probe(
-                    root, &ListOptions::default(), false, None, Some(cache),
+                    root, &ListOptions::default(), true, None, Some(cache),
                     |paths, _| {
                         assert_eq!(paths.len(), 1);
                         entered_tx.send(()).unwrap();
@@ -323,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_reachability_is_not_cached() {
+    fn reachable_socket_cannot_rescue_gone_identity_with_cached_metadata() {
         let root = Root::new();
         root.write("first", "label");
         std::fs::write(root.0.join("first.pid"), "2147483647").unwrap();
@@ -332,7 +331,9 @@ mod tests {
         let options = ListOptions::default();
         let cache = RegistryListCache::default();
         let before = parses();
-        assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Running);
+        let reachable = cache.list(&root.0, &options);
+        assert_eq!(reachable[0].status, SessionStatus::Vanished);
+        assert_eq!(reachable[0].identity, super::super::DaemonIdentityCheck::Gone);
         drop(listener);
         // Unlink the endpoint before replacing it with an unreachable companion:
         // another test's concurrent fork can briefly inherit the listener FD.
@@ -340,6 +341,56 @@ mod tests {
         std::fs::write(&socket, []).unwrap();
         assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Vanished);
         assert_eq!(parses() - before, 1);
+    }
+
+    #[test]
+    fn cached_metadata_preserves_unknown_owner_and_fresh_identity_classification() {
+        use super::super::{DaemonIdentityCheck, read_boot_id, read_process_start_token};
+        let root = Root::new();
+        let pid = std::process::id() as i32;
+        let mut metadata: serde_json::Value = serde_json::from_slice(&record("label")).unwrap();
+        metadata["daemonPid"] = pid.into();
+        metadata["daemonStartToken"] = read_process_start_token(pid).unwrap().into();
+        metadata["tags"] = serde_json::json!({"owner": "person/robin"});
+        metadata["futureField"] = serde_json::json!({"retained": true});
+        let path = root.0.join("first.json");
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let cache = RegistryListCache::default();
+        let options = ListOptions::default();
+        let before = parses();
+        for _ in 0..2 {
+            let unknown = cache.list(&root.0, &options);
+            assert_eq!(unknown[0].identity, DaemonIdentityCheck::Unknown);
+            assert_eq!(unknown[0].status, SessionStatus::Running);
+            assert_eq!(unknown[0].pid, Some(pid));
+            assert_eq!(unknown[0].metadata.as_ref().unwrap().to_map()["tags"], metadata["tags"]);
+            assert_eq!(unknown[0].metadata.as_ref().unwrap().to_map()["futureField"], metadata["futureField"]);
+        }
+        assert_eq!(parses() - before, 1);
+
+        metadata["daemonBootId"] = read_boot_id().unwrap().into();
+        std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert_eq!(cache.list(&root.0, &options)[0].identity, DaemonIdentityCheck::Match);
+        // Companion disagreement changes identity even with unchanged cached JSON.
+        let sidecar = root.0.join("first.pid");
+        std::fs::write(&sidecar, "2147483647").unwrap();
+        let conflicting = cache.list(&root.0, &options);
+        assert_eq!(conflicting[0].identity, DaemonIdentityCheck::Unknown);
+        assert_eq!(conflicting[0].status, SessionStatus::Running);
+        assert_eq!(conflicting[0].pid, Some(2147483647));
+        assert!(conflicting[0].metadata.is_some());
+        std::fs::remove_file(sidecar).unwrap();
+        assert_eq!(cache.list(&root.0, &options)[0].identity, DaemonIdentityCheck::Match);
+        assert_eq!(parses() - before, 2);
+
+        metadata.as_object_mut().unwrap().remove("daemonBootId");
+        metadata["exitCode"] = 0.into();
+        std::fs::write(path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let exited = cache.list(&root.0, &options);
+        assert_eq!(exited[0].identity, DaemonIdentityCheck::Unknown);
+        assert_eq!(exited[0].status, SessionStatus::Exited);
+        assert_eq!(exited[0].pid, Some(pid));
+        assert!(exited[0].metadata.is_some());
     }
 
     #[test]
@@ -358,6 +409,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(running[0].status, SessionStatus::Running);
+        assert_eq!(running[0].identity, super::super::DaemonIdentityCheck::Unknown);
         let gone = cache.list(&root.0, &options);
         assert_eq!(gone[0].status, SessionStatus::Vanished);
         assert_eq!(gone[0].pid, None);

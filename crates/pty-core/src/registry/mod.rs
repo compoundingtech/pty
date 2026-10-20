@@ -37,7 +37,8 @@ pub use activity::{
 pub use atomic::{atomic_write, is_tmp_name, random_hex16};
 pub use cleanup::{
     SessionGenerationOwner, cleanup, cleanup_all, cleanup_all_while_locked, cleanup_owned_all,
-    cleanup_owned_socket, cleanup_socket, is_current_generation_owner,
+    cleanup_owned_socket, cleanup_socket, is_current_generation_owner, retire_stale_daemon_record,
+    retire_stale_daemon_records,
 };
 pub use evidence::{
     EvidenceStream, EvidenceUnavailableReason, RemoveSessionGenerationResult, SessionExitEvidence,
@@ -45,12 +46,14 @@ pub use evidence::{
     get_session_exit_evidence, remove_session_generation,
 };
 pub use list::{
-    DEFAULT_SOCKET_PROBE_BUDGET, Inventory, InventoryError, InventoryErrorKind, ListOptions,
-    SessionInfo, SessionStatus, all_session_names, ambiguous_reference_message, get_session,
-    get_session_by_name, has_process_exited_for_reap, list_sessions, list_sessions_in,
-    list_sessions_strict_in, list_sessions_with, observe_session_strict_in, pid_alive,
-    probe_sockets_within_budget, read_pid, read_pid_with, read_process_start_token,
-    read_session_pid, read_signal_target_with, resolve_ref, session_exists, socket_reachable,
+    DEFAULT_SOCKET_PROBE_BUDGET, DaemonIdentityCheck, DaemonIdentityCounters, Inventory,
+    InventoryError, InventoryErrorKind, ListOptions, SessionInfo, SessionStatus, all_session_names,
+    ambiguous_reference_message, check_daemon_identity, check_record_identity, check_record_identity_in,
+    daemon_identity_counters, get_session, get_session_by_name, has_process_exited_for_reap,
+    list_sessions, list_sessions_in, list_sessions_strict_in, list_sessions_with,
+    observe_session_strict_in, pid_alive, probe_sockets_within_budget, read_boot_id, read_pid,
+    read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
+    record_daemon_identity_check, resolve_ref, session_exists, socket_reachable,
     wait_for_process_exit,
 };
 pub use lock::{

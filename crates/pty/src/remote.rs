@@ -24,6 +24,7 @@ use serde_json::Value;
 struct SessionRow {
     name: String,
     status: String,
+    identity: registry::DaemonIdentityCheck,
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +41,7 @@ impl SessionRow {
         SessionRow {
             name: s.name.clone(),
             status: s.status.as_str().to_string(),
+            identity: s.identity,
             // `command` is the command as the user typed it.
             command: meta
                 .map(|m| m.display_command.clone())

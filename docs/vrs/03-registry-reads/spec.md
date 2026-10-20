@@ -17,7 +17,7 @@ Not defined here: which sessions a listing probes and how it classifies them (`c
 ```
 caller thread
   │
-  ├─ list_sessions_with ──► probe_sockets_within_budget(paths, budget) ──┐
+  ├─ list_sessions_strict_in ──► probe_sockets_within_budget(paths, budget) ──┐
   │                                                                      ├─► unix_connect::connect  (per socket, per round)
   └─ query_stats_batch_in(root, names, deadline) ────────────────────────┘   unix_connect::poll_until (one poll(2) per round)
 ```
@@ -64,7 +64,49 @@ Each round:
 | `Failed`, or `InProgress` then an error | `false` |
 | `Busy` or `InProgress` at the deadline | absent (`PTY.REG-R05`) |
 
-The listing reads `false` and absent the same way: unreachable. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`.
+Daemon identity Match requires matching recorded stable boot identity and start
+token on Linux and macOS, plus thread-group leadership on Linux. Compare
+readable start tokens first: a difference proves Mismatch even without boot
+evidence. Matching tokens with missing/unreadable boot evidence remain Unknown.
+Legacy `darwin:{...}` boottime evidence cannot prove a boot match or mismatch.
+Unknown is not gone (`PTY.REG-R09`): retain the named PID and conservative
+`running` status unless an explicit exit record says `exited`. Carry
+`SessionInfo.identity` as the additive `identity` list JSON/remote field
+(`match`, `mismatch`, `gone`, `unknown`); Unknown never grants signal,
+cleanup or replacement authority, even with an exit record. Metadata with no
+named PID and absent PID/socket companions is Gone and removable; unreadable
+or malformed companions never prove absence. Teardown uses the existing
+`operation::exact::Exact` pinned-owner abstraction (Linux pidfd / macOS audit
+token); socket probes cannot substitute for identity requirements.
+
+Strict inventory probes transport only when daemon identity is unconfirmed; a probe cannot change that identity result or the lifecycle projection. Failed or unanswered probes make transport diagnostics incomplete. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`. Ordinary listings classify identity without probing sockets.
+
+## Parsed metadata cache
+
+Repeated embedders may retain `pty_core::registry::list::RegistryListCache`
+(or the `pty_client::list` facade). Stateless listing remains unchanged.
+The cache retains successful parsed regular-file `SessionMetadata` only,
+keyed by path, device/inode, size, and nanosecond mtime/ctime. Every lookup
+opens the file to check readability and compares descriptor metadata; reads
+are retained only when fstat identity is stable before and after reading.
+Missing entries are evicted per observed root, and read/parse failures and
+nonregular companions are never cached.
+
+Every call still discovers directory entries, reads PID sidecars, checks
+current boot/start-token/leader evidence and classifies identity. Neither
+`DaemonIdentityCheck` nor projected status/PID is cached. In particular,
+unchanged JSON cannot conceal process death or companion disagreement.
+Unknown retains the parsed metadata, named PID and conservative lifecycle
+projection required by `PTY.REG-R09`; explicit exit evidence still projects
+`exited`, without granting destructive authority.
+
+The handle supports concurrent `&self` calls and can be shared through `Arc`
+without an outer mutex. Its internal lock covers cache operations only, not
+filesystem reads, identity checks, transport probes or attached-client queries.
+No live observation or socket survives a call (`PTY.REG-R01`, `PTY.REG-R02`);
+retained parsed records are evicted as registry entries disappear, rather than
+accumulating on each poll (`PTY.REG-R03`).
+
 
 ## Batch STATUS
 
@@ -149,3 +191,4 @@ The one intended difference (`PTY.REG-T02`): the single read issues a blocking c
 | `PTY.REG-R04`, `PTY.REG-R05`, `PTY.REG-R07` | `crates/pty-client/tests/observation_roots.rs::socket_probe_matches_a_blocking_connect` |
 | `PTY.REG-R06`, `PTY.REG-R08` | `crates/pty-client/tests/observation_roots.rs::batch_stats_bound_every_session_by_one_deadline`, `batch_stats_bound_a_peer_that_floods_data` |
 | `PTY.REG-T01` | `crates/pty-client/tests/observation_roots.rs::batch_stats_throttle_busy_retries_beside_a_flooding_peer`, `batch_stats_never_retry_a_busy_connect_at_the_deadline`, `socket_probe_never_retries_a_busy_connect_at_the_deadline` |
+| `PTY.REG-R09` with parsed metadata reuse | `crates/pty-core/src/registry/list/metadata_cache.rs::tests::cached_metadata_preserves_unknown_owner_and_fresh_identity_classification`, `reachable_socket_cannot_rescue_gone_identity_with_cached_metadata`, `fallback_process_start_token_is_not_cached` |
