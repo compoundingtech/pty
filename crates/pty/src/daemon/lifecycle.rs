@@ -550,7 +550,15 @@ pub(crate) fn publish_session(
     // The caller must keep this pin from admission through the last effect.
     pty_core::operation::barrier::barrier("publication-before-effects");
     let _creation_lock = p.creation_lock;
+    // A daemon without complete birth evidence cannot be safely managed.
+    // Refuse before publishing companions or starting its terminal child.
+    let daemon_start_token = registry::read_process_start_token(std::process::id() as i32)
+        .ok_or_else(|| "daemon start identity is unavailable".to_string())?;
+    let daemon_boot_id = registry::read_boot_id()
+        .ok_or_else(|| "daemon boot identity is unavailable".to_string())?;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
+    // Do not inspect this name: its pid/metadata publication is still in flight.
+    registry::retire_stale_daemon_records(name);
     // The predecessor may still be flushing its shutdown events after the
     // coordinator releases the event claim. Use the writer's bounded lock
     // admission instead of failing publication on that transient append.
@@ -573,7 +581,8 @@ pub(crate) fn publish_session(
     let mut metadata = SessionMetadata {
         generation: Some(p.generation.to_string()),
         daemon_pid: Some(std::process::id() as i32),
-        daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
+        daemon_start_token: Some(daemon_start_token),
+        daemon_boot_id: Some(daemon_boot_id),
         recovery: None,
         command: cfg.command.clone(),
         args: cfg.args.clone(),
@@ -780,7 +789,9 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(packet) => {
-                    let _guard = writer_lock.lock().unwrap_or_else(|error| error.into_inner());
+                    let _guard = writer_lock
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
@@ -1056,10 +1067,21 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx, disconnect, write_lock } => {
+            Msg::Connect {
+                id,
+                tx,
+                disconnect,
+                write_lock,
+            } => {
                 self.clients.insert(
                     id,
-                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols(), write_lock),
+                    Client::new(
+                        tx,
+                        disconnect,
+                        self.actor.rows(),
+                        self.actor.cols(),
+                        write_lock,
+                    ),
                 );
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
@@ -1839,7 +1861,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))));
+        clients.insert(
+            1,
+            Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))),
+        );
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(answering_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");

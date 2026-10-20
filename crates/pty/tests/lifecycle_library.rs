@@ -75,6 +75,8 @@ fn gc_dry_run_reports_without_mutating_then_applies_the_same_cleanup() {
     let metadata = SessionMetadata {
         generation: Some("gone-generation".into()),
         daemon_pid: Some(DEAD_PID),
+        daemon_start_token: Some("fixture:dead".into()),
+        daemon_boot_id: registry::read_boot_id(),
         command: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 0".into()],
         display_command: "exit 0".into(),
@@ -147,6 +149,11 @@ fn spawn_params_new_supplies_a_usable_cwd_to_a_real_daemon() {
         .expect("SpawnParams::new should be spawnable without overwriting cwd");
     let published = registry::read_metadata(&name).expect("daemon published metadata");
     assert_eq!(published.daemon_pid, Some(started.pid as i32));
+    assert_eq!(published.daemon_boot_id, registry::read_boot_id());
+    assert_eq!(
+        registry::check_daemon_identity(started.pid as i32, &published),
+        registry::DaemonIdentityCheck::Match,
+    );
     assert_eq!(
         published.generation.as_deref(),
         Some(started.generation.as_str())
@@ -286,6 +293,78 @@ fn returned_generation_belongs_to_the_publication_matched_with_the_returned_pid(
     let _root = ROOT.as_path();
     spawn_across_publication_mutation(PublicationMutation::Remove);
     spawn_across_publication_mutation(PublicationMutation::Replace);
+}
+
+#[test]
+fn real_daemon_startup_retires_stale_exited_records_without_touching_live_or_unknown() {
+    skip_without_a_real_machine!();
+    let _serial = serial();
+    let _root = ROOT.as_path();
+    let stale_name = unique_name("startup-stale");
+    let live_name = unique_name("startup-live");
+    let unknown_name = unique_name("startup-unknown");
+    let name = unique_name("startup-new");
+    let pid = std::process::id() as i32;
+    let token = registry::read_process_start_token(pid).expect("test process start token");
+    let stale = SessionMetadata {
+        generation: Some("stale-exited-generation".into()),
+        daemon_pid: Some(pid),
+        daemon_start_token: Some("previous:process-token".into()),
+        daemon_boot_id: registry::read_boot_id(),
+        exit_code: Some(0),
+        exited_at: Some("2026-10-01T00:00:00.000Z".into()),
+        ..Default::default()
+    };
+    registry::write_metadata_publication(&stale_name, &stale).unwrap();
+    registry::write_pid(&stale_name, pid as u32).unwrap();
+    let companions = [
+        registry::socket_path(&stale_name),
+        registry::events_path(&stale_name),
+        registry::recovery_revision_path(&stale_name),
+        registry::output_activity_path(&stale_name),
+    ];
+    for path in &companions {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"retained history").unwrap();
+    }
+    let live = SessionMetadata {
+        generation: Some("matching-generation".into()),
+        daemon_pid: Some(pid),
+        daemon_start_token: Some(token.clone()),
+        daemon_boot_id: registry::read_boot_id(),
+        ephemeral: Some(false),
+        ..Default::default()
+    };
+    registry::write_metadata_publication(&live_name, &live).unwrap();
+    let unknown = SessionMetadata {
+        daemon_start_token: None,
+        ..live.clone()
+    };
+    registry::write_metadata_publication(&unknown_name, &unknown).unwrap();
+    let live_bytes = std::fs::read(registry::metadata_path(&live_name)).unwrap();
+    let unknown_bytes = std::fs::read(registry::metadata_path(&unknown_name)).unwrap();
+
+    let params = SpawnParams::new(&name, "/bin/sh", &["-c".into(), "exec sleep 30".into()]);
+    let started =
+        spawn_daemon(Path::new(pty_bin()), params).expect("start daemon and sweep registry");
+    assert!(!registry::metadata_path(&stale_name).exists());
+    assert!(!registry::pid_path(&stale_name).exists());
+    assert!(companions.iter().all(|path| !path.exists()));
+    assert_eq!(registry::read_metadata(&live_name), Some(live));
+    assert_eq!(registry::read_metadata(&unknown_name), Some(unknown));
+    assert_eq!(std::fs::read(registry::metadata_path(&live_name)).unwrap(), live_bytes);
+    assert_eq!(std::fs::read(registry::metadata_path(&unknown_name)).unwrap(), unknown_bytes);
+    assert_eq!(registry::read_process_start_token(pid).as_deref(), Some(token.as_str()));
+    assert_eq!(
+        registry::check_daemon_identity(
+            started.pid as i32,
+            &registry::read_metadata(&name).unwrap()
+        ),
+        registry::DaemonIdentityCheck::Match,
+    );
+    stop_daemon(&name, &started);
+    registry::cleanup_all(&live_name).unwrap();
+    registry::cleanup_all(&unknown_name).unwrap();
 }
 
 fn managed_params(

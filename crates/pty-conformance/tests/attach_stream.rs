@@ -240,7 +240,7 @@ fn has_pending_data(s: &UnixStream, timeout: Duration) -> Option<bool> {
 /// and hang up without sending; the first connection that sends bytes (the
 /// ATTACH) is handed to `on_attach`, still unread.
 fn fake_daemon(rig: &Rig, on_attach: impl FnOnce(UnixStream) + Send + 'static) {
-    write_fake_metadata(rig.root(), FAKE, FakeMeta::created(0));
+    write_fake_metadata(rig.root(), FAKE, FakeMeta::created(0).identity(std::process::id() as i32));
     let listener = UnixListener::bind(rig.socket_path(FAKE)).expect("bind fake socket");
     std::thread::spawn(move || {
         let mut handler = Some(on_attach);

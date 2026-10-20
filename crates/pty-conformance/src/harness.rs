@@ -872,7 +872,9 @@ impl Rig {
         let mut pids = Vec::new();
         let mut stack = dirs;
         while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -1307,6 +1309,22 @@ impl FakeMeta {
     pub fn extra(mut self, k: &str, v: Value) -> Self {
         self.extra.push((k.into(), v));
         self
+    }
+
+    /// Bind a fixture to a real process, or to a known absent daemon PID.
+    pub fn identity(self, pid: i32) -> Self {
+        let token = pty_core::registry::read_process_start_token(pid).unwrap_or_else(|| {
+            assert!(!pid_alive(pid), "a live fixture needs a readable identity");
+            "fixture:dead".to_string()
+        });
+        self.extra("daemonPid", serde_json::json!(pid))
+            .extra("daemonStartToken", serde_json::json!(token))
+            .extra(
+                "daemonBootId",
+                serde_json::json!(
+                    pty_core::registry::read_boot_id().expect("fixture boot identity")
+                ),
+            )
     }
 }
 

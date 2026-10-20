@@ -23,6 +23,9 @@ fn write_flapping_exited(rig: &Rig, id: &str, extra_tags: &[(&str, &str)]) {
     }
     let meta = json!({
         "command": "sh", "args": ["-c", "exit 1"], "displayCommand": "sh -c 'exit 1'",
+        "daemonPid": i32::MAX,
+        "daemonStartToken": "fixture:dead",
+        "daemonBootId": pty_core::registry::read_boot_id().expect("fixture boot identity"),
         "cwd": "/tmp",
         "createdAt": iso_timestamp(-600),
         "exitedAt": iso_timestamp(0),
@@ -39,6 +42,10 @@ fn write_flapping_exited(rig: &Rig, id: &str, extra_tags: &[(&str, &str)]) {
 fn write_running(rig: &Rig, id: &str, tags: serde_json::Value) {
     let meta = json!({
         "command": "sh", "args": [], "displayCommand": "sh",
+        "daemonPid": std::process::id(),
+        "daemonStartToken": pty_core::registry::read_process_start_token(std::process::id() as i32)
+            .expect("live fixture identity"),
+        "daemonBootId": pty_core::registry::read_boot_id().expect("live fixture boot identity"),
         "cwd": "/tmp",
         "createdAt": iso_timestamp(0),
         "tags": tags,
@@ -75,7 +82,11 @@ fn restart_drops_all_four_gc_bookkeeping_tags() {
 #[test]
 fn running_flapping_session_shows_flapping_badge() {
     let rig = Rig::new();
-    write_running(&rig, "fc2", json!({"strategy": "permanent", "strategy.status": "flapping"}));
+    write_running(
+        &rig,
+        "fc2",
+        json!({"strategy": "permanent", "strategy.status": "flapping"}),
+    );
     let out = rig.pty(&["list"]);
     expect_status(&out, 0);
     expect_contains(&out.stdout(), "[flapping]");

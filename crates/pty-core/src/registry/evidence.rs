@@ -11,13 +11,14 @@ use std::os::unix::fs::OpenOptionsExt;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::list::{pid_alive, read_session_pid, socket_reachable};
+use super::list::{DaemonIdentityCheck, check_record_identity_in, read_session_pid};
 use super::lock::{acquire_event_lock, acquire_lock};
-use super::metadata::SESSION_EXIT_LAST_LINES_LIMIT;
-use super::root::{
-    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, socket_path,
-};
+use super::metadata::{SESSION_EXIT_LAST_LINES_LIMIT, SessionMetadata};
 use super::names::validate_name;
+use super::root::{
+    events_path, metadata_path, output_activity_path, pid_path, recovery_revision_path, session_dir,
+    socket_path,
+};
 
 const METADATA_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -83,17 +84,16 @@ pub enum RemoveSessionGenerationResult {
     Busy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct EvidenceMetadata {
     generation: String,
-    daemon_pid: Option<i32>,
-    daemon_start_token: Option<String>,
+    identity: SessionMetadata,
     exited_at: Option<String>,
     exit_code: Option<i32>,
     last_lines: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum EvidenceMetadataRead {
     Valid(EvidenceMetadata),
     Missing,
@@ -157,6 +157,11 @@ fn read_evidence_metadata(name: &str) -> EvidenceMetadataRead {
             .filter(|token| !token.is_empty())
             .map(str::to_string),
     };
+    let daemon_boot_id = match record.get("daemonBootId") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.to_string()),
+        Some(_) => return EvidenceMetadataRead::Invalid,
+        None => None,
+    };
     let exited_at = record.get("exitedAt");
     let exit_code = record.get("exitCode");
     if exited_at.is_some() != exit_code.is_some() {
@@ -191,24 +196,22 @@ fn read_evidence_metadata(name: &str) -> EvidenceMetadataRead {
     };
     EvidenceMetadataRead::Valid(EvidenceMetadata {
         generation: generation.to_string(),
-        daemon_pid,
-        daemon_start_token,
+        identity: SessionMetadata {
+            daemon_pid,
+            daemon_start_token,
+            daemon_boot_id,
+            ..Default::default()
+        },
         exited_at,
         exit_code,
         last_lines,
     })
 }
 
-fn generation_is_alive(name: &str, metadata: &EvidenceMetadata) -> bool {
-    let daemon_pid_is_alive = |pid| {
-        metadata.daemon_start_token.as_deref().is_some_and(|token| {
-            pid_alive(pid)
-                && super::list::read_process_start_token(pid).as_deref() == Some(token)
-        })
-    };
-    read_session_pid(name).is_some_and(daemon_pid_is_alive)
-        || metadata.daemon_pid.is_some_and(daemon_pid_is_alive)
-        || (socket_path(name).exists() && socket_reachable(&socket_path(name)))
+fn generation_identity(name: &str, metadata: &EvidenceMetadata) -> DaemonIdentityCheck {
+    check_record_identity_in(
+        &session_dir(), name, read_session_pid(name), Some(&metadata.identity),
+    )
 }
 
 pub fn get_session_exit_evidence(name: &str) -> SessionExitEvidenceResult {
@@ -240,10 +243,18 @@ pub fn get_session_exit_evidence(name: &str) -> SessionExitEvidenceResult {
             };
         }
     };
-    if generation_is_alive(name, &metadata) {
-        return SessionExitEvidenceResult::Unavailable {
-            reason: EvidenceUnavailableReason::Running,
-        };
+    match generation_identity(name, &metadata) {
+        DaemonIdentityCheck::Match => {
+            return SessionExitEvidenceResult::Unavailable {
+                reason: EvidenceUnavailableReason::Running,
+            };
+        }
+        DaemonIdentityCheck::Unknown => {
+            return SessionExitEvidenceResult::Unavailable {
+                reason: EvidenceUnavailableReason::InvalidMetadata,
+            };
+        }
+        DaemonIdentityCheck::Mismatch | DaemonIdentityCheck::Gone => {}
     }
     let exited = metadata.exited_at.is_some();
     SessionExitEvidenceResult::Snapshot {
@@ -299,7 +310,10 @@ pub fn remove_session_generation(
     if first.generation != expected_generation {
         return Ok(RemoveSessionGenerationResult::GenerationMismatch);
     }
-    if generation_is_alive(name, &first) {
+    if matches!(
+        generation_identity(name, &first),
+        DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown
+    ) {
         return Ok(RemoveSessionGenerationResult::NotTerminal);
     }
     let second = match read_evidence_metadata(name) {
@@ -314,6 +328,14 @@ pub fn remove_session_generation(
     };
     if second.generation != expected_generation {
         return Ok(RemoveSessionGenerationResult::GenerationMismatch);
+    }
+    if second != first
+        || matches!(
+            generation_identity(name, &second),
+            DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown
+        )
+    {
+        return Ok(RemoveSessionGenerationResult::NotTerminal);
     }
     // Evidence metadata is removed last. Any preceding I/O failure preserves
     // the generation for a safe retry.

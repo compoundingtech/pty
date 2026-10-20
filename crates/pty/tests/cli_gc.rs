@@ -27,6 +27,16 @@ fn mutate_meta(rig: &Rig, name: &str, mutate: impl FnOnce(&mut Value)) {
     .unwrap();
 }
 
+/// Policy fixtures need explicit gone-process evidence; absence of a PID or
+/// token is deliberately not deletion/respawn authority.
+fn write_gone_meta(rig: &Rig, name: &str, mut metadata: Value) {
+    assert!(!pty_core::registry::pid_alive(DEAD_PID));
+    metadata["daemonPid"] = json!(DEAD_PID);
+    metadata["daemonStartToken"] = json!("fixture:dead");
+    metadata["daemonBootId"] = json!(pty_core::registry::read_boot_id().unwrap());
+    rig.write_meta(name, metadata);
+}
+
 /// node: tests/gc.test.ts:121-135, 198-229, 268-286; tests/exit-reap.test.ts:875-932
 #[test]
 fn sweeps_gone_sessions_and_keeps_kept_ones() {
@@ -36,9 +46,10 @@ fn sweeps_gone_sessions_and_keeps_kept_ones() {
         rig.ok(&["gc", "--dry-run"]).stdout,
         "Nothing would be cleaned up.\n"
     );
-    rig.write_meta("van", json!({}));
-    rig.write_meta("ex", json!({"exitCode": 1, "exitedAt": iso_now(0)}));
-    rig.write_meta(
+    write_gone_meta(&rig, "van", json!({}));
+    write_gone_meta(&rig, "ex", json!({"exitCode": 1, "exitedAt": iso_now(0)}));
+    write_gone_meta(
+        &rig,
         "kept",
         json!({"exitCode": 0, "exitedAt": iso_now(0), "tags": {"keep": "true"}}),
     );
@@ -60,15 +71,15 @@ fn sweeps_gone_sessions_and_keeps_kept_ones() {
         out.stdout,
         "Kept (keep tag): kept — swept once dead for 7d, or remove the keep tag to reap it now\nNothing to clean up.\n"
     );
-    rig.write_meta("one", json!({}));
+    write_gone_meta(&rig, "one", json!({}));
     assert_eq!(
         rig.ok(&["gc"]).stdout,
         "Removed: one\nKept (keep tag): kept — swept once dead for 7d, or remove the keep tag to reap it now\nCleaned up 1 stale session.\n"
     );
 }
 
-/// node: src/sessions.ts:643-705 — raw debris with a dead pid and no
-/// metadata is reclaimed; a live pid file is not.
+/// Unbound runtime debris is retained rather than treating Unknown as dead;
+/// malformed metadata without runtime files can still be reclaimed.
 #[test]
 fn reclaims_raw_debris() {
     let rig = Rig::new();
@@ -77,15 +88,9 @@ fn reclaims_raw_debris() {
     std::fs::write(rig.path("broken.json"), "not json").unwrap();
     std::fs::write(rig.path("mine.pid"), std::process::id().to_string()).unwrap();
     let out = rig.ok(&["gc"]);
-    assert_eq!(
-        out.stdout,
-        "Removed: broken\nRemoved: debris\nCleaned up 2 stale sessions.\n"
-    );
-    assert!(
-        !rig.exists("debris.pid")
-            && !rig.exists("debris.events.jsonl")
-            && !rig.exists("broken.json")
-    );
+    assert_eq!(out.stdout, "Removed: broken\nCleaned up 1 stale session.\n");
+    assert!(rig.exists("debris.pid") && rig.exists("debris.events.jsonl"));
+    assert!(!rig.exists("broken.json"));
     assert!(rig.exists("mine.pid"));
 }
 
@@ -93,15 +98,21 @@ fn reclaims_raw_debris() {
 #[test]
 fn kills_orphan_children() {
     let rig = Rig::new();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "child-missing",
         json!({"tags": {"parent": "nonexistent-parent"}}),
     );
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "dead-parent",
         json!({"exitCode": 0, "exitedAt": iso_now(0), "tags": {"keep": "true"}}),
     );
-    rig.write_meta("child-dead", json!({"tags": {"parent": "dead-parent"}}));
+    write_gone_meta(
+        &rig,
+        "child-dead",
+        json!({"tags": {"parent": "dead-parent"}}),
+    );
     let out = rig.ok(&["gc", "--dry-run"]);
     assert_eq!(
         out.stdout,
@@ -156,16 +167,71 @@ fn reaps_a_live_orphan() {
     assert!(!rig.exists("orphan.json") && !rig.exists("orphan.sock"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mismatched_permanent_respawns_without_signalling_the_reused_pid() {
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let rig = Rig::new();
+    let mut unrelated = OwnedChild(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn owned unrelated process"),
+    );
+    let pid = unrelated.0.id();
+    let listener = std::os::unix::net::UnixListener::bind(rig.path("reused-permanent.sock"))
+        .expect("stale socket");
+    rig.write_meta(
+        "reused-permanent",
+        json!({
+            "generation": "old-generation",
+            "daemonPid": pid,
+            "daemonStartToken": "linux:1",
+            "daemonBootId": pty_core::registry::read_boot_id().unwrap(),
+            "command": "cat",
+            "args": [],
+            "tags": {"strategy": "permanent"}
+        }),
+    );
+    std::fs::write(rig.path("reused-permanent.pid"), pid.to_string()).unwrap();
+    let dry = rig.ok(&["gc", "--dry-run"]);
+    assert!(dry.stdout.contains("Would respawn: reused-permanent"));
+    assert!(unrelated.0.try_wait().unwrap().is_none());
+    let actual = rig.ok(&["gc"]);
+    assert!(
+        actual.stdout.contains("Respawned: reused-permanent"),
+        "{}",
+        actual.stdout
+    );
+    wait_until("replacement permanent publication", || {
+        rig.read_meta("reused-permanent").is_some_and(|metadata| {
+            metadata["generation"] != "old-generation" && metadata["daemonPid"] != pid
+        })
+    });
+    assert!(
+        unrelated.0.try_wait().unwrap().is_none(),
+        "GC must not signal the reused PID"
+    );
+    drop(listener);
+}
+
 /// node: tests/gc-permanent.test.ts — stopped permanents respawn once under
 /// their stable id, while ordinary stopped sessions are swept.
 #[test]
 fn respawns_permanent_sessions_and_sweeps_non_permanent() {
     let rig = Rig::new();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "perm",
         json!({"command": "cat", "args": [], "tags": {"strategy": "permanent"}}),
     );
-    rig.write_meta("plain", json!({"command": "cat", "args": []}));
+    write_gone_meta(&rig, "plain", json!({"command": "cat", "args": []}));
 
     let dry = rig.ok(&["gc", "--dry-run"]);
     assert!(dry.stdout.contains("Would respawn: perm\n"));
@@ -207,7 +273,8 @@ fn respawns_permanent_sessions_and_sweeps_non_permanent() {
 #[test]
 fn permanent_respawn_preserves_persisted_launch_options() {
     let rig = Rig::new();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "options",
         json!({
             "command": "cat",
@@ -221,7 +288,8 @@ fn permanent_respawn_preserves_persisted_launch_options() {
             "tags": {"strategy": "permanent"}
         }),
     );
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "exact-env",
         json!({
             "command": "cat",
@@ -233,8 +301,7 @@ fn permanent_respawn_preserves_persisted_launch_options() {
 
     let out = rig.ok(&["gc"]);
     assert!(
-        out.stdout.contains("Respawned: options")
-            && out.stdout.contains("Respawned: exact-env"),
+        out.stdout.contains("Respawned: options") && out.stdout.contains("Respawned: exact-env"),
         "unexpected gc output:\nstdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
@@ -279,13 +346,18 @@ fn permanent_respawn_timestamp_is_taken_at_its_reconciliation() {
     rig.write_meta(
         "a-slow-abandon",
         json!({
+            "daemonPid": delayed.id(),
+            "daemonStartToken": pty_core::registry::read_process_start_token(delayed.id() as i32)
+                .expect("owned child identity"),
+            "daemonBootId": pty_core::registry::read_boot_id().unwrap(),
             "cwd": gone,
             "tags": {"strategy": "permanent"}
         }),
     );
     std::fs::write(rig.path("a-slow-abandon.pid"), delayed.id().to_string()).unwrap();
     std::fs::remove_dir_all(rig.scratch.join("slow-gone")).unwrap();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "z-respawn",
         json!({"command": "cat", "args": [], "tags": {"strategy": "permanent"}}),
     );
@@ -394,11 +466,7 @@ fn manifest_command_change_recovers_a_flapping_session() {
             .is_some_and(|value| value.is_string())
             && std::os::unix::net::UnixStream::connect(rig.path(&format!("{id}.sock"))).is_err()
     });
-    assert!(
-        rig.ok(&["gc"])
-            .stdout
-            .contains(&format!("Flapping: {id}"))
-    );
+    assert!(rig.ok(&["gc"]).stdout.contains(&format!("Flapping: {id}")));
 
     std::fs::write(
         manifest.join("pty.toml"),
@@ -424,7 +492,8 @@ fn manifest_command_change_recovers_a_flapping_session() {
 #[test]
 fn concurrent_gc_respawns_a_permanent_only_once() {
     let rig = Rig::new();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "perm",
         json!({"command": "cat", "args": [], "tags": {"strategy": "permanent"}}),
     );
@@ -465,7 +534,8 @@ fn concurrent_gc_respawns_a_permanent_only_once() {
 #[test]
 fn failed_permanent_respawn_is_retried_on_the_next_gc() {
     let rig = Rig::new();
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "broken",
         json!({
             "command": "pty-command-that-does-not-exist",
@@ -490,7 +560,8 @@ fn failed_permanent_respawn_is_retried_on_the_next_gc() {
 fn fast_fail_accounting_flaps_resets_and_honours_overrides() {
     let rig = Rig::new();
     let hash = "bb9f87a41097ca1f";
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "flap",
         json!({
             "command": "sh",
@@ -535,7 +606,8 @@ fn fast_fail_accounting_flaps_resets_and_honours_overrides() {
     assert_eq!(flapping_events[0]["limit"], 3);
     assert_eq!(flapping_events[0]["window"], 60);
 
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "slow",
         json!({
             "command": "sh",
@@ -549,7 +621,8 @@ fn fast_fail_accounting_flaps_resets_and_honours_overrides() {
             }
         }),
     );
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "changed",
         json!({
             "command": "sh",
@@ -564,7 +637,8 @@ fn fast_fail_accounting_flaps_resets_and_honours_overrides() {
             }
         }),
     );
-    rig.write_meta(
+    write_gone_meta(
+        &rig,
         "override",
         json!({
             "command": "sh",
@@ -678,7 +752,7 @@ fn abandonment_does_not_unlink_a_reachable_session_without_confirmed_pid() {
     let out = rig.ok(&["gc"]);
     assert!(
         out.stdout
-            .contains("Skipped abandoned reap: unconfirmed (pid-unavailable, before signalling)"),
+            .contains("Skipped abandoned reap: unconfirmed (identity-unknown, before signalling)"),
         "unexpected gc output:\n{}",
         out.stdout
     );

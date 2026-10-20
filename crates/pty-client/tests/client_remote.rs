@@ -187,6 +187,7 @@ fn fetch_remote_list_parses_rows_at_eof() {
         vec![RemoteSessionRow {
             name: "abc".into(),
             status: "running".into(),
+            identity: None,
             command: Some("sleep 300".into()),
             cwd: None,
             tags: None,
@@ -217,4 +218,14 @@ fn fetch_remote_list_parses_rows_at_eof() {
         err.to_string().starts_with("bad remote response: "),
         "{err}"
     );
+}
+
+#[test]
+fn remote_list_preserves_additive_identity_result() {
+    let (ctl, _h) = control_server("list-identity", |_, mut stream| {
+        stream.write_all(br#"{"sessions":[{"name":"legacy","status":"running","identity":"unknown"}]}"#).unwrap();
+    });
+    let rows = dialer("unused").fetch_remote_list(&ctl).unwrap();
+    assert_eq!(rows[0].identity, Some(pty_core::registry::DaemonIdentityCheck::Unknown));
+    assert_eq!(serde_json::to_value(&rows[0]).unwrap()["identity"], "unknown");
 }

@@ -160,6 +160,7 @@ mod tests {
             socket_path,
             pid: Some(42),
             status: SessionStatus::Running,
+            identity: registry::DaemonIdentityCheck::Match,
             metadata: None,
         }
     }
