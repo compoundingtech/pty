@@ -91,7 +91,10 @@ fn auto_restart_revoked_binding_preserves_retained_artifacts_without_running_chi
         // terminal, a prompt, or ever reaching the stored command.
         let out = rig.run(&["attach", "--auto-restart", "--force", "ended"]);
         assert_eq!(out.code, 1, "{out:?}");
-        assert!(out.stderr.contains("operation-revoked"), "{out:?}");
+        // A retained socket with no recorded PID cannot prove the daemon
+        // gone, so identity refuses before the revocation fence is reached.
+        let reason = if retained_socket { "identity is unknown" } else { "operation-revoked" };
+        assert!(out.stderr.contains(reason), "{out:?}");
         assert_eq!(std::fs::read(rig.path("ended.json")).unwrap(), metadata);
         assert_eq!(std::fs::read(rig.path("ended.events.jsonl")).unwrap(), events);
         match socket_before {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use pty_core::registry::{
     ListOptions, SessionMetadata, cleanup_socket, list_sessions_strict_in,
-    observe_session_strict_in, socket_path_in, with_root,
+    observe_session_strict_in, read_boot_id, read_process_start_token, socket_path_in, with_root,
 };
 
 struct Root(PathBuf);
@@ -41,6 +41,8 @@ fn bounded_address_preserves_logical_id_in_inventory_lookup_and_cleanup() {
     let listener = UnixListener::bind(&socket).unwrap();
     let metadata = SessionMetadata {
         daemon_pid: Some(std::process::id() as i32),
+        daemon_start_token: read_process_start_token(std::process::id() as i32),
+        daemon_boot_id: read_boot_id(),
         ..Default::default()
     };
     std::fs::write(
@@ -91,6 +93,8 @@ fn noncanonical_socket_debris_does_not_alias_the_live_session() {
     let _listener = UnixListener::bind(&socket).unwrap();
     let metadata = SessionMetadata {
         daemon_pid: Some(std::process::id() as i32),
+        daemon_start_token: read_process_start_token(std::process::id() as i32),
+        daemon_boot_id: read_boot_id(),
         ..Default::default()
     };
     std::fs::write(

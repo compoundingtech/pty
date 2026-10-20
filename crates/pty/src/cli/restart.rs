@@ -105,14 +105,27 @@ pub fn run(args: &[String]) -> CliResult {
         return Ok(1);
     }
 
+    if session.status == SessionStatus::Running
+        && !yes
+        && ask::declined(&ask::ask(&format!(
+            "Session \"{name}\" is running. Kill and restart? [Y/n] "
+        )))
+    {
+        return Ok(0);
+    }
+    let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
+    params.display_command = meta.display_command.clone();
+    params.cwd = meta.cwd.clone();
+    // An explicit retry drops flapping bookkeeping, never launch provenance.
+    params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
+    params.display_name = meta.display_name.clone();
+    apply_persisted_launch_options(&mut params, &meta);
+    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
+    // Refuse a revoked or unverifiable launch before stopping the survivor.
+    pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
+
     if session.status == SessionStatus::Running {
-        if !yes
-            && ask::declined(&ask::ask(&format!(
-                "Session \"{name}\" is running. Kill and restart? [Y/n] "
-            )))
-        {
-            return Ok(0);
-        }
         let stopped = match pty_client::stop(&name, meta.generation.as_deref()) {
             Ok(stopped) => stopped,
             Err(error) => {
@@ -142,16 +155,7 @@ pub fn run(args: &[String]) -> CliResult {
     if !registry::metadata_matches_observation(&meta, &current) {
         return Err(format!("Session \"{name}\" changed before restart.").into());
     }
-    let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
-    params.display_command = meta.display_command.clone();
-    params.cwd = meta.cwd.clone();
-    // An explicit retry drops flapping bookkeeping, never launch provenance.
-    params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
-    params.display_name = meta.display_name.clone();
-    apply_persisted_launch_options(&mut params, &meta);
-    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
     pty_lifecycle::config_for(&params).check_publication()?;
-    let publisher = super::prepare_daemon(&mut params)?;
     params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
     registry::cleanup_all_while_locked(&name);
     event_guard.release();
