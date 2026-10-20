@@ -78,9 +78,28 @@ pub struct ListedSession {
     pub clients: Option<ClientSet>,
 }
 
+/// Retained parsed-metadata state for repeated [`list`](Self::list) calls.
+/// Liveness and attached-client observations are never cached.
+#[derive(Debug, Default)]
+pub struct RegistryListCache {
+    registry: registry::list::RegistryListCache,
+}
+
+impl RegistryListCache {
+    /// List with unchanged metadata reused; retain this handle between calls.
+    pub fn list(&mut self, root: &Path, options: &ListOptions) -> Vec<ListedSession> {
+        let sessions = self.registry.list(root, &options.registry);
+        with_clients(sessions, options)
+    }
+}
+
 /// One bounded observation of `root`, sorted by session name.
 pub fn list(root: &Path, options: &ListOptions) -> Vec<ListedSession> {
     let sessions = registry::list::list_sessions_in(root, &options.registry);
+    with_clients(sessions, options)
+}
+
+fn with_clients(sessions: Vec<SessionInfo>, options: &ListOptions) -> Vec<ListedSession> {
     let clients = match &options.clients {
         Some(query) => attached_clients(&sessions, query)
             .into_iter()
@@ -262,5 +281,25 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert_eq!(clients, vec![ClientSet::Unknown]);
         assert!(!contacted, "an exited session was queried");
+    }
+
+    #[test]
+    fn registry_list_cache_preserves_stateless_listing_and_observes_changes() {
+        let root = sock("metadata-cache");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.json");
+        std::fs::write(&path, br#"{"command":"cat","args":[],"displayCommand":"cat","cwd":"/tmp","createdAt":"2026-10-20T00:00:00Z"}"#).unwrap();
+        let options = ListOptions::default();
+        let mut cache = RegistryListCache::default();
+        for _ in 0..2 {
+            let cached = cache.list(&root, &options);
+            let uncached = list(&root, &options);
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].info, uncached[0].info);
+            assert_eq!(cached[0].clients, uncached[0].clients);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.list(&root, &options).is_empty());
+        std::fs::remove_dir(root).unwrap();
     }
 }

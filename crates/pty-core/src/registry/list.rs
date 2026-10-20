@@ -148,12 +148,16 @@ fn serialize_inventory_path<S: serde::Serializer>(
     serializer.serialize_str(&path.to_string_lossy())
 }
 
-struct Scanner {
+mod metadata_cache;
+pub use metadata_cache::RegistryListCache;
+
+struct Scanner<'a> {
     strict: bool,
     errors: Vec<InventoryError>,
+    cache: Option<&'a mut RegistryListCache>,
 }
 
-impl Scanner {
+impl Scanner<'_> {
     fn error(&mut self, path: &Path, kind: InventoryErrorKind, detail: impl ToString) {
         if self.strict {
             self.errors.push(InventoryError {
@@ -207,15 +211,17 @@ impl Scanner {
     }
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
+        if let Some(cache) = self.cache.as_mut() {
+            return match cache.metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err((kind, detail)) => {
+                    self.error(path, kind, detail);
+                    None
+                }
+            };
+        }
         let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
-        let result = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|value| {
-            if !value.is_object() {
-                return Err(<serde_json::Error as serde::de::Error>::custom(
-                    "metadata must be a JSON object",
-                ));
-            }
-            serde_json::from_value(value)
-        });
+        let result = metadata_cache::parse_metadata(&bytes);
         match result {
             Ok(metadata) => Some(metadata),
             Err(error) => {
@@ -610,7 +616,7 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false, None).entries
+    scan_sessions(root, options, false, None, None).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
@@ -621,14 +627,14 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 /// is omitted. Strict PID validation requires a complete, positive decimal i32;
 /// classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, None)
+    scan_sessions(root, options, true, None, None)
 }
 
 /// [`list_sessions_strict_in`] for one session id: that id's companions are
 /// read and classified exactly as a whole-root strict scan would classify
 /// them, and no other entry is touched.
 pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, Some(name))
+    scan_sessions(root, options, true, Some(name), None)
 }
 
 fn scan_sessions(
@@ -636,10 +642,12 @@ fn scan_sessions(
     options: &ListOptions,
     strict: bool,
     only: Option<&str>,
+    cache: Option<&mut RegistryListCache>,
 ) -> Inventory {
     let mut scanner = Scanner {
         strict,
         errors: Vec::new(),
+        cache,
     };
     let dir = match std::fs::read_dir(root) {
         Ok(dir) => dir,

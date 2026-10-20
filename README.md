@@ -394,6 +394,18 @@ for s in &sessions {
 }
 ```
 
+Repeated observers can retain a `pty_client::list::RegistryListCache` and call
+`cache.list(&root, &options)` instead. This explicit stateful API reuses parsed
+regular-file metadata only when path, device/inode, size, and nanosecond
+mtime/ctime match. Each call still opens metadata to check readability, lists
+the directory, reads PID sidecars, checks process identity/liveness, probes
+sockets with the same budget, and queries attached clients when requested.
+New, changed, and removed sessions are observed on the next call; read/parse
+failures are not cached. The existing stateless `list` API is unchanged.
+Callers sharing the cache across threads or cloned runtime handles should put
+it behind their own shared mutex. The lower-level equivalent is
+`pty_core::registry::list::RegistryListCache`.
+
 The rest of what the CLI does to a session is there too, for a registry the
 caller names rather than `$PTY_ROOT`: `send_in`, `peek_screen_in`,
 `query_stats_in`, `stop_in` (`pty kill`), `remove_in` (`pty rm`), and
