@@ -1382,6 +1382,7 @@ pub fn type_name(t: MessageType) -> &'static str {
         MessageType::Geometry => "GEOMETRY",
         MessageType::ResetInputModes => "RESET_INPUT_MODES",
         MessageType::ConnectionError => "CONNECTION_ERROR",
+        MessageType::History => "HISTORY",
         MessageType::Unknown(_) => "UNKNOWN",
     }
 }
