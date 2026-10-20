@@ -179,7 +179,7 @@ gap is in what the daemon does with the frames.
 | Reap vs preserve precedence (`keep` > `ephemeral` > `permanent` > `PTY_REAP_ON_EXIT`) | have | Rust accepts only `keep=true`; Node accepts any value except `false/0/no/off`. |
 | On preserve: `exitCode`, `exitedAt`, `lastLines` (≤ 200) | partial | Rust keeps 50 lines and writes a Rust-only `<name>.screen` file. |
 | Scrollback 10000, `scrollbackCapacity = rows + 10000` | have | |
-| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | missing | |
+| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | partial | Rust writes all of these except `cursor_visible`, which is Node-only and optional. A TUI can toggle the cursor on every redraw, and those records filled the event history, so Rust daemons stopped writing them in #172. Node's `docs/disk-layout.md` still lists `cursor_visible` in its tier-1 `events.jsonl` table. A reader must not wait for it or filter on it to learn anything about a session. Rust still reads and formats existing `cursor_visible` records. |
 | Live recovery request handling (`.recovery/`) | deferred | |
 
 ## 5. Registry on disk (`$PTY_ROOT`)
