@@ -38,6 +38,8 @@ pub enum MessageType {
     ResetInputModes,
     /// Server → Client: attachment failure, not a child exit (wire value 12).
     ConnectionError,
+    /// Read-only, bounded primary-buffer history request/response (wire value 13).
+    History,
     /// An unrecognized wire byte, preserved verbatim.
     Unknown(u8),
 }
@@ -58,6 +60,7 @@ impl MessageType {
             10 => MessageType::Geometry,
             11 => MessageType::ResetInputModes,
             12 => MessageType::ConnectionError,
+            13 => MessageType::History,
             8 => MessageType::AcceptedSocketOwnership,
             9 => MessageType::LifecycleCas,
             other => MessageType::Unknown(other),
@@ -80,6 +83,7 @@ impl MessageType {
             MessageType::Geometry => 10,
             MessageType::ResetInputModes => 11,
             MessageType::ConnectionError => 12,
+            MessageType::History => 13,
             MessageType::Unknown(b) => b,
         }
     }
@@ -173,6 +177,39 @@ pub enum LifecycleCompareAndSetResult {
     InvalidRequest {
         reason: String,
     },
+}
+
+/// A backwards page of retained primary-buffer rows, excluding the viewport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryRequest {
+    /// Exact daemon generation observed in the owner's session metadata.
+    pub expected_generation: String,
+    pub limit: u16,
+    pub before: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryRow {
+    pub ansi: String,
+    pub wrapped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum HistoryResponse {
+    Page {
+        columns: u16,
+        retained_rows: usize,
+        rows: Vec<HistoryRow>,
+        next_before: Option<String>,
+    },
+    CursorGap,
+    StaleGeneration,
+    AlternateScreen,
+    InvalidRequest,
+    Unavailable,
+    TooLarge,
 }
 
 const HEADER_SIZE: usize = 5;

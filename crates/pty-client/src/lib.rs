@@ -46,6 +46,7 @@
 
 pub mod attach;
 pub mod connection;
+pub mod history;
 pub mod list;
 pub mod peek;
 pub mod readiness;
