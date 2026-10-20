@@ -121,7 +121,7 @@ pub fn connect(
     cols: u16,
     tx: Sender<Vec<u8>>,
 ) -> io::Result<(UnixStream, Arc<ServerState>)> {
-    let socket_path = root.join(format!("{name}.sock"));
+    let socket_path = pty_core::registry::socket_path_in(root, name);
     let deadline = Instant::now() + START_TIMEOUT;
     let mut socket = loop {
         match UnixStream::connect(&socket_path) {

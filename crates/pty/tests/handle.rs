@@ -11,7 +11,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pty::{AttachOptions, HandleEvent, SessionRef, SpawnOptions, TerminalHandle};
+use pty::{
+    AttachOptions, HandleEvent, Location, PastePacket, PasteRefusal, PasteTarget, ReadError,
+    SessionRef, SpawnOptions, TerminalHandle,
+};
 use pty_terminal::graphics::PLACEHOLDER;
 use pty_terminal::input::{Key, KeyEvent, MouseButton, MouseEvent};
 use pty_terminal::{GraphicsOptions, PlacementPosition, Range};
@@ -73,6 +76,51 @@ fn spawn_reports_exit_code() {
     }
     assert!(saw_exit);
     h.kill();
+}
+
+/// Closing a spawned handle ends the child's process group, not just the
+/// child: a background job that ignores SIGHUP does not outlive it (#162).
+#[test]
+fn close_kills_the_spawned_childs_process_group() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "pty-handle-group-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pidfile = dir.join("job.pid");
+    let script = format!(
+        "trap '' HUP; sleep 1000 & echo $! > '{}'; wait",
+        pidfile.display()
+    );
+    let h = TerminalHandle::spawn("sh", &["-c", &script], SpawnOptions::default()).expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let job = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the background job never started");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Signal 0 only checks that the pid exists.
+    let alive = |pid| pty_core::kill::process(pid, 0).is_ok();
+    assert!(alive(job));
+    h.close();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(job) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(job);
+    if survived {
+        // The job this test started, not reaped while it is alive.
+        let _ = pty_core::kill::process(job, libc::SIGKILL);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!survived, "background job {job} outlived the closed handle");
 }
 
 #[test]
@@ -741,6 +789,185 @@ fn attach_to_missing_session_is_an_error() {
         AttachOptions::default(),
     );
     assert!(r.is_err());
+}
+
+// ── enhanced paste against the Rust daemon ──
+
+/// `image/png text/plain`, base64.
+const PNG_AND_TEXT: &str = "aW1hZ2UvcG5nIHRleHQvcGxhaW4=";
+
+/// Wait for the daemon's own terminal to show `needle`, before any handle
+/// attaches: what the child printed by then can only reach a handle
+/// through the replay.
+fn wait_peek(rig: &Rig, id: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, out, _) = rig.pty(&["peek", "--plain", id]);
+        if out.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never showed {needle:?}: {out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Paste events the program turned on before this handle attached are on
+/// once the first SCREEN is in, under the first attempt.
+#[test]
+fn paste_events_set_before_the_attach_are_on_with_the_first_screen() {
+    let rig = Rig::new();
+    rig.run("p", "printf '\\033[?5522hREADY\\n'; exec sleep 60");
+    wait_peek(&rig, "p", "READY");
+    let h = TerminalHandle::attach(rig.session("p"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    assert_eq!(h.enhanced_paste(), (h.attempt(), true));
+    h.kill();
+    rig.kill("p");
+}
+
+/// A read the program made before this handle attached is history. It is
+/// not replayed, so the one read slot is free: the program's next read is
+/// published and answered, and the program hears that answer, not `EBUSY`.
+#[test]
+fn a_read_made_before_the_attach_is_never_delivered() {
+    let rig = Rig::new();
+    let answer = rig.root.join("answer");
+    let denied = PastePacket::ReadError(ReadError::Denied)
+        .encode(Some("new"))
+        .unwrap();
+    let script = format!(
+        "stty raw -echo; \
+         printf '\\033[?5522h\\033]5522;type=read:id=old;{PNG_AND_TEXT}\\033\\\\READY\\r\\n'; \
+         dd bs=1 count=1 >/dev/null 2>&1; \
+         printf '\\033]5522;type=read:id=new;{PNG_AND_TEXT}\\033\\\\'; \
+         dd bs=1 count={} of='{}' 2>/dev/null; exec sleep 60",
+        denied.len(),
+        answer.display()
+    );
+    rig.run("r", &script);
+    wait_peek(&rig, "r", "READY");
+    let h = TerminalHandle::attach(rig.session("r"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    let events = h.subscribe();
+    h.write(b"x");
+    let (attempt, read) = loop {
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(HandleEvent::EnhancedPasteRequest {
+                attempt,
+                read,
+                request,
+            }) => {
+                assert_eq!(request.id.as_deref(), Some("new"));
+                break (attempt, read);
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the program's new read was never published: {e}"),
+        }
+    };
+    h.write_enhanced_paste(
+        attempt,
+        PasteTarget::Read(read),
+        PastePacket::ReadError(ReadError::Denied),
+    )
+    .expect("answer the read");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::metadata(&answer).map_or(0, |m| m.len()) < denied.len() as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "the program never heard the answer"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read(&answer).unwrap(), denied);
+    h.kill();
+    rig.kill("r");
+}
+
+/// A reconnect turns paste events off under the old attempt, and the new
+/// attempt's SCREEN turns them on again; the old attempt can no longer
+/// write. Losing the session turns them off under the new attempt.
+#[test]
+fn a_reconnect_turns_paste_events_off_then_restates_them() {
+    let rig = Rig::new();
+    rig.run("c", "printf '\\033[?5522hREADY\\n'; exec sleep 60");
+    let h = TerminalHandle::attach(rig.session("c"), AttachOptions::default()).expect("attach");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    wait_text(&h, "READY");
+    let first = h.attempt();
+    assert_eq!(h.enhanced_paste(), (first, true));
+    let events = h.subscribe();
+
+    h.reconnect().expect("reconnect");
+    assert!(h.wait_ready(Duration::from_secs(5)));
+    let second = h.attempt();
+    assert_ne!(first, second);
+    assert_eq!(h.enhanced_paste(), (second, true));
+    let paste_and_lifecycle =
+        |events: &std::sync::mpsc::Receiver<HandleEvent>| -> Vec<HandleEvent> {
+            events
+                .try_iter()
+                .filter(|ev| {
+                    matches!(
+                        ev,
+                        HandleEvent::EnhancedPasteMode { .. }
+                            | HandleEvent::Connected(_)
+                            | HandleEvent::Disconnected
+                            | HandleEvent::Exited(_)
+                    )
+                })
+                .collect()
+        };
+    assert_eq!(
+        paste_and_lifecycle(&events),
+        [
+            HandleEvent::EnhancedPasteMode {
+                attempt: first,
+                enabled: false
+            },
+            HandleEvent::Connected(second),
+            HandleEvent::EnhancedPasteMode {
+                attempt: second,
+                enabled: true
+            },
+        ]
+    );
+    let listing = PastePacket::Listing {
+        location: Location::Clipboard,
+        password: None,
+        mimes: vec!["text/plain".into()],
+    };
+    assert_eq!(
+        h.write_enhanced_paste(first, PasteTarget::Paste, listing),
+        Err(PasteRefusal::StaleAttempt)
+    );
+
+    rig.kill("c");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.connected() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(h.enhanced_paste(), (second, false));
+    let ended = paste_and_lifecycle(&events);
+    assert_eq!(
+        ended.first(),
+        Some(&HandleEvent::EnhancedPasteMode {
+            attempt: second,
+            enabled: false
+        }),
+        "off before the end is announced: {ended:?}"
+    );
+    assert_eq!(
+        ended
+            .iter()
+            .filter(|ev| matches!(ev, HandleEvent::EnhancedPasteMode { .. }))
+            .count(),
+        1,
+        "{ended:?}"
+    );
+    h.kill();
 }
 
 // ── input reaches the child ──

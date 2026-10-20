@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::atomic::is_tmp_name;
 use super::lock::parse_leading_int;
 use super::metadata::{SessionMetadata, read_metadata_at};
-use super::root::{metadata_path, pid_path, session_dir};
+use super::root::{metadata_path, pid_path, session_dir, socket_path_in};
 use crate::unix_connect::{self, Connect};
 
 /// `running` / `exited` / `vanished`.
@@ -280,9 +280,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: signal 0 only checks for existence/permission.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Signal 0 only checks for existence/permission.
+    match crate::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
+    }
 }
 
 /// The sidecar `<name>.pid`, parsed like `parseInt(content.trim(), 10)`.
@@ -432,11 +434,11 @@ pub fn check_record_identity_in(
     metadata: Option<&SessionMetadata>,
 ) -> DaemonIdentityCheck {
     if sidecar.is_none() && metadata.is_some_and(|record| record.daemon_pid.is_none()) {
-        let absent = |extension| {
-            std::fs::symlink_metadata(root.join(format!("{name}.{extension}")))
+        let absent = |path: &Path| {
+            std::fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         };
-        if absent("pid") && absent("sock") {
+        if absent(&root.join(format!("{name}.pid"))) && absent(&socket_path_in(root, name)) {
             record_daemon_identity_check(DaemonIdentityCheck::Gone);
             return DaemonIdentityCheck::Gone;
         }
@@ -545,7 +547,7 @@ pub fn read_process_start_token(pid: i32) -> Option<String> {
         // poll loop, and a failure here already means "cannot confirm" rather
         // than "gone". `proctable::LiveIdentity` exists so the cheap identity
         // used by the teardown can never be confused with this one.
-        let out = std::process::Command::new("ps")
+        let out = std::process::Command::new("/bin/ps")
             .args(["-o", "lstart=", "-p", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -905,23 +907,81 @@ fn scan_sessions(
     }
     if let Some(only) = only {
         let companions = [
-            format!("{only}.sock"),
+            socket_path_in(root, only)
+                .file_name()
+                .expect("session socket has a filename")
+                .to_string_lossy()
+                .into_owned(),
             format!("{only}.json"),
             format!("{only}.pid"),
         ];
         entries.retain(|entry| companions.contains(entry));
     }
+    entries.retain(|entry| {
+        if entry.starts_with('@') && (entry.ends_with(".json") || entry.ends_with(".pid")) {
+            scanner.error(
+                &root.join(entry),
+                InventoryErrorKind::EntryUnreadable,
+                "registry companion uses the reserved socket digest namespace",
+            );
+            false
+        } else {
+            true
+        }
+    });
     entries.sort();
+
+    // A bounded transport filename carries no logical id. Resolve it from
+    // the registry's id-named companions, never invent an id from the digest.
+    let socket_names: HashMap<String, &str> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry.strip_suffix(".json").or_else(|| entry.strip_suffix(".pid"))
+        })
+        .map(|name| {
+            let path = socket_path_in(root, name);
+            let filename = path.file_name().expect("session socket has a filename");
+            (filename.to_string_lossy().into_owned(), name)
+        })
+        .collect();
+    let sockets: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let stem = entry.strip_suffix(".sock")?;
+            let name = if let Some(name) = socket_names.get(entry) {
+                *name
+            } else if stem.starts_with('@') {
+                scanner.error(
+                    &root.join(entry),
+                    InventoryErrorKind::EntryUnreadable,
+                    "bounded socket has no id-named registry companion",
+                );
+                return None;
+            } else {
+                stem
+            };
+            if socket_path_in(root, name).file_name() != Some(std::ffi::OsStr::new(entry)) {
+                scanner.error(
+                    &root.join(entry),
+                    InventoryErrorKind::EntryUnreadable,
+                    "socket filename is not the canonical address for its logical id",
+                );
+                return None;
+            }
+            Some((name, entry.as_str()))
+        })
+        .collect();
+    let socket_ids: BTreeSet<&str> = sockets.iter().map(|(name, _)| *name).collect();
 
     // Read each companion once; strict also validates pid-only records.
     let names: BTreeSet<&str> = entries
         .iter()
         .filter_map(|entry| {
             entry
-                .strip_suffix(".sock")
-                .or_else(|| entry.strip_suffix(".json"))
+                .strip_suffix(".json")
                 .or_else(|| strict.then(|| entry.strip_suffix(".pid")).flatten())
         })
+        .chain(socket_ids.iter().copied())
         .collect();
     let mut sessions = Vec::new();
     let mut uncertain_sockets = Vec::new();
@@ -932,7 +992,7 @@ fn scan_sessions(
             &root.join(&metadata_name),
             entries.binary_search(&metadata_name).is_ok(),
         );
-        let has_socket = entries.binary_search(&format!("{name}.sock")).is_ok();
+        let has_socket = socket_ids.contains(name);
         // Avoid opening a possibly blocking PID special file during a tolerant
         // listing when there is no usable record or socket.
         if !strict && metadata.is_none() && !has_socket {
@@ -969,7 +1029,7 @@ fn scan_sessions(
                 "cannot prove daemon leader, start token and boot identity",
             );
             if strict && has_socket {
-                uncertain_sockets.push(root.join(format!("{name}.sock")));
+                uncertain_sockets.push(socket_path_in(root, name));
             }
         }
         // Unknown is not a loss observation. Retain the named PID without
@@ -989,7 +1049,7 @@ fn scan_sessions(
         // In particular, do not connect to rescue a known mismatched PID.
         sessions.push(SessionInfo {
             name: name.to_string(),
-            socket_path: root.join(format!("{name}.sock")),
+            socket_path: socket_path_in(root, name),
             pid: if retained { pid } else { None },
             status,
             identity,

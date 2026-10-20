@@ -198,9 +198,9 @@ impl Rig {
                 && let Ok(pid) = pid.trim().parse::<i32>()
                 && pid != std::process::id() as i32
             {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+                // A pid file holds whatever a test wrote into it; a -1 there
+                // must not become a SIGTERM to everything this user runs.
+                let _ = pty_core::kill::process(pid, libc::SIGTERM);
             }
         }
     }
@@ -411,11 +411,9 @@ struct DisposableChild(std::process::Child);
 impl Drop for DisposableChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
-            // SAFETY: this child was spawned into its own process group;
-            // teardown signals only the fixture's disposable process group.
-            unsafe {
-                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
-            }
+            // This child was spawned into its own process group; teardown
+            // signals only the fixture's disposable process group.
+            let _ = pty_core::kill::group(self.0.id() as i32, libc::SIGKILL);
         }
         let _ = self.0.wait();
     }

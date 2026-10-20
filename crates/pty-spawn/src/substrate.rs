@@ -39,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, ExitStatus as PortableExitStatus, MasterPty, PtyPair, PtySize};
+use pty_core::kill::Target;
 
 /// How many undelivered bytes one attachment may hold. An attached stream
 /// that falls further behind than this is detached; the owner's own stream
@@ -81,7 +82,7 @@ impl SessionRef {
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> &str { &self.id }
     pub fn generation(&self) -> &str { &self.generation }
-    pub fn socket_path(&self) -> PathBuf { self.root.join(format!("{}.sock", self.id)) }
+    pub fn socket_path(&self) -> PathBuf { pty_core::registry::socket_path_in(&self.root, &self.id) }
 }
 
 /// The only lifecycle outcomes a client can observe from the substrate.
@@ -903,14 +904,10 @@ fn read_master(
 struct ChildSignals {
     pid: Option<u32>,
     reaped: Mutex<bool>,
-    /// `kill(2)`. A seam, so a test can see exactly what was sent.
-    kill: fn(libc::pid_t, libc::c_int) -> libc::c_int,
-}
-
-fn os_kill(target: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-    // SAFETY: kill(2) has no memory-safety preconditions. Which process it
-    // may target is `ChildSignals::send`'s job.
-    unsafe { libc::kill(target, signal) }
+    /// `kill(2)` through `pty_core::kill`, which refuses a pid or group that
+    /// would reach more than the child. A seam, so a test can see exactly
+    /// what was sent.
+    kill: fn(Target, libc::c_int) -> io::Result<()>,
 }
 
 impl ChildSignals {
@@ -918,7 +915,7 @@ impl ChildSignals {
         Self {
             pid,
             reaped: Mutex::new(false),
-            kill: os_kill,
+            kill: pty_core::kill::send,
         }
     }
 
@@ -950,18 +947,17 @@ impl ChildSignals {
             return Ok(());
         }
         let target = if group {
-            -(pid as libc::pid_t)
+            Target::Group(pid as libc::pid_t)
         } else {
-            pid as libc::pid_t
+            Target::Process(pid as libc::pid_t)
         };
         // The child is unreaped while `reaped` is held and false, so its pid,
         // and a group id equal to it, cannot have been reused.
         let result = (self.kill)(target, signal);
         drop(reaped);
-        if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        match result {
+            Err(error) if error.raw_os_error() != Some(libc::ESRCH) => Err(error),
+            _ => Ok(()),
         }
     }
 }
@@ -971,21 +967,57 @@ fn reap_child(
     signals: Arc<ChildSignals>,
     tx: Sender<Command>,
 ) {
-    let status = match child.process_id() {
+    let status = reap_fenced(&mut *child, &signals);
+    let _ = tx.send(Command::Reaped(status.unwrap_or(ExitStatus {
+        code: None,
+        signal: None,
+    })));
+}
+
+/// Wait for the child to exit and collect it under `signals`' lock.
+fn reap_fenced(child: &mut (dyn Child + Send + Sync), signals: &ChildSignals) -> Option<ExitStatus> {
+    match child.process_id() {
         Some(pid) => {
             wait_until_exited(pid);
-            collect_fenced(pid, &signals)
+            collect_fenced(pid, signals)
         }
         None => {
             let status = child.wait().ok().map(ExitStatus::from_portable);
             *signals.lock() = true;
             status
         }
-    };
-    let _ = tx.send(Command::Reaped(status.unwrap_or(ExitStatus {
-        code: None,
-        signal: None,
-    })));
+    }
+}
+
+/// The same signal fence, for a child spawned outside a [`SessionOwner`]
+/// (an embedded terminal's own child). Every signal goes through it, and the
+/// child is collected only through [`ReapFence::reap`], under the same lock,
+/// so a signal reaches the child or its unreaped corpse and never a process
+/// that reused its pid or its process group id.
+pub struct ReapFence(ChildSignals);
+
+impl ReapFence {
+    /// A fence for the child with this pid. `None` (no pid) sends nothing.
+    pub fn new(pid: Option<u32>) -> Self {
+        Self(ChildSignals::new(pid))
+    }
+
+    /// Signal the child, unless it has been collected.
+    pub fn signal(&self, signal: i32) -> io::Result<()> {
+        self.0.signal(signal)
+    }
+
+    /// Signal the child's process group, unless the child has been
+    /// collected. A pty child leads its own group (`setsid`).
+    pub fn signal_group(&self, signal: i32) -> io::Result<()> {
+        self.0.signal_group(signal)
+    }
+
+    /// Wait for the child to exit, then collect it under the fence. Call it
+    /// once, from the thread that owns the child.
+    pub fn reap(&self, child: &mut (dyn Child + Send + Sync)) -> Option<ExitStatus> {
+        reap_fenced(child, &self.0)
+    }
 }
 
 /// Block until the child has exited, leaving it unreaped (`WNOWAIT`): its pid
@@ -1529,6 +1561,12 @@ mod tests {
     /// stream is held full, so the reader parks before the child's last write
     /// and those bytes are provably still in the PTY when the child is
     /// reaped. Released afterwards, they must all arrive.
+    ///
+    /// **macOS cannot set this up.** There the child does not become waitable
+    /// while its pty output is unread: its exit waits for the master to read
+    /// (macOS 27, measured 2026-10-19; docs/parity.md §12c). So the test
+    /// checks what holds on macOS: no reap while the output is unread, and
+    /// once the reader is released, every byte before the exit.
     #[test]
     fn output_still_in_the_pty_when_the_child_is_reaped_is_delivered() {
         let (_owner, client, stream) = sh_attached(
@@ -1552,17 +1590,28 @@ mod tests {
         client.input(b"a\n".to_vec()).unwrap();
         wait_for_queued(&stream, b"a");
         client.input(b"b\n".to_vec()).unwrap();
-        assert!(
-            (0..500).any(|_| {
-                thread::sleep(Duration::from_millis(10));
-                matches!(client.lifecycle(), Ok(Lifecycle::Exited(_)))
-            }),
-            "the child was never reaped"
-        );
-        assert!(
-            !queued_data(&stream).ends_with(b"tail"),
-            "the tail was read before the reap, so this proves nothing"
-        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                (0..500).any(|_| {
+                    thread::sleep(Duration::from_millis(10));
+                    matches!(client.lifecycle(), Ok(Lifecycle::Exited(_)))
+                }),
+                "the child was never reaped"
+            );
+            assert!(
+                !queued_data(&stream).ends_with(b"tail"),
+                "the tail was read before the reap, so this proves nothing"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            thread::sleep(Duration::from_millis(1500));
+            assert!(
+                !matches!(client.lifecycle(), Ok(Lifecycle::Exited(_))),
+                "macOS reaped a child whose pty output was unread"
+            );
+        }
         {
             let mut state = stream.queue.lock();
             state.reserved = state.reserved.saturating_sub(held);
@@ -1573,6 +1622,19 @@ mod tests {
             data(&events).ends_with(b"tail"),
             "output unread at the reap was dropped: {events:?}"
         );
+        #[cfg(target_os = "macos")]
+        {
+            let exit = events
+                .iter()
+                .position(|event| matches!(event, SessionEvent::Lifecycle(Lifecycle::Exited(_))))
+                .unwrap();
+            assert!(
+                events[exit + 1..]
+                    .iter()
+                    .all(|event| !matches!(event, SessionEvent::Data(_))),
+                "output after the exit: {events:?}"
+            );
+        }
     }
 
     /// PR #32: the reviewer's reproduction, through the owner's pre-registered
@@ -1610,6 +1672,13 @@ mod tests {
 
     /// The exit still gets published when a descendant keeps the PTY open,
     /// and output keeps flowing after it until the PTY closes.
+    ///
+    /// **On macOS no descendant can keep it open.** The kernel closes the
+    /// terminal when its session leader exits, and the master reads EOF within
+    /// milliseconds although a SIGHUP-ignoring descendant still holds the slave
+    /// (macOS 27, measured 2026-10-19; docs/parity.md §12c). There the output
+    /// closes first, the exit follows promptly, and nothing written later
+    /// arrives.
     #[test]
     fn an_exit_is_published_after_the_drain_bound_when_a_descendant_holds_the_pty() {
         // The kernel hangs up the foreground group when the session leader
@@ -1625,20 +1694,32 @@ mod tests {
             SessionEvent::Lifecycle(Lifecycle::Running)
         );
         let started = Instant::now();
-        let exit = stream.recv_timeout(T).unwrap();
-        assert_eq!(
-            exit,
-            SessionEvent::Lifecycle(Lifecycle::Exited(ExitStatus {
-                code: Some(3),
-                signal: None
-            }))
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "the exit waited for the descendant"
-        );
-        let rest = until_closed_and_exited_after_exit(&stream);
-        assert_eq!(data(&rest), b"late");
+        let exited = SessionEvent::Lifecycle(Lifecycle::Exited(ExitStatus {
+            code: Some(3),
+            signal: None,
+        }));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let exit = stream.recv_timeout(T).unwrap();
+            assert_eq!(exit, exited);
+            assert!(
+                started.elapsed() < Duration::from_millis(900),
+                "the exit waited for the descendant"
+            );
+            let rest = until_closed_and_exited_after_exit(&stream);
+            assert_eq!(data(&rest), b"late");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let events = until_closed_and_exited(&stream);
+            assert!(
+                started.elapsed() < Duration::from_millis(900),
+                "the session waited for the descendant: {events:?}"
+            );
+            assert_eq!(events.first(), Some(&SessionEvent::OutputClosed), "{events:?}");
+            assert!(events.contains(&exited), "{events:?}");
+            assert!(data(&events).is_empty(), "{events:?}");
+        }
     }
 
     fn until_closed_and_exited_after_exit(stream: &AttachStream) -> Vec<SessionEvent> {
@@ -1918,14 +1999,18 @@ mod tests {
 
     static SENT: Mutex<Vec<(libc::pid_t, libc::c_int)>> = Mutex::new(Vec::new());
 
-    fn record_kill(target: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-        SENT.lock().unwrap().push((target, signal));
-        0
+    fn record_kill(target: Target, signal: libc::c_int) -> io::Result<()> {
+        let raw = match target {
+            Target::Process(pid) => pid,
+            Target::Group(pgid) => -pgid,
+        };
+        SENT.lock().unwrap().push((raw, signal));
+        Ok(())
     }
 
     fn exists(pid: u32) -> bool {
-        // SAFETY: signal 0 only asks whether the pid names a process.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        // Signal 0 only asks whether the pid names a process.
+        pty_core::kill::process(pid as libc::pid_t, 0).is_ok()
     }
 
     /// PR #31 P1: the reaper must not release the child's pid while a signal

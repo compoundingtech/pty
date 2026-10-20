@@ -81,7 +81,7 @@ pub use remote::{
     RemoteDialer, RemoteError, RemoteSessionRow, RouteRefusedError, dial_and_route,
     fetch_remote_list,
 };
-pub use remove::{RemoveError, remove, remove_in};
+pub use remove::{RemoveError, remove, remove_in, wait_for_recorded_owner_loss};
 pub use sanitize::{CLEAR_SCREEN_HOME, CURSOR_TO_BOTTOM, TERMINAL_SANITIZE};
 pub use send::{DEFAULT_SEQ_DELAY_MS, SendOptions, resolve_seq_delay_ms, send, send_in, send_over};
 pub use signal::{Delivery, SignalError, Signalled, signal, signal_in};

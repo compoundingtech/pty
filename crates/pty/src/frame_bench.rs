@@ -78,6 +78,9 @@ fn core(rows: u16, cols: u16, image: bool) -> (Core, Receiver<HandleEvent>) {
         },
         dirty: false,
         last_publish: Instant::now(),
+        paste: PasteRead::default(),
+        paste_reads: 0,
+        paste_mode: false,
     };
     core.publish();
     core.flush_frame(true);

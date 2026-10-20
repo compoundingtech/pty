@@ -19,7 +19,7 @@ use pty_core::registry::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{SpawnParams, apply_persisted_launch_options, spawn_daemon};
+use crate::{SpawnParams, apply_persisted_launch_options, prepare_daemon};
 /// Options for one stateless garbage-collection pass.
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -126,6 +126,17 @@ pub fn gc(options: GcOptions) -> GcResult {
         daemon_executable,
     } = options;
     let mut result = GcResult::default();
+
+    if !dry_run {
+        let root = session_dir();
+        cleanup_dead_atomic_temps(&root);
+        for sidecar in [".activity", ".recovery"] {
+            let directory = root.join(sidecar);
+            if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+                cleanup_dead_atomic_temps(&directory);
+            }
+        }
+    }
 
     // Raw debris: runtime files whose metadata is missing or malformed.
     let raw_candidates = inventory_raw_cleanup_candidates(None);
@@ -264,7 +275,16 @@ pub fn gc(options: GcOptions) -> GcResult {
             continue;
         }
         if dry_run {
-            let (params, ptyfile_reread) = respawn_params(&s.name, meta);
+            let (params, ptyfile_reread) = match respawn_params(&s.name, meta) {
+                Ok(params) => params,
+                Err(error) => {
+                    result.respawn_failed.push(RespawnFailed {
+                        name: s.name.clone(),
+                        error,
+                    });
+                    continue;
+                }
+            };
             let decision = classify_flapping(
                 meta,
                 &params.command,
@@ -655,7 +675,13 @@ fn reconcile_permanent(
         return PermanentOutcome::Stale;
     }
 
-    let (mut params, ptyfile_reread) = respawn_params(name, &current);
+    let (mut params, ptyfile_reread) = match respawn_params(name, &current) {
+        Ok(params) => params,
+        Err(error) => return PermanentOutcome::Failed(error),
+    };
+    if let Err(error) = crate::launch::config_for(&params).check_publication() {
+        return PermanentOutcome::Failed(error);
+    }
     let now_ms = now_epoch_ms();
     let decision = classify_flapping(
         &current,
@@ -705,6 +731,12 @@ fn reconcile_permanent(
                     "daemon executable is required to respawn permanent sessions".to_string(),
                 );
             };
+            // Verify and pin the managed publisher before changing retained
+            // evidence; spawn must execute this same image after cleanup.
+            let prepared = match prepare_daemon(daemon_executable, &params) {
+                Ok(prepared) => prepared,
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             for (key, value) in &decision.bookkeeping {
                 params.tags.insert(key.clone(), value.clone());
             }
@@ -713,9 +745,13 @@ fn reconcile_permanent(
             }
             let mut retry_meta = current.clone();
             retry_meta.tags = (!params.tags.is_empty()).then(|| params.tags.clone());
+            params.creation_lock_delegate = match creation_guard.delegate() {
+                Ok(delegate) => Some(delegate),
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             cleanup_all_while_locked(name);
             event_guard.release();
-            let spawn = spawn_daemon(daemon_executable, params).map_err(|error| error.to_string());
+            let spawn = prepared.spawn(params).map_err(|error| error.to_string());
             if spawn.is_err() && read_metadata(name).is_none() {
                 // Preserve the desired state when launch failed before a new
                 // daemon could publish. The next gc tick must be able to retry.
@@ -734,7 +770,7 @@ fn reconcile_permanent(
 /// fresh pty.toml definition when the recorded binding still resolves.
 ///
 /// node: src/sessions.ts:899-982
-fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
+fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bool), String> {
     let mut command = meta.command.clone();
     let mut args = meta.args.clone();
     let mut display_command = meta.display_command.clone();
@@ -755,6 +791,20 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
             .cwd
             .clone()
             .unwrap_or_else(|| file.dir.to_string_lossy().into_owned());
+        // A managed binding's digest belongs to the external start request,
+        // not a hash we can reconstruct from these generic launch parameters.
+        // Compare the exact persisted executable, argument vector and cwd:
+        // env from pty.toml is already encoded in the shell argument above.
+        // Do not normalize paths or shell text and accidentally authorize a
+        // different launch under the original operation/digest/root.
+        if meta.publication_binding.is_some()
+            && (command != meta.command || args != meta.args || cwd != meta.cwd)
+        {
+            return Err(
+                "managed pty.toml launch inputs changed; a new operation and publication binding are required"
+                    .into(),
+            );
+        }
         let mut user_keys: Vec<String> = session
             .tags
             .as_ref()
@@ -793,7 +843,7 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, meta);
     params.respawn = true;
-    (params, ptyfile_reread)
+    Ok((params, ptyfile_reread))
 }
 
 /// A zombie is gone only after its recorded identity has matched. Socket
@@ -830,6 +880,37 @@ fn parent_of(s: &SessionInfo) -> Option<String> {
         .cloned()
 }
 
+/// Reclaim only regular atomic-publication leftovers whose writer has exited.
+/// PID reuse conservatively retains a leftover; live writers never lose their
+/// temporary file. Malformed names and symlinks are not cleanup candidates.
+fn cleanup_dead_atomic_temps(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let filename = entry.file_name();
+        let Some(pid) = filename.to_str().and_then(atomic_temp_pid) else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) && !pid_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn atomic_temp_pid(filename: &str) -> Option<i32> {
+    let (_, suffix) = filename.rsplit_once(".tmp.")?;
+    let (pid, random) = suffix.split_once('.')?;
+    if !pid.starts_with(|c: char| c.is_ascii_digit() && c != '0')
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || random.len() != 16
+        || !random.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// Malformed metadata with no runtime files at all. Missing identity for
 /// runtime debris is Unknown, not authorization to delete a socket or PID.
 ///
@@ -844,11 +925,15 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
         .collect();
     let mut names: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
+        if registry::is_tmp_name(entry) {
+            continue;
+        }
         let name = entry
             .strip_suffix(".events.jsonl")
             .or_else(|| entry.strip_suffix(".sock"))
             .or_else(|| entry.strip_suffix(".pid"))
-            .or_else(|| entry.strip_suffix(".json"));
+            .or_else(|| entry.strip_suffix(".json"))
+            .filter(|name| !name.starts_with('@'));
         if let Some(name) = name
             && only.is_none_or(|o| o == name)
         {
@@ -859,10 +944,13 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
     names
         .into_iter()
         .filter(|name| {
+            let has_socket = socket_path(name).file_name().is_some_and(|filename| {
+                entries.contains(filename.to_string_lossy().as_ref())
+            });
             entries.contains(&format!("{name}.json"))
                 && metadata_is_malformed(name)
                 && !entries.contains(&format!("{name}.pid"))
-                && !entries.contains(&format!("{name}.sock"))
+                && !has_socket
         })
         .collect()
 }
@@ -915,6 +1003,7 @@ fn cleanup_observed_session(session: &SessionInfo) -> bool {
             if metadata_matches_observation(observed, &current)
                 && known_owner_lost(daemon_identity(&session.name, &current)) =>
         {
+            pty_core::operation::barrier::barrier("gc-cleanup-before-effects");
             cleanup_all_while_locked(&session.name);
             true
         }
@@ -1232,6 +1321,40 @@ mod tests {
             assert_eq!(std::fs::read(metadata_path("unknown")).unwrap(), before);
         });
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_respawn_still_overlays_manifest_launch_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-gc-legacy-manifest-{}-{}",
+            std::process::id(),
+            now_epoch_ms(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let manifest = dir.join("pty.toml");
+        std::fs::write(
+            &manifest,
+            "[sessions.worker]\ncommand = 'echo changed'\ncwd = 'subdir'\nenv = { VALUE = 'new' }\n",
+        )
+        .unwrap();
+        let mut tags = TagMap::new();
+        tags.insert("ptyfile".into(), manifest.to_string_lossy().into_owned());
+        tags.insert("ptyfile.session".into(), "worker".into());
+        let metadata = SessionMetadata {
+            command: "/bin/true".into(),
+            args: vec!["old-argument".into()],
+            cwd: "/old-cwd".into(),
+            tags: Some(tags),
+            ..Default::default()
+        };
+        let (params, reread) = respawn_params("legacy-manifest", &metadata).unwrap();
+        assert!(reread);
+        assert_eq!(params.command, "/bin/sh");
+        assert_eq!(params.args, ["-c", "export VALUE='new'; echo changed"]);
+        assert_eq!(params.cwd, dir.join("subdir").to_string_lossy());
+        assert!(params.publication_binding.is_none());
+        assert!(params.publication_root_id.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

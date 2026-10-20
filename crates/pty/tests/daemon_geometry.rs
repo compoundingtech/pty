@@ -16,17 +16,28 @@ const T: Duration = Duration::from_secs(5);
 
 /// A child that clears and prints `X` × (2 × cols) on every SIGWINCH.
 ///
+/// Until the script runs `trap`, SIGWINCH is ignored, and these tests resize
+/// within milliseconds of attaching. So wait for the script to say the trap
+/// is set: under load on macOS a resize that beat it left the child never
+/// redrawing.
+///
 /// node: tests/effective-geometry.test.ts:28-34
 fn width_daemon() -> Daemon {
     let root = short_root();
     let body = "#!/bin/bash\n\
         redraw() { c=$(stty size < /dev/tty | cut -d' ' -f2); printf '\\033[2J\\033[H'; i=0; while [ $i -lt $((c*2)) ]; do printf X; i=$((i+1)); done; }\n\
         trap redraw WINCH\n\
+        touch \"${0%/*}/trapped\"\n\
         while :; do sleep 0.02; done\n";
     let path = script(&root, "width.sh", body);
     let mut cfg = config(&unique_name("geo"), path.to_str().unwrap(), &[]);
     cfg["cols"] = json!(20);
-    Daemon::start(&root, cfg)
+    let d = Daemon::start(&root, cfg);
+    assert!(
+        wait_until(T, || root.join("trapped").exists()),
+        "the child never set its WINCH trap"
+    );
+    d
 }
 
 /// Wait for GEOMETRY(rows, cols) followed by at least one DATA.
@@ -130,18 +141,52 @@ fn readonly_viewers_get_geometry_but_never_select_size() {
     assert!(wait_until(T, || d.connect().query_status()["terminal"]["cols"] == 10));
 }
 
+/// The shell's prompt, set so the tests can tell when it is printed.
+///
+/// Before each prompt, interactive bash reads the window size and writes the
+/// same value straight back (readline's `set_winsize`). A resize that lands
+/// between that read and that write is undone, and the child keeps the old
+/// size for good. The tests below change the size the moment they have read
+/// what they wait for, so every wait runs until the next prompt, by which
+/// time bash has written the size back.
+const PROMPT: &str = "geo> ";
+
 fn stty_daemon() -> Daemon {
     let root = short_root();
-    Daemon::start(&root, config(&unique_name("geo"), "sh", &[]))
+    // Not PS1 itself: the child starts under `/bin/sh -c 'exec "$@"'`, and a
+    // bash that is not interactive (macOS /bin/sh) drops PS1 from what it
+    // passes on. An interactive POSIX shell runs the file named by ENV.
+    let prompt = script(&root, "prompt.sh", &format!("PS1='{PROMPT}'\n"));
+    let d = Daemon::start_env(
+        &root,
+        config(&unique_name("geo"), "sh", &[]),
+        &[("ENV", prompt.to_str().unwrap())],
+    );
+    // The first prompt, before any client sets a size.
+    let mut screen = None;
+    let prompted = wait_until(T, || {
+        let mut peek = d.connect();
+        peek.peek_flags(true, false);
+        screen = peek.wait_type(Screen, T).then(|| peek.screen()).flatten();
+        screen.as_deref().is_some_and(|s| s.contains(PROMPT))
+    });
+    assert!(prompted, "the shell never printed its prompt: {screen:?}");
+    d
 }
 
 fn stty_size(c: &mut Conn, expect: &str) {
     c.clear();
     c.data("stty size\n");
     assert!(
-        c.wait_for(T, |p| p.iter().any(|x| x.type_ == Data
-            && String::from_utf8_lossy(&x.payload).contains(expect))),
-        "expected `{expect}` in {:?}",
+        c.wait_for(T, |p| {
+            let out: String = p
+                .iter()
+                .filter(|x| x.type_ == Data)
+                .map(|x| String::from_utf8_lossy(&x.payload).into_owned())
+                .collect();
+            out.find(expect).is_some_and(|i| out[i..].contains(PROMPT))
+        }),
+        "expected `{expect}` and then the prompt in {:?}",
         c.output()
     );
 }

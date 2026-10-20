@@ -576,7 +576,10 @@ pub fn launch(name: &str, params: SpawnParams, control_fd: RawFd, digest: &str) 
     };
     // Exactly what today's `pty run` hands its daemon, so the session's
     // environment is today's too.
-    params.creation_lock_owner_pid = Some(std::process::id() as i32);
+    params.creation_lock_delegate = match creation_lock.delegate() {
+        Ok(delegate) => Some(delegate),
+        Err(error) => return decide(&mut channel, &forking, Cause::Refused, None, Some(error.to_string())),
+    };
     let gated = match pty_lifecycle::spawn_gated_daemon(
         &executable,
         params,

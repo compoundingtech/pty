@@ -100,24 +100,7 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
     let generation = session.metadata.as_ref().and_then(|m| m.generation.clone());
     let sidecar = registry::read_session_pid(name);
     let daemon_pid = sidecar.or_else(|| session.metadata.as_ref().and_then(|m| m.daemon_pid));
-    match registry::check_record_identity_in(
-        &registry::session_dir(), name, sidecar, session.metadata.as_ref(),
-    ) {
-        DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => {}
-        DaemonIdentityCheck::Unknown => {
-            return Err(RemoveError::IdentityUnverified {
-                name: name.to_string(),
-            });
-        }
-        DaemonIdentityCheck::Match => {
-            let (Some(pid), Some(metadata)) = (daemon_pid, session.metadata.as_ref()) else {
-                return Err(RemoveError::IdentityUnverified {
-                    name: name.to_string(),
-                });
-            };
-            wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT)?;
-        }
-    }
+    wait_for_owner_loss(name, sidecar, session.metadata.as_ref())?;
 
     // Re-check generation ownership in the same critical section as the
     // unlink so a replacement that published meanwhile is left alone.
@@ -131,6 +114,39 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
         });
     }
     Ok(())
+}
+
+/// Wait, holding no registry lock, until the daemon recorded in `metadata`
+/// is known to be gone, as [`remove`] does before it unlinks anything. It is
+/// for a caller that then takes the registry locks itself, as restart does to
+/// keep the name through the respawn, and checks the generation under them.
+pub fn wait_for_recorded_owner_loss(
+    name: &str,
+    metadata: &SessionMetadata,
+) -> Result<(), RemoveError> {
+    wait_for_owner_loss(name, registry::read_session_pid(name), Some(metadata))
+}
+
+fn wait_for_owner_loss(
+    name: &str,
+    sidecar: Option<i32>,
+    metadata: Option<&SessionMetadata>,
+) -> Result<(), RemoveError> {
+    match registry::check_record_identity_in(&registry::session_dir(), name, sidecar, metadata) {
+        DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => Ok(()),
+        DaemonIdentityCheck::Unknown => Err(RemoveError::IdentityUnverified {
+            name: name.to_string(),
+        }),
+        DaemonIdentityCheck::Match => {
+            let (Some(pid), Some(metadata)) = (sidecar.or(metadata.and_then(|m| m.daemon_pid)), metadata)
+            else {
+                return Err(RemoveError::IdentityUnverified {
+                    name: name.to_string(),
+                });
+            };
+            wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT)
+        }
+    }
 }
 
 fn wait_for_recorded_daemon_exit(

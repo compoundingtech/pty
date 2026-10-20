@@ -76,7 +76,10 @@ pub fn metadata_matches_observation(observed: &SessionMetadata, current: &Sessio
 /// Serialize one whole-record mutation against every other writer: take
 /// `<name>.lock`, read, check the guards, run `mutate`, re-read to detect a
 /// concurrent rewrite, then publish the mutated object (unknown fields and
-/// key order preserved).
+/// key order preserved). Publication provenance is immutable, including through
+/// reserved keys inserted into the flattened `extra` map. Bound sessions also
+/// retain their operation tag and launch inputs so respawn cannot reuse a
+/// binding for a different launch. Unbound legacy operation tags remain mutable.
 ///
 /// node: src/sessions.ts:347-398
 pub fn mutate_metadata_under_lock(
@@ -191,6 +194,50 @@ fn mutate_metadata_under_lock_core(
         return MutateStatus::Unchanged(before);
     }
 
+    fn operation(metadata: &SessionMetadata) -> Option<&String> {
+        metadata.tags.as_ref().and_then(|tags| tags.get("st3.start-operation"))
+    }
+    if before.publication_binding != after.publication_binding
+        || before.publication_root_id != after.publication_root_id
+        || before.publication_capability != after.publication_capability
+        || (before.publication_binding.is_some()
+            && (operation(&before) != operation(&after) || after.extra.contains_key("tags")))
+        // Flattened extras can override typed fields during serialization.
+        // Reject those aliases before diffing, even when the typed values match.
+        || [
+            "publicationBinding",
+            "publicationRootId",
+            "publicationCapability",
+        ]
+        .iter()
+        .any(|key| after.extra.contains_key(*key))
+    {
+        return MutateStatus::GenerationMismatch;
+    }
+    if before.publication_binding.is_some()
+        && (before.command != after.command
+            || before.args != after.args
+            || before.cwd != after.cwd
+            || before.isolate_env != after.isolate_env
+            || before.extra_env != after.extra_env
+            || before.session_env != after.session_env
+            || before.unset_env != after.unset_env
+            || before.env != after.env
+            || [
+                "command",
+                "args",
+                "cwd",
+                "isolateEnv",
+                "extraEnv",
+                "sessionEnv",
+                "unsetEnv",
+                "env",
+            ]
+            .iter()
+            .any(|key| after.extra.contains_key(*key)))
+    {
+        return MutateStatus::GenerationMismatch;
+    }
     let Some(latest_raw) = read_metadata_map(name) else {
         return MutateStatus::Stale;
     };

@@ -31,6 +31,14 @@ PTY.TRL-R08: a lost attachment is not a child-exit observation.
 and a Rust client talks to a Node daemon, on the same `$PTY_ROOT`. Section 11
 lists what this costs beyond drop-in.
 
+**Socket pathname extension.** For a logical id whose `<root>/<id>.sock`
+address exceeds the platform limit, Rust uses a bounded digest filename.
+Node rejects those ids. Addresses accepted by Node retain their exact paths;
+the persisted metadata, pid and event names do not change. Rust listing and
+lookup map bounded sockets through their id-named registry companions.
+Rust rejects IDs above 209 ASCII characters before launch so id-based sidecars
+and their atomic temporary filenames stay within the filesystem component limit.
+
 **Three surfaces.** The Node package has three parts. The parity rule differs
 per part:
 
@@ -318,8 +326,22 @@ non-`Send` libghostty terminal. This is the same object as the TUI `PtyHandle`
 in section 9. One crate serves both. Proposed layout from issue #1:
 `pty-protocol`, `pty-client`, `pty-terminal`, `pty-testkit`, `pty` (the CLI).
 
-Status: missing (L). `deskset/crates/pty-wire` is a partial third copy of
-`pty-protocol` + `pty-client`.
+Status: have. `pty::handle::TerminalHandle` (`crates/pty/src/handle.rs`)
+has `spawn`, `attach` and `attach_with_connector` over one actor thread that
+owns the libghostty terminal. It offers typed snapshots, modes, cursor and
+scrollback reads, `subscribe()` events, and explicit readiness
+(`wait_ready_outcome`). Each connection attempt carries a private
+`AttemptId`, and frames from an older attempt are dropped. The protocol lives
+in `pty-core` rather than a separate `pty-protocol` crate. `pty-client`,
+`pty-terminal` and `pty-testkit` exist as proposed.
+
+Where it differs from the issue's sketch:
+- The API is synchronous: `subscribe()` returns an mpsc `Receiver`.
+- The CLI's `pty_client::attach` and the handle's own connection are still two
+  client attach paths.
+
+Closing a spawned handle SIGKILLs the child's process group and then the
+child, through the same reap fence as the daemon's substrate (#162).
 
 ## 11. Mixed fleet: Node and Rust on one `$PTY_ROOT`
 
@@ -388,6 +410,29 @@ on both.
 `client_attach.rs::reset_maps_to_not_found_or_not_running` asks the kernel
 which of the two it is doing and pins the answer, rather than assuming the one
 it was written on.
+
+**A pty whose session leader exits, and a child whose output nobody has
+read.** Measured on 2026-10-19 with `forkpty` probes on macOS 27 (xnu-13432):
+
+| | Linux | macOS |
+|---|---|---|
+| the session leader exits while a descendant that ignores SIGHUP holds the terminal | the descendant keeps it open, and the master reads its later output | the master reads EOF within milliseconds, and the descendant cannot keep the terminal |
+| a shell that read input exits with output the master has not read | it is waitable at once, and the output stays readable | it is not waitable until the master reads; the output is kept (checked to 3 s) |
+
+**What it means:**
+- On macOS a session's output ends when its leader exits, so the substrate
+  publishes `OutputClosed` before the exit, and a backgrounded descendant's
+  later output is not captured.
+- A substrate reader parked by a full owner stream sees the child's exit only
+  once it reads again. The output is not lost.
+
+One more macOS case, not tied to `pty` yet: a child that writes and exits
+straight after `forkpty`, with nothing read or written on the master, becomes
+waitable after about 0.6 s, and its unread output is discarded.
+
+`pty-spawn`'s substrate tests assert each platform's behavior:
+`output_still_in_the_pty_when_the_child_is_reaped_is_delivered` and
+`an_exit_is_published_after_the_drain_bound_when_a_descendant_holds_the_pty`.
 
 ## 12d. Absent on macOS
 

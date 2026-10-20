@@ -369,7 +369,7 @@ fn reconnect_refusal_reports_connection_lost_and_exits_1() {
     assert_eq!(
         out,
         format!(
-            "\x1b[2J\x1b[Hx\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[connection lost to demo]\r\n  reconnect: pty attach demo\r\n"
+            "\x1b[2J\x1b[Hx\x1b[?5522l\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[connection lost to demo]\r\n  reconnect: pty attach demo\r\n"
         )
     );
     assert!(err.is_empty());
@@ -407,7 +407,7 @@ fn reconnect_replays_the_fresh_screen() {
     assert_eq!(
         out,
         format!(
-            "\x1b[2J\x1b[Hone\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n\x1b[2J\x1b[Htwo{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[demo exited with code 3]\r\n"
+            "\x1b[2J\x1b[Hone\x1b[?5522l\r\n[reconnecting… — Ctrl-\\ or Ctrl-C to stop]\r\n\x1b[2J\x1b[Htwo{TERMINAL_SANITIZE}{CURSOR_TO_BOTTOM}\r\n[demo exited with code 3]\r\n"
         )
     );
     h.join().unwrap();

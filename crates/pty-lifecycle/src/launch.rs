@@ -41,6 +41,8 @@ pub struct SpawnParams {
     pub ephemeral: bool,
     /// Written to the config only when non-empty.
     pub tags: TagMap,
+    pub publication_binding: Option<registry::revocation::PublicationBinding>,
+    pub publication_root_id: Option<String>,
     pub display_name: Option<String>,
     pub isolate_env: bool,
     /// Written only when non-empty.
@@ -55,9 +57,8 @@ pub struct SpawnParams {
     pub startup_lease: Option<StartupLeaseOptions>,
     /// Variables removed from the daemon's (and so the child's) environment.
     pub scrub_env: Vec<String>,
-    /// The pid that already holds `<name>.lock` for this creation; carried
-    /// for the CLI-fallback path (`PTY_CREATION_LOCK_OWNER_PID`).
-    pub creation_lock_owner_pid: Option<i32>,
+    /// Explicit authority to publish under an already-held creation claim.
+    pub creation_lock_delegate: Option<registry::lock::CreationClaimDelegate>,
     /// Set `PTY_SPAWNER_PID` so the daemon shuts down when this process dies.
     pub bind_to_spawner_lifetime: bool,
     /// Override of the 30 s start budget.
@@ -92,6 +93,8 @@ impl SpawnParams {
 ///
 /// node: src/cli.ts:3874-3884 (`persistedLaunchOptions`)
 pub fn apply_persisted_launch_options(params: &mut SpawnParams, meta: &registry::SessionMetadata) {
+    params.publication_binding = meta.publication_binding.clone();
+    params.publication_root_id = meta.publication_root_id.clone();
     if let Some(rows) = meta.rows {
         params.rows = rows;
     }
@@ -200,6 +203,8 @@ pub fn config_for(params: &SpawnParams) -> DaemonConfig {
         cols: Some(params.cols),
         ephemeral: params.ephemeral,
         tags: (!params.tags.is_empty()).then(|| params.tags.clone()),
+        publication_binding: params.publication_binding.clone(),
+        publication_root_id: params.publication_root_id.clone(),
         display_name: params.display_name.clone().filter(|d| !d.is_empty()),
         isolate_env: params.isolate_env.then_some(true),
         extra_env: (!params.extra_env.is_empty()).then(|| params.extra_env.clone()),
@@ -341,6 +346,165 @@ impl ChildWatch {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "macos_publisher.rs"]
+mod macos_publisher;
+
+/// A selected publisher held open from capability admission through exec.
+/// Prepare this before deleting a managed predecessor; never probe one path
+/// and subsequently execute its potentially downgraded replacement.
+pub struct PreparedDaemon {
+    executable: std::path::PathBuf,
+    _image: Option<File>,
+    #[cfg(target_os = "macos")]
+    quarantine: Option<Vec<u8>>,
+}
+
+impl PreparedDaemon {
+    pub fn spawn(self, params: SpawnParams) -> Result<SpawnedDaemon, SpawnError> {
+        spawn_prepared_daemon(self, params)
+    }
+
+    fn executable_for_spawn(&mut self, params: &SpawnParams) -> Result<&std::path::Path, SpawnError> {
+        if params.publication_binding.is_some() && self._image.is_none() {
+            return Err(SpawnError::Io("managed publisher was not verified".into()));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(image) = &self._image
+            && let Some((path, image)) = macos_publisher::refresh(
+                &self.executable, image, self.quarantine.as_deref(),
+            ).map_err(|error| SpawnError::Io(format!("cannot refresh managed publisher policy: {error}")))?
+        {
+            // The capability exec may have changed the cached quarantine.
+            // A fresh immutable snapshot retains the admitted bytes and raw
+            // source policy without making the assessed image writable.
+            self.executable = path;
+            self._image = Some(image);
+        }
+        Ok(&self.executable)
+    }
+}
+
+/// Legacy launches keep their existing executable selection. Managed launches
+/// probe and execute the same image: an open descriptor on Linux, or a verified
+/// private content-addressed snapshot on Darwin. Neither reopens the selected
+/// pathname after admission, including after replacement or unlink.
+pub fn prepare_daemon(
+    executable: &std::path::Path,
+    params: &SpawnParams,
+) -> Result<PreparedDaemon, SpawnError> {
+    if params.publication_binding.is_none() {
+        return Ok(PreparedDaemon {
+            executable: executable.to_owned(), _image: None,
+            #[cfg(target_os = "macos")]
+            quarantine: None,
+        });
+    }
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let mut image = File::open(executable)
+        .map_err(|error| SpawnError::Io(format!("cannot pin managed publisher: {error}")))?;
+    let metadata = image.metadata().map_err(|error| SpawnError::Io(error.to_string()))?;
+    let mut magic = [0; 4];
+    image.read_exact(&mut magic).map_err(|error| SpawnError::Io(error.to_string()))?;
+    let native = magic == *b"\x7fELF" || matches!(magic,
+        [0xfe, 0xed, 0xfa, 0xce] | [0xce, 0xfa, 0xed, 0xfe]
+        | [0xfe, 0xed, 0xfa, 0xcf] | [0xcf, 0xfa, 0xed, 0xfe]
+        | [0xca, 0xfe, 0xba, 0xbe] | [0xbe, 0xba, 0xfe, 0xca]);
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 || !native {
+        return Err(SpawnError::Io("managed publisher must be a native executable, not a wrapper".into()));
+    }
+    #[cfg(target_os = "linux")]
+    let (pinned, image) = {
+        // CLOEXEC closes the pin only after the kernel opens this exact image.
+        // Keep it clear of the config/operation descriptors.
+        let fd = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+        if fd < 0 {
+            return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
+        }
+        // SAFETY: fcntl returned a newly owned descriptor.
+        (std::path::PathBuf::from(format!("/proc/self/fd/{fd}")), unsafe { File::from_raw_fd(fd) })
+    };
+    #[cfg(target_os = "macos")]
+    let (pinned, image, quarantine) = macos_publisher::pin(image)
+        .map_err(|error| SpawnError::Io(format!("cannot snapshot managed publisher: {error}")))?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let pinned: std::path::PathBuf = return Err(SpawnError::Io(
+        "managed publisher image pinning is unsupported on this platform".into(),
+    ));
+    let mut probe = Command::new(&pinned).args(["capabilities", "--json"])
+        // Old PTYs can forward an unknown verb to pty-capabilities on PATH.
+        // Only this image's built-in implementation may establish capability.
+        .env_remove("PATH")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|error| SpawnError::Io(format!("cannot verify managed publisher: {error}")))?;
+    let mut stdout = probe.stdout.take().expect("capability stdout is piped");
+    let mut bytes = Vec::new();
+    let result = (|| {
+        // Bound both output and time without a reader thread that an inherited
+        // stdout in an unsupported publisher's descendant could keep alive.
+        // SAFETY: stdout owns a live pipe descriptor; these calls only change
+        // that descriptor's blocking mode.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe {
+            libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } < 0 {
+            return Err(SpawnError::Io(std::io::Error::last_os_error().to_string()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut status = None;
+        loop {
+            let mut chunk = [0; 4096];
+            let ended = match stdout.read(&mut chunk) {
+                Ok(0) => true,
+                Ok(count) => {
+                    if bytes.len() + count > 65_536 {
+                        return Err(SpawnError::Io("managed publisher capability output is oversized".into()));
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(SpawnError::Io(error.to_string())),
+            };
+            if status.is_none() {
+                status = probe.try_wait().map_err(|error| SpawnError::Io(error.to_string()))?;
+            }
+            if ended && let Some(status) = status {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(SpawnError::Io("managed publisher capability probe timed out".into()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = probe.kill();
+        let _ = probe.wait();
+    }
+    let status = result?;
+    let capabilities = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let publication = capabilities.as_ref().and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("publication-revocation"));
+    let verified = status.success()
+        && publication.is_some_and(|value| {
+            value["versions"].as_array().is_some_and(|versions| versions.contains(&serde_json::json!(1)))
+                && value["recordSchemas"].as_array().is_some_and(|schemas| schemas.contains(&serde_json::json!(1)))
+                && value["atomicNamePublication"] == true
+                && value["managedImmutableBinding"] == true
+        });
+    if !verified {
+        return Err(SpawnError::Io("managed publisher lacks publication-revocation v1".into()));
+    }
+    Ok(PreparedDaemon {
+        executable: pinned, _image: Some(image),
+        #[cfg(target_os = "macos")]
+        quarantine,
+    })
+}
+
 /// Spawn `<daemon_executable> __daemon` detached and wait until it has
 /// published the session. On any failure after the process started (and it has
 /// not already exited) the daemon is sent SIGTERM.
@@ -353,17 +517,34 @@ pub fn spawn_daemon(
     daemon_executable: &std::path::Path,
     params: SpawnParams,
 ) -> Result<SpawnedDaemon, SpawnError> {
+    prepare_daemon(daemon_executable, &params)?.spawn(params)
+}
+
+fn spawn_prepared_daemon(
+    mut publisher: PreparedDaemon,
+    params: SpawnParams,
+) -> Result<SpawnedDaemon, SpawnError> {
     let name = params.name.clone();
+    if let Some(binding) = &params.publication_binding {
+        // Durable revocation is monotonic: this deny-only preflight needs no
+        // publication lock. Report the revoked intent before a live survivor
+        // can mask the daemon's refusal as AlreadyPublished. A missing record
+        // is not admission; the daemon still checks under its creation claim.
+        if registry::revocation::read(&name, &binding.operation)
+            .map_err(|error| SpawnError::Io(error.to_string()))?
+            .is_some()
+        {
+            return Err(SpawnError::Io("operation-revoked".into()));
+        }
+    }
     let timeout = params.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT);
-    let (mut watch, pid) = start_daemon_process(daemon_executable, &params, None)?;
+    let (mut watch, pid) = start_daemon_process(&mut publisher, &params, None)?;
     let outcome = wait_for_publication(&name, pid, timeout, &mut watch);
     if let Err(err) = &outcome
         && !matches!(err, SpawnError::DaemonExited { .. })
     {
-        // SAFETY: SIGTERM to the pid we spawned.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
+        // SIGTERM to the pid we spawned.
+        let _ = pty_core::kill::process(pid as i32, libc::SIGTERM);
     }
     // Keep a waiter alive for this direct child. Detaching changes its session,
     // not its parent; without waitpid an embedding process accumulates zombies.
@@ -450,6 +631,7 @@ pub fn spawn_gated_daemon(
     params: SpawnParams,
     operation: OperationLaunch,
 ) -> Result<GatedDaemon, SpawnError> {
+    let mut publisher = prepare_daemon(daemon_executable, &params)?;
     let mut gate = [0i32; 2];
     // Close-on-exec from creation, so no other thread's fork and exec can
     // inherit an end before it is re-homed.
@@ -471,7 +653,7 @@ pub fn spawn_gated_daemon(
     };
     // SAFETY: freshly re-homed descriptor owned here.
     let gate_write = unsafe { File::from_raw_fd(gate_write) };
-    let started = start_daemon_process(daemon_executable, &params, Some((&operation, gate_read)));
+    let started = start_daemon_process(&mut publisher, &params, Some((&operation, gate_read)));
     // SAFETY: the parent's copy of the gate read end; the daemon has its own.
     unsafe { libc::close(gate_read) };
     let (watch, pid) = started?;
@@ -568,7 +750,7 @@ fn rehome_cloexec(fd: RawFd) -> Result<RawFd, ()> {
 /// Start the daemon process with the config on fd 3 and the readiness pipe,
 /// plus the operation descriptors when there are any.
 fn start_daemon_process(
-    daemon_executable: &std::path::Path,
+    publisher: &mut PreparedDaemon,
     params: &SpawnParams,
     operation: Option<(&OperationLaunch, RawFd)>,
 ) -> Result<(ChildWatch, u32), SpawnError> {
@@ -577,6 +759,10 @@ fn start_daemon_process(
     {
         return Err(SpawnError::EnvExclusive);
     }
+    // This is the only execution boundary for ordinary and gated launches.
+    // A prepared publisher is required, and every path rechecks final policy
+    // here before allocating launch descriptors or spawning a process.
+    let daemon_executable = publisher.executable_for_spawn(params)?;
     let config = serde_json::to_string(&config_for(params))
         .map_err(|e| SpawnError::Io(format!("cannot encode daemon config: {e}")))?;
 
@@ -649,12 +835,16 @@ fn start_daemon_process(
     if params.bind_to_spawner_lifetime {
         cmd.env("PTY_SPAWNER_PID", std::process::id().to_string());
     }
-    match params.creation_lock_owner_pid {
-        Some(pid) => {
-            cmd.env("PTY_CREATION_LOCK_OWNER_PID", pid.to_string());
+    match &params.creation_lock_delegate {
+        Some(delegate) => {
+            // A gated operation atomically hands the same nonce to its daemon.
+            let owner = if operation.is_some() { "daemon".to_owned() } else { delegate.owner_pid.to_string() };
+            cmd.env("PTY_CREATION_LOCK_OWNER_PID", owner);
+            cmd.env("PTY_CREATION_LOCK_NONCE", &delegate.nonce);
         }
         None => {
             cmd.env_remove("PTY_CREATION_LOCK_OWNER_PID");
+            cmd.env_remove("PTY_CREATION_LOCK_NONCE");
         }
     }
     let inherited: Option<[RawFd; 3]> =
@@ -865,6 +1055,73 @@ pub fn wait_for_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gated_publisher_rechecks_quarantine_changed_after_capability_probe() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "pty-gated-policy-{}", registry::atomic::random_hex16()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let cache = root.join("cache");
+        std::fs::DirBuilder::new().mode(0o700).create(&cache).unwrap();
+        let path = cache.join("admitted-image");
+        std::fs::copy("/usr/bin/true", &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let image = File::open(&path).unwrap();
+        let value = b"0081;00000000;pty-gated-test;";
+        // Model the post-probe state: an initially unquarantined admitted image
+        // gained quarantine during capability execution. Build that fixture
+        // before making it immutable; no production hook or writable window.
+        assert_eq!(unsafe { libc::fsetxattr(
+            image.as_raw_fd(), c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0, 0,
+        ) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut publisher = PreparedDaemon {
+            executable: path, _image: Some(image), quarantine: None,
+        };
+        let mut params = SpawnParams::new("gated-policy", "/usr/bin/true", &[]);
+        params.publication_binding = Some(registry::revocation::PublicationBinding {
+            operation: "gated-policy".into(), digest: "a".repeat(64),
+        });
+        let operation = OperationLaunch { control_fd: -1, digest: "b".repeat(64) };
+        // Deliberately invalid gate/control descriptors establish that the
+        // shared gated execution boundary checks policy before launch effects.
+        let result = start_daemon_process(&mut publisher, &params, Some((&operation, -1)));
+        assert!(matches!(&result, Err(SpawnError::Io(message))
+            if message.contains("cannot discard quarantine added after publisher admission")));
+        // Also model the security-sensitive flags-only case: the probe's
+        // image became user-approved, but the captured source was not.
+        let approved_path = cache.join("approved-after-probe");
+        std::fs::copy("/usr/bin/true", &approved_path).unwrap();
+        std::fs::set_permissions(&approved_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let approved = File::open(&approved_path).unwrap();
+        let approved_value = b"00c1;00000000;pty-gated-test;";
+        assert_eq!(unsafe { libc::fsetxattr(
+            approved.as_raw_fd(), c"com.apple.quarantine".as_ptr(),
+            approved_value.as_ptr().cast(), approved_value.len(), 0, 0,
+        ) }, 0);
+        std::fs::set_permissions(&approved_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        publisher = PreparedDaemon {
+            executable: approved_path.clone(), _image: Some(approved),
+            quarantine: Some(value.to_vec()),
+        };
+        let result = start_daemon_process(&mut publisher, &params, Some((&operation, -1)));
+        assert!(matches!(&result, Err(SpawnError::Io(message))
+            if message.contains("failed to start daemon")));
+        assert_ne!(publisher.executable, approved_path, "gated launch must refresh changed flags");
+        assert!(macos_publisher::refresh(
+            &publisher.executable, publisher._image.as_ref().unwrap(), Some(value),
+        ).unwrap().is_none(), "the final image must carry the exact original raw policy");
+        assert_eq!(
+            std::fs::metadata(approved_path).unwrap().permissions().mode() & 0o777,
+            0o500, "the assessed image must never become writable",
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn error_texts_match_node() {

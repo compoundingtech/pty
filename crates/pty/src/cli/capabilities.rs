@@ -19,7 +19,13 @@ pub fn capabilities() -> serde_json::Value {
             CAPABILITY: {
                 "versions": VERSIONS,
                 "recordSchemas": [RECORD_SCHEMA],
-            }
+            },
+            "publication-revocation": {
+                "versions": [1],
+                "recordSchemas": [1],
+                "atomicNamePublication": true,
+                "managedImmutableBinding": true,
+            },
         }
     })
 }

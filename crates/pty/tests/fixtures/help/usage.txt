@@ -63,6 +63,8 @@ Observe:
   pty list --remote <peer>                List a fabric peer's sessions (over fabric)
   pty list --remote                       Include remote sessions via pty-relay (when installed)
   pty root [--json]                       Report effective and native default registry roots
+  pty publication-revocation identity --json
+                                          Enroll/query the owner-private publication root identity
   pty remote-serve --stdio                Serve remote access on-demand (fabric --exec spawns it per dial)
   pty remote-serve --socket <path>        Serve remote access as a listening daemon (being retired)
 
@@ -72,6 +74,10 @@ Modify:
   pty evidence snapshot --id <id>         Read exact-generation retained exit evidence as JSON
   pty readiness ownership --id <id>        Prove exact held TCP connection ownership
   pty readiness cas --id <id>              Generation-fenced lifecycle tag CAS
+  pty publication-revocation install --id <id> --operation <operation> --binding <sha256> --intent <sha256> --json
+                                          Durably reject an exact operation; never kills a survivor
+  pty publication-revocation read --id <id> --operation <operation> --json
+                                          Read the durable exact-operation revocation
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName

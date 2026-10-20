@@ -14,13 +14,15 @@ fn events(rig: &Rig, id: &str) -> Vec<Value> {
 }
 
 /// **Wait for the event; one read after `wait_for_exit` races it.** The exit
-/// metadata and the `session_exit` event are two writes, and nothing orders
-/// the event first. Both daemons queue the event to an async writer and then
-/// save the metadata synchronously (`finalize_exit`; node:
-/// src/server.ts:593-610). Measured 2026-10-14 with the test sharing one busy
-/// core: the single read found no `session_exit` in 29 runs of 30 against
-/// Node and 20 of 30 against Rust, so either side can lose and the gate
-/// reports whichever one did as a divergence. Waiting: 0 of 30 on each.
+/// metadata and the `session_exit` event are two writes, and Node does not
+/// order the event first: it queues the event to an async writer and then
+/// saves the metadata synchronously (node: src/server.ts:593-610). Rust's
+/// `finalize_exit` flushes the event before it saves the metadata, unless the
+/// flush gives up on the event lock. Measured 2026-10-14, before Rust added
+/// that flush, with the test sharing one busy core: the single read found no
+/// `session_exit` in 29 runs of 30 against Node and 20 of 30 against Rust, so
+/// either side could lose and the gate reported whichever one did as a
+/// divergence. Waiting: 0 of 30 on each.
 fn session_exit(rig: &Rig, id: &str) -> Value {
     let path = rig.root().join(format!("{id}.events.jsonl"));
     wait_until(&format!("{id} session_exit event"), || {

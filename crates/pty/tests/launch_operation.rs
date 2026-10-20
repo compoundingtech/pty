@@ -85,6 +85,8 @@ struct Plan {
     executable: Option<PathBuf>,
     /// The session id, when not `rt-<tag>`.
     runtime_id: Option<String>,
+    /// Immutable managed-publication operation, digest and root identity.
+    publication: Option<(String, String, String)>,
 }
 
 /// The owner of one launch operation.
@@ -153,13 +155,21 @@ impl Owner {
             &digest,
             "--id",
             &runtime_id,
-            "--",
-        ])
-        .args(&command)
-        .env("PTY_TEST_OPERATION_BARRIERS", &barriers)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        ]);
+        if let Some((operation, binding, root)) = &plan.publication {
+            cmd.args([
+                "--publication-operation", operation,
+                "--publication-binding", binding,
+                "--publication-root-id", root,
+            ]);
+            cmd.args(["--tag", &format!("st3.start-operation={operation}")]);
+        }
+        cmd.arg("--")
+            .args(&command)
+            .env("PTY_TEST_OPERATION_BARRIERS", &barriers)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (key, value) in &plan.env {
             cmd.env(key, value);
         }
@@ -433,11 +443,11 @@ fn wait_gone(pid: i32) {
 }
 
 /// Settle until the verdict is `verdict` (and its kind `kind`), waiting in
-/// between on exactly the processes the evidence names (a live writer or
-/// participant, a marked or unreadable process) to exit. A process of this
-/// user caught exiting is honestly unreadable for that capture; the next
-/// capture follows its exit, not a timer. A verdict that names no process to
-/// wait for fails at once.
+/// between on exactly the processes the evidence names (a writer or
+/// participant that has not exited, a marked or unreadable process) to exit.
+/// A process of this user caught exiting is honestly unknown for that
+/// capture; the next capture follows its exit, not a timer. A verdict that
+/// names no process to wait for fails at once.
 fn settle_reactively(
     rig: &Rig,
     operation_id: &str,
@@ -473,13 +483,14 @@ fn settle_reactively(
     panic!("settle never became {verdict}/{kind:?}");
 }
 
-/// Every process a settle verdict names as still live or unreadable.
+/// Every process a settle verdict names as not yet exited: live, caught
+/// exiting, or unreadable.
 fn named_processes(v: &Value) -> Vec<i32> {
     let mut pids = Vec::new();
     for component in v["components"].as_array().into_iter().flatten() {
         let detail = &component["detail"];
         match component["name"].as_str() {
-            Some("writer") if component["status"] == "pending" => {
+            Some("writer") if component["status"] != "verified" => {
                 let pid = detail["pid"]
                     .as_i64()
                     .or_else(|| detail["holderPid"].as_i64())
@@ -488,7 +499,7 @@ fn named_processes(v: &Value) -> Vec<i32> {
             }
             Some("participants") => {
                 for p in detail["participants"].as_array().into_iter().flatten() {
-                    if p["status"] == "live" {
+                    if p["status"] != "gone" {
                         pids.extend(p["pid"].as_i64().map(|pid| pid as i32));
                     }
                 }
@@ -509,11 +520,43 @@ fn named_processes(v: &Value) -> Vec<i32> {
     pids
 }
 
+/// A participant or writer caught exiting makes the verdict unknown, and is
+/// the process to wait for: the shape a loaded macOS host produced, with
+/// the producer still exiting while the launcher and the child were gone.
+#[test]
+fn a_process_caught_exiting_is_one_to_wait_for() {
+    let participants = json!({
+        "verdict": "unknown",
+        "kind": "participants",
+        "components": [
+            {"name": "writer", "status": "verified", "detail": {"role": "none"}},
+            {"name": "participants", "status": "unknown", "detail": {
+                "tableComplete": true,
+                "participants": [
+                    {"role": "launcher", "pid": 11, "startToken": "a", "status": "gone"},
+                    {"role": "producer", "pid": 12, "startToken": "b", "status": "exiting"},
+                    {"role": "child", "pid": 13, "startToken": "c", "status": "gone"},
+                ],
+            }},
+        ],
+    });
+    assert_eq!(named_processes(&participants), [12]);
+    let writer = json!({
+        "verdict": "unknown",
+        "kind": "writer",
+        "components": [
+            {"name": "writer", "status": "unknown", "detail": {
+                "role": "producer", "pid": 21, "startToken": "d", "status": "exiting",
+            }},
+        ],
+    });
+    assert_eq!(named_processes(&writer), [21]);
+}
+
+/// A signal to a test-owned process. A pid read from a record is never
+/// trusted to be one: `pty_core::kill` refuses pid 1 and below.
 fn kill(pid: i32, signal: i32) {
-    // SAFETY: a signal to a test-owned process.
-    unsafe {
-        libc::kill(pid, signal);
-    }
+    let _ = pty_core::kill::process(pid, signal);
 }
 
 fn row_exists(rig: &Rig, name: &str) -> bool {
@@ -1440,7 +1483,7 @@ fn a_group_stop_reaches_the_prepared_child_and_cancel_still_retires_it() {
     let ready = owner.wait_for("ready");
     let child = ready["incarnation"]["child"]["pid"].as_i64().unwrap() as i32;
     // The prepared child leads its own process group.
-    kill(-child, libc::SIGSTOP);
+    pty_core::kill::group(child, libc::SIGSTOP).unwrap();
     wait_until(
         "the group to stop",
         || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
@@ -3022,9 +3065,282 @@ fn without_an_identity_safe_signal_recovery_sends_none() {
     ignore = "test hooks exist only in debug builds"
 )]
 fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
-    let rig = Rig::new();
+    bounded_stopped_child_test(
+        "a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired",
+        |rig| stopped_child_scenario(rig, true),
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test hooks exist only in debug builds"
+)]
+fn a_child_stopped_right_after_its_fork_is_retired_by_its_live_daemon() {
+    bounded_stopped_child_test(
+        "a_child_stopped_right_after_its_fork_is_retired_by_its_live_daemon",
+        |rig| stopped_child_scenario(rig, false),
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn an_ordinary_child_stopped_before_exec_cannot_pin_its_dead_daemons_name() {
+    bounded_stopped_child_test(
+        "an_ordinary_child_stopped_before_exec_cannot_pin_its_dead_daemons_name",
+        ordinary_stopped_child_scenario,
+    );
+}
+
+/// Isolate the entire scenario, including blocking CLI calls and unwinding.
+/// A thread timeout alone cannot stop an Owner/Rig destructor or retire CLI
+/// stuck on a file lock. The fixture supervisor never takes registry locks.
+fn bounded_stopped_child_test(test: &str, scenario: fn(&Rig)) {
+    const FIXTURE: &str = "PTY_STOPPED_CHILD_FIXTURE";
+    if std::env::var(FIXTURE).as_deref() == Ok(test) {
+        // Adoption is process-wide, so enable it only in this isolated test
+        // executable, never in the parallel integration-test runner.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0,
+            "enable stopped-child fixture subreaper"
+        );
+        let rig = Rig::new();
+        let directory = rig.root.parent().unwrap().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| scenario(&rig));
+            // Include Rig cleanup in the deadline, not just the assertions.
+            drop(rig);
+            let _ = send.send(result.is_ok());
+        });
+        let result = receive.recv_timeout(Duration::from_secs(30));
+        if result.is_err() {
+            eprintln!("{test}: scenario or cleanup exceeded 30 seconds");
+        }
+        let cleaned = cleanup_stopped_child_fixture(std::process::id() as i32, true);
+        let _ = std::fs::remove_dir_all(directory);
+        // A timed-out worker may still be unwinding. Do not join it or run
+        // its destructors again; all owned OS processes have been retired.
+        std::process::exit(if result == Ok(true) && cleaned { 0 } else { 1 });
+    }
+
+    // Reuse the integration harness's self-executable fixture pattern, but
+    // inherit output: reading a pipe to EOF could itself wait on a daemon.
+    let mut fixture = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(FIXTURE, test)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Some(status) = fixture.try_wait().unwrap() {
+            assert!(status.success(), "{test}: isolated fixture failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Last-resort supervision also uses exact process identities,
+            // not a saved PID that might now name an unrelated process.
+            let _ = cleanup_stopped_child_fixture(fixture.id() as i32, false);
+            let _ = fixture.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while fixture.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < reap_deadline, "{test}: killed fixture was not reaped");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("{test}: isolated fixture exceeded 40 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill only this fixture's descendants, plus its marked daemon/held child
+/// (which can already be reparented to init on macOS). Linux adopts and reaps
+/// stopped orphans; macOS's init reaps the exact-signalled orphan instead.
+fn cleanup_stopped_child_fixture(parent: i32, reap: bool) -> bool {
+    use pty_core::operation::{exact::Exact, record::ProcessId};
+    use pty_core::proctable::{ProcTable, argv::scan_argv};
+
+    let digest = sha256_hex(format!("op-fork-stop-{parent}").as_bytes());
+    let boot = pty_core::boot::read_boot_identity().expect("fixture boot identity");
+    let uid = unsafe { libc::getuid() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let table = ProcTable::read();
+        let mut descendants = std::collections::HashSet::from([parent]);
+        loop {
+            let before = descendants.len();
+            for row in table.rows() {
+                if descendants.contains(&row.ppid) {
+                    descendants.insert(row.pid);
+                }
+            }
+            if before == descendants.len() {
+                break;
+            }
+        }
+        let scan = scan_argv(uid);
+        let mut targets = Vec::new();
+        for row in table.rows().filter(|row| row.pid != parent && descendants.contains(&row.pid)) {
+            if let Some(identity) = &row.identity {
+                targets.push((row.pid, identity.clone()));
+            }
+        }
+        for row in &scan.rows {
+            if pty_core::operation::settle::argv_carries_marker(&row.argv, &digest)
+                && let Some(identity) = &row.identity
+            {
+                targets.push((row.pid, identity.clone()));
+            }
+        }
+        let mut clean = table.is_complete() && scan.complete;
+        for (pid, identity) in targets {
+            let id = ProcessId {
+                pid: pid as u32,
+                start_token: identity.as_str().to_owned(),
+                boot_id: boot.clone(),
+                uid,
+            };
+            match Exact::pin(&id, Some(&boot)) {
+                Ok(Some(process)) => {
+                    clean = false;
+                    if let Err(error) = process.signal(libc::SIGKILL) {
+                        eprintln!("fixture cleanup could not signal {pid}: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    clean = false;
+                    eprintln!("fixture cleanup could not pin {pid}: {error}");
+                }
+            }
+        }
+        if reap {
+            // Only the isolated fixture calls waitpid(-1): never steal a
+            // sibling test's children from the parallel outer runner.
+            while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+        }
+        if clean {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("stopped-child fixture cleanup exceeded 5 seconds");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn ordinary_stopped_child_scenario(rig: &Rig) {
+    use std::os::unix::fs::PermissionsExt;
+    use pty_core::operation::{exact::Exact, record::ProcessId};
+    use pty_core::proctable::ProcTable;
+    use pty_core::registry::{acquire_lock, lock::release_file_lock_owned_by, with_root};
+
+    std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+        .as_str().unwrap().to_owned();
+    let name = "ordinary-fork-stop";
+    let operation = format!("ordinary-fork-stop-{}", std::process::id());
+    let binding = "f".repeat(64);
+    let marker = rig.scratch.join("ran-ordinary-fork-stop");
+    let script = format!("echo ran > {}; exec sleep 60", marker.display());
+    // This is the ordinary launcher: no operation fd, launch digest, or
+    // operation argv marker. Its real portable-pty fork stops before pre_exec.
+    let mut launcher = rig.cmd(&[
+        "run", "-d", "--force", "--id", name,
+        "--publication-operation", &operation,
+        "--publication-binding", &binding,
+        "--publication-root-id", &root,
+        "--tag", &format!("st3.start-operation={operation}"),
+        "--tag", "keep=true",
+        "--", "/bin/sh", "-c", &script,
+    ])
+        .env("PTY_TEST_ORDINARY_CHILD", "stop-after-fork")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn().unwrap();
+    wait_until("ordinary publication metadata", || {
+        rig.read_meta(name).is_some_and(|meta| meta["daemonPid"].as_i64().is_some())
+    });
+    let meta = rig.read_meta(name).unwrap();
+    assert_eq!(meta["publicationBinding"], json!({
+        "operation": operation, "digest": binding,
+    }));
+    assert_eq!(meta["publicationRootId"], root);
+    assert_eq!(meta["publicationCapability"], 1);
+    let daemon = meta["daemonPid"].as_i64().unwrap() as i32;
+    let mut child = None;
+    wait_until("ordinary daemon's direct child stopped before exec", || {
+        let table = ProcTable::read();
+        child = table.rows()
+            .find(|row| row.ppid == daemon && row.is_stopped() && !row.is_zombie())
+            .map(|row| row.pid);
+        child.is_some()
+    });
+    let child = child.unwrap();
+    assert!(!marker.exists(), "ordinary command executed before the fork stop");
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{child}/exe")).unwrap(),
+        std::fs::read_link(format!("/proc/{daemon}/exe")).unwrap(),
+        "stopped child must still be the unexeced daemon image"
+    );
+    assert!(launcher.try_wait().unwrap().is_none(), "launcher skipped spawn readiness");
+    let lock = rig.root.join(format!("{name}.lock"));
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(daemon.to_string().as_str()));
+    assert_ne!(daemon as u32, launcher.id());
+    // Exercise the launcher's old-owner release while the transferred claim
+    // still belongs to a live daemon. It must not unlink the replacement.
+    assert!(alive(daemon));
+    assert!(!release_file_lock_owned_by(&lock, launcher.id()));
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(daemon.to_string().as_str()));
+
+    let boot = pty_core::boot::read_boot_identity().unwrap();
+    let table = ProcTable::read();
+    let row = table.rows().find(|row| row.pid == daemon).unwrap();
+    let daemon_id = ProcessId {
+        pid: daemon as u32,
+        start_token: row.identity.as_ref().unwrap().as_str().to_owned(),
+        boot_id: boot.clone(),
+        uid: unsafe { libc::getuid() },
+    };
+    let exact_daemon = Exact::pin(&daemon_id, Some(&boot)).unwrap().unwrap();
+    exact_daemon.signal(libc::SIGKILL).unwrap();
+    let mut status = None;
+    wait_until("ordinary launcher to report daemon death", || {
+        status = launcher.try_wait().unwrap();
+        status.is_some()
+    });
+    assert!(!status.unwrap().success());
+    wait_gone(daemon);
+    assert!(matches!(
+        pty_core::proctable::process(child),
+        pty_core::proctable::Answer::Known(row)
+            if row.is_stopped() && !row.is_zombie() && row.ppid == std::process::id() as i32
+    ), "the subreaper must retain the still-stopped orphan for exact cleanup");
+    assert!(!marker.exists(), "ordinary command executed after daemon death");
+    // This is intentionally a blocking acquisition inside the whole-scenario
+    // watchdog: an inherited flock must fail the test, not hang the runner.
+    with_root(&rig.root, || {
+        let claim = acquire_lock(name).expect("dead daemon's name is reclaimable");
+        assert_eq!(std::fs::read_to_string(&lock).unwrap().split_whitespace().next(), Some(std::process::id().to_string().as_str()));
+        claim.release();
+        assert!(!lock.exists(), "reclaimed name claim was not released");
+    });
+    assert!(matches!(
+        pty_core::proctable::process(child),
+        pty_core::proctable::Answer::Known(row) if row.is_stopped() && !row.is_zombie()
+    ));
+    assert!(!marker.exists(), "stale-name recovery executed the ordinary child");
+    // The shared subreaper supervisor exact-signals and reaps this child.
+}
+
+fn stopped_child_scenario(rig: &Rig, daemon_death: bool) {
     let mut owner = Owner::start(
-        &rig,
+        rig,
         "fork-stop",
         Plan {
             env: vec![("PTY_TEST_HELD_CHILD".into(), "stop-after-fork".into())],
@@ -3032,22 +3348,32 @@ fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
         },
     );
     owner.wait_for("decision");
-    let record = loop {
-        let record = owner.record(&rig);
-        if !record["participants"]["child"].is_null() {
-            break record;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    wait_until("the stopped child's participant record", || {
+        !owner.record(rig)["participants"]["child"].is_null()
+    });
+    let record = owner.record(rig);
     let child = record["participants"]["child"]["pid"].as_i64().unwrap() as i32;
     wait_until(
         "the child to stop",
         || matches!(pty_core::proctable::process(child), pty_core::proctable::Answer::Known(row) if row.is_stopped()),
     );
-    // Stopped before it shed anything: it holds copies of every descriptor
-    // of the daemon's, the lock file's among them, and it is still in the
-    // daemon's process group.
+    // Stopped before it shed any descriptors or left the daemon's process
+    // group. Neither publication nor creation may leave an inherited pin.
     let daemon = record["participants"]["producer"]["pid"].as_i64().unwrap() as i32;
+    if !daemon_death {
+        assert!(alive(daemon), "cancel must reach a live producer");
+        owner.cancel("c-fork-stop");
+        let decision = owner.wait_for("decision");
+        assert_eq!(decision["decision"]["cause"], "cancel", "{decision:#}");
+        let retirement = owner.wait_for("retirement");
+        assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+        assert!(!alive(child), "live producer left its stopped child behind");
+        assert_ne!(owner.launcher_exit(), 0);
+        wait_gone(daemon);
+        owner.settle_until(rig, "closed");
+        assert!(!owner.ran());
+        return;
+    }
     kill(daemon, libc::SIGKILL);
     owner.launcher_exit();
     wait_gone(daemon);
@@ -3072,4 +3398,286 @@ fn a_child_stopped_right_after_its_fork_holds_no_lock_and_is_retired() {
     assert!(!alive(child));
     owner.settle_until(&rig, "closed");
     assert!(!owner.ran());
+}
+
+/// Operation mode bypasses ordinary create preflight and delegates the name
+/// claim to a gated daemon; the final worker must still enforce the fence.
+#[test]
+#[cfg(debug_assertions)]
+fn managed_operation_checks_revocation_in_the_final_publication_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+        .as_str().unwrap().to_owned();
+    let name = "managed-operation";
+    let revoked = format!("op-managed-revoked-{}", std::process::id());
+    let binding = "a".repeat(64);
+    let intent = "b".repeat(64);
+    rig.ok(&[
+        "publication-revocation", "install", "--id", name,
+        "--operation", &revoked, "--binding", &binding, "--intent", &intent,
+        "--root-id", &root, "--json",
+    ]);
+    let mut owner = Owner::start(&rig, "managed-revoked", Plan {
+        runtime_id: Some(name.into()),
+        publication: Some((revoked.clone(), binding.clone(), root.clone())),
+        hold: vec!["publication-before-lock"],
+        ..Plan::default()
+    });
+    owner.wait_reached("publication-before-lock");
+    assert_eq!(owner.operation_id, revoked);
+    assert!(!owner.ran());
+    assert!(!row_exists(&rig, name));
+    owner.release("publication-before-lock");
+    let retirement = owner.wait_for("retirement");
+    assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+    owner.drain();
+    assert_ne!(owner.launcher_exit(), 0);
+    assert!(!owner.ran(), "a revoked operation executed its command");
+    for suffix in ["json", "pid", "sock", "events.jsonl"] {
+        assert!(!rig.exists(&format!("{name}.{suffix}")), "published {suffix}");
+    }
+
+    let mut replacement = Owner::start(&rig, "managed-replacement", Plan {
+        runtime_id: Some(name.into()),
+        publication: Some(("replacement-operation".into(), "c".repeat(64), root.clone())),
+        ..Plan::default()
+    });
+    let ready = replacement.wait_for("ready");
+    assert!(!replacement.ran(), "operation child must remain held until transfer");
+    replacement.transfer("managed-replacement-transfer", &ready["incarnation"]);
+    assert_eq!(replacement.wait_for("transferred")["transfer"]["released"], true);
+    wait_until("replacement command", || replacement.ran());
+    let meta = rig.read_meta(name).unwrap();
+    assert_eq!(meta["publicationBinding"], json!({
+        "operation": "replacement-operation", "digest": "c".repeat(64),
+    }));
+    assert_eq!(meta["publicationRootId"], root);
+    assert_eq!(meta["generation"], ready["incarnation"]["generation"]);
+    assert_eq!(meta["publicationCapability"], 1);
+    replacement.drain();
+    assert_eq!(replacement.launcher_exit(), 0);
+    rig.ok(&["kill", name]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn managed_operation_revoked_after_publication_refuses_to_fork_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+        .as_str().unwrap().to_owned();
+    let operation = format!("op-revoked-before-child-{}", std::process::id());
+    let binding = "d".repeat(64);
+    let mut owner = Owner::start(&rig, "revoked-before-child", Plan {
+        publication: Some((operation.clone(), binding.clone(), root.clone())),
+        hold: vec!["published-before-child-fork"],
+        ..Plan::default()
+    });
+    owner.wait_reached("published-before-child-fork");
+    assert!(row_exists(&rig, &owner.runtime_id));
+    assert!(!owner.ran());
+    let before = rig.read_meta(&owner.runtime_id).unwrap();
+    let daemon = before["daemonPid"].as_i64().unwrap() as i32;
+    let installed = rig.ok(&[
+        "publication-revocation", "install", "--id", &owner.runtime_id,
+        "--operation", &operation, "--binding", &binding, "--intent", &"e".repeat(64),
+        "--root-id", &root, "--json",
+    ]).json();
+    assert_eq!(installed["occupancy"]["entries"][0]["status"], "running");
+    assert!(alive(daemon), "install stopped the published operation daemon");
+    assert_eq!(rig.read_meta(&owner.runtime_id).unwrap(), before);
+    assert!(!owner.ran());
+    owner.release("published-before-child-fork");
+    let retirement = owner.wait_for("retirement");
+    assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+    owner.drain();
+    assert_ne!(owner.launcher_exit(), 0);
+    assert!(!owner.ran(), "revocation between publication and fork executed the command");
+    assert!(!owner.frames.iter().any(|frame| frame["type"] == "held" || frame["type"] == "ready"));
+    assert!(!row_exists(&rig, &owner.runtime_id));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_waits_for_transient_metadata_contention() {
+    bounded_stopped_child_test(
+        "child_fork_waits_for_transient_metadata_contention",
+        |rig| child_fork_contention(rig, "transient"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_metadata_contention_has_a_deadline() {
+    bounded_stopped_child_test(
+        "child_fork_metadata_contention_has_a_deadline",
+        |rig| child_fork_contention(rig, "persistent"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn cancellation_during_child_fork_admission_waits_for_the_committed_ticket() {
+    bounded_stopped_child_test(
+        "cancellation_during_child_fork_admission_waits_for_the_committed_ticket",
+        |rig| child_fork_contention(rig, "cancel"),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_rechecks_generation_after_metadata_contention() {
+    bounded_stopped_child_test(
+        "child_fork_rechecks_generation_after_metadata_contention",
+        |rig| child_fork_contention(rig, "generation"),
+    );
+}
+
+#[cfg(debug_assertions)]
+fn child_fork_contention(rig: &Rig, outcome: &str) {
+    use pty_core::registry::{take_metadata_lock, with_root};
+
+    // Keep the fixture's existing exact-marker cleanup applicable on macOS,
+    // where a daemon may already have been reparented to init.
+    let mut owner = Owner::start(rig, "fork-stop", Plan {
+        hold: vec!["published-before-child-fork"],
+        ..Plan::default()
+    });
+    owner.wait_reached("published-before-child-fork");
+    let guard = with_root(&rig.root, || take_metadata_lock(&owner.runtime_id).unwrap());
+    let started = Instant::now();
+    owner.release("published-before-child-fork");
+    owner.wait_reached("metadata-lock-busy");
+    assert_eq!(owner.holder("metadata-lock-busy"), owner.holder("published-before-child-fork"));
+    assert!(!owner.reached("child-forked-before-record"));
+    assert!(!owner.ran());
+
+    if outcome == "persistent" {
+        // Keep the real claim held past the worker's entire budget. The
+        // whole-scenario supervisor catches an accidental unbounded wait,
+        // including retirement and destructor lock acquisitions.
+        let retirement = owner.wait_for("retirement");
+        assert!(started.elapsed() >= pty_core::registry::METADATA_PATCH_LOCK_WAIT);
+        assert!(!owner.reached("child-forked-before-record"));
+        assert_eq!(retirement["retirement"]["requestId"], "producer:startup-failed");
+        drop(guard);
+        owner.drain();
+        assert_ne!(owner.launcher_exit(), 0);
+        assert!(!owner.ran());
+        return;
+    }
+    if outcome == "cancel" {
+        owner.cancel("cancel-contended-fork");
+        let decision = owner.wait_for("decision");
+        let decision = if decision["decision"]["cause"] == "launch" {
+            owner.wait_for("decision")
+        } else {
+            decision
+        };
+        assert_eq!(decision["decision"]["cause"], "cancel", "{decision:#}");
+        // Retirement must not certify an effect which is still waiting.
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "retirement"));
+        assert_eq!(owner.record(rig)["retirement"]["phase"], "requested");
+    }
+    if outcome == "generation" {
+        let mut metadata = rig.read_meta(&owner.runtime_id).unwrap();
+        metadata["generation"] = json!("replacement-generation");
+        // Model a replacement under the very claim the worker is awaiting.
+        std::fs::write(rig.path(&format!("{}.json", owner.runtime_id)),
+            serde_json::to_vec(&metadata).unwrap()).unwrap();
+    }
+    drop(guard);
+    if outcome == "transient" {
+        let ready = owner.wait_for("ready");
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "retirement"));
+        assert!(!owner.ran());
+        owner.transfer("transfer-after-contention", &ready["incarnation"]);
+        assert_eq!(owner.wait_for("transferred")["transfer"]["released"], true);
+        wait_until("command after transient contention", || owner.ran());
+        owner.drain();
+        assert_eq!(owner.launcher_exit(), 0);
+        #[cfg(target_os = "linux")]
+        let reaper = {
+            let daemon = rig.read_meta(&owner.runtime_id).unwrap()["daemonPid"].as_i64().unwrap() as i32;
+            std::thread::spawn(move || {
+                // This isolated fixture is a subreaper, so after launcher
+                // exit it must perform init's job for the adopted daemon.
+                // `pty kill` waits on kill(pid, 0), which includes zombies.
+                wait_until("adopted contention daemon to be reaped", || {
+                    let mut status = 0;
+                    // SAFETY: waitpid can reap only this fixture's child with
+                    // this PID; it cannot consume an unrelated process.
+                    unsafe { libc::waitpid(daemon, &mut status, libc::WNOHANG) == daemon }
+                });
+            })
+        };
+        rig.ok(&["kill", &owner.runtime_id]);
+        #[cfg(target_os = "linux")]
+        reaper.join().unwrap();
+    } else {
+        let retirement = owner.wait_for("retirement");
+        assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+        owner.drain();
+        assert_ne!(owner.launcher_exit(), 0);
+        assert!(!owner.ran());
+        assert!(!owner.frames.iter().any(|frame| frame["type"] == "ready"));
+        if outcome == "generation" {
+            assert!(!owner.reached("child-forked-before-record"));
+            assert_eq!(rig.read_meta(&owner.runtime_id).unwrap()["generation"], "replacement-generation");
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn child_fork_rechecks_revocation_after_waiting_for_its_installer() {
+    bounded_stopped_child_test(
+        "child_fork_rechecks_revocation_after_waiting_for_its_installer",
+        |rig| {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&rig.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let root = rig.ok(&["publication-revocation", "identity", "--json"]).json()["root_id"]
+                .as_str().unwrap().to_owned();
+            let operation = format!("op-fork-stop-{}", std::process::id());
+            let binding = "f".repeat(64);
+            let mut owner = Owner::start(rig, "fork-stop", Plan {
+                publication: Some((operation.clone(), binding.clone(), root.clone())),
+                hold: vec!["published-before-child-fork", "revocation-install-pinned"],
+                ..Plan::default()
+            });
+            owner.wait_reached("published-before-child-fork");
+            let mut installer = rig.cmd(&[
+                "publication-revocation", "install", "--id", &owner.runtime_id,
+                "--operation", &operation, "--binding", &binding, "--intent", &"e".repeat(64),
+                "--root-id", &root, "--json",
+            ]).env("PTY_TEST_OPERATION_BARRIERS", &owner.barriers)
+                .stdout(Stdio::null()).spawn().unwrap();
+            owner.wait_reached("revocation-install-pinned");
+            owner.release("published-before-child-fork");
+            owner.wait_reached("metadata-lock-busy");
+            assert!(!owner.reached("child-forked-before-record"));
+            // The installer writes the durable revocation only after this
+            // release, then drops its real metadata claim.
+            owner.release("revocation-install-pinned");
+            let mut status = None;
+            wait_until("contending revocation installer", || {
+                status = installer.try_wait().unwrap();
+                status.is_some()
+            });
+            assert!(status.unwrap().success());
+            let retirement = owner.wait_for("retirement");
+            assert_eq!(retirement["retirement"]["phase"], "verified", "{retirement:#}");
+            owner.drain();
+            assert_ne!(owner.launcher_exit(), 0);
+            assert!(!owner.ran());
+            assert!(!owner.reached("child-forked-before-record"));
+            assert!(!owner.frames.iter().any(|frame| frame["type"] == "held" || frame["type"] == "ready"));
+        },
+    );
 }

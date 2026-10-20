@@ -29,6 +29,8 @@ pub const SCRUBBED_ENV: &[&str] = &[
     "PTY_SERVER_CONFIG",
     "ST_AGENT",
     "ST_ROOT",
+    "FRACTAL_AGENT",
+    "FRACTAL_ROOT",
     "NO_COLOR",
     "PTY_ROOT",
 ];
@@ -226,12 +228,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: kill(2) with signal 0 only checks for existence/permission.
-    let r = unsafe { libc::kill(pid, 0) };
-    if r == 0 {
-        return true;
+    // Signal 0 only checks for existence/permission.
+    match pty_core::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Has `pid` exited? A zombie counts: it has finished and only waits for
@@ -270,12 +271,7 @@ pub fn wait_for_process_gone(pid: i32) {
 
 /// Send `sig` to `pid`, ignoring errors.
 pub fn kill_pid(pid: i32, sig: i32) {
-    if pid > 0 {
-        // SAFETY: plain kill(2).
-        unsafe {
-            libc::kill(pid, sig);
-        }
-    }
+    let _ = pty_core::kill::process(pid, sig);
 }
 
 fn mkdtemp(prefix: &str) -> PathBuf {
@@ -359,7 +355,7 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join(format!("{}.sock", self.id))
+        pty_core::registry::socket_path_in(&self.root, &self.id)
     }
 
     pub fn meta_path(&self) -> PathBuf {
@@ -800,7 +796,7 @@ impl Rig {
 
     /// Path helpers for a session id in this rig's root.
     pub fn socket_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.sock"))
+        pty_core::registry::socket_path_in(&self.root, id)
     }
 
     pub fn meta_path(&self, id: &str) -> PathBuf {

@@ -10,8 +10,9 @@ same commands and JSON output. This repository is a Rust port of the Node
 [libghostty](https://libghostty.tip.ghostty.org/) (the terminal core extracted
 from [Ghostty](https://ghostty.org)) in place of `@xterm/headless`. The port is
 meant as a drop-in: same commands, flags, texts, JSON shapes, exit codes, files
-under `$PTY_ROOT`, and socket protocol, so the two implementations can share a
-registry while a fleet migrates.
+under `$PTY_ROOT`, and socket protocol, so the two implementations can share an
+ordinary unmanaged registry while a fleet migrates. Managed publication-revocation
+roots exclude legacy publishers; see the compatibility boundary below.
 
 ## Where it stands
 
@@ -80,6 +81,31 @@ last published frame can be stale; lifecycle subscribers do not incur capture
 cost. Publication coalesces queued updates and advances during sustained
 output at an inline 16 ms interval, not a hard realtime deadline. See
 [architecture.md](docs/architecture.md) for ownership and publication details.
+Closing a handle disconnects its event subscribers even if clients retain the
+handle: after queued events are drained, `recv()` returns an error. Subscribing
+after close returns an already-disconnected receiver.
+
+The daemon publishes event-log snapshots in 250 ms batches. Each batch takes
+the cross-process event lock once and reads the log once. Normal batches use
+one atomic replacement; retention publishes the shrink separately from
+later records so offset-based readers can recognize it. Records keep their
+exact bytes and order; retention still checks every 100 daemon records and
+keeps the newest 500 at the 1000-line boundary. The Rust follower also checks
+the consumed prefix when snapshots change, covering coalesced retention
+and regrowth. Delivery takes up to one batch window plus the follower poll
+interval and event-lock wait. Each window closes on its own timer, and session
+exit and orderly shutdown flush pending records; SIGKILL, abort, writer panic,
+or the forced exit at the shutdown deadline (`PTY_SHUTDOWN_DEADLINE_MS`) can
+lose the current buffered window. One-shot writers (`pty emit`, metadata, tags,
+display name, `pty exec`, and gc) retain their existing event-lock behavior, so
+their records can land before daemon records from up to one window earlier.
+
+Cursor visibility is terminal state, not durable event history: TUI redraws
+can toggle it dozens of times per second, so daemons do not persist
+`cursor_visible` transitions. Existing cursor-visible records remain readable
+and formattable. GC removes recognized atomic `.tmp.<pid>.<16hex>` files in
+the registry and activity/recovery directories only after their writer PID
+dies; live or reused PIDs, malformed names and symlinks are left alone.
 
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express
@@ -226,6 +252,9 @@ mechanism. That trade holds while the daily users are the affected users. If
 this ever ships to people who are not in the room, the trade changes and a
 pull-request macOS job comes back — via Nix, because Cargo cannot build it there.
 
+Each pull-request workflow cancels older runs of the same workflow on the same
+pull request. Other pull requests, pushes to `main`, and releases run independently.
+
 All workflows and `.github/repo-settings.json` are generated from their
 neighboring `.genie.ts` sources. The generator has its own shell so ordinary
 `nix develop` and Rust CI do not build generator tooling:
@@ -233,6 +262,7 @@ neighboring `.genie.ts` sources. The generator has its own shell so ordinary
 ```sh
 nix develop .#genie -c genie
 nix develop .#genie -c genie --check
+python3 scripts/check-workflow-policy.py
 ```
 
 That shell links the pinned effect-utils flake source into `repos/effect-utils`;
@@ -261,6 +291,14 @@ unix socket, pid file, and metadata file per session. The hostname keeps
 registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
+
+Session ids remain independent of Unix socket pathname limits. A socket uses
+`<id>.sock` when that address fits; longer addresses use an `@`-prefixed digest
+filename within the same registry. Metadata, pid files and events keep their
+id-based names. Socket clients use `SessionInfo.socket_path` or
+`pty_core::registry::socket_path_in`, rather than constructing a pathname.
+Existing readable socket addresses are unchanged. Rust IDs are limited to 209
+ASCII characters to leave room for registry sidecars and atomic publication.
 
 `pty list --json --strict` reports one registry as
 `{"root":"…","complete":true,"entries":[…],"errors":[]}`. The root is resolved
@@ -386,6 +424,12 @@ and can mistake that for success, which is what happens if you forget
 `run` runs the command directly and `restart` restarts without attaching.
 Both did what was asked, so both exit 0.
 
+Restarted sessions do not inherit the restarter's `ST_AGENT`, `ST_ROOT`,
+`FRACTAL_AGENT`, `FRACTAL_ROOT`, or `AGENT_TRACE_FILE`. The CLI applies the
+same scrub to attach-triggered and picker-triggered restarts. Fresh `run`
+commands still inherit these variables. Explicit `--env` assignments survive
+restart in either namespace.
+
 ### Commands not in this build
 
 Two Node commands are deferred (see [docs/parity.md §12](docs/parity.md#12-candidates-to-leave-off)
@@ -410,6 +454,221 @@ Node contender can still unlink a newer Rust or Node claim. Such recovery
 must be externally serialized in a mixed registry.
 `crates/pty-core/src/registry/lock.rs` and `docs/hardening.md` describe the
 boundary in full.
+
+### Durable publication revocation (version 1)
+
+Publication revocation fences one exact stable session ID and start operation
+in one registry root. It is not a stop, remove, or recovery command:
+
+```sh
+pty publication-revocation identity --json
+pty publication-revocation install --id worker --operation start-operation \
+  --binding <64-lowercase-hex-launch-binding> \
+  --intent <64-lowercase-hex-repair-intent-digest> \
+  --root-id <enrolled-root-id> --json
+pty publication-revocation read --id worker --operation start-operation --json
+```
+
+All three forms require the exact flags shown (`--json` is required); duplicate or
+unknown flags are errors. There is no clear verb. IDs are stable IDs, never
+display-name lookups, and operation IDs are exact, not prefixes. Install returns
+`{record, occupancy, alreadyInstalled}`: the durable tombstone, the current
+strict occupancy observation, and whether this exact record was already
+installed. Read returns the exact record, or exits nonzero if absent. Read does
+not infer current occupancy. Conflicting binding or intent digests fail rather
+than overwrite a record. Installing a fence against a live session reports its
+occupancy without signaling, replacing, or changing its metadata.
+Installation requires the expected enrolled root identity and refuses a mismatch
+before writing a record. Records include `capabilityVersion: 1`, `revoked: true`,
+`attestationReceiptOrIntentId` (the supplied intent digest), `writerUid`, and
+`recordedAt`, alongside the schema, exact root/name/binding, and intent digest.
+
+
+`identity --json` establishes or validates the root's durable enrollment identity
+and returns `{"root_id":"…"}` without targeting or altering any session. Capture
+this identity before managed launch, then supply all three immutable launch flags
+together:
+
+```sh
+pty run -d --id worker --publication-operation start-operation \
+  --publication-binding <64-lowercase-hex-launch-binding> \
+  --publication-root-id <enrolled-root-id> \
+  --tag st3.start-operation=start-operation -- command
+```
+
+Partial flag sets are refused, and the daemon checks the supplied root identity
+against the actual enrolled root before publication. Managed metadata carries
+`publicationBinding`, `publicationCapability: 1`, and `publicationRootId`; mutable
+tags are not substitutes for this immutable launch provenance. The
+`st3.start-operation` tag is required and must exactly match the binding's
+operation. Recreating an ended managed row requires an explicit new binding;
+an ordinary unbound `run` or library launch cannot overwrite its retained
+provenance or events. The common final creation-claim admission enforces this
+rule before any publication effect, regardless of the caller.
+
+Managed restart, picker restart, recreation and permanent GC prepare the publisher
+before predecessor cleanup. Linux probes and executes its pinned `/proc/self/fd`
+image. Darwin cannot execute `/dev/fd` vnodes, so it probes and executes a private
+`0500` snapshot in a `0700` `compoundingtech-pty-publishers` directory beneath
+Darwin's per-user cache (`confstr(_CS_DARWIN_USER_CACHE_DIR)`), never beneath an
+arbitrary registry root. Every component of the resolved cache path is checked
+with `lstat`: no symlinks, root/effective-UID ownership only, and no group/other
+writes unless a sticky ancestor protects the next trusted-owned component.
+The private leaf itself must not allow group/other writes, so another UID cannot
+rename an ancestor and substitute code between admission and execution.
+The cache key includes the image digest and the full raw source quarantine
+value, including every flag: user approval and restriction states never share
+an identity. Reuse verifies exact quarantine equality, bytes and permissions.
+A changed cached quarantine is a cache miss, yielding a fresh immutable entry;
+the already-assessed entry is neither modified nor made writable. One shared
+execution boundary rechecks policy for both ordinary and gated operation-mode
+launches, since the capability probe is also an exec. If quarantine was newly
+added to an initially unquarantined image, launch refuses rather than stripping
+it. Native copying preserves embedded code signatures and source xattrs;
+because Darwin can synthesize quarantine provenance during copy, each fresh
+snapshot restores and verifies the captured full source value before becoming
+`0500`. Admission never strips quarantine or re-signs the image. Unchanged
+copies remain cached for reuse; a policy change may require a new first-exec
+assessment rather than silently reusing a more permissive copy.
+An unsupported/downgraded publisher or script wrapper refuses without changing
+the predecessor; atomic install-path replacement or unlink cannot switch the
+verified image. These guarantees exclude hostile same-UID cache mutation.
+Library callers preparing their own cleanup use
+`pty_lifecycle::prepare_daemon(executable, &params)` and retain the returned
+`PreparedDaemon` through its `spawn(params)` call. Publisher images must still
+come from the trusted immutable deployment; capability output is not executable
+authentication against a malicious same-UID native binary.
+
+Permanent GC cannot reuse a managed binding after `pty.toml` changes the stored
+command, arguments or cwd. Manifest environment exports are part of the compared
+shell arguments. Such changes require a new operation/binding, not an ordinary
+respawn under the old request digest. Unbound legacy sessions retain manifest
+reload and operation-tag mutation behavior.
+
+Rust callers use `pty_core::registry::revocation::{root_id, install, read, check,
+PublicationBinding, PublicationRevocation, RevocationInstall}`. `root_id()` returns
+`io::Result<String>` for prelaunch enrollment. `install(name,
+&binding, intent_digest, expected_root_id)` serializes with publication using the name creation
+lock and durably installs the immutable record; `read(name, operation)` returns
+`io::Result<Option<PublicationRevocation>>`. `check(name, binding,
+tag_operation)` must be called while the publisher holds that same creation
+lock and never acquires it itself. A revoked operation is refused with
+`PermissionDenied` / `operation-revoked`, even if a caller supplies a different
+binding digest. Binding and operation-tag disagreement is also refused.
+`None`/`None` retains ordinary unmanaged publication behavior; it is not proof
+of capable managed launch.
+
+Operation-mode publication drops its inode pin before reporting completion to
+the actor, so the actor can release the creation claim before handing off to
+child creation. Child creation rechecks the fence and exact published generation
+under a fresh creation claim owned by the daemon itself. Ordinary publication
+pins the delegated launcher's inode through publication, then atomically replaces
+its owner record with the daemon's PID before spawning the child. The launcher's
+expected-owner release cannot unlink this transferred claim. Both child paths
+hold descriptor-free daemon-owned claims across `fork`: a child stopped before
+descriptor cleanup cannot retain a dead daemon's flock or prevent recovery.
+The earlier delegated publication boundary still pins its inode while a separate
+launcher may die; after handover, daemon death leaves no surviving publisher.
+After ordinary child spawn returns, a still-live delegated coordinator receives
+its claim back only while its guard has not released it, preserving its original
+PID and pathname until release. A hand-back I/O failure is diagnosed without
+killing the already-spawned serving session; the daemon's guard still performs
+owner-checked cleanup. A revoked managed binding is rejected before spawning a publisher,
+so a live survivor cannot mask that refusal as an already-running error; this
+deny-only preflight does not replace the final serialized publication check.
+Publication clears the event log using the event writer's five-second lock
+deadline, allowing a predecessor's shutdown append to finish during restart.
+Other callers of `clear_events` retain fail-fast event-lock behavior.
+Ordinary, undelegated event claims wait for a transient stale-checker's inode
+inspection when releasing, so a live daemon cannot strand its event lock.
+Delegated event claims retain the nonblocking withdrawal protocol.
+
+Creation claims carry a decimal PID prefix plus a random per-claim nonce.
+Library launchers that already own the name must explicitly set
+`SpawnParams::creation_lock_delegate = Some(creation_guard.delegate()?)`;
+neither the library nor daemon borrows a claim merely because its PID matches.
+`LockGuard::pin()` takes a nonblocking inode flock while the guard remains held;
+revocation installation holds that pin through its final effects. Delegated
+publication validates the nonce and owner on the same inode under flock, so an
+in-process install or gc claim cannot authorize an unrelated library launch.
+Delegation lazily creates a private per-claim token whose hashed filename keeps
+the session-ID boundary valid for sidecars and their atomic temporary files.
+Ordinary event writes do not create or remove token sidecars.
+Release withdraws that token before a
+nonblocking inode-lock attempt, so a stopped pinned daemon cannot hang the
+launcher, restart, or gc coordinator. A withdrawn token cannot be reactivated,
+and return checks it both before and after replacing the owner record.
+Publication pin drop finishes a withdrawn original claim's cleanup if no
+transfer occurs, preventing a live coordinator PID from leaving the name busy.
+Advisory inode leases explicitly unlock after their critical section, rather
+than relying on descriptor close: an unrelated concurrent fork may still hold
+an inherited close-on-exec descriptor before it reaches exec.
+The CLI alone upgrades the legacy external `PTY_CREATION_LOCK_OWNER_PID`
+contract to nonce delegation and restores a PID-only coordinator's original
+encoding after ordinary child spawn. Daemon nonce/owner control values are
+not inherited by the session command.
+Successful PID-only hand-back removes its now-unreferenced legacy token.
+
+Version-1 records live at
+`$PTY_ROOT/.publication-revocations/v1/<sha256(id)>/<sha256(operation)>.json`,
+bound to a persistent root identity and the canonical ID and operation in the
+record. Enrollment validates the existing root too: roots/directories must be
+owner-private `0700`, files `0600`, owned by the effective UID. Ancestor symlinks
+(including macOS `/tmp`) are canonicalized before descriptor-relative no-follow
+traversal; the selected root's final component and every store component must
+not be symlinks. Publication uses atomic no-replace rename (`renameat2` with
+`RENAME_NOREPLACE` on Linux, `renameatx_np` with `RENAME_EXCL` on macOS) and
+file/directory durability barriers. A crash before rename may leave an ignored
+`.tmp.*` file; after rename the canonical file has exactly one link, with no
+link/unlink crash gap. These records survive `rm`, GC, session
+recreation, display-name rename, and daemon replacement. Never delete them to
+roll back an intent, downgrade, or restore metadata; disaster restoration must
+restore the durable fences and the caller's intent/receipt state together
+before publication resumes. Replacing or reinitializing a fenced root is not
+an unrevocation mechanism.
+
+**Publication root re-enrollment after a device-number change:** root identity
+validation includes canonical path, inode and `st_dev`. Device numbers can change
+across reboot/remount even when the filesystem and root are unchanged; PTY fails
+closed on this mismatch and never silently resets enrollment. Recovery is an
+explicit same-UID operator action, not `identity` enrolling a new root:
+
+1. Quiesce all publishers, launchers, installers and GC for this root. Back up
+   the complete `.publication-revocations` tree and the matching caller
+   intent/receipt state before editing anything.
+2. Independently verify this is the same filesystem and root directory (using
+   the volume's persistent identity or mount configuration), that canonical path
+   and inode still match `v1/root.json`, and that the complete fence tree was
+   retained. A changed device number alone is not proof. If these conditions
+   cannot be established, keep publication disabled and restore trusted state;
+   do not use this procedure to migrate to another root.
+3. Replace **only** `device` in `v1/root.json` with the verified root's current
+   `st_dev`, using an owner-private `0600` single-link temporary file, file fsync,
+   atomic rename and parent-directory fsync. Keep `schema`, `rootId`, `path`,
+   `inode` and every revocation record unchanged. Never delete or recreate the
+   store, remove a fence, or generate a new root ID.
+4. Query `publication-revocation identity --json` and the retained exact fences;
+   verify the original root ID and revoked operations before resuming
+   publishers. Preserve the backup until those checks succeed.
+
+
+This is a same-UID OS-principal trust boundary, not per-agent cryptography.
+Supported executable selection must exclude legacy/downgraded publishers for
+a managed root; an old binary cannot be trusted to obey a new fence. Existing
+serving daemons remain untouched, but installing a new binary does not upgrade
+their at-launch proof. Missing binding/root identity, old binaries or
+intermediaries, and mixed uncontrolled publishers are **UNPROVEN**, not
+retroactively authorized repair. New consumers must refuse attested repair in
+those cases; ordinary unmanaged use remains compatible. In particular, this
+feature provides no recovery claim for Fractal operation
+`01a145e9-f5e1-73a0-90d7-8c9abd6fb98c`: its exact scope is unidentified and
+producer closure remains UNPROVEN.
+
+For legacy tag-only launches, an absent revocation store does not impose enrollment
+restrictions on the existing root mode or symlinked ancestors. Absence must be
+proved without following the store entry; any present, malformed, symlinked or
+uninspectable store remains fail-closed under the strict enrolled-root checks.
+
 
 ## The crates
 

@@ -33,6 +33,11 @@ pub fn validate_name(name: &str) -> Result<(), String> {
             "Invalid session name \"{name}\". Names may only contain letters, numbers, dots, hyphens, and underscores."
         ));
     }
+    // NAME_MAX is 255 on supported filesystems. Reserve 14 bytes for
+    // .revision.json and 32 for .tmp.<10-digit-pid>.<16-hex> publication.
+    if name.len() > 209 {
+        return Err("Session name too long for registry sidecars (max 209 characters).".to_string());
+    }
     let byte_len = socket_path(name).as_os_str().len();
     if byte_len > SUN_PATH_MAX {
         let overflow = byte_len - SUN_PATH_MAX;
