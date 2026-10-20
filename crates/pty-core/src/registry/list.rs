@@ -154,7 +154,7 @@ pub use metadata_cache::RegistryListCache;
 struct Scanner<'a> {
     strict: bool,
     errors: Vec<InventoryError>,
-    cache: Option<&'a mut RegistryListCache>,
+    cache: Option<&'a RegistryListCache>,
 }
 
 impl Scanner<'_> {
@@ -211,7 +211,7 @@ impl Scanner<'_> {
     }
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
-        if let Some(cache) = self.cache.as_mut() {
+        if let Some(cache) = self.cache {
             return match cache.metadata(path) {
                 Ok(metadata) => Some(metadata),
                 Err((kind, detail)) => {
@@ -642,7 +642,20 @@ fn scan_sessions(
     options: &ListOptions,
     strict: bool,
     only: Option<&str>,
-    cache: Option<&mut RegistryListCache>,
+    cache: Option<&RegistryListCache>,
+) -> Inventory {
+    scan_sessions_with_probe(root, options, strict, only, cache, |paths, budget| {
+        probe_socket_outcomes(paths, budget, |result| result)
+    })
+}
+
+fn scan_sessions_with_probe(
+    root: &Path,
+    options: &ListOptions,
+    strict: bool,
+    only: Option<&str>,
+    cache: Option<&RegistryListCache>,
+    probe: impl FnOnce(&[PathBuf], Duration) -> HashMap<PathBuf, std::io::Result<()>>,
 ) -> Inventory {
     let mut scanner = Scanner {
         strict,
@@ -652,6 +665,9 @@ fn scan_sessions(
     let dir = match std::fs::read_dir(root) {
         Ok(dir) => dir,
         Err(error) => {
+            if let Some(cache) = cache {
+                cache.retain(root, &BTreeSet::new());
+            }
             let kind = if error.kind() == std::io::ErrorKind::NotFound {
                 InventoryErrorKind::RootMissing
             } else {
@@ -759,6 +775,9 @@ fn scan_sessions(
         })
         .chain(socket_ids.iter().copied())
         .collect();
+    if let Some(cache) = cache {
+        cache.retain(root, &names);
+    }
     let mut records = HashMap::new();
     for name in names {
         let metadata_name = format!("{name}.json");
@@ -819,8 +838,7 @@ fn scan_sessions(
         .filter(|c| !c.pid_alive)
         .map(|c| c.socket_path.clone())
         .collect();
-    let reachability =
-        probe_socket_outcomes(&needs_probe, options.socket_probe_budget, |result| result);
+    let reachability = probe(&needs_probe, options.socket_probe_budget);
 
     for c in candidates {
         seen.insert(c.name.clone());

@@ -79,7 +79,8 @@ pub struct ListedSession {
 }
 
 /// Retained parsed-metadata state for repeated [`list`](Self::list) calls.
-/// Liveness and attached-client observations are never cached.
+/// Internally synchronized: share via `Arc`, without an outer mutex. Liveness
+/// and attached-client observations are never cached or performed under its lock.
 #[derive(Debug, Default)]
 pub struct RegistryListCache {
     registry: registry::list::RegistryListCache,
@@ -87,7 +88,7 @@ pub struct RegistryListCache {
 
 impl RegistryListCache {
     /// List with unchanged metadata reused; retain this handle between calls.
-    pub fn list(&mut self, root: &Path, options: &ListOptions) -> Vec<ListedSession> {
+    pub fn list(&self, root: &Path, options: &ListOptions) -> Vec<ListedSession> {
         let sessions = self.registry.list(root, &options.registry);
         with_clients(sessions, options)
     }
@@ -290,7 +291,7 @@ mod tests {
         let path = root.join("session.json");
         std::fs::write(&path, br#"{"command":"cat","args":[],"displayCommand":"cat","cwd":"/tmp","createdAt":"2026-10-20T00:00:00Z"}"#).unwrap();
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         for _ in 0..2 {
             let cached = cache.list(&root, &options);
             let uncached = list(&root, &options);

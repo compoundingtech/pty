@@ -402,9 +402,12 @@ the directory, reads PID sidecars, checks process identity/liveness, probes
 sockets with the same budget, and queries attached clients when requested.
 New, changed, and removed sessions are observed on the next call; read/parse
 failures are not cached. The existing stateless `list` API is unchanged.
-Callers sharing the cache across threads or cloned runtime handles should put
-it behind their own shared mutex. The lower-level equivalent is
-`pty_core::registry::list::RegistryListCache`.
+The handle is internally synchronized and `list` takes `&self`: share an
+`Arc<RegistryListCache>` across threads or cloned runtimes, without an outer
+mutex. Only cache lookup/insert/eviction operations take its lock; metadata
+reads/parsing, PID/start-token checks, socket probes, and attached-client queries
+run without that lock, so a slow probe does not serialize concurrent observers.
+The lower-level equivalent is `pty_core::registry::list::RegistryListCache`.
 
 The rest of what the CLI does to a session is there too, for a registry the
 caller names rather than `$PTY_ROOT`: `send_in`, `peek_screen_in`,

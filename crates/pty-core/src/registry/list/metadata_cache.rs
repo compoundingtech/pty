@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use super::{InventoryErrorKind, ListOptions, SessionInfo, SessionMetadata};
 
@@ -32,7 +33,6 @@ impl Identity {
 struct Entry {
     identity: Identity,
     metadata: SessionMetadata,
-    seen: bool,
 }
 
 /// Stateful parsed-metadata cache for repeated registry observations.
@@ -40,26 +40,34 @@ struct Entry {
 /// Keep this handle between calls. Only regular-file JSON metadata is cached;
 /// directory discovery, PID reads, process identity and socket probes run anew.
 /// Each hit opens the file to observe current readability and descriptor identity.
-/// Errors are never retained. A handle can be reused across different roots.
+/// Errors are never retained. Concurrent calls share only short cache operations;
+/// no cache lock is held during file reads, parsing or live observations.
 #[derive(Debug, Default)]
 pub struct RegistryListCache {
-    entries: HashMap<PathBuf, Entry>,
+    entries: Mutex<HashMap<PathBuf, Entry>>,
 }
 
 impl RegistryListCache {
     /// Observe the registry with the same semantics and probe budget as
     /// [`super::list_sessions_in`], reusing unchanged parsed metadata.
-    pub fn list(&mut self, root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-        for entry in self.entries.values_mut() {
-            entry.seen = false;
-        }
-        let inventory = super::scan_sessions(root, options, false, None, Some(self));
-        self.entries.retain(|_, entry| entry.seen);
-        inventory.entries
+    pub fn list(&self, root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
+        super::scan_sessions(root, options, false, None, Some(self)).entries
+    }
+
+    fn entries(&self) -> MutexGuard<'_, HashMap<PathBuf, Entry>> {
+        self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn retain(&self, root: &Path, names: &std::collections::BTreeSet<&str>) {
+        self.entries().retain(|path, _| {
+            path.parent() != Some(root)
+                || path.file_stem().and_then(|name| name.to_str())
+                    .is_some_and(|name| names.contains(name))
+        });
     }
 
     pub(super) fn metadata(
-        &mut self,
+        &self,
         path: &Path,
     ) -> Result<SessionMetadata, (InventoryErrorKind, String)> {
         let unreadable = |error: io::Error| (InventoryErrorKind::MetadataUnreadable, error.to_string());
@@ -69,15 +77,15 @@ impl RegistryListCache {
                 .custom_flags(libc::O_NONBLOCK)
                 .open(path)?;
             let before = Identity::of(&file)?;
-            if let Some(identity) = &before
-                && let Some(entry) = self.entries.get_mut(path)
-                && &entry.identity == identity
-                && Identity::of(&file)?.as_ref() == Some(identity)
+            let cached = self.entries().get(path)
+                .filter(|entry| Some(&entry.identity) == before.as_ref())
+                .map(|entry| entry.metadata.clone());
+            if let Some(metadata) = cached
+                && Identity::of(&file)? == before
             {
-                entry.seen = true;
-                return Ok(Ok(entry.metadata.clone()));
+                return Ok(Ok(metadata));
             }
-            self.entries.remove(path);
+            self.entries().remove(path);
             let mut bytes = Vec::new();
             if before.is_some() {
                 file.read_to_end(&mut bytes)?;
@@ -96,16 +104,15 @@ impl RegistryListCache {
                     (InventoryErrorKind::MetadataMalformed, error.to_string())
                 })?;
                 if let Some(identity) = identity {
-                    self.entries.insert(path.to_path_buf(), Entry {
+                    self.entries().insert(path.to_path_buf(), Entry {
                         identity,
                         metadata: metadata.clone(),
-                        seen: true,
                     });
                 }
                 Ok(metadata)
             }
             Err(error) => {
-                self.entries.remove(path);
+                self.entries().remove(path);
                 Err(unreadable(error))
             }
         }
@@ -173,11 +180,51 @@ mod tests {
     }
 
     #[test]
+    // The probe is deliberately held until the second observer has completed.
+    // The timeout only bounds a broken test; channels establish the ordering.
+    fn concurrent_probe_does_not_hold_cache_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = Root::new();
+        root.write("first", "label");
+        std::fs::write(root.0.join("first.pid"), "2147483647").unwrap();
+        std::fs::write(super::super::socket_path_in(&root.0, "first"), []).unwrap();
+        let cache = RegistryListCache::default();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = &root.0;
+            let cache = &cache;
+            let first = scope.spawn(move || {
+                super::super::scan_sessions_with_probe(
+                    root, &ListOptions::default(), false, None, Some(cache),
+                    |paths, _| {
+                        assert_eq!(paths.len(), 1);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        HashMap::new()
+                    },
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            scope.spawn(move || {
+                let rows = cache.list(root, &ListOptions::default());
+                completed_tx.send(rows.len()).unwrap();
+            });
+            let completed = completed_rx.recv_timeout(Duration::from_secs(10));
+            release_tx.send(()).unwrap();
+            first.join().unwrap();
+            assert_eq!(completed.unwrap(), 1, "second listing completes before the first probe");
+        });
+    }
+
+    #[test]
     fn unchanged_changed_new_removed_and_same_size_replacement() {
         let root = Root::new();
         root.write("first", "before");
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let before = parses();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
         assert_eq!(parses() - before, 1);
@@ -203,7 +250,7 @@ mod tests {
         assert_eq!(parses() - before, 4);
         std::fs::remove_file(path).unwrap();
         assert_eq!(cache.list(&root.0, &options)[0].name, "second");
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries().len(), 1);
     }
 
     #[test]
@@ -212,23 +259,27 @@ mod tests {
         let path = root.0.join("first.json");
         std::fs::write(&path, b"invalid").unwrap();
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let before = parses();
         assert!(cache.list(&root.0, &options).is_empty());
         assert!(cache.list(&root.0, &options).is_empty());
         assert_eq!(parses() - before, 2);
-        assert!(cache.entries.is_empty());
+        assert!(cache.entries().is_empty());
         root.write("first", "valid");
         assert_eq!(cache.list(&root.0, &options).len(), 1);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(cache.list(&root.0, &options).is_empty());
-        assert!(cache.entries.is_empty());
+        assert!(cache.entries().is_empty());
         std::fs::remove_dir(&path).unwrap();
         root.write("first", "restored");
         cache.list(&root.0, &options);
-        assert!(cache.list(&root.0.join("absent"), &options).is_empty());
-        assert!(cache.entries.is_empty());
+        let moved = root.0.with_extension("moved");
+        std::fs::rename(&root.0, &moved).unwrap();
+        let missing = cache.list(&root.0, &options);
+        std::fs::rename(&moved, &root.0).unwrap();
+        assert!(missing.is_empty());
+        assert!(cache.entries().is_empty());
     }
 
     #[test]
@@ -238,7 +289,7 @@ mod tests {
         root.write("first", "label");
         let path = root.0.join("first.json");
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
         let cached = cache.list(&root.0, &options);
@@ -246,7 +297,7 @@ mod tests {
         assert_eq!(cached, ordinary);
         // A privileged test process may still read a mode-000 file.
         if ordinary.is_empty() {
-            assert!(cache.entries.is_empty());
+            assert!(cache.entries().is_empty());
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
@@ -258,7 +309,7 @@ mod tests {
         root.write("first", "live");
         let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         std::fs::write(root.0.join("first.pid"), child.id().to_string()).unwrap();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let options = ListOptions::default();
         let before = parses();
         let running = cache.list(&root.0, &options);
@@ -279,10 +330,14 @@ mod tests {
         let socket = super::super::socket_path_in(&root.0, "first");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let before = parses();
         assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Running);
         drop(listener);
+        // Unlink the endpoint before replacing it with an unreachable companion:
+        // another test's concurrent fork can briefly inherit the listener FD.
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::write(&socket, []).unwrap();
         assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Vanished);
         assert_eq!(parses() - before, 1);
     }
@@ -297,7 +352,7 @@ mod tests {
         metadata["recovery"] = serde_json::json!({"processStartToken": token});
         std::fs::write(root.0.join("first.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
         let options = ListOptions::default();
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let before = parses();
         let running = cache.list(&root.0, &options);
         child.kill().unwrap();
@@ -313,7 +368,7 @@ mod tests {
     fn pid_sidecar_and_exit_metadata_changes_are_observed_next_pass() {
         let root = Root::new();
         root.write("first", "label");
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         let options = ListOptions::default();
         assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Vanished);
         let before = parses();
@@ -345,7 +400,7 @@ mod tests {
         }
         let uncached = started.elapsed();
         let uncached_parses = parses() - before;
-        let mut cache = RegistryListCache::default();
+        let cache = RegistryListCache::default();
         cache.list(&root.0, &options);
         let before = parses();
         let started = Instant::now();
