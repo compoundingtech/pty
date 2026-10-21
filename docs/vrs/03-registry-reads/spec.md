@@ -34,6 +34,16 @@ fields, remain available in `SessionInfo.metadata`. Syntax/type errors still
 omit metadata in tolerant scans and report `MetadataMalformed` in strict scans;
 non-object records remain malformed and absent defaulted fields remain accepted.
 
+Object entries are buffered as borrowed raw JSON slices, not `Value` trees, so
+duplicate keys retain their historical last-key-wins behavior before typed
+validation. This also applies recursively to tags, environment maps, publication
+bindings and unknown fields. Only the effective `lastLines`, `extraEnv`, and
+`sessionEnv` values are shape-validated; overwritten values cannot invalidate
+an otherwise valid record. Arrays stream their elements.
+An allocation-free value visitor first preserves the JSON parser's numeric,
+Unicode and nesting-limit checks, including in overwritten values; raw-slice
+skipping alone would weaken these checks. It retains no payload tree.
+
 Ordinary `list_sessions`, `list_sessions_with`, `list_sessions_in`, and strict
 observations return this projection (the three omitted fields are `None`);
 their Rust signatures are unchanged. The additive `list_sessions_full` API
@@ -45,7 +55,8 @@ resolution; `get_session_by_name` scans only the named record with full payloads
 restart environments, or legacy whole-record comparison must use a full path.
 
 `registry::list_metadata::tests` covers projection equivalence, malformed input,
-and a printed old/new parsing comparison over 500 approximately 15 KB records,
+duplicate-key equivalence on both paths, legacy whole-record identity, and a
+printed old/new parsing comparison over 500 approximately 15 KB records,
 without a timing threshold.
 
 ## Non-blocking connect
