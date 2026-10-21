@@ -1379,3 +1379,138 @@ fn unavailable_birth_identity_prevents_daemon_publication_and_child_launch() {
     assert!(!marker.exists(), "unverified daemon launched its child");
     assert!(read_events(&root, &name).is_empty());
 }
+
+/// A daemon spawned to hold at `barrier`, with the barrier directory.
+#[cfg(debug_assertions)]
+fn held_at(barrier: &str, cfg: serde_json::Value) -> (Daemon, std::path::PathBuf) {
+    let root = short_root();
+    let barriers = short_root();
+    std::fs::write(barriers.join(format!("{barrier}.hold")), "").unwrap();
+    let d = Daemon::spawn(
+        &root,
+        cfg,
+        &[("PTY_TEST_OPERATION_BARRIERS", barriers.to_str().unwrap())],
+    );
+    assert!(
+        wait_until(T, || barriers.join(format!("{barrier}.reached")).exists()),
+        "daemon {} never reached {barrier}",
+        d.name
+    );
+    (d, barriers)
+}
+
+#[cfg(debug_assertions)]
+fn release(barriers: &std::path::Path, barrier: &str) {
+    std::fs::write(barriers.join(format!("{barrier}.release")), "").unwrap();
+}
+
+/// compoundingtech/pty#184: any process that reads a published session's
+/// pid sidecar can signal it. A daemon that had published `session_start`
+/// but not yet started its signal listener died by SIGTERM's default action,
+/// with no exit record and no cleanup. Signalled while held just after
+/// publication, it must serve the SIGTERM as an ordinary external kill.
+#[cfg(debug_assertions)]
+#[test]
+fn a_sigterm_just_after_publication_is_an_ordinary_external_kill() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    let barrier = "published-before-child-fork";
+    let (mut d, barriers) = held_at(barrier, config(&unique_name("termpub"), "sleep", &["30"]));
+    assert!(
+        !d.events("session_start").is_empty(),
+        "published before {barrier}"
+    );
+    d.signal(libc::SIGTERM);
+    release(&barriers, barrier);
+    assert_eq!(
+        d.wait_exit(T),
+        Some(0),
+        "the SIGTERM ended the daemon by its default action"
+    );
+    assert_eq!(d.events("session_exit").len(), 1);
+    let m = d.meta().expect("metadata preserved on an external kill");
+    assert!(m["exitedAt"].is_string(), "{m}");
+    assert!(!d.socket_path().exists());
+}
+
+/// compoundingtech/pty#184, with the child already forked: the daemon must
+/// end it, not orphan it.
+#[cfg(debug_assertions)]
+#[test]
+fn a_sigterm_with_the_child_forked_is_an_ordinary_external_kill() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    let barrier = "before-claim-hand-back";
+    let name = unique_name("termfork");
+    let pid_file = short_root().join("child.pid");
+    let cfg = config(
+        &name,
+        "sh",
+        &[
+            "-c",
+            "echo $$ > \"$1\"; exec sleep 30",
+            "child",
+            pid_file.to_str().unwrap(),
+        ],
+    );
+    let (mut d, barriers) = held_at(barrier, cfg);
+    assert!(wait_until(T, || std::fs::read_to_string(&pid_file)
+        .is_ok_and(|s| s.ends_with('\n'))));
+    let child: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    d.signal(libc::SIGTERM);
+    release(&barriers, barrier);
+    assert_eq!(
+        d.wait_exit(T),
+        Some(0),
+        "the SIGTERM ended the daemon by its default action"
+    );
+    assert_eq!(d.events("session_exit").len(), 1);
+    assert!(
+        wait_dead(child, Duration::from_secs(3)),
+        "child {child} outlived its daemon"
+    );
+    let m = d.meta().expect("metadata preserved on an external kill");
+    assert!(m["exitedAt"].is_string(), "{m}");
+    assert!(!d.socket_path().exists());
+}
+
+/// compoundingtech/pty#184: catching SIGTERM from the start must not change
+/// what an early one means. Before publication it still ends the daemon with
+/// nothing published and no child.
+#[cfg(debug_assertions)]
+#[test]
+fn a_sigterm_before_publication_publishes_nothing() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    let barrier = "publication-before-lock";
+    let name = unique_name("termearly");
+    let marker = short_root().join("child-started");
+    let cfg = config(
+        &name,
+        "sh",
+        &["-c", "touch \"$1\"", "child", marker.to_str().unwrap()],
+    );
+    let (mut d, barriers) = held_at(barrier, cfg);
+    d.signal(libc::SIGTERM);
+    release(&barriers, barrier);
+    assert_eq!(
+        d.wait_exit(T),
+        Some(1),
+        "the daemon must refuse, not die by the signal"
+    );
+    for suffix in ["sock", "pid", "json"] {
+        assert!(
+            !d.root.join(format!("{name}.{suffix}")).exists(),
+            "a daemon terminated before publication published {suffix}"
+        );
+    }
+    assert!(read_events(&d.root, &name).is_empty());
+    assert!(
+        !marker.exists(),
+        "a daemon terminated before publication launched its child"
+    );
+}
