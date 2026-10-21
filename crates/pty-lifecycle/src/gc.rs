@@ -128,14 +128,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let mut result = GcResult::default();
 
     if !dry_run {
-        let root = session_dir();
-        cleanup_dead_atomic_temps(&root);
-        for sidecar in [".activity", ".recovery"] {
-            let directory = root.join(sidecar);
-            if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
-                cleanup_dead_atomic_temps(&directory);
-            }
-        }
+        cleanup_dead_registry_temps();
     }
 
     // Raw debris: runtime files whose metadata is missing or malformed.
@@ -879,6 +872,21 @@ fn parent_of(s: &SessionInfo) -> Option<String> {
         .and_then(|t| t.get("parent"))
         .filter(|p| !p.is_empty())
         .cloned()
+}
+
+/// Sweep atomic-publication leftovers without reconciling sessions.
+///
+/// Daemons run this narrow maintenance pass automatically; explicit GC shares
+/// the same conservative writer-liveness and file-type checks.
+pub fn cleanup_dead_registry_temps() {
+    let root = session_dir();
+    cleanup_dead_atomic_temps(&root);
+    for sidecar in [".activity", ".recovery"] {
+        let directory = root.join(sidecar);
+        if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+            cleanup_dead_atomic_temps(&directory);
+        }
+    }
 }
 
 /// Reclaim only regular atomic-publication leftovers whose writer has exited.

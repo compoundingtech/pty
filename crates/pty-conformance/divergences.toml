@@ -50,6 +50,22 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
+test = "events::animated_titles_do_not_fill_event_history"
+side = "node"
+kind = "intended"
+reason = """
+Rust keeps the current OSC 0/2 title in terminal state and forwards the \
+original output to attached clients, but no longer persists title_change \
+records. Animated titles are redraw state, not durable session facts; \
+writing every spinner frame replaces the event log and evicts useful \
+history. The pinned Node daemon still persists distinct title frames. \
+The fixture emits 40 animated OSC 0 titles, a final OSC 2 title and a BEL \
+processing barrier, then requires no title_change record. Old title records \
+remain readable and formattable. Remove this entry when Node stops \
+persisting titles, or if Rust resumes it.
+"""
+
+[[divergence]]
 test = "events::cursor_redraws_do_not_fill_event_history"
 side = "node"
 kind = "intended"
@@ -99,6 +115,22 @@ temporary behind. The Node on-disk layout gives these files no tier and \
 tells readers to ignore them, so collecting them changes nothing a reader \
 sees. Remove this entry when Node collects the same leftovers, or if Rust \
 stops.
+"""
+
+[[divergence]]
+test = "gc::daemon_automatically_removes_only_dead_writer_atomic_temporaries"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust daemons run the existing conservative dead-writer atomic-temp \
+sweep on entering the serving loop and every 30 seconds thereafter, \
+including while idle. This does not run full session GC or alter canonical \
+event history. The fixture covers event-lock and event-log temporaries in \
+the registry, `.activity`, and `.recovery`, preserving live writers, malformed \
+names, directories and symlinks. The existing explicit-GC divergence above \
+records that pinned Node leaves these ignored leftovers in place; automatic \
+collection is Rust-specific too. Remove this entry when Node provides the \
+same automatic cleanup, or if Rust removes it.
 """
 
 [[divergence]]

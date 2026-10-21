@@ -124,6 +124,8 @@ const DESCENDANT_HUP_WAIT: Duration = Duration::from_millis(1_000);
 const CHILD_KILL_WAIT: Duration = Duration::from_millis(500);
 /// `SPAWNER_POLL_INTERVAL_MS`.
 const SPAWNER_POLL: Duration = Duration::from_millis(5_000);
+/// Narrow dead-writer temp maintenance, never full session reconciliation.
+const ATOMIC_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// The default `PTY_SHUTDOWN_DEADLINE_MS`.
 const SHUTDOWN_DEADLINE_DEFAULT_MS: f64 = 5_000.0;
 
@@ -157,6 +159,7 @@ pub(crate) struct Daemon {
     exit_drain_deadline: Option<Instant>,
     exit_shutdown_at: Option<Instant>,
     exit_meta_retry: Option<(Instant, Instant)>,
+    atomic_temp_sweep_at: Instant,
     /// Unix milliseconds for the newest child output, in memory. `None`
     /// until the child prints something.
     last_output_at_ms: Option<i64>,
@@ -954,6 +957,7 @@ impl Daemon {
             exit_drain_deadline: None,
             exit_shutdown_at: None,
             exit_meta_retry: None,
+            atomic_temp_sweep_at: Instant::now(),
             last_output_at_ms: None,
             activity_persist_at: None,
             client_generation: 0,
@@ -1009,6 +1013,7 @@ impl Daemon {
                 self.activity_persist_at,
                 self.client_meta_retry.map(|(next, _)| next),
                 self.startup_lease_timer,
+                Some(self.atomic_temp_sweep_at),
             ]
             .into_iter()
             .flatten()
@@ -1432,6 +1437,10 @@ impl Daemon {
 
     fn service_timers(&mut self, now: Instant) {
         self.service_cuts(now);
+        if self.atomic_temp_sweep_at <= now {
+            pty_lifecycle::cleanup_dead_registry_temps();
+            self.atomic_temp_sweep_at = Instant::now() + ATOMIC_TEMP_SWEEP_INTERVAL;
+        }
         if let Some(at) = self.activity_persist_at
             && at <= now
         {

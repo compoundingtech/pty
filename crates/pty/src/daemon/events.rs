@@ -24,7 +24,10 @@ impl Daemon {
         for ev in self.actor.take_events() {
             let event = match ev {
                 TerminalEvent::Bell => Event::bell(&self.name),
-                TerminalEvent::TitleChange(value) => Event::title_change(&self.name, &value),
+                // Titles are live terminal state (including animated spinner
+                // frames), not durable history. The actor retains the current
+                // title; attached clients still receive the original OSC bytes.
+                TerminalEvent::TitleChange(_) => continue,
                 TerminalEvent::Notification(n) => Event::notification(
                     &self.name,
                     n.title.as_deref(),
