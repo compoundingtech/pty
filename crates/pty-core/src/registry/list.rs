@@ -70,6 +70,8 @@ pub struct SessionInfo {
     pub identity: DaemonIdentityCheck,
     /// `None` when `<name>.json` is missing or unreadable (a socket-only
     /// entry).
+    /// Bulk listings omit retained `last_lines`, `extra_env`, and `session_env`.
+    /// Read full metadata explicitly before restarting or displaying scrollback.
     pub metadata: Option<SessionMetadata>,
 }
 
@@ -215,14 +217,7 @@ impl Scanner {
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
         let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
-        let result = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|value| {
-            if !value.is_object() {
-                return Err(<serde_json::Error as serde::de::Error>::custom(
-                    "metadata must be a JSON object",
-                ));
-            }
-            serde_json::from_value(value)
-        });
+        let result = super::list_metadata::parse(&bytes);
         match result {
             Ok(metadata) => Some(metadata),
             Err(error) => {
@@ -1092,7 +1087,9 @@ fn scan_sessions(
 ///
 /// node: src/sessions.ts:1345-1347
 pub fn get_session_by_name(name: &str) -> Option<SessionInfo> {
-    list_sessions().into_iter().find(|s| s.name == name)
+    let mut session = list_sessions().into_iter().find(|s| s.name == name)?;
+    session.metadata = super::metadata::read_metadata(name);
+    Some(session)
 }
 
 /// The text `get_session` fails with when a display name matches several
@@ -1116,14 +1113,19 @@ pub fn ambiguous_reference_message(reference: &str, ids: &[String]) -> String {
 pub fn get_session(reference: &str) -> Result<Option<SessionInfo>, String> {
     let sessions = list_sessions();
     if let Some(s) = sessions.iter().find(|s| s.name == reference) {
-        return Ok(Some(s.clone()));
+        let mut session = s.clone();
+        session.metadata = super::metadata::read_metadata(&session.name);
+        return Ok(Some(session));
     }
     let mut by_display: Vec<SessionInfo> = sessions
         .into_iter()
         .filter(|s| s.display_name() == Some(reference))
         .collect();
     if by_display.len() <= 1 {
-        return Ok(by_display.pop());
+        return Ok(by_display.pop().map(|mut session| {
+            session.metadata = super::metadata::read_metadata(&session.name);
+            session
+        }));
     }
     let ids: Vec<String> = by_display.into_iter().map(|s| s.name).collect();
     Err(ambiguous_reference_message(reference, &ids))

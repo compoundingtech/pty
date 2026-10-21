@@ -20,6 +20,7 @@ pub mod atomic;
 pub mod cleanup;
 pub mod evidence;
 pub mod list;
+mod list_metadata;
 pub mod lock;
 pub mod metadata;
 pub mod mutate;

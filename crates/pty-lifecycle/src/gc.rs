@@ -275,6 +275,15 @@ pub fn gc(options: GcOptions) -> GcResult {
             continue;
         }
         if dry_run {
+            // Listings omit retained environment payloads; reconstruct launch
+            // options only from a full record of the observed generation.
+            let Some(full) = read_metadata(&s.name) else {
+                continue;
+            };
+            if !metadata_matches_observation(meta, &full) {
+                continue;
+            }
+            let meta = &full;
             let (params, ptyfile_reread) = match respawn_params(&s.name, meta) {
                 Ok(params) => params,
                 Err(error) => {

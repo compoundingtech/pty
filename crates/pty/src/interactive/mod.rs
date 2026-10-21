@@ -401,6 +401,9 @@ impl Picker {
         if !registry::metadata_matches_observation(&meta, &current) {
             return Err(format!("{}: session changed before restart", session.name));
         }
+        // The listing is a projection without retained environment maps.
+        // Restart from the full, lock-held record after generation validation.
+        let meta = current;
         let mut params = crate::cli::SpawnParams::new(&session.name, &meta.command, &meta.args);
         params.display_command = meta.display_command.clone();
         params.cwd = meta.cwd.clone();

@@ -24,6 +24,28 @@ caller thread
 
 Both entry points compute one absolute deadline at entry (`now + budget`) and run rounds until every socket has an outcome or the deadline passes (`PTY.REG-R04`, `PTY.REG-R06`). No thread is spawned (`PTY.REG-R01`). Every socket is owned by a local of the call and is closed when the call returns (`PTY.REG-R02`).
 
+### Metadata projection
+
+Registry scans deserialize metadata directly from bytes. The list projection
+consumes `lastLines`, `extraEnv`, and `sessionEnv` without retaining their
+strings or containers, while validating their original optional string-array
+and string-map shapes. All other fields, including unknown provenance and scope
+fields, remain available in `SessionInfo.metadata`. Syntax/type errors still
+omit metadata in tolerant scans and report `MetadataMalformed` in strict scans;
+non-object records remain malformed and absent defaulted fields remain accepted.
+
+Bulk `list_sessions*` and strict single-session observations return this
+projection (the three omitted fields are `None`); their Rust signatures are
+unchanged. `read_metadata*` still returns full metadata. Reference lookups
+(`get_session` and `get_session_by_name`) hydrate only the selected record.
+Permanent-session GC and picker restart read the full record and validate the
+observed generation before using persisted environment options. Callers needing
+retained output or restart environments must use the full reader, not a listing.
+
+`registry::list_metadata::tests` covers projection equivalence, malformed input,
+and a printed old/new parsing comparison over 500 approximately 15 KB records,
+without a timing threshold.
+
 ## Non-blocking connect
 
 `unix_connect::connect(path)` opens an AF_UNIX stream socket that is non-blocking and close-on-exec, then issues one `connect(2)`.
