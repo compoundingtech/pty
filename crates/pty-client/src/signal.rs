@@ -167,7 +167,7 @@ pub fn signal(
             actual: metadata.generation.clone(),
         });
     }
-    let Some(bound) = registry::read_control_target_with(name, Some(&metadata)) else {
+    let Some(bound) = registry::read_control_signal_target_with(name, Some(&metadata)) else {
         return Err(SignalError::NotRunning {
             name: name.to_string(),
         });

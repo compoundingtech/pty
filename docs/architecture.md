@@ -124,10 +124,15 @@ authority. Metadata with no named PID and no PID/socket companions is Gone and
 removable.
 
 **Legacy controls do not upgrade inventory proof.** Records without
-`daemonBootId` use the pre-boot-publication ownership check for explicit stop,
-signal and removal: the selected live PID must agree with the recorded PID and
-any recorded start token must match. This separate `LegacyVerified` outcome is
-not Match and cannot clear publication fences or authorize automatic retirement.
+`daemonBootId` retain operation-specific pre-boot-publication checks. Stop may
+select a tokenless PID only from its sidecar; metadata-only fallback requires
+a matching `recovery.processStartToken`. A child signal always requires a
+recorded daemon PID and matching recorded start token, even with a sidecar.
+Removal sends no signal: it refuses running sessions, waits for an exited
+record's owner to leave, then checks generation ownership before unlinking.
+The selected live PID must agree with any recorded PID and any recorded start
+token must match. This separate `LegacyVerified` outcome is not Match and cannot
+clear publication fences or authorize automatic retirement.
 Present boot evidence always takes the strict full-tuple path, including refusal
 when the evidence mismatches or cannot be read. There is no historical producer
 version marker: removing boot evidence from a modern record selects the same

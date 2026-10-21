@@ -662,10 +662,25 @@ pub fn read_control_target_with(name: &str, metadata: Option<&SessionMetadata>) 
     read_control_target_with_in(&session_dir(), name, metadata)
 }
 
+/// Resolve an explicit child-signal target. Unlike legacy stop, signals
+/// always require a recorded daemon PID and start token, even with a sidecar.
+pub fn read_control_signal_target_with(name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
+    read_explicit_control_target_in(&session_dir(), name, metadata, true)
+}
+
 fn read_control_target_with_in(
     root: &Path,
     name: &str,
     metadata: Option<&SessionMetadata>,
+) -> Option<i32> {
+    read_explicit_control_target_in(root, name, metadata, false)
+}
+
+fn read_explicit_control_target_in(
+    root: &Path,
+    name: &str,
+    metadata: Option<&SessionMetadata>,
+    child_signal: bool,
 ) -> Option<i32> {
     let mut scanner = Scanner {
         strict: true,
@@ -687,6 +702,20 @@ fn read_control_target_with_in(
         return None;
     }
     let pid = sidecar.or(retained.daemon_pid)?;
+    if retained.daemon_boot_id.is_none() {
+        if child_signal {
+            // Pre-boot signals required a recorded PID and persisted token.
+            retained.daemon_pid?;
+            retained.daemon_start_token()?;
+        } else if sidecar.is_none() {
+            // Pre-boot stop accepted a tokenless PID only from the sidecar.
+            // Its metadata-only fallback required the recovery start token.
+            let expected = retained.process_start_token()?;
+            if read_process_start_token(pid).as_deref() != Some(expected) {
+                return None;
+            }
+        }
+    }
     matches!(
         check_control_identity(pid, retained),
         ControlIdentityCheck::Match | ControlIdentityCheck::LegacyVerified
@@ -1510,10 +1539,25 @@ mod control_identity_tests {
         let pid = std::process::id() as i32;
         let metadata = legacy_record();
         let target = || read_control_target_with_in(&root, name, Some(&metadata));
-        assert_eq!(target(), Some(pid), "recorded PID can select the legacy leader");
+        assert_eq!(target(), None, "a bare recorded PID is not legacy authority");
+        let mut recovered = metadata.clone();
+        recovered.recovery = Some(serde_json::json!({
+            "processStartToken": read_process_start_token(pid).unwrap(),
+        }));
+        assert_eq!(read_control_target_with_in(&root, name, Some(&recovered)), Some(pid));
+        recovered.recovery = Some(serde_json::json!({ "processStartToken": "test:wrong-owner" }));
+        assert_eq!(read_control_target_with_in(&root, name, Some(&recovered)), None);
+        let mut native_token = metadata.clone();
+        native_token.daemon_start_token = read_process_start_token(pid);
+        assert_eq!(read_control_target_with_in(&root, name, Some(&native_token)), None,
+            "stop's metadata-only fallback historically required the recovery token");
+        assert_eq!(read_explicit_control_target_in(&root, name, Some(&native_token), true), Some(pid),
+            "signals accept either recorded start-token representation");
         let path = root.join(format!("{name}.pid"));
         std::fs::write(&path, pid.to_string()).unwrap();
         assert_eq!(target(), Some(pid));
+        assert_eq!(read_explicit_control_target_in(&root, name, Some(&metadata), true), None,
+            "a tokenless sidecar authorizes stop, never a child signal");
         std::fs::write(&path, (pid + 1).to_string()).unwrap();
         assert_eq!(target(), None, "conflicting sidecar vetoes a live recorded PID");
         std::fs::write(&path, "not-a-pid").unwrap();
