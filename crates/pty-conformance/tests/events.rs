@@ -216,7 +216,7 @@ fn formats_title_change() {
         "value": "Building..."
     });
     std::fs::write(events_path(&rig, "fmtt"), format!("{old}\n")).unwrap();
-    assert_eq!(recent_json_of_type(&rig, "fmtt", "title_change"), [old]);
+    assert_eq!(recent_json(&rig, "fmtt"), [old]);
     expect_contains(&recent_text(&rig, "fmtt"), "title -> \"Building...\"");
 }
 
