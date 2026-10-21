@@ -86,9 +86,14 @@ fn plain_run_force_creates_a_nested_session() {
         .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().unwrap();
     let mut found = None;
+    // The socket is bound before the metadata is published, so for a moment
+    // the row reads running with an unknown identity and no pid. Wait for the
+    // published row; one that never gains its pid still fails below.
     let _ = poll_for(Duration::from_secs(8), || {
         found = rig.list_entry(id);
-        found.as_ref().map(|f| f["status"] == "running").unwrap_or(false)
+        found
+            .as_ref()
+            .is_some_and(|f| f["status"] == "running" && f["pid"].is_number())
     });
     let found = found.expect("a nested session was created");
     assert_eq!(found["status"], "running");
