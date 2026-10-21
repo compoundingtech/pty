@@ -16,42 +16,53 @@ pub(super) fn parse_with_payloads(
     bytes: &[u8],
     full: bool,
 ) -> serde_json::Result<SessionMetadata> {
-    // RawValue's fast skip accepts numbers/escapes and nesting that Value
-    // rejects. Preserve those syntax limits even in overwritten values,
-    // without constructing strings, arrays or objects.
-    serde_json::from_slice::<JsonSyntax>(bytes)?;
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let metadata = deserializer.deserialize_map(MetadataVisitor { full })?;
     deserializer.end()?;
     Ok(metadata)
 }
 
-struct JsonSyntax;
+// Only overwritten values need a separate syntax-only walk. Effective values
+// are decoded by the typed visitor, preserving number and Unicode validation.
+struct JsonSyntax(u8);
 
-impl<'de> Deserialize<'de> for JsonSyntax {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SyntaxVisitor;
+fn descend<E: de::Error>(depth: u8) -> Result<u8, E> {
+    if depth >= 127 {
+        Err(E::custom("recursion limit exceeded"))
+    } else {
+        Ok(depth + 1)
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for JsonSyntax {
+    type Value = ();
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        struct SyntaxVisitor(u8);
         impl<'de> Visitor<'de> for SyntaxVisitor {
-            type Value = JsonSyntax;
+            type Value = ();
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("a JSON value")
             }
-            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> { Ok(JsonSyntax) }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                while seq.next_element::<JsonSyntax>()?.is_some() {}
-                Ok(JsonSyntax)
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> { Ok(()) }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> { Ok(()) }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> { Ok(()) }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> { Ok(()) }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> { Ok(()) }
+            fn visit_unit<E: de::Error>(self) -> Result<(), E> { Ok(()) }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                let depth = descend(self.0)?;
+                while seq.next_element_seed(JsonSyntax(depth))?.is_some() {}
+                Ok(())
             }
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                while map.next_entry::<DiscardString, JsonSyntax>()?.is_some() {}
-                Ok(JsonSyntax)
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+                let depth = descend(self.0)?;
+                while map.next_key::<DiscardString>()?.is_some() {
+                    map.next_value_seed(JsonSyntax(depth))?;
+                }
+                Ok(())
             }
         }
-        deserializer.deserialize_any(SyntaxVisitor)
+        deserializer.deserialize_any(SyntaxVisitor(self.0))
     }
 }
 
@@ -67,7 +78,7 @@ impl<'de> Visitor<'de> for MetadataVisitor {
     }
 
     fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
-        let mut fields = last_fields(map)?;
+        let mut fields = last_fields(map, 1)?;
         if !self.full {
             if let Some(raw) = fields.shift_remove("lastLines") {
                 serde_json::from_str::<Option<DiscardStrings<false>>>(raw.get())
@@ -75,7 +86,7 @@ impl<'de> Visitor<'de> for MetadataVisitor {
             }
             for name in ["extraEnv", "sessionEnv"] {
                 if let Some(raw) = fields.shift_remove(name) {
-                    Option::<DiscardStrings<true>>::deserialize(Effective(raw))
+                    Option::<DiscardStrings<true>>::deserialize(Effective(raw, 1))
                         .map_err(de::Error::custom)?;
                 }
             }
@@ -83,6 +94,7 @@ impl<'de> Visitor<'de> for MetadataVisitor {
         SessionMetadata::deserialize(de::value::MapAccessDeserializer::new(FieldsAccess {
             fields: fields.into_iter(),
             value: None,
+            depth: 1,
         })).map_err(de::Error::custom)
     }
 }
@@ -109,10 +121,14 @@ impl<'de> Deserialize<'de> for Key<'de> {
     }
 }
 
-fn last_fields<'de, M: MapAccess<'de>>(mut map: M) -> Result<Fields<'de>, M::Error> {
-    let mut fields = IndexMap::new();
+fn last_fields<'de, M: MapAccess<'de>>(mut map: M, depth: u8) -> Result<Fields<'de>, M::Error> {
+    let mut fields: Fields<'de> = IndexMap::new();
     while let Some((Key(key), value)) = map.next_entry::<Key<'de>, &'de RawValue>()? {
-        fields.insert(key, value);
+        if let Some(previous) = fields.insert(key, value) {
+            JsonSyntax(depth)
+                .deserialize(&mut serde_json::Deserializer::from_str(previous.get()))
+                .map_err(de::Error::custom)?;
+        }
     }
     Ok(fields)
 }
@@ -120,6 +136,7 @@ fn last_fields<'de, M: MapAccess<'de>>(mut map: M) -> Result<Fields<'de>, M::Err
 struct FieldsAccess<'de> {
     fields: indexmap::map::IntoIter<Cow<'de, str>, &'de RawValue>,
     value: Option<&'de RawValue>,
+    depth: u8,
 }
 
 impl<'de> MapAccess<'de> for FieldsAccess<'de> {
@@ -143,21 +160,21 @@ impl<'de> MapAccess<'de> for FieldsAccess<'de> {
         &mut self,
         seed: V,
     ) -> Result<V::Value, Self::Error> {
-        seed.deserialize(Effective(self.value.take().expect("value follows key")))
+        seed.deserialize(Effective(self.value.take().expect("value follows key"), self.depth))
     }
 }
 
 // Resolve duplicates recursively, including tags, publication bindings and env
 // maps. Only objects buffer key/raw-slice pairs; arrays stream their elements.
-struct Effective<'de>(&'de RawValue);
+struct Effective<'de>(&'de RawValue, u8);
 
 impl<'de> Deserializer<'de> for Effective<'de> {
     type Error = serde_json::Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.0.get().as_bytes().first() {
-            Some(b'{') => self.0.deserialize_map(ObjectVisitor(visitor)),
-            Some(b'[') => self.0.deserialize_seq(ArrayVisitor(visitor)),
+            Some(b'{') => self.0.deserialize_map(ObjectVisitor(visitor, descend(self.1)?)),
+            Some(b'[') => self.0.deserialize_seq(ArrayVisitor(visitor, descend(self.1)?)),
             _ => self.0.deserialize_any(visitor),
         }
     }
@@ -185,7 +202,7 @@ impl<'de> Deserializer<'de> for Effective<'de> {
     }
 }
 
-struct ObjectVisitor<V>(V);
+struct ObjectVisitor<V>(V, u8);
 
 impl<'de, V: Visitor<'de>> Visitor<'de> for ObjectVisitor<V> {
     type Value = V::Value;
@@ -193,13 +210,13 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for ObjectVisitor<V> {
         f.write_str("a JSON object")
     }
     fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
-        let fields = last_fields(map)?;
-        self.0.visit_map(FieldsAccess { fields: fields.into_iter(), value: None })
+        let fields = last_fields(map, self.1)?;
+        self.0.visit_map(FieldsAccess { fields: fields.into_iter(), value: None, depth: self.1 })
             .map_err(de::Error::custom)
     }
 }
 
-struct ArrayVisitor<V>(V);
+struct ArrayVisitor<V>(V, u8);
 
 impl<'de, V: Visitor<'de>> Visitor<'de> for ArrayVisitor<V> {
     type Value = V::Value;
@@ -207,11 +224,11 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for ArrayVisitor<V> {
         f.write_str("a JSON array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-        self.0.visit_seq(Elements(seq))
+        self.0.visit_seq(Elements(seq, self.1))
     }
 }
 
-struct Elements<A>(A);
+struct Elements<A>(A, u8);
 
 impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Elements<A> {
     type Error = A::Error;
@@ -220,7 +237,7 @@ impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Elements<A> {
         seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
         self.0.next_element::<&'de RawValue>()?
-            .map(|raw| seed.deserialize(Effective(raw)).map_err(de::Error::custom))
+            .map(|raw| seed.deserialize(Effective(raw, self.1)).map_err(de::Error::custom))
             .transpose()
     }
 }
@@ -403,13 +420,21 @@ mod tests {
 
     #[test]
     fn overwritten_values_keep_the_original_json_depth_limit() {
-        let bytes = format!(
-            "{{\"lastLines\":{}0{},\"lastLines\":[]}}",
-            "[".repeat(130), "]".repeat(130),
-        );
-        assert!(old(bytes.as_bytes()).is_err());
-        for full in [false, true] {
-            assert!(parse_with_payloads(bytes.as_bytes(), full).is_err());
+        for nesting in [126, 127, 130] {
+            for overwritten in [false, true] {
+                let tail = if overwritten { ",\"provenance\":null" } else { "" };
+                let bytes = format!(
+                    "{{\"provenance\":{}0{}{tail}}}",
+                    "[".repeat(nesting), "]".repeat(nesting),
+                );
+                for full in [false, true] {
+                    assert_eq!(
+                        parse_with_payloads(bytes.as_bytes(), full).is_ok(),
+                        old(bytes.as_bytes()).is_ok(),
+                        "nesting={nesting}, overwritten={overwritten}, full={full}",
+                    );
+                }
+            }
         }
     }
 

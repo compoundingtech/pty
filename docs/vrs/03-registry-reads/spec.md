@@ -40,9 +40,10 @@ validation. This also applies recursively to tags, environment maps, publication
 bindings and unknown fields. Only the effective `lastLines`, `extraEnv`, and
 `sessionEnv` values are shape-validated; overwritten values cannot invalidate
 an otherwise valid record. Arrays stream their elements.
-An allocation-free value visitor first preserves the JSON parser's numeric,
-Unicode and nesting-limit checks, including in overwritten values; raw-slice
-skipping alone would weaken these checks. It retains no payload tree.
+Overwritten values receive a syntax-only visitor walk to preserve numeric,
+Unicode and nesting-limit checks without a payload tree. Effective values are
+decoded by their typed visitors, with the original nesting limit carried across
+borrowed raw slices; ordinary non-duplicate records need no extra syntax walk.
 
 Ordinary `list_sessions`, `list_sessions_with`, `list_sessions_in`, and strict
 observations return this projection (the three omitted fields are `None`);
