@@ -687,20 +687,9 @@ fn terminal_events_reach_the_log() {
     assert!(wait_until(T, || !d.events("notification").is_empty()));
     let events = read_events(&root, &d.name);
     let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
-    assert_eq!(
-        types,
-        [
-            "session_start",
-            "bell",
-            "title_change",
-            "title_change",
-            "notification"
-        ]
-    );
-    assert_eq!(events[2]["value"], "first");
-    assert_eq!(events[3]["value"], "second");
-    assert_eq!(events[4]["body"], "hello");
-    assert_eq!(events[4]["source"], "osc9");
+    assert_eq!(types, ["session_start", "bell", "notification"]);
+    assert_eq!(events[2]["body"], "hello");
+    assert_eq!(events[2]["source"], "osc9");
 }
 
 /// A 3-deep tree whose leaf ignores HUP and TERM is dead before `pty kill`

@@ -14,7 +14,7 @@ mod startup;
 pub use config::DaemonConfig;
 pub use gc::{
     Abandoned, Flapped, GcOptions, GcResult, OrphanKill, PrunedTags, ReapSkip, RespawnFailed,
-    Respawned, gc, prune_orphan_layout_tags,
+    Respawned, cleanup_dead_registry_temps, gc, prune_orphan_layout_tags,
 };
 pub use launch::{
     DEFAULT_START_TIMEOUT, GATE_FD_ENV, GatedDaemon, OPERATION_FD_ENV, OperationLaunch,
