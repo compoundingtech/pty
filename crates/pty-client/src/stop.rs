@@ -171,12 +171,6 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
             actual: generation.map(str::to_string),
         });
     }
-    // Running is a conservative display projection, not ownership authority.
-    if session.identity == DaemonIdentityCheck::Unknown {
-        return Err(StopError::SignalFailed {
-            name: name.to_string(),
-        });
-    }
     let (SessionStatus::Running, Some(pid)) = (session.status, session.pid) else {
         return Err(StopError::NotRunning {
             name: name.to_string(),
@@ -188,7 +182,17 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
         .ok_or_else(|| StopError::SignalFailed {
             name: name.to_string(),
         })?;
-    let daemon = DaemonHandle::open(name, pid, metadata)?;
+    let Some(target) = registry::read_control_target_with(name, Some(metadata)) else {
+        return Err(StopError::SignalFailed {
+            name: name.to_string(),
+        });
+    };
+    if target != pid {
+        return Err(StopError::SignalFailed {
+            name: name.to_string(),
+        });
+    }
+    let daemon = DaemonHandle::open_control(name, pid, metadata)?;
 
     // Drop the `strategy` tag so `pty gc` does not start the session again
     // on its next pass.
@@ -208,13 +212,13 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
     // which processes the word "killed" would be a claim about.
     // Only exact snapshot identities can authorize later group signals.
     // Unknown or newly joined members fence the whole group out.
-    require_daemon_identity(name, pid, metadata)?;
+    daemon.require_identity(name, pid, metadata)?;
     let table = ProcTable::read();
     let before = snapshot_from_table(pid, &table);
     let mut groups = groups_in_tree(pid, &table);
     let own_group = own_process_group();
     groups.retain(|group| *group != own_group);
-    require_daemon_identity(name, pid, metadata)?;
+    daemon.require_identity(name, pid, metadata)?;
 
     daemon.signal(name, pid, metadata)?;
 
@@ -435,41 +439,84 @@ fn require_daemon_identity(
     })
 }
 
+fn require_identity(
+    name: &str,
+    pid: i32,
+    metadata: &SessionMetadata,
+    explicit_control: bool,
+) -> Result<(), StopError> {
+    if !explicit_control {
+        return require_daemon_identity(name, pid, metadata);
+    }
+    if registry::read_control_target_with(name, Some(metadata)) == Some(pid) {
+        return Ok(());
+    }
+    Err(StopError::SignalFailed {
+        name: name.to_string(),
+    })
+}
+
 /// Reuse the exact-owner capability used by launch-operation recovery.
 /// Unsupported or refused pinning never downgrades to numeric signalling.
 struct DaemonHandle {
     handle: pty_core::operation::exact::Exact,
+    explicit_control: bool,
     #[cfg(not(target_os = "linux"))]
     start_token: String,
 }
 
 impl DaemonHandle {
     fn open(name: &str, pid: i32, metadata: &SessionMetadata) -> Result<Self, StopError> {
-        require_daemon_identity(name, pid, metadata)?;
+        Self::open_with(name, pid, metadata, false)
+    }
+
+    fn open_control(name: &str, pid: i32, metadata: &SessionMetadata) -> Result<Self, StopError> {
+        Self::open_with(name, pid, metadata, true)
+    }
+
+    fn open_with(
+        name: &str,
+        pid: i32,
+        metadata: &SessionMetadata,
+        explicit_control: bool,
+    ) -> Result<Self, StopError> {
+        require_identity(name, pid, metadata, explicit_control)?;
         let owner = pty_core::operation::ProcessId::of(pid as u32).map_err(|_| {
             StopError::SignalFailed {
                 name: name.to_string(),
             }
         })?;
-        let handle =
-            pty_core::operation::exact::Exact::pin(&owner, metadata.daemon_boot_id.as_deref())
-                .map_err(|_| StopError::SignalFailed {
-                    name: name.to_string(),
-                })?
-                .ok_or_else(|| StopError::SignalFailed {
-                    name: name.to_string(),
-                })?;
+        // A legacy record supplies no boot proof. Pin this freshly observed
+        // process using its runtime boot identity, without upgrading the row.
+        let boot = metadata.daemon_boot_id.as_deref().unwrap_or(&owner.boot_id);
+        let handle = pty_core::operation::exact::Exact::pin(&owner, Some(boot))
+            .map_err(|_| StopError::SignalFailed {
+                name: name.to_string(),
+            })?
+            .ok_or_else(|| StopError::SignalFailed {
+                name: name.to_string(),
+            })?;
         // If the numeric PID changed before pinning, refuse the new owner.
-        require_daemon_identity(name, pid, metadata)?;
+        require_identity(name, pid, metadata, explicit_control)?;
         Ok(Self {
             handle,
+            explicit_control,
             #[cfg(not(target_os = "linux"))]
             start_token: owner.start_token,
         })
     }
 
+    fn require_identity(
+        &self,
+        name: &str,
+        pid: i32,
+        metadata: &SessionMetadata,
+    ) -> Result<(), StopError> {
+        require_identity(name, pid, metadata, self.explicit_control)
+    }
+
     fn signal(&self, name: &str, pid: i32, metadata: &SessionMetadata) -> Result<(), StopError> {
-        require_daemon_identity(name, pid, metadata)?;
+        self.require_identity(name, pid, metadata)?;
         self.handle
             .signal(libc::SIGTERM)
             .map_err(|_| StopError::SignalFailed {

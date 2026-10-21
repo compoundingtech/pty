@@ -400,6 +400,84 @@ pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIden
     result
 }
 
+/// Identity evidence for explicit stop, signal and remove controls only.
+/// `LegacyVerified` is not full daemon identity proof: it must never authorize
+/// inventory liveness, generation replacement, launch or retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlIdentityCheck {
+    Match,
+    LegacyVerified,
+    Mismatch,
+    Gone,
+    Unknown,
+}
+
+/// Keep modern records on the full identity check. Only absent boot evidence
+/// permits the pre-boot-ID control policy, never present but invalid evidence.
+pub fn check_control_identity(pid: i32, metadata: &SessionMetadata) -> ControlIdentityCheck {
+    if metadata.daemon_boot_id.is_some() {
+        return match check_daemon_identity(pid, metadata) {
+            DaemonIdentityCheck::Match => ControlIdentityCheck::Match,
+            DaemonIdentityCheck::Mismatch => ControlIdentityCheck::Mismatch,
+            DaemonIdentityCheck::Gone => ControlIdentityCheck::Gone,
+            DaemonIdentityCheck::Unknown => ControlIdentityCheck::Unknown,
+        };
+    }
+    if pid <= 0 {
+        return ControlIdentityCheck::Gone;
+    }
+    if metadata.daemon_pid.is_some_and(|recorded| recorded != pid) {
+        return ControlIdentityCheck::Mismatch;
+    }
+    #[cfg(target_os = "linux")]
+    match linux_thread_group(pid) {
+        Ok(Some(tgid)) if tgid != pid => ControlIdentityCheck::Mismatch,
+        Ok(Some(_)) => {
+            check_legacy_control_identity_with(pid, metadata, read_linux_leader_start_token)
+        }
+        Err(error) if process_status_is_gone(&error) => ControlIdentityCheck::Gone,
+        _ => ControlIdentityCheck::Unknown,
+    }
+    #[cfg(not(target_os = "linux"))]
+    match crate::proctable::process(pid) {
+        crate::proctable::Answer::NotPresent => ControlIdentityCheck::Gone,
+        crate::proctable::Answer::Unknown(_) => ControlIdentityCheck::Unknown,
+        crate::proctable::Answer::Known(_) => {
+            check_legacy_control_identity_with(pid, metadata, read_process_start_token)
+        }
+    }
+}
+
+fn check_legacy_control_identity_with(
+    pid: i32,
+    metadata: &SessionMetadata,
+    live_start_token: impl FnOnce(i32) -> Option<String>,
+) -> ControlIdentityCheck {
+    match live_start_token(pid) {
+        Some(live) => {
+            // Do not filter empty recorded tokens: a present token must match.
+            if metadata.daemon_start_token().is_some_and(|expected| expected != live) {
+                ControlIdentityCheck::Mismatch
+            } else {
+                ControlIdentityCheck::LegacyVerified
+            }
+        }
+        None => {
+            #[cfg(target_os = "linux")]
+            match linux_thread_group(pid) {
+                Ok(Some(tgid)) if tgid != pid => return ControlIdentityCheck::Mismatch,
+                Err(error) if process_status_is_gone(&error) => return ControlIdentityCheck::Gone,
+                _ => {}
+            }
+            #[cfg(not(target_os = "linux"))]
+            if !pid_alive(pid) {
+                return ControlIdentityCheck::Gone;
+            }
+            ControlIdentityCheck::Unknown
+        }
+    }
+}
+
 /// A conflicting sidecar may be an unpublished replacement. No single PID
 /// from that observation can authorize liveness, replacement or retirement.
 pub fn check_record_identity(
@@ -575,6 +653,45 @@ fn read_pid_with_in(root: &Path, name: &str, metadata: Option<&SessionMetadata>)
     };
     let pid = sidecar.or(retained.daemon_pid)?;
     (check_record_identity(sidecar, Some(retained)) == DaemonIdentityCheck::Match).then_some(pid)
+}
+
+/// Resolve an explicit control target, accepting either full identity proof or
+/// the absence-only legacy policy. Never use this for launch or retirement.
+/// A conflicting, malformed or unreadable PID companion cannot grant authority.
+pub fn read_control_target_with(name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
+    read_control_target_with_in(&session_dir(), name, metadata)
+}
+
+fn read_control_target_with_in(
+    root: &Path,
+    name: &str,
+    metadata: Option<&SessionMetadata>,
+) -> Option<i32> {
+    let mut scanner = Scanner {
+        strict: true,
+        full_metadata: true,
+        errors: Vec::new(),
+    };
+    let owned;
+    let retained = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            owned = scanner.metadata(&root.join(format!("{name}.json")), false)?;
+            &owned
+        }
+    };
+    let sidecar = scanner.pid(&root.join(format!("{name}.pid")), false);
+    if !scanner.errors.is_empty()
+        || matches!((sidecar, retained.daemon_pid), (Some(a), Some(b)) if a != b)
+    {
+        return None;
+    }
+    let pid = sidecar.or(retained.daemon_pid)?;
+    matches!(
+        check_control_identity(pid, retained),
+        ControlIdentityCheck::Match | ControlIdentityCheck::LegacyVerified
+    )
+    .then_some(pid)
 }
 
 /// Resolve the same identity-bound daemon used by inventory readers.
@@ -1288,5 +1405,132 @@ mod identity_observation_tests {
         assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ESRCH)));
         assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ENOENT)));
         assert!(!process_status_is_gone(&std::io::Error::from_raw_os_error(libc::EACCES)));
+    }
+}
+
+#[cfg(test)]
+mod control_identity_tests {
+    use super::*;
+
+    fn legacy_record() -> SessionMetadata {
+        let pid = std::process::id() as i32;
+        // The old producer published daemonPid and optionally a recovery token,
+        // but no daemonBootId. No timestamp or migration marker is necessary.
+        serde_json::from_value(serde_json::json!({
+            "name": "agent/example-legacy-control",
+            "daemonPid": pid
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_matching_token_is_control_only_not_inventory_match() {
+        let pid = std::process::id() as i32;
+        let mut metadata = legacy_record();
+        let token = read_process_start_token(pid).expect("test process has a readable start token");
+        metadata.recovery = Some(serde_json::json!({ "processStartToken": token }));
+        assert_eq!(
+            check_control_identity(pid, &metadata),
+            ControlIdentityCheck::LegacyVerified,
+        );
+        assert_eq!(check_daemon_identity(pid, &metadata), DaemonIdentityCheck::Unknown);
+    }
+
+    #[test]
+    fn legacy_mismatched_or_empty_recorded_token_is_not_authority() {
+        let pid = std::process::id() as i32;
+        for token in ["test:another-process", ""] {
+            let mut metadata = legacy_record();
+            metadata.daemon_start_token = Some(token.into());
+            assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Mismatch);
+        }
+    }
+
+    #[test]
+    fn legacy_no_token_fixture_preserves_pre_boot_control_policy() {
+        let pid = std::process::id() as i32;
+        let metadata = legacy_record();
+        assert_eq!(metadata.daemon_boot_id, None);
+        assert_eq!(metadata.daemon_start_token(), None);
+        assert_eq!(
+            check_control_identity(pid, &metadata),
+            ControlIdentityCheck::LegacyVerified,
+        );
+        assert_eq!(check_daemon_identity(pid, &metadata), DaemonIdentityCheck::Unknown);
+        assert_eq!(
+            check_legacy_control_identity_with(pid, &metadata, |_| None),
+            ControlIdentityCheck::Unknown,
+            "an unreadable live process is not legacy verification",
+        );
+    }
+
+    #[test]
+    fn legacy_gone_and_conflicting_recorded_pids_are_refused() {
+        let mut metadata = legacy_record();
+        for pid in [0, -1, i32::MAX] {
+            metadata.daemon_pid = Some(pid);
+            assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Gone);
+        }
+        let pid = std::process::id() as i32;
+        metadata.daemon_pid = Some(pid + 1);
+        assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Mismatch);
+    }
+
+    #[test]
+    fn present_boot_evidence_never_falls_back_to_legacy() {
+        let pid = std::process::id() as i32;
+        let mut metadata = legacy_record();
+        metadata.daemon_start_token =
+            Some(read_process_start_token(pid).expect("test process has a readable start token"));
+        for boot in ["", "test:wrong-boot", "darwin:{ sec = 1, usec = 0 }"] {
+            metadata.daemon_boot_id = Some(boot.into());
+            let strict = check_daemon_identity(pid, &metadata);
+            let expected = match strict {
+                DaemonIdentityCheck::Mismatch => ControlIdentityCheck::Mismatch,
+                DaemonIdentityCheck::Unknown => ControlIdentityCheck::Unknown,
+                other => panic!("invalid boot evidence unexpectedly proved identity: {other:?}"),
+            };
+            assert_eq!(check_control_identity(pid, &metadata), expected);
+        }
+        if let Some(boot) = read_boot_id() {
+            metadata.daemon_boot_id = Some(boot);
+            assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Match);
+        }
+    }
+
+    #[test]
+    fn control_target_requires_consistent_readable_pid_companions() {
+        let root = std::env::temp_dir().join(format!(
+            "pty-control-target-{}-{}",
+            std::process::id(),
+            super::super::atomic::random_hex16(),
+        ));
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        let name = "agent/example-legacy-control";
+        let pid = std::process::id() as i32;
+        let metadata = legacy_record();
+        let target = || read_control_target_with_in(&root, name, Some(&metadata));
+        assert_eq!(target(), Some(pid), "recorded PID can select the legacy leader");
+        let path = root.join(format!("{name}.pid"));
+        std::fs::write(&path, pid.to_string()).unwrap();
+        assert_eq!(target(), Some(pid));
+        std::fs::write(&path, (pid + 1).to_string()).unwrap();
+        assert_eq!(target(), None, "conflicting sidecar vetoes a live recorded PID");
+        std::fs::write(&path, "not-a-pid").unwrap();
+        assert_eq!(target(), None, "malformed is not absent");
+        std::fs::write(&path, pid.to_string()).unwrap();
+        let mut sidecar_only = metadata.clone();
+        sidecar_only.daemon_pid = None;
+        assert_eq!(read_control_target_with_in(&root, name, Some(&sidecar_only)), Some(pid));
+        assert_eq!(read_control_target_with_in(&root, name, None), None, "metadata is required");
+        std::fs::write(
+            root.join(format!("{name}.json")),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_control_target_with_in(&root, name, None), Some(pid));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_control_target_with_in(&root, name, Some(&sidecar_only)), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
