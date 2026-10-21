@@ -351,7 +351,7 @@ mod tests {
         let mut metadata: serde_json::Value = serde_json::from_slice(&record("label")).unwrap();
         metadata["daemonPid"] = pid.into();
         metadata["daemonStartToken"] = read_process_start_token(pid).unwrap().into();
-        metadata["tags"] = serde_json::json!({"owner": "person/robin"});
+        metadata["tags"] = serde_json::json!({"owner": "agent/example-owner"});
         metadata["futureField"] = serde_json::json!({"retained": true});
         let path = root.0.join("first.json");
         std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
