@@ -149,7 +149,8 @@ pub fn gc(options: GcOptions) -> GcResult {
             }
         }
     }
-    let initial = registry::list_sessions();
+    // GC also reconstructs environments and compares whole legacy records.
+    let initial = registry::list_sessions_full();
 
     // STEP 1: orphan children, in name order so cycles resolve
     // deterministically.
@@ -210,7 +211,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step1 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &after_step1 {
@@ -262,7 +263,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step15 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     for s in &after_step15 {
         let Some(meta) = s.metadata.as_ref() else {
@@ -349,7 +350,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let final_list = if dry_run {
         initial
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &final_list {

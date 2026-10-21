@@ -20,6 +20,7 @@ pub mod atomic;
 pub mod cleanup;
 pub mod evidence;
 pub mod list;
+mod list_metadata;
 pub mod lock;
 pub mod metadata;
 pub mod mutate;
@@ -50,7 +51,7 @@ pub use list::{
     InventoryError, InventoryErrorKind, ListOptions, SessionInfo, SessionStatus, all_session_names,
     ambiguous_reference_message, check_daemon_identity, check_record_identity, check_record_identity_in,
     daemon_identity_counters, get_session, get_session_by_name, has_process_exited_for_reap,
-    list_sessions, list_sessions_in, list_sessions_strict_in, list_sessions_with,
+    list_sessions, list_sessions_full, list_sessions_in, list_sessions_strict_in, list_sessions_with,
     observe_session_strict_in, pid_alive, probe_sockets_within_budget, read_boot_id, read_pid,
     read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
     record_daemon_identity_check, resolve_ref, session_exists, socket_reachable,
