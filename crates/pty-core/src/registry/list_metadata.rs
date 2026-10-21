@@ -8,14 +8,19 @@ use serde::{Deserialize, Deserializer};
 
 use super::metadata::SessionMetadata;
 
-pub(super) fn parse(bytes: &[u8]) -> serde_json::Result<SessionMetadata> {
+pub(super) fn parse_with_payloads(
+    bytes: &[u8],
+    full: bool,
+) -> serde_json::Result<SessionMetadata> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let metadata = deserializer.deserialize_map(MetadataVisitor)?;
+    let metadata = deserializer.deserialize_map(MetadataVisitor { full })?;
     deserializer.end()?;
     Ok(metadata)
 }
 
-struct MetadataVisitor;
+struct MetadataVisitor {
+    full: bool,
+}
 
 impl<'de> Visitor<'de> for MetadataVisitor {
     type Value = SessionMetadata;
@@ -25,7 +30,11 @@ impl<'de> Visitor<'de> for MetadataVisitor {
     }
 
     fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
-        SessionMetadata::deserialize(de::value::MapAccessDeserializer::new(Projection(map)))
+        if self.full {
+            SessionMetadata::deserialize(de::value::MapAccessDeserializer::new(map))
+        } else {
+            SessionMetadata::deserialize(de::value::MapAccessDeserializer::new(Projection(map)))
+        }
     }
 }
 
@@ -173,6 +182,7 @@ mod tests {
 
     #[test]
     fn projection_equivalence() {
+        assert_eq!(parse_with_payloads(&fixture(), true).unwrap(), old(&fixture()).unwrap());
         let bytes = fixture();
         let mut expected = old(&bytes).unwrap();
         expected.last_lines = None;
@@ -181,6 +191,20 @@ mod tests {
         assert_eq!(parse(&bytes).unwrap(), expected);
         // The full metadata reader remains suitable for restart and scrollback.
         assert!(serde_json::from_slice::<SessionMetadata>(&bytes).unwrap().last_lines.is_some());
+    }
+
+    #[test]
+    fn full_legacy_record_preserves_whole_record_identity() {
+        let mut value: Value = serde_json::from_slice(&fixture()).unwrap();
+        value.as_object_mut().unwrap().remove("generation");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let expected = old(&bytes).unwrap();
+        let full = parse_with_payloads(&bytes, true).unwrap();
+        assert_eq!(full, expected);
+        assert!(super::super::mutate::metadata_matches_observation(&full, &expected));
+        assert!(!super::super::mutate::metadata_matches_observation(
+            &parse(&bytes).unwrap(), &expected,
+        ));
     }
 
     #[test]
@@ -194,7 +218,12 @@ mod tests {
             b"{\"lastLines\":null,\"extraEnv\":null,\"sessionEnv\":null}",
         ] {
             assert_eq!(parse(bytes).is_ok(), old(bytes).is_ok(), "{bytes:?}");
+            assert_eq!(parse_with_payloads(bytes, true).is_ok(), old(bytes).is_ok(), "{bytes:?}");
         }
+    }
+
+    fn parse(bytes: &[u8]) -> serde_json::Result<SessionMetadata> {
+        parse_with_payloads(bytes, false)
     }
 
     #[test]

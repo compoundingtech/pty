@@ -70,8 +70,8 @@ pub struct SessionInfo {
     pub identity: DaemonIdentityCheck,
     /// `None` when `<name>.json` is missing or unreadable (a socket-only
     /// entry).
-    /// Bulk listings omit retained `last_lines`, `extra_env`, and `session_env`.
-    /// Read full metadata explicitly before restarting or displaying scrollback.
+    /// Ordinary listings omit `last_lines`, `extra_env`, and `session_env`;
+    /// [`list_sessions_full`] and reference lookups retain them for restart.
     pub metadata: Option<SessionMetadata>,
 }
 
@@ -157,6 +157,7 @@ fn serialize_inventory_path<S: serde::Serializer>(
 
 struct Scanner {
     strict: bool,
+    full_metadata: bool,
     errors: Vec<InventoryError>,
 }
 
@@ -217,7 +218,7 @@ impl Scanner {
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
         let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
-        let result = super::list_metadata::parse(&bytes);
+        let result = super::list_metadata::parse_with_payloads(&bytes, self.full_metadata);
         match result {
             Ok(metadata) => Some(metadata),
             Err(error) => {
@@ -260,6 +261,7 @@ pub(super) fn read_identity_record(
 ) -> Option<(SessionMetadata, Option<i32>)> {
     let mut scanner = Scanner {
         strict: true,
+        full_metadata: true,
         errors: Vec::new(),
     };
     let metadata = scanner.metadata(&root.join(format!("{name}.json")), false)?;
@@ -829,6 +831,13 @@ pub fn list_sessions() -> Vec<SessionInfo> {
     list_sessions_with(&ListOptions::default())
 }
 
+/// A full observation for consumers that restart sessions or compare legacy
+/// generation-less records as whole metadata. Ordinary observers should use
+/// [`list_sessions`] to avoid reading retained output and environment payloads.
+pub fn list_sessions_full() -> Vec<SessionInfo> {
+    scan_sessions(&session_dir(), &ListOptions::default(), false, None, true).entries
+}
+
 /// [`list_sessions`] with an explicit probe budget.
 pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
     let root = session_dir();
@@ -837,7 +846,7 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false, None).entries
+    scan_sessions(root, options, false, None, false).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
@@ -848,14 +857,14 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 /// sessions. Strict PID validation requires a complete, positive decimal i32;
 /// tolerant classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, None)
+    scan_sessions(root, options, true, None, false)
 }
 
 /// [`list_sessions_strict_in`] for one session id: that id's companions are
 /// read and classified exactly as a whole-root strict scan would classify
 /// them, and no other entry is touched.
 pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, Some(name))
+    scan_sessions(root, options, true, Some(name), false)
 }
 
 fn scan_sessions(
@@ -863,9 +872,11 @@ fn scan_sessions(
     options: &ListOptions,
     strict: bool,
     only: Option<&str>,
+    full_metadata: bool,
 ) -> Inventory {
     let mut scanner = Scanner {
         strict,
+        full_metadata,
         errors: Vec::new(),
     };
     let dir = match std::fs::read_dir(root) {
@@ -1087,9 +1098,8 @@ fn scan_sessions(
 ///
 /// node: src/sessions.ts:1345-1347
 pub fn get_session_by_name(name: &str) -> Option<SessionInfo> {
-    let mut session = list_sessions().into_iter().find(|s| s.name == name)?;
-    session.metadata = super::metadata::read_metadata(name);
-    Some(session)
+    scan_sessions(&session_dir(), &ListOptions::default(), false, Some(name), true)
+        .entries.into_iter().next()
 }
 
 /// The text `get_session` fails with when a display name matches several
@@ -1111,21 +1121,16 @@ pub fn ambiguous_reference_message(reference: &str, ids: &[String]) -> String {
 ///
 /// node: src/sessions.ts:1351-1363
 pub fn get_session(reference: &str) -> Result<Option<SessionInfo>, String> {
-    let sessions = list_sessions();
+    let sessions = list_sessions_full();
     if let Some(s) = sessions.iter().find(|s| s.name == reference) {
-        let mut session = s.clone();
-        session.metadata = super::metadata::read_metadata(&session.name);
-        return Ok(Some(session));
+        return Ok(Some(s.clone()));
     }
     let mut by_display: Vec<SessionInfo> = sessions
         .into_iter()
         .filter(|s| s.display_name() == Some(reference))
         .collect();
     if by_display.len() <= 1 {
-        return Ok(by_display.pop().map(|mut session| {
-            session.metadata = super::metadata::read_metadata(&session.name);
-            session
-        }));
+        return Ok(by_display.pop());
     }
     let ids: Vec<String> = by_display.into_iter().map(|s| s.name).collect();
     Err(ambiguous_reference_message(reference, &ids))
