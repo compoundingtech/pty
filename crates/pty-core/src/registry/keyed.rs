@@ -18,13 +18,27 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::list::{DaemonIdentityCheck, ListOptions, SessionInfo, SessionStatus};
+use super::list::{
+    DaemonIdentityCheck, ListOptions, SessionInfo, SessionStatus, check_boot_identity,
+    current_boot_id,
+};
 use super::metadata::SessionMetadata;
 use super::names::validate_name_lexical;
 use super::root::{socket_filenames, SUN_PATH_MAX};
 #[cfg(test)]
 use super::root::socket_path_in;
 use crate::proctable::{self, Answer, LiveIdentity};
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// `connect(2)` relative to a directory descriptor (macOS 10.11 and later).
+    fn connectat(
+        fd: libc::c_int,
+        socket: libc::c_int,
+        address: *const libc::sockaddr,
+        length: libc::socklen_t,
+    ) -> libc::c_int;
+}
 
 const METADATA_LIMIT: u64 = 1024 * 1024;
 const PID_LIMIT: u64 = 64;
@@ -213,12 +227,14 @@ trait KeyedAccess {
         filename: &OsStr,
     ) -> Result<PathBuf, KeyedSessionError>;
     fn process(&self, pid: i32) -> Result<Option<ProcessEvidence>, KeyedSessionError>;
+    fn boot_id(&self) -> Option<String> {
+        current_boot_id()
+    }
     fn probe_socket(
         &self,
         root: &Self::Root,
         filename: &OsStr,
         expected: &Stamp,
-        refused_is_absence: bool,
         budget: Duration,
     ) -> Result<bool, KeyedSessionError>;
     fn sleep(&self, duration: Duration);
@@ -294,7 +310,6 @@ impl OsAccess {
         }
     }
 
-
     fn reporting_root(root: &OpenRoot) -> &Path {
         let configured_is_pinned = std::fs::metadata(&root.path).is_ok_and(|metadata| {
             metadata.dev() == root.device
@@ -308,42 +323,15 @@ impl OsAccess {
         }
     }
 
-
-    #[cfg(target_os = "macos")]
-    fn verify_pinned_root(root: &OpenRoot) -> Result<(), KeyedSessionError> {
-        let metadata = std::fs::metadata(&root.pinned_path).map_err(|error| {
-            KeyedSessionError::new(
-                KeyedSessionErrorKind::SocketProbe,
-                Some(root.pinned_path.clone()),
-                format!("opened registry root path is unavailable: {error}"),
-            )
-        })?;
-        if metadata.dev() != root.device
-            || metadata.ino() != root.inode
-            || !metadata.file_type().is_dir()
-        {
-            return Err(KeyedSessionError::new(
-                KeyedSessionErrorKind::SocketProbe,
-                Some(root.pinned_path.clone()),
-                "opened registry root path no longer identifies the pinned directory",
-            ));
-        }
-        Ok(())
-    }
-
+    /// A refusal is never absence: only a record with no PID is probed, and on
+    /// macOS a full accept queue refuses a live listener too.
     fn probe_result(
         display_path: &Path,
         outcome: Option<&io::Result<()>>,
-        refused_is_absence: bool,
     ) -> Result<bool, KeyedSessionError> {
         match outcome {
             Some(Ok(())) => Ok(true),
             Some(Err(error)) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
-            Some(Err(error))
-                if error.raw_os_error() == Some(libc::ECONNREFUSED) && refused_is_absence =>
-            {
-                Ok(false)
-            }
             Some(Err(error)) => Err(KeyedSessionError::new(
                 KeyedSessionErrorKind::SocketProbe,
                 Some(display_path.to_path_buf()),
@@ -356,6 +344,8 @@ impl OsAccess {
             )),
         }
     }
+
+    #[cfg(not(target_os = "macos"))]
     fn open_socket_leaf(
         root: &OpenRoot,
         filename: &OsStr,
@@ -365,9 +355,7 @@ impl OsAccess {
         let name = Self::cstring(filename, KeyedSessionErrorKind::SocketProbe, &path)?;
         #[cfg(target_os = "linux")]
         let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(target_os = "linux"))]
         return Err(KeyedSessionError::new(
             KeyedSessionErrorKind::SocketProbe,
             Some(path),
@@ -397,8 +385,10 @@ impl OsAccess {
         Ok(fd)
     }
 
+    /// Any entry created, removed or renamed in the pinned root fires this
+    /// watch. A socket leaf cannot be swapped and restored without that.
     #[cfg(target_os = "macos")]
-    fn watch_socket_leaf(fd: i32, path: &Path) -> Result<OwnedFd, KeyedSessionError> {
+    fn watch_directory(fd: i32, path: &Path) -> Result<OwnedFd, KeyedSessionError> {
         let raw = unsafe { libc::kqueue() };
         if raw < 0 {
             return Err(KeyedSessionError::new(
@@ -438,7 +428,7 @@ impl OsAccess {
                 KeyedSessionErrorKind::SocketProbe,
                 Some(path.to_path_buf()),
                 format!(
-                    "cannot watch pinned socket leaf: {}",
+                    "cannot watch pinned registry root: {}",
                     io::Error::last_os_error()
                 ),
             ));
@@ -447,7 +437,7 @@ impl OsAccess {
     }
 
     #[cfg(target_os = "macos")]
-    fn socket_leaf_changed(queue: &OwnedFd, path: &Path) -> Result<bool, KeyedSessionError> {
+    fn directory_changed(queue: &OwnedFd, path: &Path) -> Result<bool, KeyedSessionError> {
         let mut event: libc::kevent = unsafe { std::mem::zeroed() };
         let timeout = libc::timespec {
             tv_sec: 0,
@@ -468,12 +458,88 @@ impl OsAccess {
                 KeyedSessionErrorKind::SocketProbe,
                 Some(path.to_path_buf()),
                 format!(
-                    "cannot read pinned socket watch: {}",
+                    "cannot read pinned registry root watch: {}",
                     io::Error::last_os_error()
                 ),
             ));
         }
         Ok(count > 0)
+    }
+
+    /// Connect to `filename` relative to the pinned root, so the address is
+    /// the short leaf name whatever the root's length. `None` is the deadline.
+    #[cfg(target_os = "macos")]
+    fn connect_at(dir: i32, filename: &OsStr, budget: Duration) -> Option<io::Result<()>> {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let name = filename.as_bytes();
+        if name.len() >= address.sun_path.len() {
+            return Some(Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG)));
+        }
+        for (slot, byte) in address.sun_path.iter_mut().zip(name) {
+            *slot = *byte as libc::c_char;
+        }
+        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1;
+        address.sun_len = length as u8;
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if raw < 0 {
+            return Some(Err(io::Error::last_os_error()));
+        }
+        // SAFETY: `socket` returned a new descriptor owned by this call.
+        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+        let fd = socket.as_raw_fd();
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
+        {
+            return Some(Err(io::Error::last_os_error()));
+        }
+        // SAFETY: `address` is a live `sockaddr_un` of at least `length` bytes.
+        let connected = unsafe {
+            connectat(
+                dir,
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            return Some(Ok(()));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Some(Err(error));
+        }
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout = libc::c_int::try_from(budget.as_millis()).unwrap_or(libc::c_int::MAX);
+        match unsafe { libc::poll(&mut ready, 1, timeout) } {
+            0 => None,
+            count if count < 0 => Some(Err(io::Error::last_os_error())),
+            _ => {
+                let mut pending: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: both pointers are valid for the duration of the call.
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut pending as *mut libc::c_int).cast(),
+                        &mut size,
+                    )
+                } < 0
+                {
+                    return Some(Err(io::Error::last_os_error()));
+                }
+                Some(match pending {
+                    0 => Ok(()),
+                    code => Err(io::Error::from_raw_os_error(code)),
+                })
+            }
+        }
     }
 }
 
@@ -675,25 +741,65 @@ impl KeyedAccess for OsAccess {
         }
     }
 
+    // XNU refuses to open a socket node (EOPNOTSUPP), so macOS cannot pin the
+    // leaf as Linux does. It connects relative to the pinned root instead and
+    // refuses the answer if any root entry or the leaf changed meanwhile.
+    #[cfg(target_os = "macos")]
     fn probe_socket(
         &self,
         root: &Self::Root,
         filename: &OsStr,
         expected: &Stamp,
-        refused_is_absence: bool,
+        budget: Duration,
+    ) -> Result<bool, KeyedSessionError> {
+        let display_path = root.pinned_path.join(filename);
+        let watch = Self::watch_directory(root.fd.as_raw_fd(), &display_path)?;
+        let unchanged = |when: &str| match self.stat_socket(root, filename)? {
+            Some(observed) if &observed == expected => Ok(()),
+            observed => Err(KeyedSessionError::new(
+                KeyedSessionErrorKind::Changed,
+                Some(display_path.clone()),
+                format!("socket leaf changed {when} the probe: {expected:?} -> {observed:?}"),
+            )),
+        };
+        unchanged("before")?;
+        #[cfg(test)]
+        trace_socket_probe(format!(
+            "pin_socket root_fd={} root={}:{} leaf={expected:?} path={}",
+            root.fd.as_raw_fd(),
+            root.device,
+            root.inode,
+            display_path.display()
+        ));
+        #[cfg(test)]
+        run_socket_probe_hook(false);
+        let outcome = Self::connect_at(root.fd.as_raw_fd(), filename, budget);
+        #[cfg(test)]
+        run_socket_probe_hook(true);
+        unchanged("during")?;
+        if Self::directory_changed(&watch, &display_path)? {
+            return Err(KeyedSessionError::new(
+                KeyedSessionErrorKind::Changed,
+                Some(display_path),
+                "registry root entries changed during the probe",
+            ));
+        }
+        #[cfg(test)]
+        trace_socket_probe(format!("probe_complete outcome={outcome:?}"));
+        Self::probe_result(&display_path, outcome.as_ref())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn probe_socket(
+        &self,
+        root: &Self::Root,
+        filename: &OsStr,
+        expected: &Stamp,
         budget: Duration,
     ) -> Result<bool, KeyedSessionError> {
         let display_path = root.pinned_path.join(filename);
         let leaf = Self::open_socket_leaf(root, filename, expected)?;
-        #[cfg(target_os = "linux")]
         let path = PathBuf::from(format!("/proc/self/fd/{}", leaf.as_raw_fd()));
-        #[cfg(target_os = "macos")]
-        let path = {
-            Self::verify_pinned_root(root)?;
-            display_path.clone()
-        };
-        #[cfg(target_os = "macos")]
-        let watch = Self::watch_socket_leaf(leaf.as_raw_fd(), &display_path)?;
         #[cfg(test)]
         trace_socket_probe(format!(
             "pin_socket root_fd={} leaf_fd={} root={}:{} leaf={expected:?} path={}",
@@ -717,28 +823,13 @@ impl KeyedAccess for OsAccess {
                 format!("socket leaf changed during the probe: {expected:?} -> {observed:?}"),
             ));
         }
-        #[cfg(target_os = "macos")]
-        {
-            Self::verify_pinned_root(root)?;
-            if Self::socket_leaf_changed(&watch, &display_path)? {
-                return Err(KeyedSessionError::new(
-                    KeyedSessionErrorKind::Changed,
-                    Some(display_path),
-                    "socket leaf was replaced during the probe",
-                ));
-            }
-        }
         #[cfg(test)]
         trace_socket_probe(format!(
             "probe_complete leaf_fd={} outcome={:?}",
             leaf.as_raw_fd(),
             outcomes.get(&path)
         ));
-        Self::probe_result(
-            &display_path,
-            outcomes.get(&path),
-            refused_is_absence,
-        )
+        Self::probe_result(&display_path, outcomes.get(&path))
     }
 
     fn sleep(&self, duration: Duration) {
@@ -937,63 +1028,93 @@ fn attempt<A: KeyedAccess>(
         Some(pid) => access.process(pid)?,
         None => None,
     };
-    if let (Some(pid), Some(process)) = (pid, process_first.as_ref()) {
-        let expected = metadata
-            .as_ref()
-            .and_then(SessionMetadata::daemon_start_token)
-            .ok_or_else(|| {
-                KeyedSessionError::new(
-                    KeyedSessionErrorKind::ProcessIdentity,
-                    Some(metadata_path.clone()),
-                    format!("live process {pid} has no registry start identity"),
-                )
-            })?;
-        if !process.live_identity.matches_registry_start_token(expected) {
-            return Err(KeyedSessionError::new(
-                KeyedSessionErrorKind::ProcessIdentity,
-                Some(metadata_path.clone()),
-                format!("process {pid} birth identity does not match the registry"),
-            ));
-        }
-    }
-
-    let socket_reachable = if (first.readable_socket.is_some()
-        || first.bounded_socket.is_some())
-        && process_first.is_none()
-    {
-        let expected = if socket_name == OsStr::new(&bounded_socket) {
-            first.bounded_socket.as_ref()
-        } else {
-            first.readable_socket.as_ref()
-        }
-        .expect("selected present socket has a captured stamp");
-        access.probe_socket(
-            root,
-            &socket_name,
-            expected,
-            pid.is_some(),
-            options.socket_probe_budget,
-        )?
-    } else {
-        false
-    };
-    let status = if metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.has_exited() || metadata.exit_code.is_some())
-    {
-        SessionStatus::Exited
-    } else if process_first.is_some() || socket_reachable {
-        SessionStatus::Running
-    } else if metadata.is_some() {
-        SessionStatus::Vanished
-    } else {
+    // As in list.rs, a PID sidecar with no record or socket is not a session.
+    if metadata.is_none() && first.readable_socket.is_none() && first.bounded_socket.is_none() {
         return Err(KeyedSessionError::new(
             KeyedSessionErrorKind::ProcessIdentity,
             Some(root_path.to_path_buf()),
             "present session artifacts do not identify a session",
         ));
+    }
+    // The registry's identity rule (list.rs): a live leader's start token, then
+    // for a match its recorded boot; a positively absent PID is gone; legacy
+    // metadata naming no PID is gone only when no PID or socket remains.
+    let identity = match (pid, process_first.as_ref()) {
+        (Some(pid), Some(process)) => {
+            let (record, expected) = metadata
+                .as_ref()
+                .and_then(|record| Some((record, record.daemon_start_token()?)))
+                .ok_or_else(|| {
+                    KeyedSessionError::new(
+                        KeyedSessionErrorKind::ProcessIdentity,
+                        Some(metadata_path.clone()),
+                        format!("live process {pid} has no registry start identity"),
+                    )
+                })?;
+            if !process.live_identity.matches_registry_start_token(expected) {
+                return Err(KeyedSessionError::new(
+                    KeyedSessionErrorKind::ProcessIdentity,
+                    Some(metadata_path.clone()),
+                    format!("process {pid} birth identity does not match the registry"),
+                ));
+            }
+            check_boot_identity(record, || access.boot_id())
+        }
+        (Some(_), None) => DaemonIdentityCheck::Gone,
+        (None, _)
+            if metadata.is_some()
+                && first.readable_socket.is_none()
+                && first.bounded_socket.is_none() =>
+        {
+            DaemonIdentityCheck::Gone
+        }
+        (None, _) => DaemonIdentityCheck::Unknown,
     };
-    let observed_pid = (process_first.is_some()).then_some(pid).flatten();
+
+    // Socket reachability is transport evidence, never process identity: a
+    // gone or mismatched PID is never rescued by a listener. Only a record
+    // naming no PID at all is probed, and the probe can confirm what list
+    // reports for it or fail closed, never turn it into a loss.
+    let status = if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.has_exited() || metadata.exit_code.is_some())
+    {
+        SessionStatus::Exited
+    } else {
+        match identity {
+            DaemonIdentityCheck::Match => SessionStatus::Running,
+            DaemonIdentityCheck::Mismatch | DaemonIdentityCheck::Gone => SessionStatus::Vanished,
+            DaemonIdentityCheck::Unknown if pid.is_some() => SessionStatus::Running,
+            DaemonIdentityCheck::Unknown => {
+                let expected = if socket_name == OsStr::new(&bounded_socket) {
+                    first.bounded_socket.as_ref()
+                } else {
+                    first.readable_socket.as_ref()
+                }
+                .expect("a record naming no PID that is not gone has a socket");
+                if !access.probe_socket(
+                    root,
+                    &socket_name,
+                    expected,
+                    options.socket_probe_budget,
+                )? {
+                    return Err(KeyedSessionError::new(
+                        KeyedSessionErrorKind::Changed,
+                        Some(socket_path),
+                        "session socket vanished during observation",
+                    ));
+                }
+                SessionStatus::Running
+            }
+        }
+    };
+    // As in list.rs, only a retained identity names its PID.
+    let observed_pid = matches!(
+        identity,
+        DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown
+    )
+    .then_some(pid)
+    .flatten();
 
     let second = capture(
         access,
@@ -1020,19 +1141,6 @@ fn attempt<A: KeyedAccess>(
             ));
         }
     }
-    let identity = if pid.is_some() && process_first.is_none()
-        || pid.is_none()
-            && metadata.is_some()
-            && first.readable_socket.is_none()
-            && first.bounded_socket.is_none()
-    {
-        DaemonIdentityCheck::Gone
-    } else {
-        // This observer proves the native start identity, but does not yet
-        // claim the registry's separate boot-identity authority.
-        DaemonIdentityCheck::Unknown
-    };
-
     Ok(Some(SessionInfo {
         name: name.to_owned(),
         socket_path,
@@ -1141,24 +1249,53 @@ mod tests {
         }
     }
 
+    fn live_metadata_on_boot(boot: &str) -> serde_json::Value {
+        let mut metadata = live_metadata();
+        metadata["daemonBootId"] = serde_json::Value::String(boot.into());
+        metadata
+    }
+
     #[test]
     fn stable_fixed_inputs_match_the_full_snapshot_oracle() {
-        for (label, value, expected) in [
-            ("live", live_metadata(), SessionStatus::Running),
+        use DaemonIdentityCheck::{Gone, Match, Mismatch, Unknown};
+        let boot = super::super::list::read_boot_id().expect("this host reports a boot identity");
+        for (label, value, expected, identity) in [
+            ("live", live_metadata(), SessionStatus::Running, Unknown),
+            (
+                "same-boot",
+                live_metadata_on_boot(&boot),
+                SessionStatus::Running,
+                Match,
+            ),
+            (
+                "other-boot",
+                live_metadata_on_boot(&format!("{boot}-other")),
+                SessionStatus::Vanished,
+                Mismatch,
+            ),
+            (
+                "gone-pid",
+                serde_json::json!({"createdAt":"2026-10-16T00:00:00Z","daemonPid":i32::MAX}),
+                SessionStatus::Vanished,
+                Gone,
+            ),
             (
                 "exited",
                 serde_json::json!({"createdAt":"2026-10-16T00:00:00Z","exitedAt":"2026-10-16T00:01:00Z","exitCode":0}),
                 SessionStatus::Exited,
+                Gone,
             ),
             (
                 "vanished",
                 serde_json::json!({"createdAt":"2026-10-16T00:00:00Z"}),
                 SessionStatus::Vanished,
+                Gone,
             ),
             (
                 "exit-code-only",
                 serde_json::json!({"createdAt":"2026-10-16T00:00:00Z","exitCode":0}),
                 SessionStatus::Exited,
+                Gone,
             ),
         ] {
             let root = Root::new(label);
@@ -1171,8 +1308,12 @@ mod tests {
             let KeyedSession::Found(found) = keyed else {
                 panic!("stable {label} target was not found: {keyed:?}");
             };
-            assert_eq!(found, listed);
-            assert_eq!(found.status, expected);
+            assert_eq!(found, listed, "{label}");
+            assert_eq!(
+                (found.status, found.identity),
+                (expected, identity),
+                "{label}"
+            );
         }
         let root = Root::new("missing");
         assert_eq!(
@@ -1206,6 +1347,81 @@ mod tests {
             assert_eq!(found.status, SessionStatus::Running);
             drop(listener);
         }
+    }
+
+    fn listed(root: &Root) -> SessionInfo {
+        super::super::list::list_sessions_in(&root.0, &ListOptions::default())
+            .into_iter()
+            .find(|session| session.name == "target")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_listener_never_rescues_a_gone_pid() {
+        for accepting in [true, false] {
+            let root = Root::new(if accepting {
+                "gone-listener"
+            } else {
+                "gone-stale"
+            });
+            root.metadata(
+                "target",
+                serde_json::json!({"createdAt":"2026-10-16T00:00:00Z","daemonPid":i32::MAX}),
+            );
+            let listener = UnixListener::bind(socket_path_in(&root.0, "target")).unwrap();
+            let listener = accepting.then_some(listener);
+            let _ = take_socket_probe_trace();
+            let keyed = observe_session_in(&root.0, "target", &fast());
+            let trace = take_socket_probe_trace();
+            let KeyedSession::Found(found) = keyed else {
+                panic!("gone PID with accepting={accepting} was not found: {keyed:?}");
+            };
+            assert_eq!(found, listed(&root), "accepting={accepting}");
+            assert_eq!(
+                (found.status, found.identity),
+                (SessionStatus::Vanished, DaemonIdentityCheck::Gone),
+                "accepting={accepting}"
+            );
+            assert!(
+                trace.iter().all(|event| !event.starts_with("pin_socket")),
+                "a gone PID's socket was probed: {trace:?}"
+            );
+            drop(listener);
+        }
+    }
+
+    #[test]
+    fn a_record_naming_no_pid_is_probed_but_never_turned_into_a_loss() {
+        let root = Root::new("no-pid");
+        root.metadata(
+            "target",
+            serde_json::json!({"createdAt":"2026-10-16T00:00:00Z"}),
+        );
+        let listener = UnixListener::bind(socket_path_in(&root.0, "target")).unwrap();
+        let keyed = observe_session_in(&root.0, "target", &fast());
+        let KeyedSession::Found(found) = keyed else {
+            panic!("an accepting socket for a record naming no PID was not found: {keyed:?}");
+        };
+        assert_eq!(found, listed(&root));
+        assert_eq!(
+            (found.status, found.identity),
+            (SessionStatus::Running, DaemonIdentityCheck::Unknown)
+        );
+        drop(listener);
+        // A refusing socket still lists as Running; this observer cannot
+        // prove the record either way, so it fails closed.
+        assert_eq!(listed(&root).status, SessionStatus::Running);
+        let refused = observe_session_in(&root.0, "target", &fast());
+        assert!(
+            matches!(
+                refused,
+                KeyedSession::Indeterminate(KeyedSessionError {
+                    kind: KeyedSessionErrorKind::SocketProbe,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -1277,7 +1493,7 @@ mod tests {
     fn invalid_socket_parent_is_indeterminate_not_absent() {
         let outcome = Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         assert!(matches!(
-            OsAccess::probe_result(Path::new("/pinned/target.sock"), Some(&outcome), false),
+            OsAccess::probe_result(Path::new("/pinned/target.sock"), Some(&outcome)),
             Err(KeyedSessionError {
                 kind: KeyedSessionErrorKind::SocketProbe,
                 ..
@@ -1288,24 +1504,12 @@ mod tests {
     fn uncorroborated_connection_refusal_is_indeterminate() {
         let refused = Err(io::Error::from_raw_os_error(libc::ECONNREFUSED));
         assert!(matches!(
-            OsAccess::probe_result(
-                Path::new("/pinned/target.sock"),
-                Some(&refused),
-                false
-            ),
+            OsAccess::probe_result(Path::new("/pinned/target.sock"), Some(&refused)),
             Err(KeyedSessionError {
                 kind: KeyedSessionErrorKind::SocketProbe,
                 ..
             })
         ));
-        assert_eq!(
-            OsAccess::probe_result(
-                Path::new("/pinned/target.sock"),
-                Some(&refused),
-                true
-            ),
-            Ok(false)
-        );
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1373,15 +1577,13 @@ mod tests {
             root: &Self::Root,
             filename: &OsStr,
             expected: &Stamp,
-            refused_is_absence: bool,
             budget: Duration,
         ) -> Result<bool, KeyedSessionError> {
             let mut counts = self.counts.borrow_mut();
             counts.probes += 1;
             counts.probe_budget += budget;
             drop(counts);
-            self.inner
-                .probe_socket(root, filename, expected, refused_is_absence, budget)
+            self.inner.probe_socket(root, filename, expected, budget)
         }
         fn sleep(&self, duration: Duration) {
             self.counts.borrow_mut().sleep_time += duration;
@@ -1466,11 +1668,9 @@ mod tests {
             root: &Self::Root,
             filename: &OsStr,
             expected: &Stamp,
-            refused_is_absence: bool,
             budget: Duration,
         ) -> Result<bool, KeyedSessionError> {
-            self.inner
-                .probe_socket(root, filename, expected, refused_is_absence, budget)
+            self.inner.probe_socket(root, filename, expected, budget)
         }
         fn sleep(&self, duration: Duration) {
             self.inner.sleep(duration);
@@ -1538,11 +1738,9 @@ mod tests {
             root: &Self::Root,
             filename: &OsStr,
             expected: &Stamp,
-            refused_is_absence: bool,
             budget: Duration,
         ) -> Result<bool, KeyedSessionError> {
-            self.inner
-                .probe_socket(root, filename, expected, refused_is_absence, budget)
+            self.inner.probe_socket(root, filename, expected, budget)
         }
         fn sleep(&self, duration: Duration) {
             self.inner.sleep(duration);

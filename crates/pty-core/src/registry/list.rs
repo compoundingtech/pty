@@ -461,7 +461,7 @@ fn check_daemon_identity_evidence(
     live_start_token: impl Fn(i32) -> Option<String>,
     live_boot_id: impl FnOnce() -> Option<String>,
 ) -> DaemonIdentityCheck {
-    use DaemonIdentityCheck::{Gone, Match, Mismatch, Unknown};
+    use DaemonIdentityCheck::{Gone, Mismatch, Unknown};
     if pid <= 0 {
         return Gone;
     }
@@ -480,25 +480,9 @@ fn check_daemon_identity_evidence(
     };
     match live_start_token(pid) {
         Some(live) if live != expected => Mismatch,
-        Some(_) => {
-            // A different readable token disproves ownership on any boot.
-            // Only a token match needs complete, stable boot evidence.
-            let Some(recorded) = metadata.daemon_boot_id.as_deref().filter(|id| !id.is_empty())
-            else {
-                return Unknown;
-            };
-            // Legacy macOS boottime changes with wall-clock steps. It cannot
-            // prove either equality or mismatch, including after a UUID upgrade.
-            if recorded.starts_with("darwin:{") {
-                return Unknown;
-            }
-            match live_boot_id() {
-                Some(live) if live.starts_with("darwin:{") => Unknown,
-                Some(live) if live == recorded => Match,
-                Some(_) => Mismatch,
-                None => Unknown,
-            }
-        }
+        // A different readable token disproves ownership on any boot.
+        // Only a token match needs complete, stable boot evidence.
+        Some(_) => check_boot_identity(metadata, live_boot_id),
         None => {
             #[cfg(target_os = "linux")]
             match linux_thread_group(pid) {
@@ -512,6 +496,33 @@ fn check_daemon_identity_evidence(
             }
             Unknown
         }
+    }
+}
+
+/// The boot half of a daemon identity, for a live leader whose start token
+/// already matches the record.
+pub(super) fn check_boot_identity(
+    metadata: &SessionMetadata,
+    live_boot_id: impl FnOnce() -> Option<String>,
+) -> DaemonIdentityCheck {
+    use DaemonIdentityCheck::{Match, Mismatch, Unknown};
+    let Some(recorded) = metadata
+        .daemon_boot_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        return Unknown;
+    };
+    // Legacy macOS boottime changes with wall-clock steps. It cannot
+    // prove either equality or mismatch, including after a UUID upgrade.
+    if recorded.starts_with("darwin:{") {
+        return Unknown;
+    }
+    match live_boot_id() {
+        Some(live) if live.starts_with("darwin:{") => Unknown,
+        Some(live) if live == recorded => Match,
+        Some(_) => Mismatch,
+        None => Unknown,
     }
 }
 
