@@ -521,6 +521,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+
 /// The token that proves an OS process identity: Linux `linux:<starttime>`
 /// (`/proc/<pid>/stat` field 22), macOS `darwin:<ps -o lstart=>`.
 ///

@@ -186,6 +186,7 @@ struct OpenRoot {
     fd: OwnedFd,
     path: PathBuf,
     pinned_path: PathBuf,
+
     device: u64,
     inode: u64,
     uid: libc::uid_t,
@@ -293,6 +294,7 @@ impl OsAccess {
         }
     }
 
+
     fn reporting_root(root: &OpenRoot) -> &Path {
         let configured_is_pinned = std::fs::metadata(&root.path).is_ok_and(|metadata| {
             metadata.dev() == root.device
@@ -305,6 +307,7 @@ impl OsAccess {
             &root.pinned_path
         }
     }
+
 
     #[cfg(target_os = "macos")]
     fn verify_pinned_root(root: &OpenRoot) -> Result<(), KeyedSessionError> {
@@ -472,7 +475,6 @@ impl OsAccess {
         }
         Ok(count > 0)
     }
-
 }
 
 impl KeyedAccess for OsAccess {
@@ -526,6 +528,7 @@ impl KeyedAccess for OsAccess {
             fd,
             path: root.to_path_buf(),
             pinned_path,
+
             device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
             uid: stat.st_uid,
@@ -1029,7 +1032,6 @@ fn attempt<A: KeyedAccess>(
         // claim the registry's separate boot-identity authority.
         DaemonIdentityCheck::Unknown
     };
-
 
     Ok(Some(SessionInfo {
         name: name.to_owned(),
@@ -1695,6 +1697,7 @@ mod tests {
         });
         assert!(matches!(observed, KeyedSession::Found(_)));
     }
+
 
     #[cfg(target_os = "macos")]
     #[test]
