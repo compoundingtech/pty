@@ -235,6 +235,11 @@ fn run(
             t.registry_seen |= present;
             let retained_exit = registry::read_metadata(name)
                 .is_some_and(|metadata| metadata.has_exited() || metadata.exit_code.is_some());
+            if retained_exit {
+                // finalize_exit flushes session_exit before saving terminal
+                // metadata. It may have done both after our first log read.
+                read_new_lines(t, &mut on_event);
+            }
             !exited && !removed && !retained_exit
         });
         if !follow_all && tracked.is_empty() {

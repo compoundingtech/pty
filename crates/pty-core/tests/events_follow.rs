@@ -321,3 +321,49 @@ fn callback_form_and_drop() {
         "stopped followers deliver nothing"
     );
 }
+
+#[test]
+fn terminal_metadata_drains_an_exit_published_after_the_first_read() {
+    let _ = root();
+    let name = unique_name("exit-between-scans");
+    registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
+    events::clear_events(&name).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let callback_name = name.clone();
+    let follower = EventFollower::start(
+        FollowerOptions::names(vec![name.clone()]),
+        move |event| {
+            if event.r#type == "bell" {
+                // The reader already captured this scan's bytes. Reproduce
+                // finalize_exit publishing its log then metadata before the
+                // follower checks the metadata, without timing a thread race.
+                events::append_event_sync(
+                    &callback_name,
+                    &Event::session_exit(&callback_name, 0, None),
+                )
+                .unwrap();
+                registry::write_metadata(
+                    &callback_name,
+                    &registry::SessionMetadata {
+                        exit_code: Some(0),
+                        exited_at: Some(registry::now_iso8601()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            tx.send(event.r#type).unwrap();
+        },
+    );
+    events::append_event_sync(&name, &Event::bell(&name)).unwrap();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "bell");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "session_exit"
+    );
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    drop(follower);
+}
