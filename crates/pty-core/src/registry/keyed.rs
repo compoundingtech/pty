@@ -29,17 +29,6 @@ use super::root::{socket_filenames, SUN_PATH_MAX};
 use super::root::socket_path_in;
 use crate::proctable::{self, Answer, LiveIdentity};
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    /// `connect(2)` relative to a directory descriptor (macOS 10.11 and later).
-    fn connectat(
-        fd: libc::c_int,
-        socket: libc::c_int,
-        address: *const libc::sockaddr,
-        length: libc::socklen_t,
-    ) -> libc::c_int;
-}
-
 const METADATA_LIMIT: u64 = 1024 * 1024;
 const PID_LIMIT: u64 = 64;
 const DEFAULT_ATTEMPTS: usize = 3;
@@ -465,82 +454,6 @@ impl OsAccess {
         }
         Ok(count > 0)
     }
-
-    /// Connect to `filename` relative to the pinned root, so the address is
-    /// the short leaf name whatever the root's length. `None` is the deadline.
-    #[cfg(target_os = "macos")]
-    fn connect_at(dir: i32, filename: &OsStr, budget: Duration) -> Option<io::Result<()>> {
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        let name = filename.as_bytes();
-        if name.len() >= address.sun_path.len() {
-            return Some(Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG)));
-        }
-        for (slot, byte) in address.sun_path.iter_mut().zip(name) {
-            *slot = *byte as libc::c_char;
-        }
-        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1;
-        address.sun_len = length as u8;
-        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        if raw < 0 {
-            return Some(Err(io::Error::last_os_error()));
-        }
-        // SAFETY: `socket` returned a new descriptor owned by this call.
-        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
-        let fd = socket.as_raw_fd();
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
-            || unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
-        {
-            return Some(Err(io::Error::last_os_error()));
-        }
-        // SAFETY: `address` is a live `sockaddr_un` of at least `length` bytes.
-        let connected = unsafe {
-            connectat(
-                dir,
-                fd,
-                (&address as *const libc::sockaddr_un).cast(),
-                length as libc::socklen_t,
-            )
-        };
-        if connected == 0 {
-            return Some(Ok(()));
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS) {
-            return Some(Err(error));
-        }
-        let mut ready = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let timeout = libc::c_int::try_from(budget.as_millis()).unwrap_or(libc::c_int::MAX);
-        match unsafe { libc::poll(&mut ready, 1, timeout) } {
-            0 => None,
-            count if count < 0 => Some(Err(io::Error::last_os_error())),
-            _ => {
-                let mut pending: libc::c_int = 0;
-                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                // SAFETY: both pointers are valid for the duration of the call.
-                if unsafe {
-                    libc::getsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        (&mut pending as *mut libc::c_int).cast(),
-                        &mut size,
-                    )
-                } < 0
-                {
-                    return Some(Err(io::Error::last_os_error()));
-                }
-                Some(match pending {
-                    0 => Ok(()),
-                    code => Err(io::Error::from_raw_os_error(code)),
-                })
-            }
-        }
-    }
 }
 
 impl KeyedAccess for OsAccess {
@@ -741,9 +654,10 @@ impl KeyedAccess for OsAccess {
         }
     }
 
-    // XNU refuses to open a socket node (EOPNOTSUPP), so macOS cannot pin the
-    // leaf as Linux does. It connects relative to the pinned root instead and
-    // refuses the answer if any root entry or the leaf changed meanwhile.
+    // XNU refuses to open a socket node (EOPNOTSUPP) and has no connectat, so
+    // macOS cannot pin the leaf as Linux does. It connects by the session's
+    // own address and refuses the answer if that address's directory stopped
+    // naming the pinned root, or if any root entry or the leaf changed.
     #[cfg(target_os = "macos")]
     fn probe_socket(
         &self,
@@ -752,15 +666,27 @@ impl KeyedAccess for OsAccess {
         expected: &Stamp,
         budget: Duration,
     ) -> Result<bool, KeyedSessionError> {
-        let display_path = root.pinned_path.join(filename);
-        let watch = Self::watch_directory(root.fd.as_raw_fd(), &display_path)?;
-        let unchanged = |when: &str| match self.stat_socket(root, filename)? {
-            Some(observed) if &observed == expected => Ok(()),
-            observed => Err(KeyedSessionError::new(
-                KeyedSessionErrorKind::Changed,
-                Some(display_path.clone()),
-                format!("socket leaf changed {when} the probe: {expected:?} -> {observed:?}"),
-            )),
+        let path = self.socket_path(root, filename)?;
+        let watch = Self::watch_directory(root.fd.as_raw_fd(), &path)?;
+        let unchanged = |when: &str| -> Result<(), KeyedSessionError> {
+            let names_root = path
+                .parent()
+                .and_then(|parent| std::fs::metadata(parent).ok())
+                .is_some_and(|metadata| {
+                    metadata.dev() == root.device
+                        && metadata.ino() == root.inode
+                        && metadata.file_type().is_dir()
+                });
+            match self.stat_socket(root, filename)? {
+                Some(observed) if names_root && &observed == expected => Ok(()),
+                observed => Err(KeyedSessionError::new(
+                    KeyedSessionErrorKind::Changed,
+                    Some(path.clone()),
+                    format!(
+                        "socket address changed {when} the probe: names pinned root={names_root}; {expected:?} -> {observed:?}"
+                    ),
+                )),
+            }
         };
         unchanged("before")?;
         #[cfg(test)]
@@ -769,24 +695,24 @@ impl KeyedAccess for OsAccess {
             root.fd.as_raw_fd(),
             root.device,
             root.inode,
-            display_path.display()
+            path.display()
         ));
         #[cfg(test)]
         run_socket_probe_hook(false);
-        let outcome = Self::connect_at(root.fd.as_raw_fd(), filename, budget);
+        let outcomes = super::list::probe_socket_results(std::slice::from_ref(&path), budget);
         #[cfg(test)]
         run_socket_probe_hook(true);
         unchanged("during")?;
-        if Self::directory_changed(&watch, &display_path)? {
+        if Self::directory_changed(&watch, &path)? {
             return Err(KeyedSessionError::new(
                 KeyedSessionErrorKind::Changed,
-                Some(display_path),
+                Some(path),
                 "registry root entries changed during the probe",
             ));
         }
         #[cfg(test)]
-        trace_socket_probe(format!("probe_complete outcome={outcome:?}"));
-        Self::probe_result(&display_path, outcome.as_ref())
+        trace_socket_probe(format!("probe_complete outcome={:?}", outcomes.get(&path)));
+        Self::probe_result(&path, outcomes.get(&path))
     }
 
     #[cfg(not(target_os = "macos"))]
