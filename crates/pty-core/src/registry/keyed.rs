@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::list::{ListOptions, SessionInfo, SessionStatus};
+use super::list::{DaemonIdentityCheck, ListOptions, SessionInfo, SessionStatus};
 use super::metadata::SessionMetadata;
 use super::names::validate_name_lexical;
 use super::root::{socket_filenames, SUN_PATH_MAX};
@@ -1017,12 +1017,26 @@ fn attempt<A: KeyedAccess>(
             ));
         }
     }
+    let identity = if pid.is_some() && process_first.is_none()
+        || pid.is_none()
+            && metadata.is_some()
+            && first.readable_socket.is_none()
+            && first.bounded_socket.is_none()
+    {
+        DaemonIdentityCheck::Gone
+    } else {
+        // This observer proves the native start identity, but does not yet
+        // claim the registry's separate boot-identity authority.
+        DaemonIdentityCheck::Unknown
+    };
+
 
     Ok(Some(SessionInfo {
         name: name.to_owned(),
         socket_path,
         pid: observed_pid,
         status,
+        identity,
         metadata,
     }))
 }
