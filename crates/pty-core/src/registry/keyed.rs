@@ -18,6 +18,8 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use super::list::linux_thread_group;
 use super::list::{
     DaemonIdentityCheck, ListOptions, SessionInfo, SessionStatus, check_boot_identity,
     current_boot_id,
@@ -182,6 +184,9 @@ struct Companion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessEvidence {
     live_identity: LiveIdentity,
+    /// The PID names a thread-group leader. Linux `/proc/<pid>/stat` also
+    /// answers for a thread id, which is never a recorded daemon.
+    leader: bool,
 }
 
 #[derive(Debug)]
@@ -641,8 +646,29 @@ impl KeyedAccess for OsAccess {
                         format!("process {pid} has no readable birth identity"),
                     )
                 })?;
+                #[cfg(target_os = "linux")]
+                let leader = match linux_thread_group(pid) {
+                    Ok(Some(tgid)) => tgid == pid,
+                    Ok(None) => {
+                        return Err(KeyedSessionError::new(
+                            KeyedSessionErrorKind::ProcessIdentity,
+                            None,
+                            format!("process {pid} reports no thread group"),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(KeyedSessionError::new(
+                            KeyedSessionErrorKind::ProcessIdentity,
+                            None,
+                            format!("process {pid} thread group is unreadable: {error}"),
+                        ));
+                    }
+                };
+                #[cfg(not(target_os = "linux"))]
+                let leader = true;
                 Ok(Some(ProcessEvidence {
                     live_identity: identity,
+                    leader,
                 }))
             }
             Answer::NotPresent => Ok(None),
@@ -966,6 +992,8 @@ fn attempt<A: KeyedAccess>(
     // for a match its recorded boot; a positively absent PID is gone; legacy
     // metadata naming no PID is gone only when no PID or socket remains.
     let identity = match (pid, process_first.as_ref()) {
+        // As in list.rs, a live thread of another process is not the leader.
+        (Some(_), Some(process)) if !process.leader => DaemonIdentityCheck::Mismatch,
         (Some(pid), Some(process)) => {
             let (record, expected) = metadata
                 .as_ref()
@@ -1347,6 +1375,51 @@ mod tests {
                 })
             ),
             "{refused:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_worker_thread_is_not_the_recorded_leader() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(unsafe { libc::syscall(libc::SYS_gettid) } as i32)
+                .unwrap();
+            let _ = parked.recv();
+        });
+        let tid = receiver.recv().unwrap();
+        // The thread's own start token and the current boot: everything but
+        // leadership matches.
+        let stat = std::fs::read_to_string(format!("/proc/{tid}/stat")).unwrap();
+        let start = stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .to_owned();
+        let boot = super::super::list::read_boot_id().expect("this host reports a boot identity");
+        let root = Root::new("worker-thread");
+        root.metadata(
+            "target",
+            serde_json::json!({
+                "createdAt": "2026-10-16T00:00:00Z",
+                "daemonPid": tid,
+                "daemonStartToken": format!("linux:{start}"),
+                "daemonBootId": boot,
+            }),
+        );
+        let keyed = observe_session_in(&root.0, "target", &fast());
+        let listed = listed(&root);
+        drop(release);
+        worker.join().unwrap();
+        let KeyedSession::Found(found) = keyed else {
+            panic!("worker-thread record was not found: {keyed:?}");
+        };
+        assert_eq!(found, listed);
+        assert_eq!(
+            (found.status, found.identity),
+            (SessionStatus::Vanished, DaemonIdentityCheck::Mismatch)
         );
     }
 

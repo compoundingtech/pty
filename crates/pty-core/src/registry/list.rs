@@ -358,7 +358,7 @@ pub(super) fn current_boot_id() -> Option<String> {
     crate::boot::read_boot_identity()
 }
 
-fn linux_thread_group(pid: i32) -> std::io::Result<Option<i32>> {
+pub(super) fn linux_thread_group(pid: i32) -> std::io::Result<Option<i32>> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     Ok(status
         .lines()
