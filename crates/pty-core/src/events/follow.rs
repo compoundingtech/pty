@@ -157,6 +157,16 @@ fn wake_on_change(tx: &SyncSender<()>, result: notify::Result<notify::Event>) {
     }
 }
 
+fn registry_entry_removed(name: &str) -> bool {
+    // Permanent respawn holds the creation lock across cleanup and replacement
+    // publication (reconcile_permanent). Confirm absence under that same lock;
+    // a missing pathname while its publisher owns the lock is not an exit.
+    let Ok(Some(_guard)) = registry::try_acquire_file_lock(&registry::lock_path(name)) else {
+        return false;
+    };
+    !metadata_path(name).exists()
+}
+
 fn run(
     options: FollowerOptions,
     mut on_event: impl FnMut(Event),
@@ -231,7 +241,7 @@ fn run(
                 return true;
             }
             let present = metadata_path(name).exists();
-            let removed = t.registry_seen && !present;
+            let removed = t.registry_seen && !present && registry_entry_removed(name);
             t.registry_seen |= present;
             let retained_exit = registry::read_metadata(name)
                 .is_some_and(|metadata| metadata.has_exited() || metadata.exit_code.is_some());
@@ -348,9 +358,13 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let wake = rx.recv_timeout(Duration::from_millis(300));
+        assert!(matches!(wake, Err(RecvTimeoutError::Timeout)), "read caused a scan: {wake:?}");
+        // A silent or broken watcher must not make the idle assertion pass.
+        std::fs::write(&path, "changed\n").unwrap();
+        let changed = rx.recv_timeout(Duration::from_secs(2));
         drop(watcher);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(matches!(wake, Err(RecvTimeoutError::Timeout)), "read caused a scan: {wake:?}");
+        assert!(changed.is_ok(), "a real write must wake the follower: {changed:?}");
     }
 
     #[test]

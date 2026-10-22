@@ -11,7 +11,8 @@ Flags:
   -t, --timeout <sec>  Timeout (seconds) for --wait or follow; exit 1 on timeout
 
 Options may appear before or after <ref>. A named follow exits when the session
-exits or its registry entry is removed; --all continues watching new sessions.
+exits or its registry entry is removed outside a locked respawn; --all continues
+watching new sessions. Terminal metadata is followed by a final event-log drain.
 --wait exits 1 if the session ends before a matching event, or on timeout.
 
 Examples:

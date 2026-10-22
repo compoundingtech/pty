@@ -367,3 +367,49 @@ fn terminal_metadata_drains_an_exit_published_after_the_first_read() {
     ));
     drop(follower);
 }
+
+#[test]
+fn registry_removal_waits_for_a_locked_respawn_to_finish() {
+    let _ = root();
+    for republish in [true, false] {
+        let name = unique_name("locked-respawn");
+        registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
+        events::clear_events(&name).unwrap();
+        let (follower, rx) = EventFollower::channel(FollowerOptions {
+            poll_interval: Duration::from_millis(20),
+            ..FollowerOptions::names(vec![name.clone()])
+        });
+        // As in reconcile_permanent, keep the creation claim across removal
+        // and replacement publication, including more than one fallback scan.
+        let claim = registry::try_acquire_file_lock(&registry::lock_path(&name))
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(registry::metadata_path(&name)).unwrap();
+        std::fs::remove_file(registry::events_path(&name)).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ), "a locked publication gap must not disconnect the follower");
+        if republish {
+            registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
+        }
+        claim.release();
+        if republish {
+            events::append_event_sync(&name, &Event::session_respawn(&name)).unwrap();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap().r#type,
+                "session_respawn"
+            );
+            events::append_event_sync(&name, &Event::session_exit(&name, 0, None)).unwrap();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap().r#type,
+                "session_exit"
+            );
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        drop(follower);
+    }
+}
