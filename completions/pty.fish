@@ -121,7 +121,7 @@ complete -c pty -n '__pty_using_command events' -l recent -d 'Print recent + exi
 complete -c pty -n '__pty_using_command events' -l json -d 'Emit JSON'
 complete -c pty -n '__pty_using_command events' -l type -x -d 'Print all retained events of exact type'
 complete -c pty -n '__pty_using_command events' -l wait -d 'Wait for a specific event type'
-complete -c pty -n '__pty_using_command events' -l timeout -s t -d 'Timeout (seconds) for --wait'
+complete -c pty -n '__pty_using_command events' -l timeout -s t -d 'Timeout (seconds) for --wait or follow'
 complete -c pty -n '__pty_using_command events' -a '(__pty_sessions)' -d 'Session'
 complete -c pty -n '__pty_using_command list ls' -l json -d 'Emit JSON'
 complete -c pty -n '__pty_using_command list ls' -l strict -d 'With --json, emit per-root inventory; exit 3 if incomplete'

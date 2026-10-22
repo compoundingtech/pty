@@ -52,8 +52,9 @@ pub fn run(args: &[String]) -> CliResult {
     let mut event_type: Option<&str> = None;
     let mut timeout = 0f64;
     let mut cur = Argv::new(args);
-    // Leading dash-tokens are flags; an unknown one ends the loop and is the ref.
-    while cur.at_dash() {
+    let mut reference = None;
+    // Options may precede or follow the session reference.
+    while !cur.is_empty() {
         match cur.peek() {
             Some("--all") => {
                 all = true;
@@ -77,10 +78,10 @@ pub fn run(args: &[String]) -> CliResult {
             Some("-t") | Some("--timeout") if cur.has_next() => {
                 timeout = js_parse_float(cur.take_value().unwrap_or_default());
             }
+            _ if reference.is_none() => reference = cur.next(),
             _ => break,
         }
     }
-    let reference = cur.peek();
 
     if !all && reference.is_none() {
         return Err(USAGE.into());
@@ -138,13 +139,14 @@ fn cmd_events(
         return Err(CliError(format!("Session \"{name}\" not found.")));
     }
 
+    let deadline = (timeout > 0.0).then(|| {
+        Instant::now() + Duration::from_secs_f64(timeout.min(u32::MAX as f64))
+    });
+
     if let Some(wait_type) = wait_type {
         let Some(name) = name else {
             return Err("--wait requires a session name.".into());
         };
-        let deadline = (timeout > 0.0).then(|| {
-            Instant::now() + Duration::from_secs_f64(timeout.min(u32::MAX as f64))
-        });
         exit_zero_on_sigint();
         let (_follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.to_string()]));
         loop {
@@ -173,7 +175,7 @@ fn cmd_events(
                     );
                     return Ok(1);
                 }
-                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+                Err(RecvTimeoutError::Disconnected) => return Ok(1),
             }
         }
     }
@@ -184,8 +186,25 @@ fn cmd_events(
         _ => FollowerOptions::all(),
     };
     let (_follower, rx) = EventFollower::channel(options);
-    while let Ok(event) = rx.recv() {
-        println!("{}", render(&event, json));
+    loop {
+        let recv = match deadline {
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    Err(RecvTimeoutError::Timeout)
+                } else {
+                    rx.recv_timeout(d - now)
+                }
+            }
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match recv {
+            Ok(event) => println!("{}", render(&event, json)),
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("Timed out after {}s following events.", js_number(timeout));
+                return Ok(1);
+            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(0),
+        }
     }
-    Ok(0)
 }
