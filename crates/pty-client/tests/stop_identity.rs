@@ -133,25 +133,56 @@ fn missing_identity_refuses_stop() {
 
 #[test]
 fn live_legacy_missing_boot_lists_unknown_but_explicit_stop_works() {
-    for recorded_token in [true, false] {
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, Some(token(pid)), None);
+    let sessions = pty_core::registry::list_sessions_in(
+        &fixture.root,
+        &pty_core::registry::ListOptions::default(),
+    );
+    assert_eq!(sessions[0].status, pty_core::registry::SessionStatus::Running);
+    assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
+    assert!(matches!(
+        pty_client::remove_in(&fixture.root, "owner"),
+        Err(pty_client::RemoveError::StillRunning { .. })
+    ));
+    assert!(pty_client::stop_in(&fixture.root, "owner", Some("original"))
+        .unwrap()
+        .verified_empty());
+    fixture.child.wait().unwrap();
+    pty_client::remove_in(&fixture.root, "owner").unwrap();
+}
+
+#[test]
+fn legacy_sidecar_without_a_recorded_start_token_stays_refused() {
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, None, None);
+    assert!(matches!(
+        pty_client::signal_in(&fixture.root, "owner", libc::SIGTERM, Some("original")),
+        Err(pty_client::SignalError::NotRunning { .. })
+    ));
+    assert_unknown_listing_and_refusal(&mut fixture, pid);
+}
+
+#[test]
+fn a_legacy_verified_stop_is_distinguishable_from_a_match() {
+    for boot_evidence in [true, false] {
         let mut fixture = Fixture::new(child());
         let pid = fixture.child.id() as i32;
-        let _socket = fixture.record(pid, recorded_token.then(|| token(pid)), None);
-        let sessions = pty_core::registry::list_sessions_in(
-            &fixture.root,
-            &pty_core::registry::ListOptions::default(),
+        let _socket = fixture.record(pid, Some(token(pid)), boot_evidence.then(boot));
+        let stopped = pty_client::stop_in(&fixture.root, "owner", Some("original")).unwrap();
+        assert!(stopped.verified_empty(), "{stopped:?}");
+        assert_eq!(
+            stopped.identity,
+            if boot_evidence {
+                pty_core::registry::ControlIdentityCheck::Match
+            } else {
+                pty_core::registry::ControlIdentityCheck::LegacyVerified
+            },
+            "only full identity proof may report Match",
         );
-        assert_eq!(sessions[0].status, pty_core::registry::SessionStatus::Running);
-        assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
-        assert!(matches!(
-            pty_client::remove_in(&fixture.root, "owner"),
-            Err(pty_client::RemoveError::StillRunning { .. })
-        ));
-        assert!(pty_client::stop_in(&fixture.root, "owner", Some("original"))
-            .unwrap()
-            .verified_empty());
         fixture.child.wait().unwrap();
-        pty_client::remove_in(&fixture.root, "owner").unwrap();
     }
 }
 

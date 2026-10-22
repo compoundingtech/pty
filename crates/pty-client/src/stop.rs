@@ -12,7 +12,9 @@ use pty_core::process_tree::{
     sweep_groups,
 };
 use pty_core::proctable::{Answer, LiveIdentity, ProcTable};
-use pty_core::registry::{self, DaemonIdentityCheck, SessionMetadata, SessionStatus};
+use pty_core::registry::{
+    self, ControlIdentityCheck, DaemonIdentityCheck, SessionMetadata, SessionStatus,
+};
 
 /// How long the daemon gets to finish its shutdown. It re-flushes the exit
 /// record on the way out, so returning early would let a following
@@ -103,6 +105,10 @@ pub struct Stopped {
     /// The `ptyfile` tag of a permanent session: the manifest that will put
     /// the strategy back on the next `pty up`.
     pub ptyfile: Option<String>,
+    /// The authority every identity check before the signal accepted: `Match`
+    /// for full identity proof, `LegacyVerified` for a record without boot
+    /// evidence. Only `Match` may count as automatic retirement proof.
+    pub identity: ControlIdentityCheck,
 }
 
 impl Stopped {
@@ -254,6 +260,7 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
         escalated,
         was_permanent,
         ptyfile,
+        identity: daemon.identity,
     })
 }
 
@@ -444,16 +451,17 @@ fn require_identity(
     pid: i32,
     metadata: &SessionMetadata,
     explicit_control: bool,
-) -> Result<(), StopError> {
+) -> Result<ControlIdentityCheck, StopError> {
     if !explicit_control {
-        return require_daemon_identity(name, pid, metadata);
+        require_daemon_identity(name, pid, metadata)?;
+        return Ok(ControlIdentityCheck::Match);
     }
-    if registry::read_control_target_with(name, Some(metadata)) == Some(pid) {
-        return Ok(());
+    match registry::read_control_target_authority_with(name, Some(metadata)) {
+        Some((target, authority)) if target == pid => Ok(authority),
+        _ => Err(StopError::SignalFailed {
+            name: name.to_string(),
+        }),
     }
-    Err(StopError::SignalFailed {
-        name: name.to_string(),
-    })
 }
 
 /// Reuse the exact-owner capability used by launch-operation recovery.
@@ -461,6 +469,9 @@ fn require_identity(
 struct DaemonHandle {
     handle: pty_core::operation::exact::Exact,
     explicit_control: bool,
+    /// The authority accepted when the handle was pinned. Later checks must
+    /// accept the same one.
+    identity: ControlIdentityCheck,
     #[cfg(not(target_os = "linux"))]
     start_token: String,
 }
@@ -480,7 +491,7 @@ impl DaemonHandle {
         metadata: &SessionMetadata,
         explicit_control: bool,
     ) -> Result<Self, StopError> {
-        require_identity(name, pid, metadata, explicit_control)?;
+        let identity = require_identity(name, pid, metadata, explicit_control)?;
         let owner = pty_core::operation::ProcessId::of(pid as u32).map_err(|_| {
             StopError::SignalFailed {
                 name: name.to_string(),
@@ -496,14 +507,16 @@ impl DaemonHandle {
             .ok_or_else(|| StopError::SignalFailed {
                 name: name.to_string(),
             })?;
-        // If the numeric PID changed before pinning, refuse the new owner.
-        require_identity(name, pid, metadata, explicit_control)?;
-        Ok(Self {
+        let handle = Self {
             handle,
             explicit_control,
+            identity,
             #[cfg(not(target_os = "linux"))]
             start_token: owner.start_token,
-        })
+        };
+        // If the numeric PID changed before pinning, refuse the new owner.
+        handle.require_identity(name, pid, metadata)?;
+        Ok(handle)
     }
 
     fn require_identity(
@@ -512,7 +525,12 @@ impl DaemonHandle {
         pid: i32,
         metadata: &SessionMetadata,
     ) -> Result<(), StopError> {
-        require_identity(name, pid, metadata, self.explicit_control)
+        if require_identity(name, pid, metadata, self.explicit_control)? == self.identity {
+            return Ok(());
+        }
+        Err(StopError::SignalFailed {
+            name: name.to_string(),
+        })
     }
 
     fn signal(&self, name: &str, pid: i32, metadata: &SessionMetadata) -> Result<(), StopError> {

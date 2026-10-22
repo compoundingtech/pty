@@ -124,15 +124,19 @@ authority. Metadata with no named PID and no PID/socket companions is Gone and
 removable.
 
 **Legacy controls do not upgrade inventory proof.** Records without
-`daemonBootId` retain operation-specific pre-boot-publication checks. Stop may
-select a tokenless PID only from its sidecar; metadata-only fallback requires
-a matching `recovery.processStartToken`. A child signal always requires a
-recorded daemon PID and matching recorded start token, even with a sidecar.
-Removal sends no signal: it refuses running sessions, waits for an exited
-record's owner to leave, then checks generation ownership before unlinking.
-The selected live PID must agree with any recorded PID and any recorded start
-token must match. This separate `LegacyVerified` outcome is not Match and cannot
-clear publication fences or authorize automatic retirement.
+`daemonBootId` retain operation-specific pre-boot-publication checks, and every
+legacy control needs a recorded start token. Stop may select a PID from its
+sidecar; metadata-only fallback requires a matching `recovery.processStartToken`.
+A child signal always requires a recorded daemon PID and matching recorded start
+token, even with a sidecar. Removal sends no signal: it refuses running sessions,
+waits for an exited record's owner to leave, then checks generation ownership
+before unlinking. The selected live PID must agree with any recorded PID, and
+the recorded start token must be present and match. A legacy record without a
+start token is refused, and cleaning it up is manual: a numeric PID alone cannot
+tell its daemon from a reused PID. This separate `LegacyVerified` outcome is not
+Match and cannot clear publication fences or authorize automatic retirement.
+`Stopped::identity` reports whether a stop was authorized by `Match` or by
+`LegacyVerified`, so a caller treats only a `Match` stop as retirement proof.
 Present boot evidence always takes the strict full-tuple path, including refusal
 when the evidence mismatches or cannot be read. There is no historical producer
 version marker: removing boot evidence from a modern record selects the same
