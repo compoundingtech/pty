@@ -329,14 +329,17 @@ fn terminal_metadata_drains_an_exit_published_after_the_first_read() {
     registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
     events::clear_events(&name).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
+    let (publication_tx, publication_rx) = std::sync::mpsc::channel();
     let callback_name = name.clone();
     let follower = EventFollower::start(
         FollowerOptions::names(vec![name.clone()]),
         move |event| {
             if event.r#type == "bell" {
-                // The reader already captured this scan's bytes. Reproduce
-                // finalize_exit publishing its log then metadata before the
-                // follower checks the metadata, without timing a thread race.
+                // The reader already captured this scan's bytes. Wait until
+                // the preceding append has returned and released its event
+                // lock before reproducing finalize_exit's log then metadata
+                // publication, still before the follower checks metadata.
+                publication_rx.recv().unwrap();
                 events::append_event_sync(
                     &callback_name,
                     &Event::session_exit(&callback_name, 0, None),
@@ -356,6 +359,7 @@ fn terminal_metadata_drains_an_exit_published_after_the_first_read() {
         },
     );
     events::append_event_sync(&name, &Event::bell(&name)).unwrap();
+    publication_tx.send(()).unwrap();
     assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "bell");
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
