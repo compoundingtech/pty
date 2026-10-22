@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Serialize, Serializer};
 
 use pty_core::protocol::AttachedClient;
-use pty_core::registry::{self, SessionInfo};
+use pty_core::registry::{self, KeyedSession, SessionInfo};
 
 use super::stats::query_attached_clients;
 
@@ -97,6 +97,15 @@ pub fn list(root: &Path, options: &ListOptions) -> Vec<ListedSession> {
             info,
         })
         .collect()
+}
+
+/// Observe one immutable session id without enumerating the registry.
+pub fn observe(
+    root: &Path,
+    name: &str,
+    options: &registry::KeyedSessionOptions,
+) -> KeyedSession {
+    registry::observe_session_in(root, name, options)
 }
 
 /// Attached clients for each of `sessions`, index-aligned. Rows that are not
