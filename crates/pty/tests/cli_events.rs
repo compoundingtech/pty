@@ -8,7 +8,7 @@ mod cli_common;
 
 use std::io::Write;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cli_common::Rig;
 use serde_json::json;
@@ -212,4 +212,78 @@ fn follow_exits_zero_on_sigint() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).ends_with("] f: bell\n"));
+}
+
+fn finish_within(mut child: std::process::Child, limit: Duration) -> std::process::Output {
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            panic!("events did not exit within {limit:?}: {out:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn timeout_applies_after_the_reference_for_wait_and_follow() {
+    let rig = Rig::new();
+    rig.write_meta("deadline", json!({}));
+    for args in [
+        vec!["events", "deadline", "--wait", "user.never", "--timeout", "1", "--json"],
+        vec!["events", "deadline", "--wait", "user.never", "-t", "1", "--json"],
+        vec!["events", "deadline", "--timeout", "1", "--json"],
+        vec!["events", "--all", "-t", "1", "--json"],
+    ] {
+        let started = Instant::now();
+        let child = rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let out = finish_within(child, Duration::from_secs(2));
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Timed out after 1s"));
+    }
+}
+
+#[test]
+fn named_followers_stop_on_exit_or_registry_removal_and_wait_fails_without_a_match() {
+    let rig = Rig::new();
+    for (name, wait, remove) in [
+        ("exit-follow", false, false),
+        ("remove-follow", false, true),
+        ("exit-wait", true, false),
+        ("remove-wait", true, true),
+    ] {
+        rig.write_meta(name, json!({}));
+        let mut args = vec!["events", name, "--json"];
+        if wait {
+            args.extend(["--wait", "user.never"]);
+        }
+        let child = rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        if remove {
+            std::fs::remove_file(rig.path(&format!("{name}.json"))).unwrap();
+        } else {
+            append_event(&rig, name, &json!({
+                "session": name, "type": "session_exit",
+                "ts": "2026-01-02T03:04:06.000Z", "exitCode": 0
+            }).to_string());
+        }
+        let out = finish_within(child, Duration::from_secs(2));
+        assert_eq!(out.status.code(), Some(i32::from(wait)), "{out:?}");
+        if !wait && !remove {
+            assert!(String::from_utf8_lossy(&out.stdout).contains("session_exit"));
+        }
+    }
+}
+
+#[test]
+fn follower_exits_after_a_real_session_ends() {
+    let rig = Rig::new();
+    rig.ok(&["run", "-d", "--id", "finite", "--", "sleep", "1"]);
+    let child = rig.cmd(&["events", "finite", "--json"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let out = finish_within(child, Duration::from_secs(3));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
