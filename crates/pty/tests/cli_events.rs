@@ -6,7 +6,7 @@
 
 mod cli_common;
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -246,22 +246,48 @@ fn timeout_applies_after_the_reference_for_wait_and_follow() {
     }
 }
 
-#[test]
-fn named_followers_stop_on_exit_or_registry_removal_and_wait_fails_without_a_match() {
-    let rig = Rig::new();
-    for (name, wait, remove) in [
-        ("exit-follow", false, false),
-        ("remove-follow", false, true),
-        ("exit-wait", true, false),
-        ("remove-wait", true, true),
-    ] {
-        rig.write_meta(name, json!({}));
-        let mut args = vec!["events", name, "--json"];
-        if wait {
-            args.extend(["--wait", "user.never"]);
+fn ready_follower(rig: &Rig, name: &str) -> (std::process::Child, std::thread::JoinHandle<String>) {
+    let mut child = rig.cmd(&["events", name, "--json"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"] == "user.ready" {
+                let _ = tx.send(());
+            }
+            output.push_str(&line);
+            output.push('\n');
         }
-        let child = rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        std::thread::sleep(Duration::from_millis(400));
+        output
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // A sentinel written before the follower's EOF snapshot can be history;
+        // keep publishing until stdout proves this follower consumed one.
+        append_event(rig, name, &json!({
+            "session": name, "type": "user.ready", "ts": "2026-01-02T03:04:05.000Z"
+        }).to_string());
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(()) => return (child, reader),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            result => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("follower never acknowledged readiness: {result:?}; {}", reader.join().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn named_followers_stop_on_exit_or_registry_removal_after_readiness() {
+    let rig = Rig::new();
+    for (name, remove) in [("exit-follow", false), ("remove-follow", true)] {
+        rig.write_meta(name, json!({}));
+        let (child, reader) = ready_follower(&rig, name);
         if remove {
             std::fs::remove_file(rig.path(&format!("{name}.json"))).unwrap();
         } else {
@@ -271,11 +297,32 @@ fn named_followers_stop_on_exit_or_registry_removal_and_wait_fails_without_a_mat
             }).to_string());
         }
         let out = finish_within(child, Duration::from_secs(2));
-        assert_eq!(out.status.code(), Some(i32::from(wait)), "{out:?}");
-        if !wait && !remove {
-            assert!(String::from_utf8_lossy(&out.stdout).contains("session_exit"));
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = reader.join().unwrap();
+        if !remove {
+            assert!(stdout.contains("session_exit"), "{stdout}");
         }
     }
+}
+
+#[test]
+fn wait_fails_without_match_for_retained_exited_session() {
+    let rig = Rig::new();
+    // --wait deliberately emits no readiness or nonmatching events. Publish
+    // retained terminal metadata before startup instead of timing readiness;
+    // core channel tests separately prove live removal and exit ordering.
+    rig.write_meta("exited-wait", json!({
+        "exitCode": 0, "exitedAt": "2026-01-02T03:04:06.000Z"
+    }));
+    append_event(&rig, "exited-wait", &json!({
+        "session": "exited-wait", "type": "session_exit",
+        "ts": "2026-01-02T03:04:06.000Z", "exitCode": 0
+    }).to_string());
+    let child = rig.cmd(&["events", "exited-wait", "--wait", "user.never", "--json"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
 }
 
 #[test]

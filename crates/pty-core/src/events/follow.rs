@@ -158,13 +158,10 @@ fn wake_on_change(tx: &SyncSender<()>, result: notify::Result<notify::Event>) {
 }
 
 fn registry_entry_removed(name: &str) -> bool {
-    // Permanent respawn holds the creation lock across cleanup and replacement
-    // publication (reconcile_permanent). Confirm absence under that same lock;
-    // a missing pathname while its publisher owns the lock is not an exit.
-    let Ok(Some(_guard)) = registry::try_acquire_file_lock(&registry::lock_path(name)) else {
-        return false;
-    };
-    !metadata_path(name).exists()
+    // Permanent respawn holds a creation claim across cleanup and replacement
+    // publication. Observe its live owner without creating, stealing, or
+    // removing a writer's claim: followers must never make a creator Busy.
+    !registry::is_creation_lock_held(name) && !metadata_path(name).exists()
 }
 
 fn run(
@@ -351,6 +348,11 @@ mod tests {
             wake_on_change(&tx, result);
         }).unwrap();
         watcher.watch(&dir, RecursiveMode::NonRecursive).unwrap();
+        // Establish that the watch is delivering changes before measuring
+        // silence. In particular, FSEvents may attach asynchronously.
+        std::fs::write(&path, "canary\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
         let status = std::process::Command::new("sh")
             .args(["-c", "i=0; while [ \"$i\" -lt 100 ]; do cat \"$1\" >/dev/null; i=$((i + 1)); done", "read-logs"])
             .arg(&path)

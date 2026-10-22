@@ -417,3 +417,69 @@ fn registry_removal_waits_for_a_locked_respawn_to_finish() {
         drop(follower);
     }
 }
+
+#[test]
+fn removal_observation_never_mutates_creation_claims() {
+    use notify::Watcher;
+    let _ = root();
+    for stale in [false, true] {
+        let name = unique_name("readonly-removal");
+        registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
+        events::clear_events(&name).unwrap();
+        let lock = registry::lock_path(&name);
+        let record = format!("{} stale-test-claim", i32::MAX);
+        assert!(!registry::pid_alive(i32::MAX));
+        if stale {
+            std::fs::write(&lock, &record).unwrap();
+        }
+        let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+        let watched_lock = lock.clone();
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if let Ok(event) = event
+                && event.paths.contains(&watched_lock)
+                && matches!(event.kind, notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_) | notify::EventKind::Remove(_))
+            {
+                lock_tx.send(event.kind).unwrap();
+            }
+        }).unwrap();
+        watcher.watch(&root(), notify::RecursiveMode::NonRecursive).unwrap();
+        let (follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.clone()]));
+        std::fs::remove_file(registry::metadata_path(&name)).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(lock_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a follower must not create, steal, or remove a creation claim");
+        assert_eq!(std::fs::read_to_string(&lock).ok(), stale.then_some(record));
+        drop(follower);
+        drop(watcher);
+    }
+}
+
+#[test]
+fn removal_observation_never_makes_a_concurrent_creator_busy() {
+    let _ = root();
+    let name = unique_name("concurrent-creator");
+    registry::write_metadata(&name, &registry::SessionMetadata::default()).unwrap();
+    events::clear_events(&name).unwrap();
+    let (follower, rx) = EventFollower::channel(FollowerOptions {
+        poll_interval: Duration::from_millis(1),
+        ..FollowerOptions::names(vec![name.clone()])
+    });
+    let claim = registry::lock_or_refusal(&registry::lock_path(&name)).unwrap();
+    std::fs::remove_file(registry::metadata_path(&name)).unwrap();
+    let creator = std::thread::spawn(move || {
+        claim.release();
+        for _ in 0..100 {
+            registry::lock_or_refusal(&registry::lock_path(&name)).unwrap().release();
+        }
+    });
+    creator.join().unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    drop(follower);
+}
