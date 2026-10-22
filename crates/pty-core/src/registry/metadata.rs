@@ -35,19 +35,19 @@ pub struct SessionMetadata {
     /// Opaque daemon-generation token (32 hex). Legacy records lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
-    /// Pid of the daemon that owns this generation. Accepted for liveness
-    /// and signal authority only with matching recorded boot and start
-    /// identities, plus thread-group leadership on Linux.
+    /// Pid of the daemon that owns this generation. Full inventory identity
+    /// requires matching boot and start identities plus Linux leadership.
+    /// Explicit controls separately permit absence-only legacy verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_pid: Option<i32>,
     /// Start identity of the Rust daemon that published this generation.
     /// Node generations carry the equivalent token in
-    /// `recovery.processStartToken`. Missing tokens make identity Unknown.
+    /// `recovery.processStartToken`. Missing tokens make full identity Unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_start_token: Option<String>,
-    /// Recorded boot identity of the daemon on Linux and macOS. Required
-    /// alongside its start token; missing boot identity is Unknown and
-    /// grants no signal authority, including for legacy records.
+    /// Recorded boot identity of the daemon on Linux and macOS. Required for
+    /// full inventory identity. Only absence permits the control-only legacy
+    /// policy; present but invalid boot evidence never does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_boot_id: Option<String>,
     /// Recovery capability advertised by Node daemons. Opaque here: preserved

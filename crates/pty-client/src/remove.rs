@@ -82,7 +82,9 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
             name: name.to_string(),
         });
     };
-    if session.identity == DaemonIdentityCheck::Unknown {
+    if session.identity == DaemonIdentityCheck::Unknown
+        && registry::read_control_target_with(name, session.metadata.as_ref()).is_none()
+    {
         return Err(RemoveError::IdentityUnverified {
             name: name.to_string(),
         });
@@ -100,7 +102,14 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
     let generation = session.metadata.as_ref().and_then(|m| m.generation.clone());
     let sidecar = registry::read_session_pid(name);
     let daemon_pid = sidecar.or_else(|| session.metadata.as_ref().and_then(|m| m.daemon_pid));
-    wait_for_owner_loss(name, sidecar, session.metadata.as_ref())?;
+    if let Some(metadata) = session.metadata.as_ref()
+        && metadata.daemon_boot_id.is_none()
+        && let Some(pid) = registry::read_control_target_with(name, Some(metadata))
+    {
+        wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT, true)?;
+    } else {
+        wait_for_owner_loss(name, sidecar, session.metadata.as_ref())?;
+    }
 
     // Re-check generation ownership in the same critical section as the
     // unlink so a replacement that published meanwhile is left alone.
@@ -144,7 +153,7 @@ fn wait_for_owner_loss(
                     name: name.to_string(),
                 });
             };
-            wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT)
+            wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT, false)
         }
     }
 }
@@ -154,20 +163,35 @@ fn wait_for_recorded_daemon_exit(
     pid: i32,
     metadata: &SessionMetadata,
     timeout: Duration,
+    explicit_control: bool,
 ) -> Result<(), RemoveError> {
     let started = Instant::now();
     loop {
-        match registry::check_daemon_identity(pid, metadata) {
-            DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => return Ok(()),
-            DaemonIdentityCheck::Unknown => {
+        let check = if explicit_control {
+            registry::check_control_identity(pid, metadata)
+        } else {
+            match registry::check_daemon_identity(pid, metadata) {
+                DaemonIdentityCheck::Match => registry::ControlIdentityCheck::Match,
+                DaemonIdentityCheck::Mismatch => registry::ControlIdentityCheck::Mismatch,
+                DaemonIdentityCheck::Gone => registry::ControlIdentityCheck::Gone,
+                DaemonIdentityCheck::Unknown => registry::ControlIdentityCheck::Unknown,
+            }
+        };
+        match check {
+            registry::ControlIdentityCheck::Gone | registry::ControlIdentityCheck::Mismatch => {
+                return Ok(());
+            }
+            registry::ControlIdentityCheck::Unknown => {
                 return Err(RemoveError::IdentityUnverified {
                     name: name.to_string(),
                 });
             }
-            DaemonIdentityCheck::Match if registry::has_process_exited_for_reap(pid) => {
+            registry::ControlIdentityCheck::Match | registry::ControlIdentityCheck::LegacyVerified
+                if registry::has_process_exited_for_reap(pid) =>
+            {
                 return Ok(());
             }
-            DaemonIdentityCheck::Match => {}
+            registry::ControlIdentityCheck::Match | registry::ControlIdentityCheck::LegacyVerified => {}
         }
         if started.elapsed() >= timeout {
             return Err(RemoveError::DaemonDidNotExit {

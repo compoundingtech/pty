@@ -140,10 +140,10 @@ pub struct Signalled {
 /// `name` is the exact session id; display names are not resolved.
 ///
 /// With `expected_generation`, the session's record must still carry that
-/// generation. Either way, the daemon must be the one the record binds by
-/// start identity, and the daemon that answers the STATUS query must be that
-/// same process. Only then is the child it reports signalled: its process
-/// group first, the child alone when the group cannot be.
+/// generation. Either way, the daemon must satisfy the record's control
+/// identity checks (including legacy records without boot evidence), and the
+/// daemon that answers STATUS must be that same process. Only then is the
+/// child it reports signalled: its group first, then the child alone.
 ///
 /// One window remains. The child can exit and be reaped after the daemon
 /// answers and before the signal lands, and its pid can then in principle
@@ -167,7 +167,7 @@ pub fn signal(
             actual: metadata.generation.clone(),
         });
     }
-    let Some(bound) = registry::read_signal_target_with(name, Some(&metadata)) else {
+    let Some(bound) = registry::read_control_signal_target_with(name, Some(&metadata)) else {
         return Err(SignalError::NotRunning {
             name: name.to_string(),
         });
