@@ -5,14 +5,14 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pty_core::process_tree::{
-    ProcessIdentity, groups_in_tree, members_of_groups, own_process_group, signal_group,
-    snapshot_from_table, sweep_groups,
+    ProcessIdentity, groups_in_tree, members_of_groups, own_process_group, snapshot_from_table,
+    sweep_groups,
 };
 use pty_core::proctable::{Answer, LiveIdentity, ProcTable};
-use pty_core::registry::{self, SessionStatus};
+use pty_core::registry::{self, DaemonIdentityCheck, SessionMetadata, SessionStatus};
 
 /// How long the daemon gets to finish its shutdown. It re-flushes the exit
 /// record on the way out, so returning early would let a following
@@ -171,11 +171,24 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
             actual: generation.map(str::to_string),
         });
     }
+    // Running is a conservative display projection, not ownership authority.
+    if session.identity == DaemonIdentityCheck::Unknown {
+        return Err(StopError::SignalFailed {
+            name: name.to_string(),
+        });
+    }
     let (SessionStatus::Running, Some(pid)) = (session.status, session.pid) else {
         return Err(StopError::NotRunning {
             name: name.to_string(),
         });
     };
+    let metadata = session
+        .metadata
+        .as_ref()
+        .ok_or_else(|| StopError::SignalFailed {
+            name: name.to_string(),
+        })?;
+    let daemon = DaemonHandle::open(name, pid, metadata)?;
 
     // Drop the `strategy` tag so `pty gc` does not start the session again
     // on its next pass.
@@ -193,36 +206,43 @@ pub fn stop(name: &str, expected_generation: Option<&str>) -> Result<Stopped, St
     // reparented to init, so the parent links that identify them as this
     // session's processes are gone. This snapshot is the only chance to learn
     // which processes the word "killed" would be a claim about.
-    // One table read serves both. The snapshot drops a descendant whose start
-    // identity could not be read; the group list does not, because a group
-    // needs no identity. So a process the snapshot cannot name is still inside
-    // a group this operation will signal.
+    // Only exact snapshot identities can authorize later group signals.
+    // Unknown or newly joined members fence the whole group out.
+    require_daemon_identity(name, pid, metadata)?;
     let table = ProcTable::read();
     let before = snapshot_from_table(pid, &table);
-    let groups = groups_in_tree(pid, &table);
+    let mut groups = groups_in_tree(pid, &table);
+    let own_group = own_process_group();
+    groups.retain(|group| *group != own_group);
+    require_daemon_identity(name, pid, metadata)?;
 
-    // SAFETY: kill(2) with a pid from the registry.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        return Err(StopError::SignalFailed {
-            name: name.to_string(),
-        });
-    }
+    daemon.signal(name, pid, metadata)?;
 
-    if !wait_for_process_exit(pid, SHUTDOWN_WAIT) {
+    if !daemon.wait_for_exit(SHUTDOWN_WAIT) {
         return Err(StopError::DaemonStillRunning {
             name: name.to_string(),
             pid,
             socket: registry::socket_path(name),
         });
     }
-    registry::cleanup_socket(name);
+    let owner = registry::SessionGenerationOwner {
+        generation: generation.unwrap_or_default().to_string(),
+        pid,
+    };
+    let cleaned = registry::cleanup_owned_socket(name, &owner);
     let mut after = aftermath(&before);
     let mut escalated = None;
-    if !after.all_gone() {
-        escalated = Some(escalate_over_groups(&groups));
+    if !after.all_gone() || !members_of_groups(&groups, &ProcTable::read()).is_empty() {
+        escalated = Some(escalate_over_groups(&groups, &before));
         // Re-measure. The result must describe the machine now, not the
         // signals that were sent at it.
         after = aftermath(&before);
+    }
+    if !cleaned {
+        eprintln!("pty_stop_cleanup_refused name={name:?} pid={pid} generation={generation:?}");
+        return Err(StopError::SignalFailed {
+            name: name.to_string(),
+        });
     }
     Ok(Stopped {
         name: name.to_string(),
@@ -287,37 +307,353 @@ fn aftermath(before: &[ProcessIdentity]) -> Aftermath {
     )
 }
 
-/// TERM the groups, wait, KILL what is left, wait, then re-read the process
-/// table. Returns the pids still alive in those groups.
-fn escalate_over_groups(groups: &[i32]) -> Vec<i32> {
+/// TERM then KILL only pinned original members. Unknown members fence out
+/// the group; a later numeric PID or process-group reuse cannot redirect
+/// a signal. Unsupported platforms fail closed and report survivors.
+fn escalate_over_groups(groups: &[i32], before: &[ProcessIdentity]) -> Vec<i32> {
     sweep_groups(
         groups,
         own_process_group(),
         ESCALATE_TERM_WAIT,
         ESCALATE_KILL_WAIT,
         |targets| members_of_groups(targets, &ProcTable::read()),
-        signal_group,
+        |group, signal| {
+            let table = ProcTable::read();
+            if group_is_owned(group, before, &table) {
+                signal_pinned_members(group, signal, before, &table);
+            }
+        },
     )
+}
+
+fn group_is_owned(group: i32, before: &[ProcessIdentity], table: &ProcTable) -> bool {
+    group_is_owned_with(group, before, table, |id| {
+        pty_core::proctable::process(id.pid)
+            .known()
+            .is_some_and(|row| row.pgid == group && row.identity.as_ref() == Some(&id.identity))
+    })
+}
+
+fn group_is_owned_with(
+    group: i32,
+    before: &[ProcessIdentity],
+    table: &ProcTable,
+    fresh_match: impl Fn(&ProcessIdentity) -> bool,
+) -> bool {
+    if !table.is_complete() {
+        return false;
+    }
+    let members = members_of_groups(&[group], table);
+    !members.is_empty()
+        && members.iter().all(|pid| {
+            before.iter().any(|id| {
+                id.pid == *pid
+                    && table.identity(*pid).known().as_ref() == Some(&id.identity)
+                    && fresh_match(id)
+            })
+        })
+}
+
+fn signal_pinned_members(group: i32, signal: i32, before: &[ProcessIdentity], table: &ProcTable) {
+    use pty_core::operation::{ProcessId, exact::Exact};
+    let Some(boot) = registry::read_boot_id() else {
+        return;
+    };
+    let mut handles = Vec::new();
+    for pid in members_of_groups(&[group], table) {
+        let Some(identity) = before.iter().find(|id| id.pid == pid) else {
+            return;
+        };
+        let Ok(owner) = ProcessId::of(pid as u32) else {
+            return;
+        };
+        if owner.start_token != identity.identity.as_str() || owner.boot_id != boot {
+            return;
+        }
+        let Ok(Some(handle)) = Exact::pin(&owner, Some(&boot)) else {
+            return;
+        };
+        if !pty_core::proctable::process(pid)
+            .known()
+            .is_some_and(|row| {
+                row.pgid == group && row.identity.as_ref() == Some(&identity.identity)
+            })
+        {
+            return;
+        }
+        handles.push(handle);
+    }
+    for handle in handles {
+        // The capability pins the original owner; failure is measured as a
+        // survivor, never retried through a numeric PID or process group.
+        let _ = handle.signal(signal);
+    }
 }
 
 fn verified_empty(after: &Aftermath, escalated: Option<&[i32]>) -> bool {
     after.all_gone() && escalated.is_none_or(<[i32]>::is_empty)
 }
 
-fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if !registry::pid_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+/// An independently verified daemon already sent SIGTERM. GC can wait on
+/// this opaque capability after releasing registry locks, without mutating
+/// tags or resolving the numeric PID again.
+pub struct SignalledDaemon {
+    handle: DaemonHandle,
+}
+
+impl SignalledDaemon {
+    /// Wait only for the process bound when it was signalled.
+    pub fn wait_for_exit(&self, timeout: Duration) -> bool {
+        self.handle.wait_for_exit(timeout)
     }
-    !registry::pid_alive(pid)
+}
+
+/// Signal a proven daemon without registry mutations. This does not acquire
+/// registry locks, so callers can validate their record while holding them.
+pub fn signal_daemon(
+    name: &str,
+    pid: i32,
+    metadata: &SessionMetadata,
+) -> Result<SignalledDaemon, StopError> {
+    let handle = DaemonHandle::open(name, pid, metadata)?;
+    handle.signal(name, pid, metadata)?;
+    Ok(SignalledDaemon { handle })
+}
+
+fn require_daemon_identity(
+    name: &str,
+    pid: i32,
+    metadata: &SessionMetadata,
+) -> Result<(), StopError> {
+    let check = registry::check_daemon_identity(pid, metadata);
+    if check == DaemonIdentityCheck::Match {
+        return Ok(());
+    }
+    eprintln!("pty_stop_identity_refused name={name:?} pid={pid} result={check:?}");
+    Err(StopError::SignalFailed {
+        name: name.to_string(),
+    })
+}
+
+/// Reuse the exact-owner capability used by launch-operation recovery.
+/// Unsupported or refused pinning never downgrades to numeric signalling.
+struct DaemonHandle {
+    handle: pty_core::operation::exact::Exact,
+    #[cfg(not(target_os = "linux"))]
+    start_token: String,
+}
+
+impl DaemonHandle {
+    fn open(name: &str, pid: i32, metadata: &SessionMetadata) -> Result<Self, StopError> {
+        require_daemon_identity(name, pid, metadata)?;
+        let owner = pty_core::operation::ProcessId::of(pid as u32).map_err(|_| {
+            StopError::SignalFailed {
+                name: name.to_string(),
+            }
+        })?;
+        let handle =
+            pty_core::operation::exact::Exact::pin(&owner, metadata.daemon_boot_id.as_deref())
+                .map_err(|_| StopError::SignalFailed {
+                    name: name.to_string(),
+                })?
+                .ok_or_else(|| StopError::SignalFailed {
+                    name: name.to_string(),
+                })?;
+        // If the numeric PID changed before pinning, refuse the new owner.
+        require_daemon_identity(name, pid, metadata)?;
+        Ok(Self {
+            handle,
+            #[cfg(not(target_os = "linux"))]
+            start_token: owner.start_token,
+        })
+    }
+
+    fn signal(&self, name: &str, pid: i32, metadata: &SessionMetadata) -> Result<(), StopError> {
+        require_daemon_identity(name, pid, metadata)?;
+        self.handle
+            .signal(libc::SIGTERM)
+            .map_err(|_| StopError::SignalFailed {
+                name: name.to_string(),
+            })
+    }
+
+    fn wait_for_exit(&self, timeout: Duration) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.handle.wait_exit(timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Do not install a numeric-PID exit watch after signalling.
+            // A new incarnation is proof that the recorded owner exited,
+            // not a process whose exit this operation may wait for.
+            let start = std::time::Instant::now();
+            loop {
+                if original_owner_exited(
+                    &self.start_token,
+                    &pty_core::proctable::process(self.handle.pid()),
+                ) {
+                    return true;
+                }
+                if start.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn original_owner_exited(expected: &str, observation: &Answer<pty_core::proctable::Row>) -> bool {
+    match observation {
+        Answer::NotPresent => true,
+        Answer::Known(row) => {
+            row.is_zombie()
+                || row
+                    .identity
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() != expected)
+        }
+        Answer::Unknown(_) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_wait_never_waits_for_a_reused_owner_or_infers_exit_from_unknown() {
+        for (shape, exited) in [
+            ("10 1 10 S original", false),
+            ("10 1 10 S replacement", true),
+            ("10 1 10 Z original", true),
+            ("10 1 10 S -", false),
+        ] {
+            let table = pty_core::proctable::table_from_shape(shape);
+            let row = table.rows().next().unwrap().clone();
+            assert_eq!(
+                original_owner_exited("original", &Answer::Known(row)),
+                exited
+            );
+        }
+        assert!(original_owner_exited("original", &Answer::NotPresent));
+        assert!(!original_owner_exited(
+            "original",
+            &Answer::Unknown(pty_core::proctable::Unknown::TableUnreadable)
+        ));
+    }
+
+    #[test]
+    fn group_sweep_requires_exact_original_members_and_fresh_proof() {
+        let table = pty_core::proctable::table_from_shape("10 1 10\n11 10 10");
+        let before = vec![id(10, "tok:10"), id(11, "tok:11")];
+        assert!(group_is_owned_with(10, &before, &table, |_| true));
+        assert!(!group_is_owned_with(10, &before[..1], &table, |_| true));
+        assert!(!group_is_owned_with(10, &before, &table, |_| false));
+        let recycled = pty_core::proctable::table_from_shape("10 1 10 S new\n11 10 10");
+        assert!(!group_is_owned_with(10, &before, &recycled, |_| true));
+        let unknown = pty_core::proctable::table_from_shape("10 1 10 S -\n11 10 10");
+        assert!(!group_is_owned_with(10, &before, &unknown, |_| true));
+        assert!(!group_is_owned_with(
+            10,
+            &before,
+            &table.marked_incomplete(),
+            |_| true
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    struct SacrificialChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SacrificialChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sacrificial_child() -> SacrificialChild {
+        SacrificialChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_registry_identity_never_signals_an_unrelated_child() {
+        let mut child = sacrificial_child();
+        let pid = child.0.id() as i32;
+        let root = std::env::temp_dir().join(format!("ptystop-{}-{}", std::process::id(), pid));
+        std::fs::create_dir(&root).expect("create isolated registry");
+        struct RootCleanup(PathBuf);
+        impl Drop for RootCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RootCleanup(root.clone());
+        registry::with_root(&root, || {
+            let listener = std::os::unix::net::UnixListener::bind(registry::socket_path("stale"))
+                .expect("bind stale socket");
+            registry::write_pid("stale", child.0.id()).expect("write retained pid");
+            let metadata = SessionMetadata {
+                generation: Some("old-generation".to_string()),
+                daemon_pid: Some(pid),
+                daemon_start_token: Some("linux:1".to_string()),
+                ..SessionMetadata::default()
+            };
+            registry::write_metadata("stale", &metadata).expect("write stale metadata");
+            let listed = registry::get_session_by_name("stale").expect("retained session");
+            assert_ne!(
+                listed.status,
+                SessionStatus::Running,
+                "reused PID is not its daemon"
+            );
+            let result = stop("stale", Some("old-generation"));
+            assert!(
+                matches!(
+                    result,
+                    Err(StopError::NotRunning { .. }) | Err(StopError::SignalFailed { .. })
+                ),
+                "{result:?}"
+            );
+            assert!(
+                child.0.try_wait().expect("inspect owned child").is_none(),
+                "stale record must not signal the unrelated child"
+            );
+            assert!(
+                registry::socket_path("stale").exists(),
+                "refusal keeps stale evidence"
+            );
+            drop(listener);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_handle_independently_refuses_mismatched_and_missing_identity() {
+        let mut child = sacrificial_child();
+        let pid = child.0.id() as i32;
+        for token in [Some("linux:1".to_string()), None] {
+            let metadata = SessionMetadata {
+                generation: Some("same-generation".to_string()),
+                daemon_pid: Some(pid),
+                daemon_start_token: token,
+                ..SessionMetadata::default()
+            };
+            assert!(matches!(
+                DaemonHandle::open("unrelated", pid, &metadata),
+                Err(StopError::SignalFailed { .. })
+            ));
+            assert!(child.0.try_wait().expect("inspect owned child").is_none());
+        }
+    }
 
     fn id(pid: i32, token: &str) -> ProcessIdentity {
         ProcessIdentity {

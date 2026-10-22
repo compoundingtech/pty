@@ -29,12 +29,26 @@ fn catch_up_and_detach(d: &Daemon) {
     // The producer's file is the barrier: the whole six-MiB burst is now
     // generated. The attacher has deliberately consumed none of it yet.
     assert!(wait_until(T, || d.root.join("burst-done").exists()));
+    // Scan each packet once, keeping just enough of the last one for a
+    // marker split across two. Copying and rescanning everything received
+    // on every socket read is quadratic: on macOS, whose socket reads are
+    // small, a debug build took two minutes to find a marker that had
+    // arrived in under a second.
+    const MARKER: &[u8] = b"AFTER-THE-FLOOD";
+    let mut scanned = 0;
+    let mut tail = Vec::new();
     assert!(slow.wait_for(T, |packets| {
-        let bytes: Vec<_> = packets.iter()
-            .filter(|packet| matches!(packet.type_, MessageType::Data | MessageType::Screen))
-            .flat_map(|packet| packet.payload.iter().copied())
-            .collect();
-        bytes.windows(b"AFTER-THE-FLOOD".len()).any(|part| part == b"AFTER-THE-FLOOD")
+        for packet in &packets[scanned..] {
+            if matches!(packet.type_, MessageType::Data | MessageType::Screen) {
+                tail.extend_from_slice(&packet.payload);
+                if tail.windows(MARKER.len()).any(|part| part == MARKER) {
+                    return true;
+                }
+                tail.drain(..tail.len().saturating_sub(MARKER.len() - 1));
+            }
+        }
+        scanned = packets.len();
+        false
     }), "the daemon dropped live output while the attacher was catching up");
     assert!(!slow.is_closed(), "attachment must remain live after draining");
     slow.detach();

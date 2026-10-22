@@ -50,6 +50,40 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
+test = "events::animated_titles_do_not_fill_event_history"
+side = "node"
+kind = "intended"
+reason = """
+Rust keeps the current OSC 0/2 title in terminal state and forwards the \
+original output to attached clients, but no longer persists title_change \
+records. Animated titles are redraw state, not durable session facts; \
+writing every spinner frame replaces the event log and evicts useful \
+history. The pinned Node daemon still persists distinct title frames. \
+The fixture emits 40 animated OSC 0 titles, a final OSC 2 title and a BEL \
+processing barrier, then requires no title_change record. Old title records \
+remain readable and formattable. Remove this entry when Node stops \
+persisting titles, or if Rust resumes it.
+"""
+
+[[divergence]]
+test = "events::cursor_redraws_do_not_fill_event_history"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust daemons no longer write `cursor_visible` records \
+(compoundingtech/pty#172). A TUI hides and restores the cursor on many \
+frames, the terminal snapshot already carries cursor visibility, and those \
+records evicted durable history from the retained log. Old records still \
+parse and format. The fixture hides and shows the cursor twice, rings the \
+bell, waits for the bell and then requires no `cursor_visible` record. \
+Against pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in \
+Linux CI run 39256826955, the Node daemon wrote them. The Node on-disk \
+layout lists `cursor_visible` among the tier-1 event types, so this is a \
+change to what the event log contains, not only to its volume. Remove this \
+entry when Node stops persisting cursor restoration, or if Rust resumes it.
+"""
+
+[[divergence]]
 test = "events::recent_type_filter_returns_every_retained_match_and_preserves_envelopes_order"
 side = "node"
 kind = "intended"
@@ -63,6 +97,40 @@ original chronological order. The fixture proves old matches remain visible \
 behind both 51 newer unrelated events and more than 50 newer matching events. \
 Remove this entry when Node supports the same exact all-retained-match and \
 empty-success semantics, or if Rust removes it.
+"""
+
+[[divergence]]
+test = "gc::removes_only_dead_writer_atomic_temporaries"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust `gc` removes atomic-write leftovers named \
+`<target>.tmp.<pid>.<16 lowercase hex>` whose writer PID is dead, in the \
+registry and its `.activity` and `.recovery` directories \
+(compoundingtech/pty#172). Live or reused PIDs, malformed names, \
+directories, symlinks and `gc --dry-run` leave them in place. Against \
+pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 in Linux \
+CI run 39256826955, Node `gc` exited 0 and left the dead writer's \
+temporary behind. The Node on-disk layout gives these files no tier and \
+tells readers to ignore them, so collecting them changes nothing a reader \
+sees. Remove this entry when Node collects the same leftovers, or if Rust \
+stops.
+"""
+
+[[divergence]]
+test = "gc::daemon_automatically_removes_only_dead_writer_atomic_temporaries"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust daemons run the existing conservative dead-writer atomic-temp \
+sweep on entering the serving loop and every 30 seconds thereafter, \
+including while idle. This does not run full session GC or alter canonical \
+event history. The fixture covers event-lock and event-log temporaries in \
+the registry, `.activity`, and `.recovery`, preserving live writers, malformed \
+names, directories and symlinks. The existing explicit-GC divergence above \
+records that pinned Node leaves these ignored leftovers in place; automatic \
+collection is Rust-specific too. Remove this entry when Node provides the \
+same automatic cleanup, or if Rust removes it.
 """
 
 [[divergence]]
@@ -89,6 +157,40 @@ restarter's trace path. Rust removes the ambient path, as it removes \
 ST_AGENT and ST_ROOT, so the new process can use its own provenance file. \
 Explicit persisted --env values remain unchanged. Remove this entry when \
 Node removes the same ambient trace path on restart.
+"""
+
+[[divergence]]
+test = "list_liveness_budget::eperm_on_kill_zero_does_not_prove_daemon_identity"
+side = "node"
+kind = "intended"
+reason = """
+PTY.REG-R09 and decision 0010 separate display status from owner identity. \
+An unproven live PID remains running but must carry identity=unknown; EPERM \
+from kill-zero cannot grant Match or signal authority. The Node reference \
+does not expose this independent identity field. The shared case deliberately \
+requires the Rust contract rather than accepting PID existence as identity.
+"""
+
+[[divergence]]
+test = "list_liveness_budget::permission_denied_fleet_without_identity_is_listed_in_name_order"
+side = "node"
+kind = "intended"
+reason = """
+The shared case retains name ordering and requires running with identity=unknown \
+for every unproven PID, as specified by PTY.REG-R09 and decision 0010. \
+The Node reference has no independent identity field. Keep this divergence \
+until it exposes Unknown separately without treating missing evidence as death.
+"""
+
+[[divergence]]
+test = "list_liveness_budget::unreachable_fleet_waits_one_shared_deadline"
+side = "node"
+kind = "intended"
+reason = """
+The shared case retains its name-order and one-deadline timing assertions, \
+and requires unidentified socket rows to carry running with identity=unknown \
+under PTY.REG-R09 and decision 0010. The Node reference does not expose this \
+identity field. Socket reachability never proves owner identity.
 """
 
 [[divergence]]

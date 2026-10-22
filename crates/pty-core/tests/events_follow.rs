@@ -66,6 +66,72 @@ fn existing_files_start_at_eof() {
     assert_eq!(received[0].r#type, "title_change");
 }
 
+/// An event appended as soon as `start` returns is new, not history: the
+/// follower has its end-of-file baseline by then, as Node's does. When the
+/// thread took it later, a busy host turned these events into history and
+/// they were never delivered.
+#[test]
+fn an_event_appended_right_after_start_is_delivered() {
+    let _ = root();
+    for i in 0..50 {
+        let name = unique_name("start");
+        events::append_event_sync(&name, &Event::bell(&name)).unwrap();
+        let (mut follower, rx) = EventFollower::channel(FollowerOptions {
+            poll_interval: Duration::from_millis(10),
+            ..FollowerOptions::names(vec![name.clone()])
+        });
+        events::append_event_sync(&name, &Event::title_change(&name, "now")).unwrap();
+        let received = collect(&rx, 1, 10_000);
+        follower.stop();
+        assert_eq!(received.len(), 1, "iteration {i}: {received:?}");
+        assert_eq!(received[0].r#type, "title_change");
+    }
+}
+
+#[test]
+fn follower_sees_retained_new_records_when_a_batch_shrinks_and_regrows() {
+    let _ = root();
+    let name = unique_name("batch-retention");
+    let history: String = (0..900)
+        .map(|i| {
+            format!(
+                "{}\n",
+                Event::bell(&name).with_ts(&format!("old-{i}")).to_json()
+            )
+        })
+        .collect();
+    std::fs::write(registry::events_path(&name), &history).unwrap();
+    let (mut follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.clone()]));
+    std::thread::sleep(Duration::from_millis(100));
+    let writer = EventWriter::new(&name);
+    let padding = "x".repeat(2000);
+    for i in 0..300 {
+        writer.append(
+            Event::new(&name, "user.batch")
+                .with("seq", i)
+                .with("padding", padding.as_str()),
+        );
+    }
+    writer.flush();
+    assert!(
+        std::fs::metadata(registry::events_path(&name))
+            .unwrap()
+            .len()
+            > history.len() as u64
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    assert!(wait_for(3000, || {
+        while let Ok(event) = rx.try_recv() {
+            if event.r#type == "user.batch" {
+                seen.insert(event.get("seq").unwrap().as_u64().unwrap());
+            }
+        }
+        seen.len() == 300
+    }));
+    follower.stop();
+    assert_eq!(seen, (0..300).collect());
+}
+
 /// node: tests/events.test.ts:336-364
 #[test]
 fn directory_watch_replays_new_files_from_offset_zero() {

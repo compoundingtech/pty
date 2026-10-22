@@ -9,8 +9,8 @@ use std::path::Path;
 
 use pty_core::ptyfile::{self, PtyFile, PtySessionDef};
 use pty_core::registry::{
-    self, GC_BOOKKEEPING_KEYS, SessionInfo, TagMap, all_session_names, cleanup_all,
-    random_session_name, update_tags, validate_display_name, validate_name,
+    self, GC_BOOKKEEPING_KEYS, SessionInfo, TagMap, all_session_names, random_session_name,
+    update_tags, validate_display_name, validate_name,
 };
 
 use super::{CliError, CliResult, SpawnParams};
@@ -144,6 +144,13 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
         toml_tags.insert("ptyfile.tags".to_string(), user_toml_keys.join(","));
 
         let bound = find_bound(&existing, &toml_path, &sess.short_name);
+        if let Some(bound) = bound
+            && bound.identity == registry::DaemonIdentityCheck::Unknown
+        {
+            eprintln!("  \u{2717} {}: daemon identity is unknown.", label_of(bound));
+            skipped += 1;
+            continue;
+        }
 
         if let Some(bound) = bound
             && bound.is_running()
@@ -214,8 +221,8 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
             && bound.is_gone()
         {
             let label = label_of(bound);
-            if let Err(busy) = cleanup_all(&bound.name) {
-                eprintln!("  \u{2717} {label}: {}", busy.message(&bound.name));
+            if let Err(error) = pty_client::remove(&bound.name) {
+                eprintln!("  \u{2717} {label}: {error}");
                 skipped += 1;
                 continue;
             }
@@ -264,11 +271,8 @@ fn cmd_up(dir: Option<&str>, names: &[String]) -> CliResult {
             continue;
         }
 
-        let mut params = SpawnParams::new(
-            &name,
-            "/bin/sh",
-            &["-c".to_string(), sess.command.clone()],
-        );
+        let mut params =
+            SpawnParams::new(&name, "/bin/sh", &["-c".to_string(), sess.command.clone()]);
         params.display_command = sess.command.clone();
         params.cwd = sess
             .cwd

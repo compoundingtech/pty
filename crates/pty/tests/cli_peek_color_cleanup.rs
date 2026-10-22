@@ -24,7 +24,17 @@ fn ansi_peek_and_wait_restore_host_colors() {
                 }
                 Err(error) => panic!("accept fake peek: {error}"),
             };
-            socket.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            // The registry's reachability probe connects and closes at once.
+            // On macOS an accepted socket inherits the listener's O_NONBLOCK,
+            // and setting a timeout on one whose peer has already closed
+            // fails with EINVAL.
+            if socket.set_nonblocking(false).is_err()
+                || socket
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .is_err()
+            {
+                continue;
+            }
             let mut reader = PacketReader::new();
             let mut buf = [0; 256];
             let before = answered;

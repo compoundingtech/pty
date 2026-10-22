@@ -107,3 +107,123 @@ pub fn cleanup_owned_all(name: &str, owner: &SessionGenerationOwner) -> bool {
 pub fn cleanup(name: &str) {
     cleanup_all_while_locked(name);
 }
+
+/// Retire a stale observation only if the complete record and sidecar still
+/// agree under event + creation locks. Exit metadata is historical evidence,
+/// not a reason to retain a boot-stale generation and its companions forever.
+pub fn retire_stale_daemon_record(name: &str, observed: &super::metadata::SessionMetadata) -> bool {
+    if super::names::validate_name(name).is_err() {
+        return false;
+    }
+    let Some((current, observed_pid)) =
+        super::list::read_identity_record(&super::root::session_dir(), name)
+    else {
+        return false;
+    };
+    if current != *observed {
+        return false;
+    }
+    retire_stale_daemon_observation(name, observed, observed_pid)
+}
+
+fn record_has_stale_boot_identity(metadata: &super::metadata::SessionMetadata) -> bool {
+    // Calendar dates cannot prove a boot boundary: both kern.boottime and
+    // Linux btime move with clock steps. The old Darwin boot identity was
+    // itself a calendar date, so it cannot authorize retirement either.
+    let Some(recorded) = metadata
+        .daemon_boot_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && !id.starts_with("darwin:{"))
+    else {
+        return false;
+    };
+    super::list::current_boot_id()
+        .filter(|id| !id.starts_with("darwin:{"))
+        .is_some_and(|current| current != recorded)
+}
+
+fn retire_stale_daemon_observation(
+    name: &str,
+    observed: &super::metadata::SessionMetadata,
+    observed_pid: Option<i32>,
+) -> bool {
+    use super::list::{DaemonIdentityCheck, check_record_identity, read_identity_record};
+    with_both_locks(name, || {
+        let Some((current, current_pid)) = read_identity_record(&super::root::session_dir(), name) else {
+            return false;
+        };
+        if current != *observed || current_pid != observed_pid {
+            return false;
+        }
+        // Startup retirement is not GC policy: preserve retained history and
+        // permanent launch recipes even when their old runtime binding is gone.
+        if super::tags::is_keep_requested(current.tags.as_ref())
+            || current.tags.as_ref().and_then(|tags| tags.get("strategy"))
+                .is_some_and(|strategy| strategy == "permanent")
+        {
+            return false;
+        }
+        let Some(pid) = observed_pid.or(current.daemon_pid) else {
+            return false;
+        };
+        let identity = check_record_identity(observed_pid, Some(&current));
+        match identity {
+            DaemonIdentityCheck::Mismatch => {}
+            DaemonIdentityCheck::Gone if record_has_stale_boot_identity(&current) => {}
+            _ => return false,
+        }
+        // Keep metadata until every companion is removed, so an I/O failure
+        // leaves a generation-fenced record available for the next startup.
+        let removed = [
+            socket_path(name), pid_path(name), events_path(name),
+            recovery_revision_path(name), output_activity_path(name), metadata_path(name),
+        ].into_iter().try_for_each(|path| match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        });
+        if let Err(error) = removed {
+            eprintln!(
+                "event=registry_retirement session={name:?} generation={:?} pid={pid} identity={} liveness=not-live action=incomplete error={error:?}",
+                current.generation, identity.as_str(),
+            );
+            return false;
+        }
+        eprintln!(
+            "event=registry_retirement session={name:?} generation={:?} pid={pid} identity={} liveness=not-live action=retired",
+            current.generation, identity.as_str(),
+        );
+        true
+    }).unwrap_or(false)
+}
+
+/// Best-effort signal-free startup retirement of proven stale boot bindings,
+/// including exited records, but never keep/permanent history or current-boot
+/// Gone records. The starting daemon's unpublished name is excluded.
+pub fn retire_stale_daemon_records(starting_name: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(super::root::session_dir()) else {
+        return 0;
+    };
+    let mut retired = 0;
+    for entry in entries.flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if super::atomic::is_tmp_name(&file_name) {
+            continue;
+        }
+        let Some(name) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        if name == starting_name || super::names::validate_name(name).is_err() {
+            continue;
+        }
+        if let Some((observed, observed_pid)) =
+            super::list::read_identity_record(&super::root::session_dir(), name)
+            && retire_stale_daemon_observation(name, &observed, observed_pid)
+        {
+            retired += 1;
+        }
+    }
+    retired
+}

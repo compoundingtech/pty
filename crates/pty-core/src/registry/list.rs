@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ use crate::unix_connect::{self, Connect};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
-    /// The daemon process is alive (or its socket is reachable).
+    /// A matching daemon, or an unproven owner conservatively retained.
     Running,
     /// The daemon wrote an exit record before shutting down.
     Exited,
@@ -62,16 +63,20 @@ pub struct SessionInfo {
     /// The stable id.
     pub name: String,
     pub socket_path: PathBuf,
-    /// The daemon pid when it is known to be alive, else `None`.
+    /// The named daemon pid, retained on Unknown; never signal authority.
     pub pid: Option<i32>,
     pub status: SessionStatus,
+    /// Ownership evidence, independent of the conservative display status.
+    pub identity: DaemonIdentityCheck,
     /// `None` when `<name>.json` is missing or unreadable (a socket-only
     /// entry).
+    /// Ordinary listings omit `last_lines`, `extra_env`, and `session_env`;
+    /// [`list_sessions_full`] and reference lookups retain them for restart.
     pub metadata: Option<SessionMetadata>,
 }
 
 impl SessionInfo {
-    /// Is the daemon alive?
+    /// Is the session conservatively listed as running? Not signal authority.
     pub fn is_running(&self) -> bool {
         self.status == SessionStatus::Running
     }
@@ -87,7 +92,7 @@ impl SessionInfo {
     }
 }
 
-/// Default shared budget for probing sockets whose pid looks dead.
+/// Default shared budget for strict unknown-identity transport diagnostics.
 pub const DEFAULT_SOCKET_PROBE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Per-socket connect timeout inside the probe.
@@ -96,7 +101,8 @@ pub const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Knobs for [`list_sessions_with`].
 #[derive(Debug, Clone)]
 pub struct ListOptions {
-    /// One deadline for every socket probe of this listing.
+    /// Shared deadline for strict unknown-identity socket diagnostics only.
+    /// Probes never establish liveness or override a proven mismatch/absence.
     pub socket_probe_budget: Duration,
 }
 
@@ -129,6 +135,7 @@ pub enum InventoryErrorKind {
     PidUnreadable,
     PidMalformed,
     ProbeTimeout,
+    IdentityUnknown,
 }
 
 /// An observation failure at an exact registry path.
@@ -150,6 +157,7 @@ fn serialize_inventory_path<S: serde::Serializer>(
 
 struct Scanner {
     strict: bool,
+    full_metadata: bool,
     errors: Vec<InventoryError>,
 }
 
@@ -181,7 +189,9 @@ impl Scanner {
                     // File::metadata uses fstat on the opened descriptor, not
                     // a path lookup that could race a sidecar replacement.
                     if !file.metadata()?.is_file() {
-                        return Err(std::io::Error::other("registry companion is not a regular file"));
+                        return Err(std::io::Error::other(
+                            "registry companion is not a regular file",
+                        ));
                     }
                     let mut bytes = Vec::new();
                     file.read_to_end(&mut bytes)?;
@@ -208,14 +218,7 @@ impl Scanner {
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
         let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
-        let result = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|value| {
-            if !value.is_object() {
-                return Err(<serde_json::Error as serde::de::Error>::custom(
-                    "metadata must be a JSON object",
-                ));
-            }
-            serde_json::from_value(value)
-        });
+        let result = super::list_metadata::parse_with_payloads(&bytes, self.full_metadata);
         match result {
             Ok(metadata) => Some(metadata),
             Err(error) => {
@@ -250,6 +253,22 @@ impl Scanner {
     }
 }
 
+/// Read a complete, regular-file identity observation without blocking on
+/// FIFOs or treating malformed/unreadable sidecars as absent.
+pub(super) fn read_identity_record(
+    root: &Path,
+    name: &str,
+) -> Option<(SessionMetadata, Option<i32>)> {
+    let mut scanner = Scanner {
+        strict: true,
+        full_metadata: true,
+        errors: Vec::new(),
+    };
+    let metadata = scanner.metadata(&root.join(format!("{name}.json")), false)?;
+    let sidecar = scanner.pid(&root.join(format!("{name}.pid")), false);
+    scanner.errors.is_empty().then_some((metadata, sidecar))
+}
+
 /// Is a process with `pid` alive? `kill(pid, 0)` succeeding or failing with
 /// `EPERM` (exists, not ours) both count as alive.
 ///
@@ -258,9 +277,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: signal 0 only checks for existence/permission.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Signal 0 only checks for existence/permission.
+    match crate::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
+    }
 }
 
 /// The sidecar `<name>.pid`, parsed like `parseInt(content.trim(), 10)`.
@@ -273,6 +294,225 @@ pub fn read_session_pid(name: &str) -> Option<i32> {
 fn read_session_pid_at(path: &Path) -> Option<i32> {
     let content = std::fs::read_to_string(path).ok()?;
     parse_leading_int(content.trim())
+}
+/// The result of proving a registry record against the live daemon identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DaemonIdentityCheck {
+    Match,
+    Mismatch,
+    Gone,
+    Unknown,
+}
+
+impl DaemonIdentityCheck {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Gone => "gone",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+static IDENTITY_MATCH: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_GONE: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Process-local, low-cardinality liveness observations; no per-scan logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonIdentityCounters {
+    pub matched: u64,
+    pub mismatched: u64,
+    pub gone: u64,
+    pub unknown: u64,
+}
+
+pub fn record_daemon_identity_check(result: DaemonIdentityCheck) {
+    let counter = match result {
+        DaemonIdentityCheck::Match => &IDENTITY_MATCH,
+        DaemonIdentityCheck::Mismatch => &IDENTITY_MISMATCH,
+        DaemonIdentityCheck::Gone => &IDENTITY_GONE,
+        DaemonIdentityCheck::Unknown => &IDENTITY_UNKNOWN,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn daemon_identity_counters() -> DaemonIdentityCounters {
+    DaemonIdentityCounters {
+        matched: IDENTITY_MATCH.load(Ordering::Relaxed),
+        mismatched: IDENTITY_MISMATCH.load(Ordering::Relaxed),
+        gone: IDENTITY_GONE.load(Ordering::Relaxed),
+        unknown: IDENTITY_UNKNOWN.load(Ordering::Relaxed),
+    }
+}
+
+/// Kernel boot identity; unavailable or unreadable evidence stays unknown.
+pub fn read_boot_id() -> Option<String> {
+    current_boot_id()
+}
+
+pub(super) fn current_boot_id() -> Option<String> {
+    crate::boot::read_boot_identity()
+}
+
+fn linux_thread_group(pid: i32) -> std::io::Result<Option<i32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    Ok(status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok()))
+}
+
+// Caller has already proved Tgid == pid. Keep the common identity path to one
+// status read and one stat read; standalone token readers prove the leader too.
+fn read_linux_leader_start_token(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = stat.get(stat.rfind(')')? + 2..)?;
+    let start_time = tail.split_whitespace().nth(19)?;
+    Some(format!("linux:{start_time}"))
+}
+
+/// Prove a positive process-leader PID, start token, and boot identity.
+/// Missing evidence is never liveness or authority to replace a generation.
+pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIdentityCheck {
+    if pid <= 0 {
+        record_daemon_identity_check(DaemonIdentityCheck::Gone);
+        return DaemonIdentityCheck::Gone;
+    }
+    #[cfg(target_os = "linux")]
+    let result = match linux_thread_group(pid) {
+        Ok(Some(tgid)) if tgid != pid => DaemonIdentityCheck::Mismatch,
+        Ok(Some(_)) => check_daemon_identity_with(pid, metadata, read_linux_leader_start_token),
+        Err(error) if process_status_is_gone(&error) => DaemonIdentityCheck::Gone,
+        _ => DaemonIdentityCheck::Unknown,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = match crate::proctable::process(pid) {
+        crate::proctable::Answer::NotPresent => DaemonIdentityCheck::Gone,
+        crate::proctable::Answer::Unknown(_) => DaemonIdentityCheck::Unknown,
+        crate::proctable::Answer::Known(_) => {
+            check_daemon_identity_with(pid, metadata, read_process_start_token)
+        }
+    };
+    record_daemon_identity_check(result);
+    result
+}
+
+/// A conflicting sidecar may be an unpublished replacement. No single PID
+/// from that observation can authorize liveness, replacement or retirement.
+pub fn check_record_identity(
+    sidecar: Option<i32>,
+    metadata: Option<&SessionMetadata>,
+) -> DaemonIdentityCheck {
+    let recorded = metadata.and_then(|record| record.daemon_pid);
+    if matches!((sidecar, recorded), (Some(a), Some(b)) if a != b) {
+        record_daemon_identity_check(DaemonIdentityCheck::Unknown);
+        return DaemonIdentityCheck::Unknown;
+    }
+    let Some(pid) = sidecar.or(recorded) else {
+        record_daemon_identity_check(DaemonIdentityCheck::Unknown);
+        return DaemonIdentityCheck::Unknown;
+    };
+    match metadata {
+        Some(metadata) => check_daemon_identity(pid, metadata),
+        None => check_daemon_identity(pid, &SessionMetadata::default()),
+    }
+}
+
+/// Check an observed record with its companion paths. Legacy metadata with
+/// no named PID is Gone only when both PID and socket companions are absent.
+/// A malformed, unreadable or non-regular companion never proves absence.
+pub fn check_record_identity_in(
+    root: &Path,
+    name: &str,
+    sidecar: Option<i32>,
+    metadata: Option<&SessionMetadata>,
+) -> DaemonIdentityCheck {
+    if sidecar.is_none() && metadata.is_some_and(|record| record.daemon_pid.is_none()) {
+        let absent = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        if absent(&root.join(format!("{name}.pid"))) && absent(&socket_path_in(root, name)) {
+            record_daemon_identity_check(DaemonIdentityCheck::Gone);
+            return DaemonIdentityCheck::Gone;
+        }
+    }
+    check_record_identity(sidecar, metadata)
+}
+
+fn process_status_is_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn check_daemon_identity_with(
+    pid: i32,
+    metadata: &SessionMetadata,
+    live_start_token: impl Fn(i32) -> Option<String>,
+) -> DaemonIdentityCheck {
+    check_daemon_identity_evidence(pid, metadata, live_start_token, current_boot_id)
+}
+
+fn check_daemon_identity_evidence(
+    pid: i32,
+    metadata: &SessionMetadata,
+    live_start_token: impl Fn(i32) -> Option<String>,
+    live_boot_id: impl FnOnce() -> Option<String>,
+) -> DaemonIdentityCheck {
+    use DaemonIdentityCheck::{Gone, Match, Mismatch, Unknown};
+    if pid <= 0 {
+        return Gone;
+    }
+    if metadata.daemon_pid.is_some_and(|recorded| recorded != pid) {
+        return Mismatch;
+    }
+    let Some(expected) = metadata
+        .daemon_start_token()
+        .filter(|token| !token.is_empty())
+    else {
+        #[cfg(not(target_os = "linux"))]
+        if !pid_alive(pid) {
+            return Gone;
+        }
+        return Unknown;
+    };
+    match live_start_token(pid) {
+        Some(live) if live != expected => Mismatch,
+        Some(_) => {
+            // A different readable token disproves ownership on any boot.
+            // Only a token match needs complete, stable boot evidence.
+            let Some(recorded) = metadata.daemon_boot_id.as_deref().filter(|id| !id.is_empty())
+            else {
+                return Unknown;
+            };
+            // Legacy macOS boottime changes with wall-clock steps. It cannot
+            // prove either equality or mismatch, including after a UUID upgrade.
+            if recorded.starts_with("darwin:{") {
+                return Unknown;
+            }
+            match live_boot_id() {
+                Some(live) if live.starts_with("darwin:{") => Unknown,
+                Some(live) if live == recorded => Match,
+                Some(_) => Mismatch,
+                None => Unknown,
+            }
+        }
+        None => {
+            #[cfg(target_os = "linux")]
+            match linux_thread_group(pid) {
+                Ok(Some(tgid)) if tgid != pid => return Mismatch,
+                Err(error) if process_status_is_gone(&error) => return Gone,
+                _ => {}
+            }
+            #[cfg(not(target_os = "linux"))]
+            if !pid_alive(pid) {
+                return Gone;
+            }
+            Unknown
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -290,10 +530,10 @@ pub fn read_process_start_token(pid: i32) -> Option<String> {
         return None;
     }
     if cfg!(target_os = "linux") {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let tail = &stat[stat.rfind(')')? + 2..];
-        let start_time = tail.split_whitespace().nth(19)?;
-        return Some(format!("linux:{start_time}"));
+        if linux_thread_group(pid).ok().flatten()? != pid {
+            return None;
+        }
+        return read_linux_leader_start_token(pid);
     }
     if cfg!(target_os = "macos") {
         #[cfg(all(test, target_os = "macos"))]
@@ -324,20 +564,15 @@ pub fn read_process_start_token(pid: i32) -> Option<String> {
     None
 }
 
-/// The pid to judge a session by: the sidecar pid file, else the record's
-/// `daemonPid` only when `recovery.processStartToken` still matches the
-/// live process.
-///
-/// node: src/sessions.ts:2086-2095
+/// Resolve a daemon only when metadata binds its sidecar (or daemonPid) to
+/// the matching live process identity. A raw PID sidecar is never authority.
 pub fn read_pid_with(name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
     let root = session_dir();
     read_pid_with_in(&root, name, metadata)
 }
 
 fn read_pid_with_in(root: &Path, name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
-    if let Some(pid) = read_session_pid_at(&root.join(format!("{name}.pid"))) {
-        return Some(pid);
-    }
+    let sidecar = read_session_pid_at(&root.join(format!("{name}.pid")));
     let owned;
     let retained = match metadata {
         Some(m) => m,
@@ -346,20 +581,19 @@ fn read_pid_with_in(root: &Path, name: &str, metadata: Option<&SessionMetadata>)
             &owned
         }
     };
-    let daemon_pid = retained.daemon_pid?;
-    let token = retained.process_start_token()?;
-    (read_process_start_token(daemon_pid).as_deref() == Some(token)).then_some(daemon_pid)
+    let pid = sidecar.or(retained.daemon_pid)?;
+    (check_record_identity(sidecar, Some(retained)) == DaemonIdentityCheck::Match).then_some(pid)
 }
 
-/// Resolve a daemon pid only when lock-held metadata binds it to the exact
-/// live OS process. Unlike [`read_pid_with`], this is suitable for destructive
-/// signals: an unbound legacy pid sidecar is never authority.
+/// Resolve the same identity-bound daemon used by inventory readers.
+/// Call while holding the lifecycle locks and revalidate before signalling.
 pub fn read_signal_target_with(name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
-    read_signal_target_with_in(&session_dir(), name, metadata, read_process_start_token)
+    read_pid_with(name, metadata)
 }
 
 /// [`read_signal_target_with`] over an explicit registry root and live
 /// start-token reader, so the binding rules are provable without `ps`.
+#[cfg(test)]
 fn read_signal_target_with_in(
     root: &Path,
     name: &str,
@@ -374,14 +608,9 @@ fn read_signal_target_with_in(
             &owned
         }
     };
-    let daemon_pid = retained.daemon_pid?;
-    if let Some(sidecar_pid) = read_session_pid_at(&root.join(format!("{name}.pid")))
-        && sidecar_pid != daemon_pid
-    {
-        return None;
-    }
-    let token = retained.daemon_start_token()?;
-    (live_start_token(daemon_pid).as_deref() == Some(token)).then_some(daemon_pid)
+    let pid = read_session_pid_at(&root.join(format!("{name}.pid"))).or(retained.daemon_pid)?;
+    (check_daemon_identity_with(pid, retained, live_start_token) == DaemonIdentityCheck::Match)
+        .then_some(pid)
 }
 
 /// [`read_pid_with`] reading the metadata itself when the sidecar is absent.
@@ -588,7 +817,9 @@ fn probe_socket_outcomes<T>(
                 continue;
             }
             if let Probe::InProgress(stream) = &probes[i] {
-                let result = stream.take_error().and_then(|error| error.map_or(Ok(()), Err));
+                let result = stream
+                    .take_error()
+                    .and_then(|error| error.map_or(Ok(()), Err));
                 results.insert(paths[i].clone(), answer(result));
                 probes[i] = Probe::Answered;
             }
@@ -618,6 +849,13 @@ pub fn list_sessions() -> Vec<SessionInfo> {
     list_sessions_with(&ListOptions::default())
 }
 
+/// A full observation for consumers that restart sessions or compare legacy
+/// generation-less records as whole metadata. Ordinary observers should use
+/// [`list_sessions`] to avoid reading retained output and environment payloads.
+pub fn list_sessions_full() -> Vec<SessionInfo> {
+    scan_sessions(&session_dir(), &ListOptions::default(), false, None, true).entries
+}
+
 /// [`list_sessions`] with an explicit probe budget.
 pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
     let root = session_dir();
@@ -626,25 +864,25 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false, None).entries
+    scan_sessions(root, options, false, None, false).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
-/// observation alongside retained sessions. Definitively absent or refused
-/// sockets retain an exited or vanished row; unknown probe failures and
-/// timeouts make the inventory incomplete. Optional absent companions are
-/// allowed; existing metadata and PID files are checked even when their session
-/// is omitted. Strict PID validation requires a complete, positive decimal i32;
-/// classification retains the legacy leading-integer parse.
+/// observation alongside retained sessions. Only an identity match is live;
+/// unknown identity makes inventory incomplete even if its socket answers.
+/// Unknown sockets receive bounded transport diagnostics, never liveness
+/// authority. Existing metadata and PID files are checked even for omitted
+/// sessions. Strict PID validation requires a complete, positive decimal i32;
+/// tolerant classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, None)
+    scan_sessions(root, options, true, None, false)
 }
 
 /// [`list_sessions_strict_in`] for one session id: that id's companions are
 /// read and classified exactly as a whole-root strict scan would classify
 /// them, and no other entry is touched.
 pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, Some(name))
+    scan_sessions(root, options, true, Some(name), false)
 }
 
 fn scan_sessions(
@@ -652,9 +890,11 @@ fn scan_sessions(
     options: &ListOptions,
     strict: bool,
     only: Option<&str>,
+    full_metadata: bool,
 ) -> Inventory {
     let mut scanner = Scanner {
         strict,
+        full_metadata,
         errors: Vec::new(),
     };
     let dir = match std::fs::read_dir(root) {
@@ -767,7 +1007,8 @@ fn scan_sessions(
         })
         .chain(socket_ids.iter().copied())
         .collect();
-    let mut records = HashMap::new();
+    let mut sessions = Vec::new();
+    let mut uncertain_sockets = Vec::new();
     for name in names {
         let metadata_name = format!("{name}.json");
         let pid_name = format!("{name}.pid");
@@ -775,180 +1016,91 @@ fn scan_sessions(
             &root.join(&metadata_name),
             entries.binary_search(&metadata_name).is_ok(),
         );
-        // Ordinary listing skips invalid metadata-only records before touching
-        // their PID companion, which may be a blocking special file.
-        if !strict
-            && metadata.is_none()
-            && !socket_ids.contains(name)
-        {
-            records.insert(name, (None, None));
+        let has_socket = socket_ids.contains(name);
+        // Avoid opening a possibly blocking PID special file during a tolerant
+        // listing when there is no usable record or socket.
+        if !strict && metadata.is_none() && !has_socket {
             continue;
         }
-        let pid = scanner
-            .pid(
-                &root.join(&pid_name),
-                entries.binary_search(&pid_name).is_ok(),
-            )
-            .or_else(|| {
-                let metadata = metadata.as_ref()?;
-                let pid = metadata.daemon_pid?;
-                let token = metadata.process_start_token()?;
-                (read_process_start_token(pid).as_deref() == Some(token)).then_some(pid)
-            });
-        records.insert(name, (metadata, pid));
-    }
-
-    let mut sessions: Vec<SessionInfo> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-
-    struct Candidate {
-        name: String,
-        socket_path: PathBuf,
-        pid: Option<i32>,
-        pid_alive: bool,
-        metadata: Option<SessionMetadata>,
-    }
-    let candidates: Vec<Candidate> = sockets
-        .iter()
-        .map(|(name, _filename)| {
-            let (metadata, pid) = records.remove(*name).expect("socket record was observed");
-            Candidate {
-                name: name.to_string(),
-                socket_path: socket_path_in(root, name),
-                pid,
-                pid_alive: pid.is_some_and(pid_alive),
-                metadata,
+        let pid_errors_before = scanner.errors.len();
+        let sidecar = scanner.pid(
+            &root.join(&pid_name),
+            entries.binary_search(&pid_name).is_ok(),
+        );
+        let pid = sidecar.or_else(|| metadata.as_ref().and_then(|record| record.daemon_pid));
+        if metadata.is_none() && !has_socket {
+            // A valid orphan PID is not replacement authority. Preserve the
+            // existing companion-error convention when the PID read itself
+            // already failed; otherwise explicitly surface unknown identity.
+            if strict
+                && sidecar.is_some()
+                && scanner.errors.len() == pid_errors_before
+                && check_record_identity(sidecar, None) == DaemonIdentityCheck::Unknown
+            {
+                scanner.error(
+                    &root.join(&pid_name),
+                    InventoryErrorKind::IdentityUnknown,
+                    "orphan PID has no daemon identity record",
+                );
             }
-        })
-        .collect();
-
-    let needs_probe: Vec<PathBuf> = candidates
-        .iter()
-        .filter(|c| !c.pid_alive)
-        .map(|c| c.socket_path.clone())
-        .collect();
-    let reachability =
-        probe_socket_outcomes(&needs_probe, options.socket_probe_budget, |result| result);
-
-    for c in candidates {
-        seen.insert(c.name.clone());
-        let socket_reachable =
-            c.pid_alive || reachability.get(&c.socket_path).is_some_and(Result::is_ok);
-        let socket_gone = strict && reachability.get(&c.socket_path).is_some_and(|result| {
-            result.as_ref().is_err_and(|error| {
-                socket_definitively_gone(error, c.pid, c.pid_alive, c.metadata.as_ref())
-            })
-        });
-        if strict && !c.pid_alive {
-            match reachability.get(&c.socket_path) {
-                None => scanner.error(
-                    &c.socket_path,
-                    InventoryErrorKind::ProbeTimeout,
-                    "socket probe deadline elapsed",
-                ),
-                Some(Err(error)) if !socket_gone => {
-                    scanner.error(&c.socket_path, InventoryErrorKind::EntryUnreadable, error);
-                }
-                _ => {}
+            continue;
+        }
+        let identity = check_record_identity_in(root, name, sidecar, metadata.as_ref());
+        if identity == DaemonIdentityCheck::Unknown {
+            scanner.error(
+                &root.join(&metadata_name),
+                InventoryErrorKind::IdentityUnknown,
+                "cannot prove daemon leader, start token and boot identity",
+            );
+            if strict && has_socket {
+                uncertain_sockets.push(socket_path_in(root, name));
             }
         }
-        if strict && !c.pid_alive && socket_gone {
-            let status = if c.metadata.as_ref().is_some_and(|metadata| {
-                metadata.has_exited() || metadata.exit_code.is_some()
-            }) {
-                SessionStatus::Exited
-            } else {
-                SessionStatus::Vanished
-            };
-            sessions.push(SessionInfo {
-                name: c.name,
-                socket_path: c.socket_path,
-                pid: None,
-                status,
-                metadata: c.metadata,
-            });
-        } else if c.pid_alive || socket_reachable {
-            let metadata = c.metadata;
-            let status = if metadata.as_ref().is_some_and(SessionMetadata::has_exited) {
-                SessionStatus::Exited
-            } else {
-                SessionStatus::Running
-            };
-            sessions.push(SessionInfo {
-                name: c.name,
-                socket_path: c.socket_path,
-                pid: c.pid,
-                status,
-                metadata,
-            });
-        } else if c.pid.is_some() {
-            if let Some(metadata) = c.metadata {
-                let vanished = metadata.exited_at.is_none() && metadata.exit_code.is_none();
-                sessions.push(SessionInfo {
-                    name: c.name,
-                    socket_path: c.socket_path,
-                    pid: None,
-                    status: if vanished {
-                        SessionStatus::Vanished
-                    } else {
-                        SessionStatus::Exited
-                    },
-                    metadata: Some(metadata),
-                });
-            }
+        // Unknown is not a loss observation. Retain the named PID without
+        // turning old pid/socket evidence into signal or cleanup authority.
+        let retained = matches!(identity, DaemonIdentityCheck::Match | DaemonIdentityCheck::Unknown);
+        let status = if metadata
+            .as_ref()
+            .is_some_and(|record| record.has_exited() || record.exit_code.is_some())
+        {
+            SessionStatus::Exited
+        } else if retained {
+            SessionStatus::Running
         } else {
-            let metadata = c.metadata;
-            let status = if metadata.as_ref().is_some_and(SessionMetadata::has_exited) {
-                SessionStatus::Exited
-            } else {
-                SessionStatus::Running
-            };
-            sessions.push(SessionInfo {
-                name: c.name,
-                socket_path: c.socket_path,
-                pid: c.pid,
-                status,
-                metadata,
-            });
-        }
-    }
-
-    for name in entries.iter().filter_map(|e| e.strip_suffix(".json")) {
-        if seen.contains(name) {
-            continue;
-        }
-        let (metadata, pid) = records.remove(name).expect("metadata record was observed");
-        let Some(metadata) = metadata else {
-            continue;
+            SessionStatus::Vanished
         };
-        if let Some(pid) = pid
-            && pid_alive(pid)
-        {
-            sessions.push(SessionInfo {
-                name: name.to_string(),
-                socket_path: socket_path_in(root, name),
-                pid: Some(pid),
-                status: if metadata.has_exited() {
-                    SessionStatus::Exited
-                } else {
-                    SessionStatus::Running
-                },
-                metadata: Some(metadata),
-            });
-            continue;
-        }
-        let vanished = metadata.exited_at.is_none() && metadata.exit_code.is_none();
+        // Socket reachability is transport evidence, never process identity.
+        // In particular, do not connect to rescue a known mismatched PID.
         sessions.push(SessionInfo {
             name: name.to_string(),
             socket_path: socket_path_in(root, name),
-            pid: None,
-            status: if vanished {
-                SessionStatus::Vanished
-            } else {
-                SessionStatus::Exited
-            },
-            metadata: Some(metadata),
+            pid: if retained { pid } else { None },
+            status,
+            identity,
+            metadata,
         });
+    }
+    let diagnostics =
+        probe_socket_outcomes(&uncertain_sockets, options.socket_probe_budget, |result| {
+            result
+        });
+    for path in uncertain_sockets {
+        match diagnostics.get(&path) {
+            None => scanner.error(
+                &path,
+                InventoryErrorKind::ProbeTimeout,
+                "socket diagnostic deadline elapsed",
+            ),
+            Some(Err(error))
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
+                ) =>
+            {
+                scanner.error(&path, InventoryErrorKind::EntryUnreadable, error);
+            }
+            _ => {}
+        }
     }
 
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
@@ -960,32 +1112,12 @@ fn scan_sessions(
     }
 }
 
-fn socket_definitively_gone(
-    error: &std::io::Error,
-    pid: Option<i32>,
-    daemon_alive: bool,
-    metadata: Option<&SessionMetadata>,
-) -> bool {
-    match error.raw_os_error() {
-        Some(libc::ENOENT) => true,
-        // macOS also refuses a live listener with a full accept queue. Fail
-        // closed on every platform unless process/exit evidence corroborates.
-        Some(libc::ECONNREFUSED) => !daemon_alive && (
-            pid.is_some_and(|pid| pid > 0)
-                || metadata.is_some_and(|metadata| {
-                    (metadata.has_exited() || metadata.exit_code.is_some())
-                        && metadata.daemon_pid.is_some_and(|pid| pid > 0 && !pid_alive(pid))
-                })
-        ),
-        _ => false,
-    }
-}
-
 /// Look a session up by its immutable id only.
 ///
 /// node: src/sessions.ts:1345-1347
 pub fn get_session_by_name(name: &str) -> Option<SessionInfo> {
-    list_sessions().into_iter().find(|s| s.name == name)
+    scan_sessions(&session_dir(), &ListOptions::default(), false, Some(name), true)
+        .entries.into_iter().next()
 }
 
 /// The text `get_session` fails with when a display name matches several
@@ -1007,7 +1139,7 @@ pub fn ambiguous_reference_message(reference: &str, ids: &[String]) -> String {
 ///
 /// node: src/sessions.ts:1351-1363
 pub fn get_session(reference: &str) -> Result<Option<SessionInfo>, String> {
-    let sessions = list_sessions();
+    let sessions = list_sessions_full();
     if let Some(s) = sessions.iter().find(|s| s.name == reference) {
         return Ok(Some(s.clone()));
     }
@@ -1059,6 +1191,7 @@ mod signal_target_tests {
         SessionMetadata {
             daemon_pid: Some(PID),
             daemon_start_token: token.map(str::to_string),
+            daemon_boot_id: read_boot_id(),
             ..Default::default()
         }
     }
@@ -1083,6 +1216,7 @@ mod signal_target_tests {
         let unreadable = SessionMetadata {
             daemon_pid: Some(PID + 1),
             daemon_start_token: Some(TOKEN.to_string()),
+            daemon_boot_id: read_boot_id(),
             ..Default::default()
         };
         assert_eq!(
@@ -1100,5 +1234,77 @@ mod signal_target_tests {
         std::fs::write(root.join("session.pid"), (PID + 1).to_string()).unwrap();
         assert_eq!(target(&bound(Some(TOKEN))), None);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod identity_observation_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_start_token_is_unknown_not_absent_or_live() {
+        let pid = std::process::id() as i32;
+        let metadata = SessionMetadata {
+            daemon_pid: Some(pid),
+            daemon_start_token: Some("recorded:token".into()),
+            daemon_boot_id: read_boot_id(),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_daemon_identity_with(pid, &metadata, |_| None),
+            DaemonIdentityCheck::Unknown,
+        );
+    }
+
+    #[test]
+    fn b3_stale_token_disproves_owner_before_missing_or_unreadable_boot() {
+        let pid = std::process::id() as i32;
+        for recorded_boot in [None, Some("linux:recorded"), Some("darwin:{ sec = 1, usec = 0 }")] {
+            let metadata = SessionMetadata {
+                daemon_pid: Some(pid),
+                daemon_start_token: Some("old-token".into()),
+                daemon_boot_id: recorded_boot.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_daemon_identity_evidence(pid, &metadata, |_| Some("new-token".into()), || {
+                    panic!("token mismatch must not require readable boot evidence")
+                }),
+                DaemonIdentityCheck::Mismatch,
+            );
+        }
+    }
+
+    #[test]
+    fn b3_matching_token_requires_complete_stable_boot_evidence() {
+        let pid = std::process::id() as i32;
+        for (recorded_boot, current_boot, expected) in [
+            (None, Some("linux:current"), DaemonIdentityCheck::Unknown),
+            (Some("linux:current"), None, DaemonIdentityCheck::Unknown),
+            (Some("darwin:{ sec = 1, usec = 0 }"), Some("darwin:uuid"), DaemonIdentityCheck::Unknown),
+            (Some("darwin:uuid"), Some("darwin:{ sec = 1, usec = 0 }"), DaemonIdentityCheck::Unknown),
+            (Some("darwin:uuid"), Some("darwin:uuid"), DaemonIdentityCheck::Match),
+        ] {
+            let metadata = SessionMetadata {
+                daemon_pid: Some(pid),
+                daemon_start_token: Some("same-token".into()),
+                daemon_boot_id: recorded_boot.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_daemon_identity_evidence(
+                    pid, &metadata, |_| Some("same-token".into()),
+                    || current_boot.map(str::to_string),
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn linux_status_esrch_is_exit_evidence_not_unknown() {
+        assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(process_status_is_gone(&std::io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(!process_status_is_gone(&std::io::Error::from_raw_os_error(libc::EACCES)));
     }
 }

@@ -179,7 +179,7 @@ gap is in what the daemon does with the frames.
 | Reap vs preserve precedence (`keep` > `ephemeral` > `permanent` > `PTY_REAP_ON_EXIT`) | have | Rust accepts only `keep=true`; Node accepts any value except `false/0/no/off`. |
 | On preserve: `exitCode`, `exitedAt`, `lastLines` (≤ 200) | partial | Rust keeps 50 lines and writes a Rust-only `<name>.screen` file. |
 | Scrollback 10000, `scrollbackCapacity = rows + 10000` | have | |
-| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | missing | |
+| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | partial | Rust does not persist `cursor_visible` or `title_change`: cursor redraws and animated title frames are live terminal state, not durable history. The actor retains the current title and attached clients receive original OSC output. A reader must not wait for these optional Node events to learn a session's state. Rust still reads and formats historical records of both types. |
 | Live recovery request handling (`.recovery/`) | deferred | |
 
 ## 5. Registry on disk (`$PTY_ROOT`)
@@ -215,9 +215,9 @@ gap is in what the daemon does with the frames.
 
 | Behavior | Rust status |
 |---|---|
-| `listSessions` never mutates; scans `.sock` then orphan `.json`; pid alive or socket reachable → running; probe budget 500 ms | partial |
-| `daemonPid` accepted only with a matching start token | missing |
-| Status `running` / `exited` / `vanished` | have |
+| `listSessions` never mutates; scans `.sock` then orphan `.json`; 500 ms transport probe budget | have; probes are diagnostics, never daemon liveness authority |
+| `daemonPid` grants authority only with matching recorded stable boot identity and start token | have; required on Linux and macOS, with thread-group leadership also required on Linux. A readable different start token proves Mismatch before boot is required. Missing/unreadable evidence is Unknown and makes strict inventory incomplete. Teardown pins exact owners through `Exact` (Linux pidfd / macOS audit token), never raw PID or group fallback |
+| Status `running` / `exited` / `vanished` | have; Unknown conservatively stays `running` with its named PID unless an explicit exit record says `exited`. Metadata without any named PID or PID/socket companion is Gone and removable. Additive `identity` in list JSON and remote rows is `match`, `mismatch`, `gone` or `unknown`; display status alone grants no signal, cleanup or replacement authority |
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |
 | Behavioral tags: `strategy=permanent`, `keep`, `parent`, `role=agent`, `strategy.*` bookkeeping, `:l<pid>-*` | partial (`keep`, `permanent` only) |
@@ -326,8 +326,22 @@ non-`Send` libghostty terminal. This is the same object as the TUI `PtyHandle`
 in section 9. One crate serves both. Proposed layout from issue #1:
 `pty-protocol`, `pty-client`, `pty-terminal`, `pty-testkit`, `pty` (the CLI).
 
-Status: missing (L). `deskset/crates/pty-wire` is a partial third copy of
-`pty-protocol` + `pty-client`.
+Status: have. `pty::handle::TerminalHandle` (`crates/pty/src/handle.rs`)
+has `spawn`, `attach` and `attach_with_connector` over one actor thread that
+owns the libghostty terminal. It offers typed snapshots, modes, cursor and
+scrollback reads, `subscribe()` events, and explicit readiness
+(`wait_ready_outcome`). Each connection attempt carries a private
+`AttemptId`, and frames from an older attempt are dropped. The protocol lives
+in `pty-core` rather than a separate `pty-protocol` crate. `pty-client`,
+`pty-terminal` and `pty-testkit` exist as proposed.
+
+Where it differs from the issue's sketch:
+- The API is synchronous: `subscribe()` returns an mpsc `Receiver`.
+- The CLI's `pty_client::attach` and the handle's own connection are still two
+  client attach paths.
+
+Closing a spawned handle SIGKILLs the child's process group and then the
+child, through the same reap fence as the daemon's substrate (#162).
 
 ## 11. Mixed fleet: Node and Rust on one `$PTY_ROOT`
 
@@ -396,6 +410,29 @@ on both.
 `client_attach.rs::reset_maps_to_not_found_or_not_running` asks the kernel
 which of the two it is doing and pins the answer, rather than assuming the one
 it was written on.
+
+**A pty whose session leader exits, and a child whose output nobody has
+read.** Measured on 2026-10-19 with `forkpty` probes on macOS 27 (xnu-13432):
+
+| | Linux | macOS |
+|---|---|---|
+| the session leader exits while a descendant that ignores SIGHUP holds the terminal | the descendant keeps it open, and the master reads its later output | the master reads EOF within milliseconds, and the descendant cannot keep the terminal |
+| a shell that read input exits with output the master has not read | it is waitable at once, and the output stays readable | it is not waitable until the master reads; the output is kept (checked to 3 s) |
+
+**What it means:**
+- On macOS a session's output ends when its leader exits, so the substrate
+  publishes `OutputClosed` before the exit, and a backgrounded descendant's
+  later output is not captured.
+- A substrate reader parked by a full owner stream sees the child's exit only
+  once it reads again. The output is not lost.
+
+One more macOS case, not tied to `pty` yet: a child that writes and exits
+straight after `forkpty`, with nothing read or written on the master, becomes
+waitable after about 0.6 s, and its unread output is discarded.
+
+`pty-spawn`'s substrate tests assert each platform's behavior:
+`output_still_in_the_pty_when_the_child_is_reaped_is_delivered` and
+`an_exit_is_published_after_the_drain_bound_when_a_descendant_holds_the_pty`.
 
 ## 12d. Absent on macOS
 

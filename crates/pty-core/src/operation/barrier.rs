@@ -12,8 +12,8 @@
 /// The variable that names the barrier directory.
 pub const BARRIERS_ENV: &str = "PTY_TEST_OPERATION_BARRIERS";
 
-/// Every barrier name, in the order a successful launch reaches them.
-pub const BARRIERS: [&str; 14] = [
+/// Named launch, revocation installation and cleanup acceptance points.
+pub const BARRIERS: [&str; 21] = [
     "launcher-before-claim",
     "launcher-before-peek",
     "launcher-before-fork",
@@ -21,13 +21,20 @@ pub const BARRIERS: [&str; 14] = [
     "before-decision",
     "publish-issued-before-commit",
     "publish-committed-before-effect",
+    "publication-before-lock",
+    "publication-before-effects",
     "published-before-child-fork",
+    "before-claim-hand-back",
+    "metadata-lock-busy",
+    "event-lock-busy",
     "child-forked-before-record",
     "child-prepared-before-ack-read",
     "before-ready",
     "transfer-before-commit",
     "transfer-committed-before-release",
     "released-before-ack",
+    "revocation-install-pinned",
+    "gc-cleanup-before-effects",
 ];
 
 /// Record that `name` was reached, and say whether a test armed it. A
@@ -42,16 +49,31 @@ pub fn armed(name: &str) -> bool {
             return false;
         };
         let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(
-            dir.join(format!("{name}.reached")),
-            std::process::id().to_string(),
-        );
+        record_reached(&dir, name);
         dir.join(format!("{name}.hold")).exists()
     }
     #[cfg(not(debug_assertions))]
     {
         let _ = name;
         false
+    }
+}
+
+/// Publish `<dir>/<name>.reached` holding this process's id. It is written
+/// aside and renamed into place, because tests read the pid as soon as the
+/// file exists, and `fs::write` shows an empty file between creating it and
+/// writing to it.
+#[cfg(debug_assertions)]
+fn record_reached(dir: &std::path::Path, name: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let staged = dir.join(format!(
+        "{name}.reached.{pid}.{}",
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&staged, pid.to_string()).is_ok() {
+        let _ = std::fs::rename(&staged, dir.join(format!("{name}.reached")));
     }
 }
 
@@ -80,10 +102,7 @@ pub fn barrier(name: &str) {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(
-            dir.join(format!("{name}.reached")),
-            std::process::id().to_string(),
-        );
+        record_reached(&dir, name);
         if !dir.join(format!("{name}.hold")).exists() {
             return;
         }

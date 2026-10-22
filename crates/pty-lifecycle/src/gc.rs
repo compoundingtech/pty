@@ -1,25 +1,25 @@
 //! Registry garbage collection and orphan-layout tag pruning.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pty_core::events::{AbandonReason, Event, append_event_locked};
 use pty_core::ptyfile;
 use pty_core::registry::{
-    self, DEFAULT_KEEP_MAX_AGE_MS, DEFAULT_SOCKET_PROBE_BUDGET, SessionInfo, SessionMetadata,
-    TagMap, apply_metadata_diff, cleanup_all_while_locked, cleanup_socket, event_lock_path,
-    events_path, has_process_exited_for_reap, is_keep_expired, is_keep_requested, lock_or_refusal,
+    self, DEFAULT_KEEP_MAX_AGE_MS, DaemonIdentityCheck, SessionInfo, SessionMetadata, TagMap,
+    apply_metadata_diff, cleanup_all_while_locked, cleanup_socket, event_lock_path, events_path,
+    has_process_exited_for_reap, is_keep_expired, is_keep_requested, lock_or_refusal,
     metadata_matches_observation, metadata_path, now_epoch_ms, output_activity_path,
-    parse_iso8601_ms, pid_alive, probe_sockets_within_budget, read_metadata, read_metadata_map,
-    read_pid, read_pid_with, recovery_revision_path, session_dir, socket_path, socket_reachable,
-    update_tags, with_both_locks, write_metadata, write_metadata_map,
+    parse_iso8601_ms, pid_alive, read_metadata, read_metadata_map, read_session_pid,
+    recovery_revision_path, session_dir, socket_path, update_tags, with_both_locks, write_metadata,
+    write_metadata_map,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{SpawnParams, apply_persisted_launch_options, spawn_daemon};
+use crate::{SpawnParams, apply_persisted_launch_options, prepare_daemon};
 /// Options for one stateless garbage-collection pass.
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -127,6 +127,10 @@ pub fn gc(options: GcOptions) -> GcResult {
     } = options;
     let mut result = GcResult::default();
 
+    if !dry_run {
+        cleanup_dead_registry_temps();
+    }
+
     // Raw debris: runtime files whose metadata is missing or malformed.
     let raw_candidates = inventory_raw_cleanup_candidates(None);
     if dry_run {
@@ -138,7 +142,8 @@ pub fn gc(options: GcOptions) -> GcResult {
             }
         }
     }
-    let initial = registry::list_sessions();
+    // GC also reconstructs environments and compares whole legacy records.
+    let initial = registry::list_sessions_full();
 
     // STEP 1: orphan children, in name order so cycles resolve
     // deterministically.
@@ -148,11 +153,16 @@ pub fn gc(options: GcOptions) -> GcResult {
     for s in with_parent {
         let parent = parent_of(s).unwrap_or_default();
         let parent_meta = read_metadata(&parent);
-        let parent_pid = parent_meta
-            .as_ref()
-            .and_then(|m| read_pid_with(&parent, Some(m)));
-        let parent_alive = parent_meta.is_some() && parent_pid.is_some_and(pid_alive);
-        if parent_alive {
+        let parent_identity = match parent_meta.as_ref() {
+            Some(metadata) => daemon_identity(&parent, metadata),
+            None if read_session_pid(&parent).is_none() && !socket_path(&parent).exists() => {
+                DaemonIdentityCheck::Gone
+            }
+            None => DaemonIdentityCheck::Unknown,
+        };
+        if !known_owner_lost(parent_identity) {
+            // Unknown is not death; a mismatch proves only that the recorded
+            // incarnation was lost, never authority to signal its reused PID.
             continue;
         }
         let reason = if parent_meta.is_some() {
@@ -160,6 +170,11 @@ pub fn gc(options: GcOptions) -> GcResult {
         } else {
             "missing"
         };
+        if s.metadata.as_ref().is_none_or(|metadata| {
+            daemon_identity(&s.name, metadata) == DaemonIdentityCheck::Unknown
+        }) {
+            continue;
+        }
         if dry_run {
             result.killed_orphan_children.push(OrphanKill {
                 name: s.name.clone(),
@@ -189,7 +204,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step1 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &after_step1 {
@@ -197,6 +212,9 @@ pub fn gc(options: GcOptions) -> GcResult {
             continue;
         };
         if !is_permanent(meta) {
+            continue;
+        }
+        if dry_run && daemon_identity(&s.name, meta) == DaemonIdentityCheck::Unknown {
             continue;
         }
         let Some(decision) = classify_abandoned(meta, global_idle_days, now_ms) else {
@@ -238,7 +256,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step15 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     for s in &after_step15 {
         let Some(meta) = s.metadata.as_ref() else {
@@ -247,8 +265,20 @@ pub fn gc(options: GcOptions) -> GcResult {
         if excluded.contains(s.name.as_str()) || !s.is_gone() || !is_permanent(meta) {
             continue;
         }
+        if !known_owner_lost(daemon_identity(&s.name, meta)) {
+            continue;
+        }
         if dry_run {
-            let (params, ptyfile_reread) = respawn_params(&s.name, meta);
+            let (params, ptyfile_reread) = match respawn_params(&s.name, meta) {
+                Ok(params) => params,
+                Err(error) => {
+                    result.respawn_failed.push(RespawnFailed {
+                        name: s.name.clone(),
+                        error,
+                    });
+                    continue;
+                }
+            };
             let decision = classify_flapping(
                 meta,
                 &params.command,
@@ -313,11 +343,17 @@ pub fn gc(options: GcOptions) -> GcResult {
     let final_list = if dry_run {
         initial
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &final_list {
         if !s.is_gone() {
+            continue;
+        }
+        if s.metadata
+            .as_ref()
+            .is_none_or(|metadata| !known_owner_lost(daemon_identity(&s.name, metadata)))
+        {
             continue;
         }
         let tags = s.metadata.as_ref().and_then(|m| m.tags.as_ref());
@@ -407,10 +443,7 @@ fn classify_abandoned(
         .and_then(|t| t.get("strategy.abandon-if-cwd-gone"))
         .map(String::as_str)
         == Some("false");
-    if !meta.cwd.is_empty()
-        && !cwd_opted_out
-        && cwd_is_gone(&meta.cwd)
-    {
+    if !meta.cwd.is_empty() && !cwd_opted_out && cwd_is_gone(&meta.cwd) {
         return Some(AbandonDecision {
             reason: AbandonReason::CwdGone,
             idle_days: None,
@@ -631,12 +664,18 @@ fn reconcile_permanent(
         .as_ref()
         .is_none_or(|old| !metadata_matches_observation(old, &current))
         || !is_permanent(&current)
-        || read_pid_with(name, Some(&current)).is_some_and(pid_alive)
+        || !known_owner_lost(daemon_identity(name, &current))
     {
         return PermanentOutcome::Stale;
     }
 
-    let (mut params, ptyfile_reread) = respawn_params(name, &current);
+    let (mut params, ptyfile_reread) = match respawn_params(name, &current) {
+        Ok(params) => params,
+        Err(error) => return PermanentOutcome::Failed(error),
+    };
+    if let Err(error) = crate::launch::config_for(&params).check_publication() {
+        return PermanentOutcome::Failed(error);
+    }
     let now_ms = now_epoch_ms();
     let decision = classify_flapping(
         &current,
@@ -686,6 +725,12 @@ fn reconcile_permanent(
                     "daemon executable is required to respawn permanent sessions".to_string(),
                 );
             };
+            // Verify and pin the managed publisher before changing retained
+            // evidence; spawn must execute this same image after cleanup.
+            let prepared = match prepare_daemon(daemon_executable, &params) {
+                Ok(prepared) => prepared,
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             for (key, value) in &decision.bookkeeping {
                 params.tags.insert(key.clone(), value.clone());
             }
@@ -694,9 +739,13 @@ fn reconcile_permanent(
             }
             let mut retry_meta = current.clone();
             retry_meta.tags = (!params.tags.is_empty()).then(|| params.tags.clone());
+            params.creation_lock_delegate = match creation_guard.delegate() {
+                Ok(delegate) => Some(delegate),
+                Err(error) => return PermanentOutcome::Failed(error.to_string()),
+            };
             cleanup_all_while_locked(name);
             event_guard.release();
-            let spawn = spawn_daemon(daemon_executable, params).map_err(|error| error.to_string());
+            let spawn = prepared.spawn(params).map_err(|error| error.to_string());
             if spawn.is_err() && read_metadata(name).is_none() {
                 // Preserve the desired state when launch failed before a new
                 // daemon could publish. The next gc tick must be able to retry.
@@ -715,7 +764,7 @@ fn reconcile_permanent(
 /// fresh pty.toml definition when the recorded binding still resolves.
 ///
 /// node: src/sessions.ts:899-982
-fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
+fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bool), String> {
     let mut command = meta.command.clone();
     let mut args = meta.args.clone();
     let mut display_command = meta.display_command.clone();
@@ -736,6 +785,20 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
             .cwd
             .clone()
             .unwrap_or_else(|| file.dir.to_string_lossy().into_owned());
+        // A managed binding's digest belongs to the external start request,
+        // not a hash we can reconstruct from these generic launch parameters.
+        // Compare the exact persisted executable, argument vector and cwd:
+        // env from pty.toml is already encoded in the shell argument above.
+        // Do not normalize paths or shell text and accidentally authorize a
+        // different launch under the original operation/digest/root.
+        if meta.publication_binding.is_some()
+            && (command != meta.command || args != meta.args || cwd != meta.cwd)
+        {
+            return Err(
+                "managed pty.toml launch inputs changed; a new operation and publication binding are required"
+                    .into(),
+            );
+        }
         let mut user_keys: Vec<String> = session
             .tags
             .as_ref()
@@ -774,7 +837,32 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> (SpawnParams, bool) {
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, meta);
     params.respawn = true;
-    (params, ptyfile_reread)
+    Ok((params, ptyfile_reread))
+}
+
+/// A zombie is gone only after its recorded identity has matched. Socket
+/// existence/reachability and a missing read_pid_with result are never proof.
+fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
+    let sidecar = read_session_pid(name);
+    let check = registry::check_record_identity_in(
+        &registry::session_dir(), name, sidecar, Some(metadata),
+    );
+    if check == DaemonIdentityCheck::Match
+        && sidecar
+            .or(metadata.daemon_pid)
+            .is_some_and(has_process_exited_for_reap)
+    {
+        DaemonIdentityCheck::Gone
+    } else {
+        check
+    }
+}
+
+fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
+    matches!(
+        check,
+        DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch
+    )
 }
 
 fn parent_of(s: &SessionInfo) -> Option<String> {
@@ -786,9 +874,54 @@ fn parent_of(s: &SessionInfo) -> Option<String> {
         .cloned()
 }
 
-/// Registry debris that `list_sessions` cannot represent: `.sock`/`.pid`
-/// with a dead pid and missing/malformed metadata (socket unreachable), or
-/// malformed metadata with no runtime files at all.
+/// Sweep atomic-publication leftovers without reconciling sessions.
+///
+/// Daemons run this narrow maintenance pass automatically; explicit GC shares
+/// the same conservative writer-liveness and file-type checks.
+pub fn cleanup_dead_registry_temps() {
+    let root = session_dir();
+    cleanup_dead_atomic_temps(&root);
+    for sidecar in [".activity", ".recovery"] {
+        let directory = root.join(sidecar);
+        if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+            cleanup_dead_atomic_temps(&directory);
+        }
+    }
+}
+
+/// Reclaim only regular atomic-publication leftovers whose writer has exited.
+/// PID reuse conservatively retains a leftover; live writers never lose their
+/// temporary file. Malformed names and symlinks are not cleanup candidates.
+fn cleanup_dead_atomic_temps(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let filename = entry.file_name();
+        let Some(pid) = filename.to_str().and_then(atomic_temp_pid) else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) && !pid_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn atomic_temp_pid(filename: &str) -> Option<i32> {
+    let (_, suffix) = filename.rsplit_once(".tmp.")?;
+    let (pid, random) = suffix.split_once('.')?;
+    if !pid.starts_with(|c: char| c.is_ascii_digit() && c != '0')
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || random.len() != 16
+        || !random.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Malformed metadata with no runtime files at all. Missing identity for
+/// runtime debris is Unknown, not authorization to delete a socket or PID.
 ///
 /// node: src/sessions.ts:643-705
 fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
@@ -801,6 +934,9 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
         .collect();
     let mut names: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
+        if registry::is_tmp_name(entry) {
+            continue;
+        }
         let name = entry
             .strip_suffix(".events.jsonl")
             .or_else(|| entry.strip_suffix(".sock"))
@@ -814,53 +950,17 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
         }
     }
 
-    struct Candidate {
-        name: String,
-        has_socket: bool,
-        has_pid: bool,
-        has_metadata: bool,
-        pid_dead: bool,
-    }
-    let candidates: Vec<Candidate> = names
+    names
         .into_iter()
-        .filter_map(|name| {
-            let has_socket = socket_path(&name).file_name().is_some_and(|filename| {
+        .filter(|name| {
+            let has_socket = socket_path(name).file_name().is_some_and(|filename| {
                 entries.contains(filename.to_string_lossy().as_ref())
             });
-            let has_pid = entries.contains(&format!("{name}.pid"));
-            let has_metadata = entries.contains(&format!("{name}.json"));
-            if has_metadata && !metadata_is_malformed(&name) {
-                return None;
-            }
-            let pid = if has_pid { read_pid(&name) } else { None };
-            let pid_dead = pid.is_some_and(|p| !pid_alive(p));
-            Some(Candidate {
-                name,
-                has_socket,
-                has_pid,
-                has_metadata,
-                pid_dead,
-            })
+            entries.contains(&format!("{name}.json"))
+                && metadata_is_malformed(name)
+                && !entries.contains(&format!("{name}.pid"))
+                && !has_socket
         })
-        .collect();
-
-    let to_probe: Vec<PathBuf> = candidates
-        .iter()
-        .filter(|c| c.has_socket && c.pid_dead)
-        .map(|c| socket_path(&c.name))
-        .collect();
-    let reachability: HashMap<PathBuf, bool> =
-        probe_sockets_within_budget(&to_probe, DEFAULT_SOCKET_PROBE_BUDGET);
-
-    candidates
-        .into_iter()
-        .filter(|c| {
-            if c.pid_dead {
-                return !c.has_socket || reachability.get(&socket_path(&c.name)) == Some(&false);
-            }
-            c.has_metadata && !c.has_pid && !c.has_socket
-        })
-        .map(|c| c.name)
         .collect()
 }
 
@@ -908,7 +1008,11 @@ fn cleanup_observed_session(session: &SessionInfo) -> bool {
         return false;
     };
     with_both_locks(&session.name, || match read_metadata(&session.name) {
-        Some(current) if metadata_matches_observation(observed, &current) => {
+        Some(current)
+            if metadata_matches_observation(observed, &current)
+                && known_owner_lost(daemon_identity(&session.name, &current)) =>
+        {
+            pty_core::operation::barrier::barrier("gc-cleanup-before-effects");
             cleanup_all_while_locked(&session.name);
             true
         }
@@ -935,8 +1039,8 @@ enum Reap {
 
 /// SIGTERM a session (when running), wait for its daemon, optionally append
 /// an abandonment event, then remove its files. Abandonment is recomputed
-/// from lock-held metadata before any signal. A running/socket-reachable
-/// observation without a confirmed live pid is never unlinked.
+/// from lock-held metadata before any signal. Only Match authorizes a signal;
+/// Gone/Mismatch permit signal-free retirement, and Unknown refuses both.
 ///
 /// node: src/sessions.ts:821-880
 fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
@@ -948,7 +1052,7 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
     };
     let name = &session.name;
     let mut abandonment = None;
-    let mut signalled_pid = None;
+    let mut signalled_daemon = None;
     let first = with_both_locks(name, || -> Result<(), &'static str> {
         let current = read_metadata(name).ok_or("stale")?;
         if let ReapMode::Abandoned { global_idle_days } = mode {
@@ -960,22 +1064,18 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
         } else if !metadata_matches_observation(observed, &current) {
             return Err("stale");
         }
-        let current_pid =
-            read_pid_with(name, Some(&current)).filter(|pid| !has_process_exited_for_reap(*pid));
-        let running_now =
-            session.is_running() || current_pid.is_some() || socket_reachable(&socket_path(name));
-        if running_now {
-            let Some(pid) = current_pid else {
-                return Err("pid-unavailable");
-            };
-            // SAFETY: signalling a live pid validated against lock-held
-            // metadata and its process-start token.
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc == 0 {
-                signalled_pid = Some(pid);
-            } else if pid_alive(pid) {
-                return Err("signal-failed");
+        match daemon_identity(name, &current) {
+            DaemonIdentityCheck::Match => {
+                let pid = read_session_pid(name)
+                    .or(current.daemon_pid)
+                    .ok_or("pid-unavailable")?;
+                signalled_daemon = Some(
+                    pty_client::signal_daemon(name, pid, &current)
+                        .map_err(|_| "identity-or-signal-failed")?,
+                );
             }
+            DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => {}
+            DaemonIdentityCheck::Unknown => return Err("identity-unknown"),
         }
         Ok(())
     });
@@ -996,12 +1096,8 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
         Ok(Ok(())) => {}
     }
 
-    if let Some(pid) = signalled_pid {
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while Instant::now() < deadline && !has_process_exited_for_reap(pid) {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        if !has_process_exited_for_reap(pid) {
+    if let Some(daemon) = &signalled_daemon {
+        if !daemon.wait_for_exit(Duration::from_secs(7)) {
             return Reap::Skipped {
                 reason: "shutdown-timeout",
                 signalled: true,
@@ -1013,9 +1109,7 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
             Some(current) if metadata_matches_observation(observed, &current) => current,
             _ => return false,
         };
-        if read_pid_with(name, Some(&current)).is_some_and(|pid| !has_process_exited_for_reap(pid))
-            || socket_reachable(&socket_path(name))
-        {
+        if !known_owner_lost(daemon_identity(name, &current)) {
             return false;
         }
         if let Some(decision) = abandonment {
@@ -1032,11 +1126,11 @@ fn reap_observed_session(session: &SessionInfo, mode: ReapMode) -> Reap {
     match second {
         Err(_) => Reap::Skipped {
             reason: "busy",
-            signalled: signalled_pid.is_some(),
+            signalled: signalled_daemon.is_some(),
         },
         Ok(false) => Reap::Skipped {
             reason: "stale",
-            signalled: signalled_pid.is_some(),
+            signalled: signalled_daemon.is_some(),
         },
         Ok(true) => Reap::Reaped(abandonment),
     }
@@ -1062,13 +1156,13 @@ fn orphan_layout_tag_pid(key: &str) -> Option<Option<i64>> {
     Some(rest[..digits].parse::<i64>().ok())
 }
 
-/// Drop layout tags whose owning pid is dead on every running session.
+/// Drop layout tags whose owning pid is dead on every verified running session.
 ///
 /// node: src/sessions.ts:2042-2074
 pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
     let mut out = Vec::new();
     for s in registry::list_sessions() {
-        if !s.is_running() {
+        if !s.is_running() || s.identity != registry::DaemonIdentityCheck::Match {
             continue;
         }
         let Some(tags) = s.metadata.as_ref().and_then(|m| m.tags.as_ref()) else {
@@ -1079,9 +1173,7 @@ pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
             .filter(|key| match orphan_layout_tag_pid(key) {
                 None => false,
                 Some(None) => true,
-                Some(Some(pid)) => {
-                    pid <= 0 || !i32::try_from(pid).map(pid_alive).unwrap_or(false)
-                }
+                Some(Some(pid)) => pid <= 0 || !i32::try_from(pid).map(pid_alive).unwrap_or(false),
             })
             .cloned()
             .collect();
@@ -1103,6 +1195,176 @@ pub fn prune_orphan_layout_tags(dry_run: bool) -> Vec<PrunedTags> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_never_signals_mismatched_or_unknown_daemon_records() {
+        struct Fixture {
+            child: std::process::Child,
+            root: PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn owned child");
+        let pid = child.id() as i32;
+        let root = std::env::temp_dir().join(format!("ptygc-{}-{pid}", std::process::id()));
+        std::fs::create_dir(&root).expect("isolated registry");
+        let mut fixture = Fixture { child, root };
+        registry::with_root(&fixture.root, || {
+            for (name, token) in [("mismatch", Some("linux:1".to_string())), ("unknown", None)] {
+                let listener = std::os::unix::net::UnixListener::bind(socket_path(name))
+                    .expect("stale listener");
+                let mut tags = TagMap::new();
+                tags.insert("strategy".into(), "permanent".into());
+                tags.insert("strategy.idle-days".into(), "1".into());
+                let metadata = SessionMetadata {
+                    generation: Some(format!("retained-{name}")),
+                    daemon_pid: Some(pid),
+                    daemon_start_token: token,
+                    daemon_boot_id: registry::read_boot_id(),
+                    cwd: "/".into(),
+                    last_attach_at: Some("1970-01-01T00:00:00.000Z".into()),
+                    tags: Some(tags),
+                    ..SessionMetadata::default()
+                };
+                registry::write_pid(name, fixture.child.id()).expect("retained pid");
+                write_metadata(name, &metadata).expect("metadata");
+                let observed = registry::get_session_by_name(name).expect("retained session");
+                if name == "mismatch" {
+                    // Known loss permits reconciliation, but cannot signal
+                    // the unrelated live process now occupying the PID.
+                    assert!(matches!(
+                        reconcile_permanent(&observed, None, None, None),
+                        PermanentOutcome::Failed(_)
+                    ));
+                    assert!(matches!(
+                        reap_observed_session(&observed, ReapMode::Orphan),
+                        Reap::Reaped(_)
+                    ));
+                    assert!(!metadata_path(name).exists() && !socket_path(name).exists());
+                } else {
+                    assert!(matches!(
+                        reap_observed_session(&observed, ReapMode::Orphan),
+                        Reap::Skipped {
+                            reason: "identity-unknown",
+                            signalled: false
+                        }
+                    ));
+                    assert!(matches!(
+                        reconcile_permanent(&observed, None, None, None),
+                        PermanentOutcome::Stale
+                    ));
+                    assert!(!cleanup_observed_session(&observed));
+                    assert!(metadata_path(name).exists() && socket_path(name).exists());
+                }
+                assert!(
+                    fixture
+                        .child
+                        .try_wait()
+                        .expect("owned child status")
+                        .is_none()
+                );
+                drop(listener);
+            }
+            // Unknown parent identity must not authorize killing a proven
+            // live child either.
+            let mut child_tags = TagMap::new();
+            child_tags.insert("parent".into(), "unknown".into());
+            let metadata = SessionMetadata {
+                generation: Some("actual-child".into()),
+                daemon_pid: Some(pid),
+                daemon_start_token: registry::read_process_start_token(pid),
+                daemon_boot_id: registry::read_boot_id(),
+                tags: Some(child_tags),
+                ..SessionMetadata::default()
+            };
+            write_metadata("child", &metadata).expect("child record");
+            let outcome = gc(GcOptions::default());
+            assert!(outcome.killed_orphan_children.is_empty());
+            assert!(outcome.respawned.is_empty() && outcome.respawn_failed.is_empty());
+            assert!(metadata_path("child").exists());
+            assert!(
+                fixture
+                    .child
+                    .try_wait()
+                    .expect("owned child status")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn b1_layout_pruning_preserves_unknown_session_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "pty-layout-unknown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        registry::with_root(&root, || {
+            let pid = std::process::id();
+            let metadata = SessionMetadata {
+                generation: Some("legacy-layout".into()),
+                daemon_pid: Some(pid as i32),
+                daemon_start_token: registry::read_process_start_token(pid as i32),
+                daemon_boot_id: None,
+                tags: Some(TagMap::from([(":l0-abc".into(), "retained".into())])),
+                ..Default::default()
+            };
+            write_metadata("unknown", &metadata).unwrap();
+            registry::write_pid("unknown", pid).unwrap();
+            let observed = registry::get_session_by_name("unknown").unwrap();
+            assert!(observed.is_running());
+            assert_eq!(observed.identity, registry::DaemonIdentityCheck::Unknown);
+            let before = std::fs::read(metadata_path("unknown")).unwrap();
+            assert!(prune_orphan_layout_tags(true).is_empty());
+            assert!(prune_orphan_layout_tags(false).is_empty());
+            assert_eq!(std::fs::read(metadata_path("unknown")).unwrap(), before);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_respawn_still_overlays_manifest_launch_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "pty-gc-legacy-manifest-{}-{}",
+            std::process::id(),
+            now_epoch_ms(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let manifest = dir.join("pty.toml");
+        std::fs::write(
+            &manifest,
+            "[sessions.worker]\ncommand = 'echo changed'\ncwd = 'subdir'\nenv = { VALUE = 'new' }\n",
+        )
+        .unwrap();
+        let mut tags = TagMap::new();
+        tags.insert("ptyfile".into(), manifest.to_string_lossy().into_owned());
+        tags.insert("ptyfile.session".into(), "worker".into());
+        let metadata = SessionMetadata {
+            command: "/bin/true".into(),
+            args: vec!["old-argument".into()],
+            cwd: "/old-cwd".into(),
+            tags: Some(tags),
+            ..Default::default()
+        };
+        let (params, reread) = respawn_params("legacy-manifest", &metadata).unwrap();
+        assert!(reread);
+        assert_eq!(params.command, "/bin/sh");
+        assert_eq!(params.args, ["-c", "export VALUE='new'; echo changed"]);
+        assert_eq!(params.cwd, dir.join("subdir").to_string_lossy());
+        assert!(params.publication_binding.is_none());
+        assert!(params.publication_root_id.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_stalled_cwd_probe_is_inconclusive_within_the_deadline() {
@@ -1157,5 +1419,29 @@ mod tests {
             .insert("strategy.abandon-if-cwd-gone".into(), "false".into());
         assert!(classify_abandoned(&missing, None, 0).is_some());
         assert!(revalidate_abandonment(&missing, &opted_out, None, 0).is_none());
+    }
+
+    #[test]
+    fn gc_reaps_pidless_metadata_without_companions() {
+        let root = std::env::temp_dir().join(format!("pty-gc-pidless-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        registry::with_root(&root, || {
+            let metadata = SessionMetadata {
+                generation: Some("legacy-history".into()),
+                ..Default::default()
+            };
+            write_metadata("legacy", &metadata).unwrap();
+            assert!(!registry::pid_path("legacy").exists());
+            assert!(!socket_path("legacy").exists());
+            let observed = registry::get_session_by_name("legacy").unwrap();
+            assert_eq!(observed.identity, DaemonIdentityCheck::Gone);
+            assert_eq!(daemon_identity("legacy", &metadata), observed.identity);
+            let result = gc(GcOptions::default());
+            assert_eq!(result.removed, vec!["legacy".to_string()]);
+            assert!(!metadata_path("legacy").exists());
+            assert!(result.killed_orphan_children.is_empty());
+            assert!(result.respawned.is_empty());
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

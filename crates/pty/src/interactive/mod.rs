@@ -4,6 +4,8 @@
 //! attaches to the one you picked, or restarts it first if it has stopped,
 //! or creates a new one from the last row. Detaching brings you back to the
 //! list rather than to the shell.
+//! Stopped-session restart revalidates the selected generation and its persisted
+//! publication binding under name locks before removing predecessor artifacts.
 //!
 //! Relay host groups are not here yet. Everything the picker does is local,
 //! so the section headers Node draws for remote hosts have nothing to show
@@ -65,7 +67,10 @@ fn load_theme() -> (Theme, String) {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    match saved.as_deref().and_then(|n| theme_by_name(n).map(|t| (t, n))) {
+    match saved
+        .as_deref()
+        .and_then(|n| theme_by_name(n).map(|t| (t, n)))
+    {
         Some((theme, name)) => (theme, name.to_string()),
         // **The default is the terminal's own theme, which paints nothing.**
         // Every slot in `TERMINAL` is `None`, so no colour sequence is emitted
@@ -135,7 +140,8 @@ impl Picker {
     /// the same session where that session is still listed.
     fn refresh(&mut self) {
         let selected_name = self.selected_session_name();
-        self.all = registry::list_sessions();
+        // Restart must retain environments and whole-record legacy identity.
+        self.all = registry::list_sessions_full();
         if !self.filter_tags.is_empty() {
             self.all.retain(|s| {
                 registry::matches_all_tags(
@@ -263,13 +269,7 @@ impl Picker {
 
         let mut lines: Vec<Line> = vec![self.filter_line(ctx), Line::from("")];
         let first = self.region.offset;
-        for (offset, row) in self
-            .shown
-            .iter()
-            .skip(first)
-            .take(viewport)
-            .enumerate()
-        {
+        for (offset, row) in self.shown.iter().skip(first).take(viewport).enumerate() {
             let at = first + offset;
             let selected = at == self.region.selected;
             let marker = if selected { "▸ " } else { "  " };
@@ -338,7 +338,10 @@ impl Picker {
     /// ctrl+g walks the built-in themes and remembers the choice.
     fn cycle_theme(&mut self, app: &mut AppCtl<()>) {
         let names = theme_names();
-        let at = names.iter().position(|n| *n == self.theme_name).unwrap_or(0);
+        let at = names
+            .iter()
+            .position(|n| *n == self.theme_name)
+            .unwrap_or(0);
         let next = names[(at + 1) % names.len()];
         if let Some(theme) = theme_by_name(next) {
             self.theme = theme;
@@ -370,7 +373,7 @@ impl Picker {
             Some(Row::Session(session)) => {
                 let session = session.clone();
                 if session.status != registry::SessionStatus::Running
-                    && let Err(msg) = self.restart(&session)
+                    && let Err(msg) = Self::restart(&session)
                 {
                     self.notice = Some(msg);
                     return;
@@ -382,11 +385,23 @@ impl Picker {
     }
 
     /// Start a stopped session again from what it was given the first time.
-    fn restart(&self, session: &SessionInfo) -> Result<(), String> {
+    fn restart(session: &SessionInfo) -> Result<(), String> {
         let Some(meta) = session.metadata.clone() else {
             return Err(format!("{}: no metadata, cannot restart", session.name));
         };
-        let _ = registry::cleanup_all(&session.name);
+        // An exited session's daemon can still be finishing, and it needs the
+        // event lock to finish, so wait for it before taking the locks.
+        pty_client::wait_for_recorded_owner_loss(&session.name, &meta)
+            .map_err(|error| error.to_string())?;
+        // Match CLI restart's event-then-creation ordering and fence the exact
+        // observed generation before touching any predecessor artifacts.
+        let event_guard = registry::take_event_lock(&session.name)?;
+        let creation_guard = registry::take_metadata_lock(&session.name)?;
+        let current = registry::read_metadata(&session.name)
+            .ok_or_else(|| format!("{}: metadata became unreadable", session.name))?;
+        if !registry::metadata_matches_observation(&meta, &current) {
+            return Err(format!("{}: session changed before restart", session.name));
+        }
         let mut params = crate::cli::SpawnParams::new(&session.name, &meta.command, &meta.args);
         params.display_command = meta.display_command.clone();
         params.cwd = meta.cwd.clone();
@@ -397,7 +412,14 @@ impl Picker {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        crate::cli::spawn_daemon(&params).map_err(|e| format!("{}: {e}", session.name))
+        pty_lifecycle::config_for(&params).check_publication()?;
+        let publisher = crate::cli::prepare_daemon(&mut params)?;
+        params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+        registry::cleanup_all_while_locked(&session.name);
+        event_guard.release();
+        let spawned = publisher.spawn(params);
+        creation_guard.release();
+        spawned.map(|_| ()).map_err(|e| format!("{}: {e}", session.name))
     }
 
     /// One keystroke makes a session: a random id, your shell, your home
@@ -433,5 +455,61 @@ impl Picker {
         }
         self.refresh();
         app.resume();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_restart_preserves_unknown_live_owner() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let root =
+            Root(std::env::temp_dir().join(format!("pty-picker-{}", registry::random_hex16())));
+        std::fs::create_dir(&root.0).unwrap();
+        registry::with_root(&root.0, || {
+            let pid = child.0.id() as i32;
+            let metadata = registry::SessionMetadata {
+                daemon_pid: Some(pid),
+                daemon_start_token: registry::read_process_start_token(pid),
+                generation: Some("unknown-owner".into()),
+                command: "true".into(),
+                ..Default::default()
+            };
+            registry::write_metadata_publication("unknown", &metadata).unwrap();
+            registry::write_pid("unknown", child.0.id()).unwrap();
+            let _listener =
+                std::os::unix::net::UnixListener::bind(registry::socket_path("unknown")).unwrap();
+            let before = std::fs::read(registry::metadata_path("unknown")).unwrap();
+            let session = registry::get_session_by_name("unknown").unwrap();
+            assert_eq!(session.status, registry::SessionStatus::Running);
+            let error = Picker::restart(&session).unwrap_err();
+            assert!(error.contains("identity is unknown"), "{error}");
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(registry::socket_path("unknown").exists());
+            assert_eq!(
+                std::fs::read(registry::metadata_path("unknown")).unwrap(),
+                before
+            );
+        });
     }
 }

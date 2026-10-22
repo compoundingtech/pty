@@ -6,10 +6,11 @@
 
 use std::fmt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pty_core::registry::{
-    self, SessionGenerationOwner, SessionStatus, cleanup_owned_all, wait_for_process_exit,
+    self, DaemonIdentityCheck, SessionGenerationOwner, SessionMetadata, SessionStatus,
+    cleanup_owned_all,
 };
 
 /// How long an exited session's daemon gets to finish before the removal
@@ -33,6 +34,10 @@ pub enum RemoveError {
     DaemonDidNotExit {
         name: String,
     },
+    /// Recorded owner identity could not be proved or disproved.
+    IdentityUnverified {
+        name: String,
+    },
     /// A new generation published under the same name while this waited,
     /// and it was left alone.
     Replaced {
@@ -52,6 +57,10 @@ impl fmt::Display for RemoveError {
             RemoveError::DaemonDidNotExit { name } => write!(
                 f,
                 "Session \"{name}\" daemon did not exit within 7s; not removed. Try again."
+            ),
+            RemoveError::IdentityUnverified { name } => write!(
+                f,
+                "Refusing to remove session \"{name}\": daemon identity is unknown."
             ),
             RemoveError::Replaced { name } => write!(
                 f,
@@ -73,6 +82,11 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
             name: name.to_string(),
         });
     };
+    if session.identity == DaemonIdentityCheck::Unknown {
+        return Err(RemoveError::IdentityUnverified {
+            name: name.to_string(),
+        });
+    }
     if session.status == SessionStatus::Running {
         return Err(RemoveError::StillRunning {
             name: name.to_string(),
@@ -84,17 +98,9 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
     // then cleans up. Wait on the old generation's daemon so an immediate
     // same-name `pty run` cannot publish a socket the old daemon unlinks.
     let generation = session.metadata.as_ref().and_then(|m| m.generation.clone());
-    let daemon_pid = session
-        .pid
-        .or_else(|| session.metadata.as_ref().and_then(|m| m.daemon_pid))
-        .or_else(|| registry::read_session_pid(name));
-    if let Some(pid) = daemon_pid
-        && !wait_for_process_exit(pid, DAEMON_EXIT_WAIT)
-    {
-        return Err(RemoveError::DaemonDidNotExit {
-            name: name.to_string(),
-        });
-    }
+    let sidecar = registry::read_session_pid(name);
+    let daemon_pid = sidecar.or_else(|| session.metadata.as_ref().and_then(|m| m.daemon_pid));
+    wait_for_owner_loss(name, sidecar, session.metadata.as_ref())?;
 
     // Re-check generation ownership in the same critical section as the
     // unlink so a replacement that published meanwhile is left alone.
@@ -110,7 +116,130 @@ pub fn remove(name: &str) -> Result<(), RemoveError> {
     Ok(())
 }
 
+/// Wait, holding no registry lock, until the daemon recorded in `metadata`
+/// is known to be gone, as [`remove`] does before it unlinks anything. It is
+/// for a caller that then takes the registry locks itself, as restart does to
+/// keep the name through the respawn, and checks the generation under them.
+pub fn wait_for_recorded_owner_loss(
+    name: &str,
+    metadata: &SessionMetadata,
+) -> Result<(), RemoveError> {
+    wait_for_owner_loss(name, registry::read_session_pid(name), Some(metadata))
+}
+
+fn wait_for_owner_loss(
+    name: &str,
+    sidecar: Option<i32>,
+    metadata: Option<&SessionMetadata>,
+) -> Result<(), RemoveError> {
+    match registry::check_record_identity_in(&registry::session_dir(), name, sidecar, metadata) {
+        DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => Ok(()),
+        DaemonIdentityCheck::Unknown => Err(RemoveError::IdentityUnverified {
+            name: name.to_string(),
+        }),
+        DaemonIdentityCheck::Match => {
+            let (Some(pid), Some(metadata)) = (sidecar.or(metadata.and_then(|m| m.daemon_pid)), metadata)
+            else {
+                return Err(RemoveError::IdentityUnverified {
+                    name: name.to_string(),
+                });
+            };
+            wait_for_recorded_daemon_exit(name, pid, metadata, DAEMON_EXIT_WAIT)
+        }
+    }
+}
+
+fn wait_for_recorded_daemon_exit(
+    name: &str,
+    pid: i32,
+    metadata: &SessionMetadata,
+    timeout: Duration,
+) -> Result<(), RemoveError> {
+    let started = Instant::now();
+    loop {
+        match registry::check_daemon_identity(pid, metadata) {
+            DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch => return Ok(()),
+            DaemonIdentityCheck::Unknown => {
+                return Err(RemoveError::IdentityUnverified {
+                    name: name.to_string(),
+                });
+            }
+            DaemonIdentityCheck::Match if registry::has_process_exited_for_reap(pid) => {
+                return Ok(());
+            }
+            DaemonIdentityCheck::Match => {}
+        }
+        if started.elapsed() >= timeout {
+            return Err(RemoveError::DaemonDidNotExit {
+                name: name.to_string(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// [`remove`] in the registry at `root` instead of `$PTY_ROOT`.
 pub fn remove_in(root: &Path, name: &str) -> Result<(), RemoveError> {
     registry::with_root(root, || remove(name))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_skips_reused_pid_wait_and_refuses_unknown_identity() {
+        struct Fixture {
+            child: std::process::Child,
+            root: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("owned child");
+        let pid = child.id() as i32;
+        let root = std::env::temp_dir().join(format!("ptyrm-{}-{pid}", std::process::id()));
+        std::fs::create_dir(&root).expect("isolated registry");
+        let mut fixture = Fixture { child, root };
+        registry::with_root(&fixture.root, || {
+            for (name, token) in [("mismatch", Some("linux:1".to_string())), ("unknown", None)] {
+                let listener = std::os::unix::net::UnixListener::bind(registry::socket_path(name))
+                    .expect("stale socket");
+                registry::write_pid(name, fixture.child.id()).expect("retained pid");
+                registry::write_metadata(
+                    name,
+                    &SessionMetadata {
+                        generation: Some(format!("retained-{name}")),
+                        daemon_pid: Some(pid),
+                        daemon_start_token: token,
+                        daemon_boot_id: registry::read_boot_id(),
+                        ..SessionMetadata::default()
+                    },
+                )
+                .expect("retained record");
+                if name == "mismatch" {
+                    // No wait on the unrelated sleep: the old owner is lost.
+                    assert!(remove(name).is_ok());
+                    assert!(!registry::metadata_path(name).exists());
+                    assert!(!registry::socket_path(name).exists());
+                } else {
+                    assert!(matches!(
+                        remove(name),
+                        Err(RemoveError::IdentityUnverified { .. })
+                    ));
+                    assert!(registry::metadata_path(name).exists());
+                    assert!(registry::socket_path(name).exists());
+                }
+                assert!(fixture.child.try_wait().unwrap().is_none());
+                drop(listener);
+            }
+        });
+    }
 }

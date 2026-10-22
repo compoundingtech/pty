@@ -41,6 +41,11 @@ pub struct DaemonConfig {
     pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<TagMap>,
+    /// Immutable identity checked against durable publication revocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_binding: Option<pty_core::registry::revocation::PublicationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_root_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +73,34 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl DaemonConfig {
+    /// Validate launch identity and its durable fence. Effectful callers hold
+    /// the name creation lock across this check and their publication effects.
+    pub fn check_publication(&self) -> Result<(), String> {
+        if self.publication_binding.is_some()
+            && self.startup_lease.as_ref().is_some_and(|lease| {
+                lease.lifecycle_tag == "st3.start-operation"
+            })
+        {
+            return Err("publication operation tag cannot be a mutable lifecycle tag".into());
+        }
+        match (&self.publication_binding, &self.publication_root_id) {
+            (Some(_), Some(expected)) => {
+                let actual = pty_core::registry::revocation::root_id()
+                    .map_err(|error| error.to_string())?;
+                if &actual != expected {
+                    return Err("publication root identity changed".into());
+                }
+            }
+            (None, None) => {}
+            _ => return Err("publication binding and root identity are required together".into()),
+        }
+        pty_core::registry::revocation::check(
+            &self.name,
+            self.publication_binding.as_ref(),
+            self.tags().and_then(|tags| tags.get("st3.start-operation")).map(String::as_str),
+        ).map_err(|error| error.to_string())
+    }
+
     /// Node's defaults: `args []`, `cwd process.cwd()`, `rows 24`, `cols 80`.
     ///
     /// node: src/server.ts:1571-1591

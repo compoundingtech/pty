@@ -5,7 +5,8 @@
 //!
 //! **Unstable.** This API will move onto `SessionRef` / `PtyRoot` with
 //! compoundingtech/pty-rust#1 and #3. Until then [`SessionInfo`] exposes the
-//! on-disk session metadata as-is.
+//! registry list projection: retained scrollback and environment payloads
+//! (`lastLines`, `extraEnv`, `sessionEnv`) require a full metadata read.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -169,6 +170,7 @@ mod tests {
             socket_path,
             pid: Some(42),
             status: SessionStatus::Running,
+            identity: registry::DaemonIdentityCheck::Match,
             metadata: None,
         }
     }

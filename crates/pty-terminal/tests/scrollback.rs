@@ -145,3 +145,224 @@ fn a_widened_terminal_reports_the_history_it_can_still_hold() {
     assert_eq!(a.scrollback_capacity(), 24 + a.scrollback());
     assert_eq!(a.scrollback_request(), DEFAULT_SCROLLBACK);
 }
+
+fn page(a: &mut TerminalActor, before: Option<String>) -> (Vec<String>, Option<String>) {
+    page_of(a, 2, before)
+}
+
+fn page_of(a: &mut TerminalActor, limit: u16, before: Option<String>) -> (Vec<String>, Option<String>) {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let HistoryResponse::Page { rows, next_before, .. } =
+        a.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit, before })
+    else { panic!("expected history page") };
+    let text = rows.into_iter().map(|row| {
+        let mut replay = TerminalActor::new(2, 80, 0);
+        replay.write(row.ansi.as_bytes());
+        replay.plain(Range::Viewport)
+    }).collect();
+    (text, next_before)
+}
+
+#[test]
+fn history_pages_remain_anchored_across_append_and_report_retention_loss() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (first, cursor) = page(&mut actor, None);
+    assert_eq!(first, ["L8", "L9"]);
+    actor.write(b"L12\r\nL13\r\n");
+    let (older, _) = page(&mut actor, cursor.clone());
+    assert_eq!(older, ["L6", "L7"]);
+    fill(&mut actor, 5_000);
+    assert!(matches!(
+        actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }),
+        HistoryResponse::CursorGap
+    ));
+}
+
+/// The oldest retained row's `fill` label, read without issuing a cursor.
+fn oldest_label(a: &TerminalActor) -> usize {
+    a.plain(Range::Full)
+        .lines()
+        .next()
+        .and_then(|line| line.trim_end().strip_prefix('L'))
+        .and_then(|n| n.parse().ok())
+        .expect("a numbered oldest row")
+}
+
+/// Write numbered lines from `next` until retention prunes, and return the
+/// next unwritten number.
+fn write_until_pruned(a: &mut TerminalActor, mut next: usize) -> usize {
+    let before = oldest_label(a);
+    while oldest_label(a) == before {
+        assert!(next < 20_000, "retention never pruned");
+        a.write(format!("L{next}\r\n").as_bytes());
+        next += 1;
+    }
+    next
+}
+
+/// Retention can prune rows a cursor still owes its reader and keep the
+/// cursor's own row. The read that reaches the oldest retained row is then a
+/// gap, never a short page that looks like the end of history. Reported with
+/// 3x80, 1000 rows of scrollback and 200-row pages; libghostty evicts whole
+/// pages, so the cursor is placed from the prune size measured here.
+#[test]
+fn history_reports_rows_pruned_under_a_retained_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 1000);
+    fill(&mut actor, 1400);
+    let before = oldest_label(&actor);
+    let next = write_until_pruned(&mut actor, 1400);
+    let prune = oldest_label(&actor) - before;
+    // Leave the cursor's row `prune + 100` rows below the oldest: the next
+    // prune keeps it and takes all but 100 of the rows it owes.
+    let request = |limit, before| HistoryRequest { expected_generation: "owner-generation".into(), limit, before };
+    let HistoryResponse::Page { retained_rows, .. } = actor.history("owner-generation", &request(1, None)) else {
+        panic!("expected a page")
+    };
+    let above = prune + 100;
+    assert!(above < retained_rows, "a prune of {prune} rows leaves no room for a cursor");
+    let mut unread = retained_rows - above;
+    let mut cursor = None;
+    let mut anchor = String::new();
+    while unread > 0 {
+        let limit = unread.min(200);
+        let (rows, next_before) = page_of(&mut actor, limit as u16, cursor);
+        anchor = rows[0].clone();
+        cursor = next_before;
+        unread -= limit;
+    }
+    let anchor: usize = anchor[1..].parse().unwrap();
+    let owed_from = oldest_label(&actor);
+    write_until_pruned(&mut actor, next);
+    let oldest = oldest_label(&actor);
+    assert!(
+        oldest > owed_from && oldest <= anchor,
+        "the prune must take rows the cursor owes and keep its row L{anchor}; the oldest is L{oldest}"
+    );
+    match actor.history("owner-generation", &request(200, cursor)) {
+        HistoryResponse::CursorGap => {}
+        HistoryResponse::Page { rows, next_before, .. } => panic!(
+            "a {}-row page (next cursor: {}) after rows from L{owed_from} to L{} were pruned",
+            rows.len(),
+            next_before.is_some(),
+            oldest - 1
+        ),
+        _ => panic!("expected a gap"),
+    }
+}
+
+/// The loss travels along the cursor chain: whole pages above the pruning
+/// are still served, and the read that reaches the oldest retained row
+/// reports the gap.
+#[test]
+fn history_carries_pruned_rows_to_the_next_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 1000);
+    fill(&mut actor, 1400);
+    let (_, mut cursor) = page_of(&mut actor, 200, None);
+    write_until_pruned(&mut actor, 1400);
+    let mut whole = 0;
+    loop {
+        match actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 200, before: cursor }) {
+            HistoryResponse::Page { rows, next_before, .. } => {
+                assert!(next_before.is_some(), "a {}-row page ended history after pruning", rows.len());
+                assert_eq!(rows.len(), 200);
+                cursor = next_before;
+                whole += 1;
+            }
+            HistoryResponse::CursorGap => break,
+            _ => panic!("expected a page or a gap"),
+        }
+    }
+    assert!(whole > 0, "pages above the pruned rows are still served");
+}
+
+#[test]
+fn history_rejects_reset_geometry_generation_and_alternate_without_consuming_cursor() {
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    let mut actor = TerminalActor::new(3, 80, 100);
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    let request = HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor };
+    assert!(matches!(actor.history("different-owner", &request), HistoryResponse::StaleGeneration));
+    actor.write(b"\x1b[?1049hALT\r\nALT\r\nALT");
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::AlternateScreen));
+    actor.write(b"\x1b[?1049l");
+    assert_eq!(page(&mut actor, request.before.clone()).0, ["L6", "L7"]);
+    actor.resize(40, 3);
+    assert!(matches!(actor.history("owner-generation", &request), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1b[3J");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+    fill(&mut actor, 12);
+    let (_, cursor) = page(&mut actor, None);
+    actor.write(b"\x1bc");
+    assert!(matches!(actor.history("owner-generation", &HistoryRequest { expected_generation: "owner-generation".into(), limit: 2, before: cursor }), HistoryResponse::CursorGap));
+}
+
+#[test]
+fn history_round_trip_preserves_cell_links_without_linking_adjacent_text() {
+    use libghostty_vt::screen::{CellContentTag, CellWide};
+    use libghostty_vt::style::StyleColor;
+    use libghostty_vt::terminal::{Point, PointCoordinate};
+    use pty_core::protocol::{HistoryRequest, HistoryResponse};
+    // Erased backgrounds live in cell content; written glyphs use the SGR style.
+    let background = |actor: &TerminalActor, column| {
+        let grid = actor.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        let cell = grid.cell().unwrap();
+        match cell.content_tag().unwrap() {
+            CellContentTag::BgColorPalette => StyleColor::Palette(cell.bg_color_palette().unwrap()),
+            CellContentTag::BgColorRgb => StyleColor::Rgb(cell.bg_color_rgb().unwrap()),
+            _ => grid.style().unwrap().bg_color,
+        }
+    };
+    let mut owner = TerminalActor::new(2, 8, 100);
+    owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/first\x1b\\A界\x1b]8;;\x1b\\\x1b[0mZ\x1b]8;;https://example.test/second\x1b\\e\u{301}\x1b]8;;\x1b\\\x1b[44m\x1b[K\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n\r\nDONE\r\nLAST".as_bytes());
+    let HistoryResponse::Page { rows, .. } = owner.history("owner", &HistoryRequest {
+        expected_generation: "owner".into(), limit: 200, before: None,
+    }) else { panic!("expected retained history") };
+    let mut replay = TerminalActor::new(2, 8, 0);
+    replay.write(rows[0].ansi.as_bytes());
+    assert_eq!(replay.plain(Range::Viewport).trim_end(), "A界Ze\u{301}");
+    let mut uri = [0_u8; 256];
+    for (column, expected) in [
+        (0, "https://example.test/first"),
+        (1, "https://example.test/first"),
+        (3, ""),
+        (4, "https://example.test/second"),
+        (5, ""),
+    ] {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        let length = cell.hyperlink_uri(&mut uri).unwrap();
+        assert_eq!(std::str::from_utf8(&uri[..length]).unwrap(), expected, "column {column}");
+    }
+    let first = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 })).unwrap().style().unwrap();
+    assert!(first.bold && first.strikethrough);
+    assert!(matches!(first.fg_color, StyleColor::Palette(index) if index.0 == 1));
+    let wide = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 1, y: 0 })).unwrap();
+    assert_eq!(wide.cell().unwrap().wide().unwrap(), CellWide::Wide);
+    let unlinked = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: 3, y: 0 })).unwrap().style().unwrap();
+    assert!(!unlinked.bold && !unlinked.strikethrough);
+    assert!(matches!(unlinked.fg_color, StyleColor::None));
+    for column in 5..8 {
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
+    }
+    replay.reset();
+    replay.write(rows[1].ansi.as_bytes());
+    for column in 0..8 {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        assert!(matches!(background(&replay, column), StyleColor::Palette(index) if index.0 == 4));
+        assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
+    }
+    replay.reset();
+    replay.write(rows[2].ansi.as_bytes());
+    assert_eq!(replay.plain(Range::Viewport), "");
+    for column in 0..8 {
+        let cell = replay.terminal().grid_ref(Point::Active(PointCoordinate { x: column, y: 0 })).unwrap();
+        assert!(matches!(background(&replay, column), StyleColor::None));
+        assert_eq!(cell.hyperlink_uri(&mut uri).unwrap(), 0);
+    }
+}

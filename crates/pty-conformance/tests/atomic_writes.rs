@@ -191,21 +191,33 @@ fn concurrent_emits_and_an_oversized_metadata_event_survive_retention() {
     for m in &markers {
         let json = serde_json::json!({"marker": m}).to_string();
         let mut cmd = rig.command(&["emit", "at6", "user.concurrent", "--json", &json]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         children.push(cmd.spawn().expect("spawn emit"));
     }
     let patch = serde_json::json!({"tags": {"description": next}}).to_string();
     let mut patched = false;
+    let mut last_patch = None;
     for _ in 0..100 {
         let out = rig.pty_stdin(patch.as_bytes(), &["metadata", "patch", "--id", "at6"]);
         if out.status == 0 {
             patched = true;
             break;
         }
+        last_patch = Some(out);
     }
-    let statuses: Vec<i32> = children.iter_mut().map(|c| c.wait().unwrap().code().unwrap_or(-1)).collect();
-    assert!(statuses.iter().all(|&s| s == 0), "emit statuses: {statuses:?}");
-    assert!(patched, "metadata patch remained busy after concurrent writers completed");
+    let results: Vec<_> = markers
+        .iter()
+        .zip(children)
+        .map(|(marker, child)| {
+            let out = child.wait_with_output().expect("wait for emit");
+            (marker, out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
+        })
+        .collect();
+    assert!(
+        results.iter().all(|(_, status, _)| *status == 0),
+        "emit results (marker, status, stderr): {results:#?}\nmetadata patched: {patched}; last failed patch: {last_patch:?}"
+    );
+    assert!(patched, "metadata patch remained busy after concurrent writers completed: {last_patch:?}");
 
     let events = read_events(&rig, "at6");
     let mut observed: Vec<String> = events

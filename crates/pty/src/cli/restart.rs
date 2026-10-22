@@ -4,8 +4,6 @@
 //! node: src/cli.ts:1358-1382 (dispatch), 3850-3857 (`statefulAgentReason`),
 //! 3886-3963 (`cmdRestart`)
 
-use std::time::Duration;
-
 use pty_core::registry::{self, SessionMetadata, SessionStatus};
 
 use super::{
@@ -20,7 +18,13 @@ const USAGE: &str = "Usage: pty restart [-y] [--force] <name>";
 ///
 /// node: src/cli.ts:3850-3857
 fn stateful_agent_reason(meta: &SessionMetadata) -> Option<&'static str> {
-    if meta.tags.as_ref().and_then(|t| t.get("role")).map(String::as_str) == Some("agent") {
+    if meta
+        .tags
+        .as_ref()
+        .and_then(|t| t.get("role"))
+        .map(String::as_str)
+        == Some("agent")
+    {
         return Some("role=agent tag");
     }
     let argv = std::iter::once(meta.command.clone())
@@ -81,9 +85,12 @@ pub fn run(args: &[String]) -> CliResult {
         eprintln!("Session \"{name}\" not found.");
         return Ok(1);
     };
+    if session.identity == registry::DaemonIdentityCheck::Unknown {
+        eprintln!("pty restart: Session \"{name}\" daemon identity is unknown.");
+        return Ok(1);
+    }
     let Some(meta) = session.metadata.clone() else {
         eprintln!("Session \"{name}\" has no metadata — cannot restart.");
-        let _ = registry::cleanup_all(&name);
         return Ok(1);
     };
 
@@ -99,33 +106,63 @@ pub fn run(args: &[String]) -> CliResult {
     }
 
     if session.status == SessionStatus::Running
-        && let Some(pid) = session.pid
-    {
-        if !yes && ask::declined(&ask::ask(&format!(
+        && !yes
+        && ask::declined(&ask::ask(&format!(
             "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        ))) {
-            return Ok(0);
-        }
-        // SAFETY: kill(2) with a pid read from the registry; an error only
-        // means the process is already gone, which is the wanted state.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        registry::cleanup_socket(&name);
-        std::thread::sleep(Duration::from_millis(200));
+        )))
+    {
+        return Ok(0);
     }
-
-    let _ = registry::cleanup_all(&name);
-
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
-    // An operator restarting by hand is saying "try again", so drop any
-    // flapping mark that would make gc skip the fresh spawn.
+    // An explicit retry drops flapping bookkeeping, never launch provenance.
     params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    if let Err(e) = super::spawn_daemon(&params) {
-        eprintln!("pty restart: {e}");
+    // Refuse a revoked or unverifiable launch before stopping the survivor.
+    pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
+
+    if session.status == SessionStatus::Running {
+        let stopped = match pty_client::stop(&name, meta.generation.as_deref()) {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                eprintln!("pty restart: {error}");
+                return Ok(1);
+            }
+        };
+        if !stopped.verified_empty() {
+            eprintln!(
+                "pty restart: Session \"{name}\" daemon stopped, but process tree could not be verified empty; not restarted."
+            );
+            return Ok(1);
+        }
+    }
+
+    // `stop` waited for the daemon it signalled. An exited session's daemon
+    // can still be finishing, and it needs the event lock to finish, so wait
+    // for it before taking the locks that keep the name through the respawn.
+    if let Err(error) = pty_client::wait_for_recorded_owner_loss(&name, &meta) {
+        eprintln!("pty restart: {error}");
+        return Ok(1);
+    }
+    let event_guard = registry::take_event_lock(&name)?;
+    let creation_guard = registry::take_metadata_lock(&name)?;
+    let current = registry::read_metadata(&name)
+        .ok_or_else(|| format!("Session \"{name}\" metadata became unreadable."))?;
+    if !registry::metadata_matches_observation(&meta, &current) {
+        return Err(format!("Session \"{name}\" changed before restart.").into());
+    }
+    pty_lifecycle::config_for(&params).check_publication()?;
+    params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+    registry::cleanup_all_while_locked(&name);
+    event_guard.release();
+    let spawned = publisher.spawn(params);
+    creation_guard.release();
+    if let Err(error) = spawned {
+        eprintln!("pty restart: {error}");
         return Ok(1);
     }
     println!("Session \"{name}\" restarted.");

@@ -29,6 +29,8 @@ pub const SCRUBBED_ENV: &[&str] = &[
     "PTY_SERVER_CONFIG",
     "ST_AGENT",
     "ST_ROOT",
+    "FRACTAL_AGENT",
+    "FRACTAL_ROOT",
     "NO_COLOR",
     "PTY_ROOT",
 ];
@@ -226,12 +228,11 @@ pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: kill(2) with signal 0 only checks for existence/permission.
-    let r = unsafe { libc::kill(pid, 0) };
-    if r == 0 {
-        return true;
+    // Signal 0 only checks for existence/permission.
+    match pty_core::kill::process(pid, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Has `pid` exited? A zombie counts: it has finished and only waits for
@@ -270,12 +271,7 @@ pub fn wait_for_process_gone(pid: i32) {
 
 /// Send `sig` to `pid`, ignoring errors.
 pub fn kill_pid(pid: i32, sig: i32) {
-    if pid > 0 {
-        // SAFETY: plain kill(2).
-        unsafe {
-            libc::kill(pid, sig);
-        }
-    }
+    let _ = pty_core::kill::process(pid, sig);
 }
 
 fn mkdtemp(prefix: &str) -> PathBuf {
@@ -876,7 +872,9 @@ impl Rig {
         let mut pids = Vec::new();
         let mut stack = dirs;
         while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -1312,6 +1310,22 @@ impl FakeMeta {
         self.extra.push((k.into(), v));
         self
     }
+
+    /// Bind a fixture to a real process, or to a known absent daemon PID.
+    pub fn identity(self, pid: i32) -> Self {
+        let token = pty_core::registry::read_process_start_token(pid).unwrap_or_else(|| {
+            assert!(!pid_alive(pid), "a live fixture needs a readable identity");
+            "fixture:dead".to_string()
+        });
+        self.extra("daemonPid", serde_json::json!(pid))
+            .extra("daemonStartToken", serde_json::json!(token))
+            .extra(
+                "daemonBootId",
+                serde_json::json!(
+                    pty_core::registry::read_boot_id().expect("fixture boot identity")
+                ),
+            )
+    }
 }
 
 /// Write a daemon-less `<name>.json` record (`cat`, cwd `/tmp`) so list
@@ -1368,6 +1382,7 @@ pub fn type_name(t: MessageType) -> &'static str {
         MessageType::Geometry => "GEOMETRY",
         MessageType::ResetInputModes => "RESET_INPUT_MODES",
         MessageType::ConnectionError => "CONNECTION_ERROR",
+        MessageType::History => "HISTORY",
         MessageType::Unknown(_) => "UNKNOWN",
     }
 }

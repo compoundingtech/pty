@@ -973,6 +973,9 @@ impl Core {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.closed = true;
         st.connected = false;
+        // Keep registration and shutdown ordered by state, and disconnect
+        // subscribers before a waiter can observe that close has completed.
+        self.shared.subs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         drop(st);
         self.shared.cv.notify_all();
     }
@@ -1055,12 +1058,18 @@ fn connect_and_attach(
     Ok(stream)
 }
 
-fn exit_code(status: portable_pty::ExitStatus) -> i32 {
-    if status.success() {
-        0
-    } else {
-        status.exit_code() as i32
-    }
+/// The code a spawned child's exit reports. A signal death reports 1, as
+/// `portable_pty::ExitStatus` did.
+fn exit_code(status: pty_spawn::ExitStatus) -> i32 {
+    status.code.unwrap_or(1)
+}
+
+/// SIGKILL a spawned child's whole process group, then the child, through the
+/// fence that collects it. The child leads its group (`setsid`), so this also
+/// reaches a descendant that ignores the SIGHUP a closing terminal sends.
+fn kill_spawned(fence: &pty_spawn::ReapFence) {
+    let _ = fence.signal_group(libc::SIGKILL);
+    let _ = fence.signal(libc::SIGKILL);
 }
 
 /// The actor both constructors build. Graphics have to be turned on here,
@@ -1085,7 +1094,8 @@ fn new_actor(
 pub struct TerminalHandle {
     tx: Sender<Msg>,
     shared: Arc<Shared>,
-    spawned_pid: Option<u32>,
+    /// The spawned child's signal fence; `None` for an attached session.
+    spawned: Option<Arc<pty_spawn::ReapFence>>,
 }
 
 impl TerminalHandle {
@@ -1106,7 +1116,7 @@ impl TerminalHandle {
         }
         let mut child = pair.slave.spawn_command(command).map_err(io::Error::other)?;
         drop(pair.slave);
-        let pid = child.process_id();
+        let fence = Arc::new(pty_spawn::ReapFence::new(child.process_id()));
         let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
         let writer = pair.master.take_writer().map_err(io::Error::other)?;
         let master = pair.master;
@@ -1134,6 +1144,7 @@ impl TerminalHandle {
         // PTY reader: bytes → actor; on EOF reap the child and report its code.
         {
             let tx = tx.clone();
+            let fence = fence.clone();
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 16384];
@@ -1148,15 +1159,15 @@ impl TerminalHandle {
                                 })
                                 .is_err()
                             {
-                                let _ = child.kill();
-                                let _ = child.wait();
+                                kill_spawned(&fence);
+                                let _ = fence.reap(&mut *child);
                                 return;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                let code = child.wait().map(exit_code).unwrap_or(-1);
+                let code = fence.reap(&mut *child).map_or(-1, exit_code);
                 let _ = tx.send(Msg::ChildExited { attempt, code });
             });
         }
@@ -1182,7 +1193,7 @@ impl TerminalHandle {
         let handle = TerminalHandle {
             tx,
             shared,
-            spawned_pid: pid,
+            spawned: Some(fence),
         };
         handle.wait_first_publish();
         Ok(handle)
@@ -1247,7 +1258,7 @@ impl TerminalHandle {
         let handle = TerminalHandle {
             tx,
             shared,
-            spawned_pid: None,
+            spawned: None,
         };
         handle.wait_first_publish();
         Ok(handle)
@@ -1655,13 +1666,19 @@ impl TerminalHandle {
     }
 
     /// Receive events. Each subscriber gets its own channel.
+    /// Closing disconnects every subscriber after any queued events are read,
+    /// even while the handle is retained. Subscribing after close returns an
+    /// already-disconnected receiver.
     pub fn subscribe(&self) -> Receiver<HandleEvent> {
         let (tx, rx) = mpsc::channel();
-        self.shared
-            .subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(tx);
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.closed {
+            self.shared
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tx);
+        }
         rx
     }
 
@@ -1754,16 +1771,14 @@ impl TerminalHandle {
             .unwrap_or_else(|_| Err(io::Error::other("handle closed")))
     }
 
-    /// Spawn: kill the child and reap it. Attach: DETACH and drop the socket
-    /// (the daemon keeps running). The actor thread stops either way.
+    /// Spawn: SIGKILL the child's process group and the child, and reap it.
+    /// Attach: DETACH and drop the socket (the daemon keeps running). The
+    /// actor thread stops either way.
     pub fn kill(&self) {
-        if let Some(pid) = self.spawned_pid
-            && !self.exited()
-        {
-            // SAFETY: plain kill(2) on a pid we spawned.
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+        // The fence refuses once the child is collected, so neither signal
+        // can reach a process that reused its pid or group id.
+        if let Some(fence) = &self.spawned {
+            kill_spawned(fence);
         }
         let _ = self.tx.send(Msg::Close);
         self.wait_state(Duration::from_secs(5), |st| st.closed);

@@ -16,6 +16,19 @@ use pty_conformance::*;
 
 const DAY: i64 = 24 * 60 * 60;
 
+/// Fake policy records still need process ownership evidence. A known absent
+/// PID plus a retained token models an exited daemon; no evidence is Unknown.
+fn bind_fixture_identity(rig: &Rig, name: &str, pid: i32) {
+    let token = pty_core::registry::read_process_start_token(pid).unwrap_or_else(|| {
+        assert!(!pid_alive(pid), "a live fixture needs a readable identity");
+        "fixture:dead".to_string()
+    });
+    let mut metadata = rig.meta(name).expect("fixture metadata");
+    metadata["daemonPid"] = serde_json::json!(pid);
+    metadata["daemonStartToken"] = serde_json::json!(token);
+    metadata["daemonBootId"] = serde_json::json!(pty_core::registry::read_boot_id().unwrap());
+    std::fs::write(rig.meta_path(name), metadata.to_string()).unwrap();
+}
 /// An exited session, dead for `dead_for_secs`, tagged `keep=true`.
 fn write_exited_keep(rig: &Rig, name: &str, dead_for_secs: i64) {
     write_fake_metadata(
@@ -25,6 +38,7 @@ fn write_exited_keep(rig: &Rig, name: &str, dead_for_secs: i64) {
             .exited(-dead_for_secs, 0)
             .tag("keep", "true"),
     );
+    bind_fixture_identity(rig, name, i32::MAX);
 }
 
 /// node: tests/gc-keep-expiry.test.ts:101
@@ -56,6 +70,7 @@ fn sweeps_an_expired_keep_session_apart_from_the_plain_sweep() {
         &stale,
         FakeMeta::created(-30 * DAY).exited(-30 * DAY, 0),
     );
+    bind_fixture_identity(&rig, &stale, i32::MAX);
 
     let out = rig.pty(&["gc"]);
     expect_status(&out, 0);
@@ -133,6 +148,7 @@ fn anchors_on_created_at_when_there_is_no_exit_record() {
         &name,
         FakeMeta::created(-30 * DAY).tag("keep", "true"),
     );
+    bind_fixture_identity(&rig, &name, i32::MAX);
 
     let out = rig.pty(&["gc"]);
     expect_status(&out, 0);
@@ -148,16 +164,15 @@ fn anchors_on_created_at_when_there_is_no_exit_record() {
 fn never_sweeps_a_running_keep_session_even_at_zero() {
     let rig = Rig::new();
     let name = unique_id("gke");
-    // The test process itself stands in for a live daemon (the same device
-    // list_filters.rs uses): an alive pid with no exit record reads as
-    // status=running. Aged well past the window, so the only thing keeping
-    // it out of the sweep is that it is still running.
+    // The test process stands in for a live daemon with its exact recorded
+    // start token. Age alone must not make a proven live session a candidate.
     std::fs::write(rig.pid_path(&name), std::process::id().to_string()).unwrap();
     write_fake_metadata(
         rig.root(),
         &name,
         FakeMeta::created(-30 * DAY).tag("keep", "true"),
     );
+    bind_fixture_identity(&rig, &name, std::process::id() as i32);
     assert_eq!(rig.list_entry(&name).expect("listed")["status"], "running");
 
     let out = rig.pty(&["gc", "--keep-max-age", "0"]);

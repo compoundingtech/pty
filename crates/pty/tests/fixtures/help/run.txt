@@ -21,6 +21,11 @@ Flags:
   --startup-timeout-ms <ms>
                        Add a hard startup deadline (requires --lifecycle-tag)
   --force              Create even from inside another pty session (bypass the nesting guard)
+  --publication-operation <operation>
+  --publication-binding <sha256>
+  --publication-root-id <identity>
+                       Immutable managed launch identity (all three, --id and -d required)
+                       A revoked operation refuses before publication; --force cannot override it
 
 Examples:
   pty run -- node server.js

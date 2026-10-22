@@ -124,6 +124,8 @@ const DESCENDANT_HUP_WAIT: Duration = Duration::from_millis(1_000);
 const CHILD_KILL_WAIT: Duration = Duration::from_millis(500);
 /// `SPAWNER_POLL_INTERVAL_MS`.
 const SPAWNER_POLL: Duration = Duration::from_millis(5_000);
+/// Narrow dead-writer temp maintenance, never full session reconciliation.
+const ATOMIC_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// The default `PTY_SHUTDOWN_DEADLINE_MS`.
 const SHUTDOWN_DEADLINE_DEFAULT_MS: f64 = 5_000.0;
 
@@ -135,6 +137,9 @@ pub(crate) struct Daemon {
     /// The substrate owner is the sole PTY master reader/writer/reaper.
     _owner: SessionOwner,
     pub(crate) session: pty_spawn::substrate::SessionClient,
+    /// Input for the child, written in order by [`spawn_input_writer`]'s
+    /// thread. `None` when that thread could not start.
+    input: Option<Sender<Vec<u8>>>,
     pub(crate) child_pid: i32,
     child_identity: Option<ProcessIdentity>,
     pub(crate) clients: BTreeMap<u64, Client>,
@@ -154,6 +159,7 @@ pub(crate) struct Daemon {
     exit_drain_deadline: Option<Instant>,
     exit_shutdown_at: Option<Instant>,
     exit_meta_retry: Option<(Instant, Instant)>,
+    atomic_temp_sweep_at: Instant,
     /// Unix milliseconds for the newest child output, in memory. `None`
     /// until the child prints something.
     last_output_at_ms: Option<i64>,
@@ -311,9 +317,33 @@ fn teardown_process_table() -> ProcTable {
     ProcTable::read()
 }
 
+/// Stop the actual ordinary child before any pre-exec descriptor cleanup.
+/// This debug-only hook exercises inherited descriptors, not a synthetic fork.
+#[cfg(debug_assertions)]
+fn install_ordinary_child_test_hook() -> Result<(), String> {
+    if std::env::var("PTY_TEST_ORDINARY_CHILD").as_deref() != Ok("stop-after-fork") {
+        return Ok(());
+    }
+    unsafe extern "C" fn stop_child() {
+        // Both calls are async-signal-safe in the post-fork child.
+        let _ = pty_core::kill::process(unsafe { libc::getpid() }, libc::SIGSTOP);
+    }
+    // SAFETY: the child callback uses only async-signal-safe operations and
+    // remains valid for the process lifetime. Register just before spawn.
+    let error = unsafe { libc::pthread_atfork(None, None, Some(stop_child)) };
+    if error != 0 {
+        return Err(format!(
+            "Failed to install ordinary child test hook: {}",
+            std::io::Error::from_raw_os_error(error)
+        ));
+    }
+    Ok(())
+}
+
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
 pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
+    let mut kill_signals = catch_kill_signals()?;
     let name = cfg.name.clone();
     let generation = cfg
         .generation
@@ -341,6 +371,15 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     let pair = pty_spawn::open(rows, cols)
         .map_err(|e| format!("Failed to open a PTY for session \"{name}\": {e}"))?;
 
+    let publication_lock = prepare_publication(&cfg)?;
+    // A kill that arrived before publication ends the daemon unpublished, as
+    // the default action did. One arriving from here on is served as an
+    // ordinary external kill once the actor runs.
+    if kill_signals.pending().next().is_some() {
+        return Err(format!(
+            "Session \"{name}\" was terminated before it was published"
+        ));
+    }
     let (listener, metadata) = publish_session(&Publication {
         cfg: &cfg,
         generation: &generation,
@@ -349,7 +388,15 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         child_env: &child_env,
         events: &events,
         marker: None,
+        creation_lock: &publication_lock,
     })?;
+    // Publish while the delegated claim is pinned, then atomically hand it
+    // to this daemon. No flock descriptor may cross the ordinary child fork:
+    // a stopped pre-exec child must not prevent recovery after daemon death.
+    let delegated_owner = publication_lock.delegate();
+    let creation_claim = publication_lock
+        .into_daemon_claim()
+        .map_err(|error| format!("Failed to take daemon creation claim: {error}"))?;
     let socket_path = registry::socket_path(&name);
 
     // The child: `/bin/sh -c 'exec "$@"' sh <command> <args...>`, so PATH
@@ -360,6 +407,9 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     for (k, v) in &child_env {
         command.env(k, v);
     }
+    pty_core::operation::barrier::barrier("published-before-child-fork");
+    #[cfg(debug_assertions)]
+    install_ordinary_child_test_hook()?;
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => {
@@ -382,6 +432,18 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
             ));
         }
     };
+    pty_core::operation::barrier::barrier("before-claim-hand-back");
+    if let Some(owner) = delegated_owner.filter(|delegate| registry::pid_alive(delegate.owner_pid)) {
+        // A coordinating parent owns its claim beyond successful publication.
+        // Restore it only after fork has returned, never as an inherited fd.
+        if let Err(error) = creation_claim.hand_back(&owner) {
+            // The child is already serving. hand_back drops its daemon guard
+            // on failure; report cleanup failure without killing the session.
+            eprintln!("pty daemon: Failed to restore delegated creation claim for {name}: {error}");
+        }
+    } else {
+        drop(creation_claim);
+    }
     let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let child_identity = live_identity(child_pid);
     let session = SessionRef::new(registry::session_dir(), name.clone(), generation.clone());
@@ -394,7 +456,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
 
     let listener_fd = listener.as_raw_fd();
     spawn_acceptor(listener, tx.clone());
-    spawn_signal_listener(tx.clone());
+    spawn_signal_listener(kill_signals, tx.clone());
     install_spawner_watchdog(tx);
 
     let daemon = Daemon::assemble(DaemonParts {
@@ -437,6 +499,50 @@ pub(crate) struct Publication<'a> {
     pub(crate) events: &'a EventWriter,
     /// The launch-operation marker, `{"digest":<h>,"phase":"startup"}`.
     pub(crate) marker: Option<serde_json::Value>,
+    /// Pins the exact name claim through all publication effects.
+    pub(crate) creation_lock: &'a registry::lock::PublicationLock,
+}
+
+/// Final admission, shared by ordinary, library, respawn and operation launches.
+/// The inode pin outlives every effect, even if a delegating launcher dies.
+pub(crate) fn prepare_publication(
+    cfg: &DaemonConfig,
+) -> Result<registry::lock::PublicationLock, String> {
+    pty_core::operation::barrier::barrier("publication-before-lock");
+    let owner = std::env::var("PTY_CREATION_LOCK_OWNER_PID").ok();
+    let nonce = std::env::var("PTY_CREATION_LOCK_NONCE").ok();
+    let delegate = match (owner, nonce) {
+        (Some(owner), Some(nonce)) => {
+            let owner_pid = if owner == "daemon" {
+                std::process::id() as i32
+            } else {
+                owner.parse().map_err(|_| "invalid creation claim owner")?
+            };
+            Some(registry::lock::CreationClaimDelegate { owner_pid, nonce })
+        }
+        (None, None) => None,
+        _ => return Err("incomplete creation claim delegation".into()),
+    };
+    let guard = registry::lock::pin_publication(&cfg.name, delegate.as_ref())
+        .map_err(|error| error.to_string())?;
+    cfg.check_publication()?;
+    let observed = registry::observe_session_strict_in(
+        &registry::session_dir(), &cfg.name, &registry::ListOptions::default(),
+    );
+    if !observed.complete {
+        return Err("publication occupancy is unreadable".into());
+    }
+    if observed.entries.iter().any(|session| session.is_running()) {
+        return Err(format!("Session id \"{}\" is already in use.", cfg.name));
+    }
+    if cfg.publication_binding.is_none()
+        && observed.entries.iter().any(|session| {
+            session.metadata.as_ref().is_some_and(|metadata| metadata.publication_binding.is_some())
+        })
+    {
+        return Err("recreating a managed session requires a new explicit publication binding".into());
+    }
+    Ok(guard)
 }
 
 /// Publication before the child spawns: dir → clear events → stale socket →
@@ -453,8 +559,22 @@ pub(crate) fn publish_session(
 ) -> Result<(UnixListener, SessionMetadata), String> {
     let cfg = p.cfg;
     let name = &cfg.name;
+    // The caller must keep this pin from admission through the last effect.
+    pty_core::operation::barrier::barrier("publication-before-effects");
+    let _creation_lock = p.creation_lock;
+    // A daemon without complete birth evidence cannot be safely managed.
+    // Refuse before publishing companions or starting its terminal child.
+    let daemon_start_token = registry::read_process_start_token(std::process::id() as i32)
+        .ok_or_else(|| "daemon start identity is unavailable".to_string())?;
+    let daemon_boot_id = registry::read_boot_id()
+        .ok_or_else(|| "daemon boot identity is unavailable".to_string())?;
     registry::ensure_session_dir().map_err(|e| e.to_string())?;
-    pty_core::events::clear_events(name)?;
+    // Do not inspect this name: its pid/metadata publication is still in flight.
+    registry::retire_stale_daemon_records(name);
+    // The predecessor may still be flushing its shutdown events after the
+    // coordinator releases the event claim. Use the writer's bounded lock
+    // admission instead of failing publication on that transient append.
+    pty_core::events::clear_events_with_wait(name, registry::lock::EVENT_LOCK_WAIT)?;
     let socket_path = registry::socket_path(name);
     let _ = std::fs::remove_file(&socket_path);
     // SAFETY: umask(2) has no preconditions.
@@ -473,7 +593,8 @@ pub(crate) fn publish_session(
     let mut metadata = SessionMetadata {
         generation: Some(p.generation.to_string()),
         daemon_pid: Some(std::process::id() as i32),
-        daemon_start_token: registry::read_process_start_token(std::process::id() as i32),
+        daemon_start_token: Some(daemon_start_token),
+        daemon_boot_id: Some(daemon_boot_id),
         recovery: None,
         command: cfg.command.clone(),
         args: cfg.args.clone(),
@@ -485,6 +606,9 @@ pub(crate) fn publish_session(
         created_at: p.created_at.clone(),
         display_name: cfg.display_name().map(str::to_string),
         tags: (!p.published_tags.is_empty()).then(|| p.published_tags.clone()),
+        publication_binding: cfg.publication_binding.clone(),
+        publication_root_id: cfg.publication_root_id.clone(),
+        publication_capability: cfg.publication_binding.as_ref().map(|_| 1),
         isolate_env: cfg.isolate_env().then_some(true),
         extra_env: cfg.extra_env().cloned(),
         session_env: permanent_respawn_env(cfg, p.published_tags, p.child_env),
@@ -543,6 +667,32 @@ fn terminal_actor(rows: u16, cols: u16) -> TerminalActor {
         daemon_warn!("pty: kitty graphics unavailable for this session");
     }
     actor
+}
+
+/// Write the child's input on a thread of its own, in the order the actor
+/// sends it.
+///
+/// `SessionClient::input` returns once the kernel has taken every byte, so
+/// it waits on the child whenever the PTY's input buffer is full. The actor
+/// must never wait there: one large paste into a program that is not
+/// reading would stop the daemon serving every client, STATUS included,
+/// until the program read it or exited.
+fn spawn_input_writer(session: pty_spawn::substrate::SessionClient) -> Option<Sender<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let spawned = std::thread::Builder::new()
+        .name("pty-input".into())
+        .spawn(move || {
+            for bytes in rx {
+                let _ = session.input(bytes);
+            }
+        });
+    match spawned {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            daemon_warn!("pty daemon: cannot start input writer thread: {e}");
+            None
+        }
+    }
 }
 
 pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, tx: Sender<Msg>) {
@@ -651,7 +801,9 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
         while let Ok(out) = out_rx.recv() {
             match out {
                 Out::Bytes(packet) => {
-                    let _guard = writer_lock.lock().unwrap_or_else(|error| error.into_inner());
+                    let _guard = writer_lock
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     if wstream.write_all(&packet.bytes).is_err() {
                         break;
                     }
@@ -710,16 +862,23 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     }
 }
 
-/// SIGTERM and SIGINT are external kills.
+/// Catch SIGTERM and SIGINT before anything is published.
+///
+/// Any process that reads the pid sidecar can signal a published session.
+/// Under the default action that signal killed the daemon outright, with no
+/// exit record and no cleanup, and orphaned a child it had already forked
+/// (compoundingtech/pty#184). A signal caught here waits in `Signals` until
+/// [`spawn_signal_listener`] reads it.
+fn catch_kill_signals() -> Result<signal_hook::iterator::Signals, String> {
+    signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT])
+        .map_err(|e| format!("Failed to catch SIGTERM and SIGINT: {e}"))
+}
+
+/// SIGTERM and SIGINT are external kills, including any caught since
+/// [`catch_kill_signals`].
 ///
 /// node: src/server.ts:1598-1603
-pub(crate) fn spawn_signal_listener(tx: Sender<Msg>) {
-    let Ok(mut signals) = signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-    ]) else {
-        return;
-    };
+pub(crate) fn spawn_signal_listener(mut signals: signal_hook::iterator::Signals, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         for _ in signals.forever() {
             if tx.send(Msg::ExternalKill).is_err() {
@@ -794,6 +953,7 @@ impl Daemon {
             cfg,
             actor: terminal_actor(rows, cols),
             _owner: owner,
+            input: spawn_input_writer(session.clone()),
             session,
             child_pid,
             child_identity,
@@ -813,6 +973,7 @@ impl Daemon {
             exit_drain_deadline: None,
             exit_shutdown_at: None,
             exit_meta_retry: None,
+            atomic_temp_sweep_at: Instant::now(),
             last_output_at_ms: None,
             activity_persist_at: None,
             client_generation: 0,
@@ -846,7 +1007,14 @@ impl Daemon {
         if bytes.is_empty() || self.child_status.is_some() {
             return;
         }
-        let _ = self.session.input(bytes.to_vec());
+        match &self.input {
+            Some(input) => {
+                let _ = input.send(bytes.to_vec());
+            }
+            None => {
+                let _ = self.session.input(bytes.to_vec());
+            }
+        }
     }
 
     /// The serving loop, then the shutdown. Returns the process exit status.
@@ -861,6 +1029,7 @@ impl Daemon {
                 self.activity_persist_at,
                 self.client_meta_retry.map(|(next, _)| next),
                 self.startup_lease_timer,
+                Some(self.atomic_temp_sweep_at),
             ]
             .into_iter()
             .flatten()
@@ -919,10 +1088,21 @@ impl Daemon {
                     self.exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN);
                 }
             }
-            Msg::Connect { id, tx, disconnect, write_lock } => {
+            Msg::Connect {
+                id,
+                tx,
+                disconnect,
+                write_lock,
+            } => {
                 self.clients.insert(
                     id,
-                    Client::new(tx, disconnect, self.actor.rows(), self.actor.cols(), write_lock),
+                    Client::new(
+                        tx,
+                        disconnect,
+                        self.actor.rows(),
+                        self.actor.cols(),
+                        write_lock,
+                    ),
                 );
             }
             Msg::Packet { id, packet } => self.on_packet(id, packet),
@@ -1273,6 +1453,10 @@ impl Daemon {
 
     fn service_timers(&mut self, now: Instant) {
         self.service_cuts(now);
+        if self.atomic_temp_sweep_at <= now {
+            pty_lifecycle::cleanup_dead_registry_temps();
+            self.atomic_temp_sweep_at = Instant::now() + ATOMIC_TEMP_SWEEP_INTERVAL;
+        }
         if let Some(at) = self.activity_persist_at
             && at <= now
         {
@@ -1365,6 +1549,7 @@ impl Daemon {
         self.broadcast(&encode_exit(code));
         self.events
             .append(Event::session_exit(&self.name, code, signal));
+        self.events.flush();
         if matches!(
             self.save_exit_metadata(),
             MutateStatus::Busy | MutateStatus::Stale
@@ -1701,7 +1886,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (disconnect, _peer) = UnixStream::pair().unwrap();
         let mut clients = BTreeMap::new();
-        clients.insert(1, Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))));
+        clients.insert(
+            1,
+            Client::new(tx, disconnect, 24, 80, Arc::new(Mutex::new(()))),
+        );
         let mut actor = TerminalActor::new(24, 80, 0);
         actor.set_clipboard_client_available(answering_client_available(&clients));
         assert_eq!(actor.write(b"\x1b]52;c;?\x07"), b"");

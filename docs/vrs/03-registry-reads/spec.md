@@ -17,12 +17,48 @@ Not defined here: which sessions a listing probes and how it classifies them (`c
 ```
 caller thread
   │
-  ├─ list_sessions_with ──► probe_sockets_within_budget(paths, budget) ──┐
+  ├─ list_sessions_strict_in ──► probe_sockets_within_budget(paths, budget) ──┐
   │                                                                      ├─► unix_connect::connect  (per socket, per round)
   └─ query_stats_batch_in(root, names, deadline) ────────────────────────┘   unix_connect::poll_until (one poll(2) per round)
 ```
 
 Both entry points compute one absolute deadline at entry (`now + budget`) and run rounds until every socket has an outcome or the deadline passes (`PTY.REG-R04`, `PTY.REG-R06`). No thread is spawned (`PTY.REG-R01`). Every socket is owned by a local of the call and is closed when the call returns (`PTY.REG-R02`).
+
+### Metadata projection
+
+Registry scans deserialize metadata directly from bytes. The list projection
+consumes `lastLines`, `extraEnv`, and `sessionEnv` without retaining their
+strings or containers, while validating their original optional string-array
+and string-map shapes. All other fields, including unknown provenance and scope
+fields, remain available in `SessionInfo.metadata`. Syntax/type errors still
+omit metadata in tolerant scans and report `MetadataMalformed` in strict scans;
+non-object records remain malformed and absent defaulted fields remain accepted.
+
+Object entries are buffered as borrowed raw JSON slices, not `Value` trees, so
+duplicate keys retain their historical last-key-wins behavior before typed
+validation. This also applies recursively to tags, environment maps, publication
+bindings and unknown fields. Only the effective `lastLines`, `extraEnv`, and
+`sessionEnv` values are shape-validated; overwritten values cannot invalidate
+an otherwise valid record. Arrays stream their elements.
+Overwritten values receive a syntax-only visitor walk to preserve numeric,
+Unicode and nesting-limit checks without a payload tree. Effective values are
+decoded by their typed visitors, with the original nesting limit carried across
+borrowed raw slices; ordinary non-duplicate records need no extra syntax walk.
+
+Ordinary `list_sessions`, `list_sessions_with`, `list_sessions_in`, and strict
+observations return this projection (the three omitted fields are `None`);
+their Rust signatures are unchanged. The additive `list_sessions_full` API
+retains all fields, also deserializing directly from bytes. GC and the picker
+use it because they reconstruct persisted environments and compare whole
+generation-less legacy records. `get_session` uses a full listing for reference
+resolution; `get_session_by_name` scans only the named record with full payloads.
+`read_metadata*` remains full metadata. Consumers needing retained output,
+restart environments, or legacy whole-record comparison must use a full path.
+
+`registry::list_metadata::tests` covers projection equivalence, malformed input,
+duplicate-key equivalence on both paths, legacy whole-record identity, and a
+printed old/new parsing comparison over 500 approximately 15 KB records,
+without a timing threshold.
 
 ## Non-blocking connect
 
@@ -64,7 +100,22 @@ Each round:
 | `Failed`, or `InProgress` then an error | `false` |
 | `Busy` or `InProgress` at the deadline | absent (`PTY.REG-R05`) |
 
-The listing reads `false` and absent the same way: unreachable. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`.
+Daemon identity Match requires matching recorded stable boot identity and start
+token on Linux and macOS, plus thread-group leadership on Linux. Compare
+readable start tokens first: a difference proves Mismatch even without boot
+evidence. Matching tokens with missing/unreadable boot evidence remain Unknown.
+Legacy `darwin:{...}` boottime evidence cannot prove a boot match or mismatch.
+Unknown is not gone (`PTY.REG-R09`): retain the named PID and conservative
+`running` status unless an explicit exit record says `exited`. Carry
+`SessionInfo.identity` as the additive `identity` list JSON/remote field
+(`match`, `mismatch`, `gone`, `unknown`); Unknown never grants signal,
+cleanup or replacement authority, even with an exit record. Metadata with no
+named PID and absent PID/socket companions is Gone and removable; unreadable
+or malformed companions never prove absence. Teardown uses the existing
+`operation::exact::Exact` pinned-owner abstraction (Linux pidfd / macOS audit
+token); socket probes cannot substitute for identity requirements.
+
+Strict inventory probes transport only when daemon identity is unconfirmed; a probe cannot change that identity result or the lifecycle projection. Failed or unanswered probes make transport diagnostics incomplete. Present entries match a blocking connect (`PTY.REG-R07`). A probe never writes to or reads from the socket; a connected probe socket is closed at once. `socket_reachable(path)` is the probe with one path and `SOCKET_PROBE_TIMEOUT` (500 ms), and an absent entry is `false`. Ordinary listings classify identity without probing sockets.
 
 ## Batch STATUS
 

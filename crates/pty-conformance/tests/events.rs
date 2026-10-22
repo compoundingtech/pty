@@ -1,6 +1,6 @@
 //! Port of tests/events.test.ts, CLI half: what the daemon records in
-//! `<id>.events.jsonl` (bell, title changes with deduplication, OSC 9 / OSC
-//! 777 notifications, the log truncated at daemon start) as read back through
+//! `<id>.events.jsonl` (bell, OSC 9 / OSC 777 notifications, the log truncated
+//! at daemon start) as read back through
 //! `pty events --recent [--json]`, the `formatEvent` text shapes as printed
 //! by `pty events --recent` (fed through `pty emit` for the `user.*` cases),
 //! and follow mode (`pty events <id>`) printing events appended after it
@@ -134,35 +134,23 @@ fn bell_is_logged() {
     assert_eq!(bells[0]["session"], "evb");
 }
 
-/// node: tests/events.test.ts:435
+/// Titles are current terminal state; animated OSC 0/2 frames must not
+/// evict durable events or trigger event-log publication.
 #[test]
-fn title_change_is_logged() {
+fn animated_titles_do_not_fill_event_history() {
     let rig = Rig::new();
-    emitting_session(&rig, "evt", "\\033]0;My Custom Title\\a");
-    let events = wait_for_events(&rig, "evt", "title_change", 1);
-    let titles: Vec<&Value> = events.iter().filter(|e| e["type"] == "title_change").collect();
-    assert_eq!(titles[0]["value"], "My Custom Title");
-}
-
-/// node: tests/events.test.ts:453
-#[test]
-fn identical_title_changes_are_deduplicated() {
-    let rig = Rig::new();
-    emitting_session(
-        &rig,
-        "evd",
-        "\\033]0;Same Title\\a'; sleep 0.2; printf '\\033]0;Same Title\\a'; sleep 0.2; printf '\\033]0;Different Title\\a",
+    rig.daemon(
+        "evt",
+        &[
+            "sh",
+            "-c",
+            "i=0; while [ \"$i\" -lt 40 ]; do printf '\\033]0;spinner-%s\\a' \"$i\"; i=$((i+1)); sleep 0.01; done; printf '\\033]2;settled\\a\\a'; exec cat",
+        ],
+        DaemonOpts::no_display_name(),
     );
-    wait_for_events(&rig, "evd", "title_change", 2);
-    std::thread::sleep(Duration::from_millis(300));
-    let events = recent_json(&rig, "evd");
-    let values: Vec<&str> = events
-        .iter()
-        .filter(|e| e["type"] == "title_change")
-        .filter_map(|e| e["value"].as_str())
-        .collect();
-    assert_eq!(values.iter().filter(|v| **v == "Same Title").count(), 1, "{values:?}");
-    assert!(values.contains(&"Different Title"), "{values:?}");
+    // The final BEL follows every title and is a positive processing barrier.
+    let events = wait_for_events(&rig, "evt", "bell", 1);
+    assert!(!events.iter().any(|e| e["type"] == "title_change"), "{events:?}");
 }
 
 /// node: tests/events.test.ts:484
@@ -216,12 +204,19 @@ fn formats_bell() {
     expect_regex(&text, r"(?m)\] fmtb: bell$");
 }
 
-/// node: tests/events.test.ts:226
+/// Historical title records remain readable and formattable.
 #[test]
 fn formats_title_change() {
     let rig = Rig::new();
-    emitting_session(&rig, "fmtt", "\\033]0;Building...\\a");
-    wait_for_events(&rig, "fmtt", "title_change", 1);
+    std::fs::write(rig.meta_path("fmtt"), "{}").unwrap();
+    let old = json!({
+        "session": "fmtt",
+        "type": "title_change",
+        "ts": "2026-01-02T03:04:05.000Z",
+        "value": "Building..."
+    });
+    std::fs::write(events_path(&rig, "fmtt"), format!("{old}\n")).unwrap();
+    assert_eq!(recent_json(&rig, "fmtt"), [old]);
     expect_contains(&recent_text(&rig, "fmtt"), "title -> \"Building...\"");
 }
 
@@ -246,13 +241,13 @@ fn formats_focus_request() {
     expect_contains(&recent_text(&rig, "fmtf"), "focus requested");
 }
 
-/// node: tests/events.test.ts:258
+/// Cursor visibility is terminal state, not a durable event per TUI redraw.
 #[test]
-fn formats_cursor_visible() {
+fn cursor_redraws_do_not_fill_event_history() {
     let rig = Rig::new();
-    emitting_session(&rig, "fmtc", "\\033[?25l'; sleep 0.1; printf '\\033[?25h");
-    wait_for_events(&rig, "fmtc", "cursor_visible", 1);
-    expect_contains(&recent_text(&rig, "fmtc"), "cursor restored");
+    emitting_session(&rig, "fmtc", "\\033[?25l\\033[?25h\\033[?25l\\033[?25h\\007");
+    wait_for_events(&rig, "fmtc", "bell", 1);
+    assert!(recent_json(&rig, "fmtc").iter().all(|event| event["type"] != "cursor_visible"));
 }
 
 /// node: tests/events.test.ts:267

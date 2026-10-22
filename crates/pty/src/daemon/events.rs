@@ -24,7 +24,10 @@ impl Daemon {
         for ev in self.actor.take_events() {
             let event = match ev {
                 TerminalEvent::Bell => Event::bell(&self.name),
-                TerminalEvent::TitleChange(value) => Event::title_change(&self.name, &value),
+                // Titles are live terminal state (including animated spinner
+                // frames), not durable history. The actor retains the current
+                // title; attached clients still receive the original OSC bytes.
+                TerminalEvent::TitleChange(_) => continue,
                 TerminalEvent::Notification(n) => Event::notification(
                     &self.name,
                     n.title.as_deref(),
@@ -32,7 +35,9 @@ impl Daemon {
                     source(n.source),
                 ),
                 TerminalEvent::FocusRequest => Event::focus_request(&self.name),
-                TerminalEvent::CursorVisible => Event::cursor_visible(&self.name),
+                // Cursor restoration is redraw state, often toggled on every
+                // TUI frame; it belongs in terminal snapshots, not history.
+                TerminalEvent::CursorVisible => continue,
                 // Paste events belong to the attached client that answers
                 // them, never to the session's event log.
                 TerminalEvent::EnhancedPasteMode(_) | TerminalEvent::EnhancedPasteRead(_) => {

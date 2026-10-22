@@ -143,6 +143,10 @@ fn attach_session(
         eprintln!("Session \"{name}\" not found.");
         return Ok(1);
     };
+    if session.identity == registry::DaemonIdentityCheck::Unknown {
+        eprintln!("pty attach: refusing session \"{name}\": daemon identity is unknown.");
+        return Ok(1);
+    }
 
     if session.status == SessionStatus::Running {
         if !force {
@@ -154,7 +158,9 @@ fn attach_session(
                 }
                 None => {
                     eprintln!("pty attach: cannot verify the current session for \"{name}\".");
-                    eprintln!("  Retry when the session responds, or pass --force to attach anyway.");
+                    eprintln!(
+                        "  Retry when the session responds, or pass --force to attach anyway."
+                    );
                     return Ok(1);
                 }
                 Some(false) => {}
@@ -179,14 +185,9 @@ fn attach_session(
 /// Show what the session last printed, then offer to start it again.
 ///
 /// node: src/cli.ts:1808-1853
-fn handle_dead_session(
-    name: &str,
-    meta: Option<SessionMetadata>,
-    auto_restart: bool,
-) -> CliResult {
+fn handle_dead_session(name: &str, meta: Option<SessionMetadata>, auto_restart: bool) -> CliResult {
     let Some(meta) = meta else {
         eprintln!("Session \"{name}\" exited (no metadata available).");
-        let _ = registry::cleanup_all(name);
         return Ok(1);
     };
 
@@ -220,7 +221,20 @@ fn handle_dead_session(
         return Ok(0);
     }
 
-    let _ = registry::cleanup_all(name);
+    // An exited session's daemon can still be finishing, and it needs the
+    // event lock to finish, so wait for it before taking the locks that keep
+    // the name through the respawn.
+    if let Err(error) = client::wait_for_recorded_owner_loss(name, &meta) {
+        eprintln!("pty attach: {error}");
+        return Ok(1);
+    }
+    let event_guard = registry::take_event_lock(name)?;
+    let creation_guard = registry::take_metadata_lock(name)?;
+    let current = registry::read_metadata(name)
+        .ok_or_else(|| format!("Session \"{name}\" metadata became unreadable."))?;
+    if !registry::metadata_matches_observation(&meta, &current) {
+        return Err(format!("Session \"{name}\" changed before restart.").into());
+    }
     let mut params = SpawnParams::new(name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
@@ -228,7 +242,14 @@ fn handle_dead_session(
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    if let Err(msg) = super::spawn_daemon(&params) {
+    pty_lifecycle::config_for(&params).check_publication()?;
+    let publisher = super::prepare_daemon(&mut params)?;
+    params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);
+    registry::cleanup_all_while_locked(name);
+    event_guard.release();
+    let spawned = publisher.spawn(params);
+    creation_guard.release();
+    if let Err(msg) = spawned {
         eprintln!("pty attach: {msg}");
         return Ok(1);
     }

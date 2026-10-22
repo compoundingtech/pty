@@ -1160,8 +1160,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        crate::kill::process(pid, libc::SIGKILL).unwrap();
         unsafe {
-            libc::kill(pid, libc::SIGKILL);
             libc::waitpid(pid, std::ptr::null_mut(), 0);
             libc::close(pipe[0]);
             libc::close(pipe[1]);

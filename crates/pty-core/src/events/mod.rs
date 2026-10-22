@@ -13,8 +13,9 @@
 pub mod follow;
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -416,6 +417,58 @@ fn append_line(
     atomic_write(path, published)
 }
 
+/// Apply retention at each original record boundary. Publish each shrink
+/// separately so offset-based followers can recognize a retention rewrite.
+fn append_batch(path: &Path, events: &[Event], append_count: &mut usize) -> std::io::Result<()> {
+    let mut content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let mut published_len = content.len();
+    let mut dirty = false;
+    for event in events {
+        content.extend_from_slice(event.to_json().as_bytes());
+        content.push(b'\n');
+        dirty = true;
+        *append_count += 1;
+        if *append_count >= TRUNCATE_CHECK_INTERVAL {
+            if let Some(suffix) = retained_suffix(&content) {
+                let start = content.len() - suffix.len();
+                let retained_len = content.len() - start;
+                if retained_len >= published_len {
+                    // Large records can make even the retained suffix larger
+                    // than the old log. Establish a full snapshot to shrink.
+                    publish_batch_snapshot(path, &content)?;
+                }
+                content.drain(..start);
+                publish_batch_snapshot(path, &content)?;
+                published_len = content.len();
+                dirty = false;
+            }
+            *append_count = 0;
+        }
+    }
+    if dirty {
+        publish_batch_snapshot(path, &content)?;
+    }
+    Ok(())
+}
+
+fn publish_batch_snapshot(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    BATCH_WRITES.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    BATCH_BYTES.with(|bytes| bytes.set(bytes.get() + content.len()));
+    atomic_write(path, content)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Append while the caller owns the session's event lock. Publication
 /// atomically replaces the previous snapshot and applies the one-shot
 /// size-gated retention check in the same replacement.
@@ -469,8 +522,18 @@ pub fn emit_user_event(
 ///
 /// node: src/events.ts:392-402
 pub fn clear_events(name: &str) -> Result<(), String> {
+    clear_events_with_wait(name, std::time::Duration::ZERO)
+}
+
+/// Clear a publisher's log after waiting out a predecessor's event append.
+/// A zero budget preserves [`clear_events`]'s fail-fast behavior.
+pub fn clear_events_with_wait(name: &str, wait: std::time::Duration) -> Result<(), String> {
     ensure_session_dir().map_err(|e| e.to_string())?;
-    let _lock = take_event_lock(name)?;
+    let _lock = if wait.is_zero() {
+        take_event_lock(name)?
+    } else {
+        wait_for_event_lock(name, wait)?
+    };
     let _ = atomic_write(&events_path(name), b"");
     Ok(())
 }
@@ -555,11 +618,11 @@ enum WriterMsg {
     Flush(Sender<()>),
 }
 
-/// The daemon's serialized, background event writer: one thread drains a
-/// queue, each append under the event lock (waiting up to 5 s), retention
-/// checked every [`TRUNCATE_CHECK_INTERVAL`] appends. Errors are dropped,
-/// as Node's promise chain drops them. Call [`EventWriter::flush`] before
-/// exiting; dropping the writer does not wait for queued lines.
+/// The daemon's serialized background writer publishes records in 250 ms
+/// batches, holding the cross-process event lock once per batch. Retention
+/// is checked at the same record boundaries as the one-record writer.
+/// Exit records, explicit flushes and shutdown publish pending records.
+/// Errors are dropped, as Node's promise chain drops them.
 ///
 /// node: src/events.ts:352-380
 pub struct EventWriter {
@@ -583,22 +646,56 @@ impl EventWriter {
 
     fn run(name: &str, rx: Receiver<WriterMsg>) {
         let mut append_count = 0usize;
-        while let Ok(msg) = rx.recv() {
+        let mut pending = Vec::new();
+        let mut deadline: Option<Instant> = None;
+        loop {
+            if deadline.is_some_and(|until| Instant::now() >= until) {
+                Self::publish(name, &mut pending, &mut append_count);
+                deadline = None;
+            }
+            let msg = if let Some(until) = deadline {
+                rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            } else {
+                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
             match msg {
-                WriterMsg::Append(event) => {
-                    if let Ok(_lock) = wait_for_event_lock(name, EVENT_LOCK_WAIT) {
-                        let path = events_path(name);
-                        let check_retention = append_count + 1 >= TRUNCATE_CHECK_INTERVAL;
-                        if append_line(&path, &event, |_| check_retention).is_ok() {
-                            append_count = if check_retention { 0 } else { append_count + 1 };
-                        }
+                Ok(WriterMsg::Append(event)) => {
+                    let exiting = event.r#type == event_type::SESSION_EXIT;
+                    pending.push(event);
+                    deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
+                    if exiting {
+                        Self::publish(name, &mut pending, &mut append_count);
+                        deadline = None;
                     }
                 }
-                WriterMsg::Flush(reply) => {
+                Ok(WriterMsg::Flush(reply)) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    deadline = None;
                     let _ = reply.send(());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    deadline = None;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    Self::publish(name, &mut pending, &mut append_count);
+                    break;
                 }
             }
         }
+    }
+
+    fn publish(name: &str, pending: &mut Vec<Event>, append_count: &mut usize) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Ok(_lock) = wait_for_event_lock(name, EVENT_LOCK_WAIT) {
+            let mut next_count = *append_count;
+            if append_batch(&events_path(name), pending, &mut next_count).is_ok() {
+                *append_count = next_count;
+            }
+        }
+        pending.clear();
     }
 
     /// Queue an event; returns immediately.
@@ -631,7 +728,11 @@ impl EventWriter {
 
 impl Drop for EventWriter {
     fn drop(&mut self) {
+        self.flush();
         self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -779,5 +880,185 @@ pub fn format_event(event: &Event) -> String {
             };
             format!("{prefix} {other}{suffix}")
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    struct TestRoot(std::path::PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("pty-batch-{}-{label}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn batch_reduces_replacements_and_preserves_bytes_and_retention() {
+        let root = TestRoot::new("retention");
+        crate::registry::root::with_root(root.path(), || {
+            let events: Vec<_> = (0..2150)
+                .map(|i| Event::bell("batch").with_ts(&format!("timestamp-{i}")))
+                .collect();
+            let reference = root.path().join("reference");
+            for (index, event) in events.iter().enumerate() {
+                append_line(&reference, event, |_| {
+                    (index + 1) % TRUNCATE_CHECK_INTERVAL == 0
+                })
+                .unwrap();
+            }
+            BATCH_WRITES.with(|writes| writes.set(0));
+            append_batch(&events_path("batch"), &events, &mut 0).unwrap();
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 7));
+            assert_eq!(
+                std::fs::read(events_path("batch")).unwrap(),
+                std::fs::read(reference).unwrap()
+            );
+            let (tx, rx) = channel();
+            for _ in 0..80 {
+                tx.send(WriterMsg::Append(Event::bell("short"))).unwrap();
+            }
+            drop(tx);
+            BATCH_WRITES.with(|writes| writes.set(0));
+            EventWriter::run("short", rx);
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 1));
+            assert_eq!(read_all_events("short").len(), 80);
+        });
+    }
+
+    /// The production shape: records arriving over time, not queued up
+    /// front. This bounds the replacement count; the byte work is measured
+    /// on its own below. The bound scales with the measured elapsed time, so
+    /// a slow runner widens it instead of failing.
+    #[test]
+    fn a_steady_stream_publishes_once_per_window_not_once_per_record() {
+        let root = TestRoot::new("stream");
+        crate::registry::root::with_root(root.path(), || {
+            let records = 60;
+            let (tx, rx) = channel();
+            let producer = std::thread::spawn(move || {
+                for _ in 0..records {
+                    tx.send(WriterMsg::Append(Event::bell("stream"))).unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            BATCH_WRITES.with(|writes| writes.set(0));
+            let started = Instant::now();
+            EventWriter::run("stream", rx);
+            let elapsed = started.elapsed();
+            producer.join().unwrap();
+            let windows = elapsed.as_millis() as usize / 250 + 2;
+            let writes = BATCH_WRITES.with(|writes| writes.get());
+            assert!(
+                writes <= windows,
+                "{writes} publications for {records} records over {elapsed:?}; at most {windows} windows"
+            );
+            assert_eq!(read_all_events("stream").len(), records);
+        });
+    }
+
+    /// Byte work, measured apart from the replacement count. Every
+    /// publication rewrites the whole retained log, so the cost of a record
+    /// is the log's size, not its own. Over a log already near its cap, and
+    /// across a retention check, a steady stream must rewrite about one log
+    /// per window (plus the separately published shrink), not one per record.
+    #[test]
+    fn a_steady_stream_over_a_full_log_rewrites_about_one_log_per_window() {
+        let root = TestRoot::new("stream-bytes");
+        crate::registry::root::with_root(root.path(), || {
+            let line = |ts: &str| format!("{}\n", Event::bell("bytes").with_ts(ts).to_json());
+            let seed: String = (0..950).map(|i| line(&format!("old-{i:04}"))).collect();
+            std::fs::write(events_path("bytes"), &seed).unwrap();
+            let records = 120;
+            let largest = seed.len() + records * line("new-0000").len();
+            let (tx, rx) = channel();
+            let producer = std::thread::spawn(move || {
+                for i in 0..records {
+                    let event = Event::bell("bytes").with_ts(&format!("new-{i:04}"));
+                    tx.send(WriterMsg::Append(event)).unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            BATCH_BYTES.with(|bytes| bytes.set(0));
+            let started = Instant::now();
+            EventWriter::run("bytes", rx);
+            let elapsed = started.elapsed();
+            producer.join().unwrap();
+            // One more publication than windows: the retention shrink.
+            let windows = elapsed.as_millis() as usize / 250 + 2;
+            let bytes = BATCH_BYTES.with(|bytes| bytes.get());
+            assert!(
+                bytes <= (windows + 1) * largest,
+                "{bytes} bytes rewritten for {records} records over {elapsed:?}; \
+                 at most {} logs of {largest} bytes",
+                windows + 1
+            );
+            // The retention check at the 100th record kept the newest 500.
+            assert_eq!(read_all_events("bytes").len(), 500 + (records - 100));
+        });
+    }
+
+    /// The window closes on the writer's own timer. With the channel held
+    /// open, no flush, exit record or disconnect can be what publishes the
+    /// record, so a daemon busy shutting down still gets earlier records to
+    /// disk before its shutdown deadline.
+    #[test]
+    fn an_open_window_publishes_on_its_own_timer() {
+        let root = TestRoot::new("timer");
+        crate::registry::root::with_root(root.path(), || {
+            let path = events_path("timer");
+            let (tx, rx) = channel();
+            let observer = std::thread::spawn(move || {
+                tx.send(WriterMsg::Append(Event::bell("timer"))).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if std::fs::read_to_string(&path).is_ok_and(|log| log.lines().count() == 1) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                false
+            });
+            EventWriter::run("timer", rx);
+            assert!(
+                observer.join().unwrap(),
+                "the open window was not published within 2 s while the writer stayed open"
+            );
+        });
+    }
+
+    #[test]
+    fn exit_and_flush_publish_separate_batches_before_acknowledgement() {
+        let root = TestRoot::new("exit");
+        crate::registry::root::with_root(root.path(), || {
+            let (tx, rx) = channel();
+            tx.send(WriterMsg::Append(Event::bell("exit"))).unwrap();
+            tx.send(WriterMsg::Append(Event::session_exit("exit", 0, None)))
+                .unwrap();
+            tx.send(WriterMsg::Append(Event::bell("exit"))).unwrap();
+            let (reply, ack) = channel();
+            tx.send(WriterMsg::Flush(reply)).unwrap();
+            drop(tx);
+            BATCH_WRITES.with(|writes| writes.set(0));
+            EventWriter::run("exit", rx);
+            ack.recv().unwrap();
+            BATCH_WRITES.with(|writes| assert_eq!(writes.get(), 2));
+            assert_eq!(read_all_events("exit").len(), 3);
+        });
     }
 }

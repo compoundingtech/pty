@@ -28,9 +28,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// is killed would not run a destructor anyway, so this cleans up on the way
 /// IN rather than on the way out.
 fn definitely_gone(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks for existence and permission.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    // Signal 0 only checks for existence and permission.
+    pty_core::kill::process(pid, 0).is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH))
 }
 
 fn reap_dead_roots(tmp: &Path) {

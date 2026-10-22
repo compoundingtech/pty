@@ -25,6 +25,7 @@ pub mod help;
 pub mod list;
 pub mod metadata;
 pub mod operation;
+pub mod publication_revocation;
 pub mod readiness;
 pub mod remote_serve;
 pub mod rename;
@@ -107,7 +108,8 @@ pub fn require_ref(args: &[String], usage: &str) -> Result<String, CliError> {
 /// `AGENT_TRACE_FILE` is a per-session provenance path: the new process needs its own, never the old one.
 ///
 /// node: src/cli.ts:3869
-pub const RESTART_SCRUBBED_ENV: [&str; 3] = ["ST_AGENT", "ST_ROOT", "AGENT_TRACE_FILE"];
+pub const RESTART_SCRUBBED_ENV: [&str; 5] =
+    ["ST_AGENT", "ST_ROOT", "FRACTAL_AGENT", "FRACTAL_ROOT", "AGENT_TRACE_FILE"];
 
 /// Refuse a command that would nest a client inside the current session.
 /// Returns `Some(1)` when it refused, having printed the reason and the
@@ -278,6 +280,7 @@ pub fn dispatch(mut args: Vec<String>) -> i32 {
         "evidence" => evidence::run(rest),
         "capabilities" => capabilities::run(rest),
         "operation" => operation::run(rest),
+        "publication-revocation" => publication_revocation::run(rest),
         "rm" | "remove" => rm::run(rest),
         "test" => deferred::run("test"),
         "completions" => Ok(completions::run(rest)),
@@ -360,11 +363,16 @@ pub use pty_lifecycle::{SpawnParams, apply_persisted_launch_options};
 /// node: src/spawn.ts:372-393, 164-243
 pub fn spawn_daemon(p: &SpawnParams) -> Result<(), String> {
     let mut params = p.clone();
-    params.command = pty_core::spawn::resolve_command(&p.command)?;
-    let executable = daemon_executable()?;
-    pty_lifecycle::spawn_daemon(&executable, params)
+    prepare_daemon(&mut params)?.spawn(params)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Select and pin the publisher before a restart/recreation cleans its row.
+pub fn prepare_daemon(params: &mut SpawnParams) -> Result<pty_lifecycle::PreparedDaemon, String> {
+    params.command = pty_core::spawn::resolve_command(&params.command)?;
+    let executable = daemon_executable()?;
+    pty_lifecycle::prepare_daemon(&executable, params).map_err(|error| error.to_string())
 }
 
 /// The executable that implements `__daemon`: this one, or its replacement

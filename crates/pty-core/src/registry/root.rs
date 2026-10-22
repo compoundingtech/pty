@@ -346,6 +346,16 @@ mod tests {
         drop(stream);
         let pid_file = real.join(format!("{id}.pid"));
         std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        // A PID without a record is unknown identity; record this process.
+        let pid = std::process::id() as i32;
+        let metadata = super::super::SessionMetadata {
+            daemon_pid: Some(pid),
+            daemon_start_token: super::super::read_process_start_token(pid),
+            daemon_boot_id: super::super::read_boot_id(),
+            ..Default::default()
+        };
+        let metadata_file = real.join(format!("{id}.json"));
+        std::fs::write(&metadata_file, serde_json::to_vec(&metadata).unwrap()).unwrap();
         let inventory = super::super::list_sessions_strict_in(
             &real,
             &super::super::ListOptions::default(),

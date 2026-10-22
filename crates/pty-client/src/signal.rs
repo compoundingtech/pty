@@ -11,7 +11,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use pty_core::registry;
+use pty_core::{kill, registry};
 
 use crate::{ClientError, query_stats};
 
@@ -195,22 +195,23 @@ pub fn signal(
             pid,
         });
     }
-    // SAFETY: kill(2) on a pid the session's own daemon reported, after the
-    // fences above.
-    if unsafe { libc::kill(-pid, signal) } == 0 {
+    // kill(2) on a pid the session's own daemon reported, after the fences
+    // above.
+    if kill::group(pid, signal).is_ok() {
         return Ok(Signalled {
             pid,
             delivery: Delivery::Group,
         });
     }
-    // SAFETY: as above.
-    if unsafe { libc::kill(pid, signal) } == 0 {
-        return Ok(Signalled {
-            pid,
-            delivery: Delivery::Process,
-        });
-    }
-    let error = io::Error::last_os_error();
+    let error = match kill::process(pid, signal) {
+        Ok(()) => {
+            return Ok(Signalled {
+                pid,
+                delivery: Delivery::Process,
+            });
+        }
+        Err(error) => error,
+    };
     if error.raw_os_error() == Some(libc::ESRCH) {
         return Ok(Signalled {
             pid,

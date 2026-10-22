@@ -36,14 +36,20 @@ pub struct SessionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
     /// Pid of the daemon that owns this generation. Accepted for liveness
-    /// only when `recovery.processStartToken` still proves the process.
+    /// and signal authority only with matching recorded boot and start
+    /// identities, plus thread-group leadership on Linux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_pid: Option<i32>,
     /// Start identity of the Rust daemon that published this generation.
     /// Node generations carry the equivalent token in
-    /// `recovery.processStartToken`.
+    /// `recovery.processStartToken`. Missing tokens make identity Unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_start_token: Option<String>,
+    /// Recorded boot identity of the daemon on Linux and macOS. Required
+    /// alongside its start token; missing boot identity is Unknown and
+    /// grants no signal authority, including for legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_boot_id: Option<String>,
     /// Recovery capability advertised by Node daemons. Opaque here: preserved
     /// verbatim on rewrite, never produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +76,13 @@ pub struct SessionMetadata {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<TagMap>,
+    /// Launcher identity, immutable through ordinary metadata/tag mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_binding: Option<super::revocation::PublicationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_capability: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolate_env: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,8 +168,8 @@ impl SessionMetadata {
         serde_json::from_value(Value::Object(map)).ok()
     }
 
-    /// The Node publication order with one optional Rust identity field after
-    /// `daemonPid`: `generation, daemonPid, daemonStartToken?, recovery?,
+    /// The Node publication order with optional native identity fields after
+    /// `daemonPid`: `generation, daemonPid, daemonStartToken?, daemonBootId?, recovery?,
     /// command, args, displayCommand, cwd, rows, cols, ephemeral, createdAt,
     /// tags?, displayName?, isolateEnv?, extraEnv?, unsetEnv?, env?`.
     /// `ephemeral` is always written (`=== true`); `tags`/`extraEnv`/
@@ -174,6 +187,9 @@ impl SessionMetadata {
         }
         if let Some(token) = &self.daemon_start_token {
             m.insert("daemonStartToken".into(), Value::from(token.as_str()));
+        }
+        if let Some(boot_id) = &self.daemon_boot_id {
+            m.insert("daemonBootId".into(), Value::from(boot_id.as_str()));
         }
         if let Some(r) = &self.recovery {
             m.insert("recovery".into(), r.clone());
@@ -196,6 +212,16 @@ impl SessionMetadata {
             Value::from(self.ephemeral == Some(true)),
         );
         m.insert("createdAt".into(), Value::from(self.created_at.as_str()));
+        if let Some(binding) = &self.publication_binding {
+            m.insert("publicationBinding".into(), serde_json::to_value(binding)
+                .expect("publication binding is serializable"));
+        }
+        if let Some(root) = &self.publication_root_id {
+            m.insert("publicationRootId".into(), Value::from(root.as_str()));
+        }
+        if let Some(version) = self.publication_capability {
+            m.insert("publicationCapability".into(), Value::from(version));
+        }
         if let Some(tags) = &self.tags
             && !tags.is_empty()
         {
