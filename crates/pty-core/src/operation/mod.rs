@@ -16,8 +16,8 @@
 //! - [`settle`]: occupancy, the birth-marker match, `settle` and `retire`.
 //! - [`barrier`]: debug-build test barriers.
 //!
-//! The contract this implements is the pty producer contract for Smalltalk
-//! #2489 slice 2, revision 4.
+//! The contract this implements is the pty producer contract for Fractal
+//! (compoundingtech/fractal#2489) slice 2, revision 4.
 
 pub mod barrier;
 pub mod envelope;

@@ -1731,7 +1731,7 @@ mod tests {
     /// (`ETXTBSY`, "Text file busy"). `run_ps_program` turns that refusal
     /// into `None`, so the fake looked as if it never ran. It only happened
     /// under load and only now and then, which is how it reached a nix build
-    /// on Small Talk's CI. Once the child has exited, no process can hold
+    /// on Fractal's CI. Once the child has exited, no process can hold
     /// the script open for writing, however the other threads interleave.
     fn fake_ps(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
