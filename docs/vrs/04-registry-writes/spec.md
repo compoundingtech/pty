@@ -22,6 +22,7 @@ Not defined here: the record's other fields and key order ([docs/parity.md](../.
 | Client facts change (below) | `clientGeneration` | metadata lock, `expectedGeneration` |
 | Child exits | `exitCode`, `exitedAt`, `lastLines`, `lastOutputAtMs` | metadata lock, `expectedGeneration` |
 | Child output | nothing (sidecar only) | – |
+| Opt-in retention sweep (`PTY_RETAIN_FINISHED`) first sees a *vanished* record of another session | that record's `tags["retention.lost-at"]`, the first-sighting time its age counts from | both locks, `metadata_matches_observation`, owner proven gone |
 
 Every other daemon event leaves the record alone (`PTY.REGW-R01`).
 
@@ -91,6 +92,7 @@ Write: one `mutate_metadata_under_lock` with `expectedGeneration` = the daemon's
 | Output debounce and exit fold | `crates/pty/src/daemon/lifecycle.rs` — `stamp_output_activity`, `persist_output_activity`, `save_exit_metadata` |
 | Client facts and bumps | `crates/pty/src/daemon/clients.rs` — `ClientFacts`, `note_client_change`, `write_client_generation` |
 | Session cleanup | `crates/pty-core/src/registry/cleanup.rs`, `crates/pty-core/src/registry/evidence.rs`, `crates/pty-lifecycle/src/gc.rs` |
+| Retention sweep and `retention.lost-at` | `crates/pty-lifecycle/src/retention.rs`; the key and window in `crates/pty-core/src/registry/tags.rs` — `RETENTION_LOST_AT_TAG`, `retain_finished_window` |
 
 ## Traceability
 
