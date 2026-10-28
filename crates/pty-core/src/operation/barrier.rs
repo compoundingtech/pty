@@ -13,7 +13,7 @@
 pub const BARRIERS_ENV: &str = "PTY_TEST_OPERATION_BARRIERS";
 
 /// Named launch, revocation installation and cleanup acceptance points.
-pub const BARRIERS: [&str; 21] = [
+pub const BARRIERS: [&str; 22] = [
     "launcher-before-claim",
     "launcher-before-peek",
     "launcher-before-fork",
@@ -35,6 +35,7 @@ pub const BARRIERS: [&str; 21] = [
     "released-before-ack",
     "revocation-install-pinned",
     "gc-cleanup-before-effects",
+    "settle-writer-lock-refused",
 ];
 
 /// Record that `name` was reached, and say whether a test armed it. A
