@@ -59,7 +59,8 @@ fn run_pty_env(root: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> (String, 
         // PTY_REAP_ON_EXIT so the reap DEFAULT (reap) is deterministic
         // regardless of ambient env; preserve-mode tests set it explicitly.
         .env_remove("PTY_SESSION")
-        .env_remove("PTY_REAP_ON_EXIT");
+        .env_remove("PTY_REAP_ON_EXIT")
+        .env_remove("PTY_RETAIN_FINISHED");
     for (k, v) in env {
         c.env(k, v);
     }

@@ -74,6 +74,7 @@ impl Rig {
             .env_remove("PTY_SESSION")
             .env_remove("PTY_SESSION_DIR")
             .env_remove("PTY_REAP_ON_EXIT")
+            .env_remove("PTY_RETAIN_FINISHED")
             .env("PTY_ROOT", &self.root)
             .env("PTY_ROOT_LEGACY_SILENT", "1")
             .current_dir(&self.scratch)

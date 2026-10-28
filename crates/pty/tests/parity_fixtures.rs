@@ -42,7 +42,8 @@ fn pty_env(root: &PathBuf, args: &[&str], env: &[(String, String)]) -> (String, 
     c.args(args)
         .env("PTY_ROOT", root)
         .env_remove("PTY_SESSION")
-        .env_remove("PTY_REAP_ON_EXIT");
+        .env_remove("PTY_REAP_ON_EXIT")
+        .env_remove("PTY_RETAIN_FINISHED");
     for (k, v) in env {
         c.env(k, v);
     }

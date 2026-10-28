@@ -9,6 +9,7 @@ mod gc;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod image_ancestry;
 mod launch;
+mod retention;
 mod startup;
 
 pub use config::DaemonConfig;
@@ -22,6 +23,7 @@ pub use launch::{
     PreparedDaemon, apply_persisted_launch_options, config_for, prepare_daemon, set_process_title,
     spawn_daemon, spawn_gated_daemon,
 };
+pub use retention::{RetentionResult, spawn_retention_sweep, stop_retention, sweep_finished};
 pub use pty_core::registry::{
     LockBusy, SessionGenerationOwner, cleanup_all, cleanup_owned_all, cleanup_owned_socket,
     cleanup_socket, wait_for_process_exit,

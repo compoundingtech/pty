@@ -219,6 +219,7 @@ fn strip_gc_bookkeeping_keys() {
             "strategy.consecutive-fast-fails",
             "strategy.last-respawn-at",
             "strategy.command-hash",
+            "retention.lost-at",
         ]
     );
     assert_eq!(registry::strip_gc_bookkeeping(None), None);
@@ -248,5 +249,45 @@ fn strip_gc_bookkeeping_keys() {
     assert_eq!(
         registry::strip_gc_bookkeeping(Some(&only_bookkeeping)),
         None
+    );
+}
+
+/// Retention is off unless `PTY_RETAIN_FINISHED` is a positive duration; a
+/// value that cannot be read is off, never "remove now".
+#[test]
+fn retain_finished_is_off_unless_a_positive_duration() {
+    for raw in [
+        None,
+        Some(""),
+        Some("off"),
+        Some(" No "),
+        Some("false"),
+        Some("0"),
+        Some("0d"),
+        Some("-1d"),
+        Some("7"),
+        Some("1w"),
+        Some("1d12h"),
+        Some("99999999999999999d"),
+    ] {
+        assert_eq!(registry::parse_retain_finished(raw), None, "{raw:?}");
+    }
+    assert_eq!(registry::parse_retain_finished(Some("90s")), Some(90_000));
+    assert_eq!(
+        registry::parse_retain_finished(Some(" 7d ")),
+        Some(7 * 24 * 60 * 60 * 1000)
+    );
+}
+
+/// A restart drops the retention stamp with gc's other bookkeeping.
+#[test]
+fn strip_gc_bookkeeping_drops_the_retention_stamp() {
+    let stamped = tags(&[
+        (registry::RETENTION_LOST_AT_TAG, "2026-01-01T00:00:00.000Z"),
+        ("user", "kept"),
+    ]);
+    assert_eq!(
+        registry::strip_gc_bookkeeping(Some(&stamped)),
+        Some(tags(&[("user", "kept")]))
     );
 }

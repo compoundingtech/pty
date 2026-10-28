@@ -43,7 +43,7 @@ pub fn parse_duration(input: &str) -> Option<i64> {
     if n < 0 {
         return None;
     }
-    Some(n * unit_ms)
+    n.checked_mul(unit_ms)
 }
 
 /// Render a millisecond value into a compact duration string. Negative values

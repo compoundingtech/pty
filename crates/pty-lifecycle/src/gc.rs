@@ -347,21 +347,11 @@ pub fn gc(options: GcOptions) -> GcResult {
     };
     let now_ms = now_epoch_ms();
     for s in &final_list {
-        if !s.is_gone() {
+        let Some(metadata) = removable_finished(s) else {
             continue;
-        }
-        if s.metadata
-            .as_ref()
-            .is_none_or(|metadata| !known_owner_lost(daemon_identity(&s.name, metadata)))
-        {
-            continue;
-        }
-        let tags = s.metadata.as_ref().and_then(|m| m.tags.as_ref());
-        if tags.and_then(|t| t.get("strategy")).map(String::as_str) == Some("permanent") {
-            continue;
-        }
-        let keep_requested = is_keep_requested(tags);
-        if keep_requested && !is_keep_expired(s.metadata.as_ref(), now_ms, keep_max_age_ms) {
+        };
+        let keep_requested = is_keep_requested(metadata.tags.as_ref());
+        if keep_requested && !is_keep_expired(Some(metadata), now_ms, keep_max_age_ms) {
             result.kept.push(s.name.clone());
             continue;
         }
@@ -381,6 +371,16 @@ pub fn gc(options: GcOptions) -> GcResult {
 struct AbandonDecision {
     reason: AbandonReason,
     idle_days: Option<i64>,
+}
+
+/// A finished record pty may remove: `exited` or `vanished`, its recorded
+/// owner proven lost, and not `strategy=permanent` (gc respawns or abandons
+/// those). gc's sweep and the retention sweep both start from this test, and
+/// removal proves it again under both locks ([`cleanup_observed_session`]).
+pub(crate) fn removable_finished(s: &SessionInfo) -> Option<&SessionMetadata> {
+    let metadata = s.metadata.as_ref().filter(|_| s.is_gone())?;
+    (known_owner_lost(daemon_identity(&s.name, metadata)) && !is_permanent(metadata))
+        .then_some(metadata)
 }
 
 fn is_permanent(meta: &SessionMetadata) -> bool {
@@ -842,7 +842,7 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bo
 
 /// A zombie is gone only after its recorded identity has matched. Socket
 /// existence/reachability and a missing read_pid_with result are never proof.
-fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
+pub(crate) fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
     let sidecar = read_session_pid(name);
     let check = registry::check_record_identity_in(
         &registry::session_dir(), name, sidecar, Some(metadata),
@@ -858,7 +858,7 @@ fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityChec
     }
 }
 
-fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
+pub(crate) fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
     matches!(
         check,
         DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch
@@ -1003,7 +1003,7 @@ fn cleanup_raw_candidate_guarded(name: &str) -> bool {
 /// Generation-CAS cleanup of an observed session.
 ///
 /// node: src/sessions.ts:769-790
-fn cleanup_observed_session(session: &SessionInfo) -> bool {
+pub(crate) fn cleanup_observed_session(session: &SessionInfo) -> bool {
     let Some(observed) = &session.metadata else {
         return false;
     };
