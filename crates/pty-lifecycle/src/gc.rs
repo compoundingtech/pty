@@ -376,14 +376,14 @@ struct AbandonDecision {
 /// A finished record pty may remove: `exited` or `vanished`, its recorded
 /// owner proven lost, and not `strategy=permanent` (gc respawns or abandons
 /// those). gc's sweep and the retention sweep both start from this test, and
-/// removal proves it again under both locks ([`cleanup_observed_session`]).
+/// each proves it again under both locks before removing anything.
 pub(crate) fn removable_finished(s: &SessionInfo) -> Option<&SessionMetadata> {
     let metadata = s.metadata.as_ref().filter(|_| s.is_gone())?;
     (known_owner_lost(daemon_identity(&s.name, metadata)) && !is_permanent(metadata))
         .then_some(metadata)
 }
 
-fn is_permanent(meta: &SessionMetadata) -> bool {
+pub(crate) fn is_permanent(meta: &SessionMetadata) -> bool {
     meta.tags
         .as_ref()
         .and_then(|t| t.get("strategy"))
@@ -1003,7 +1003,7 @@ fn cleanup_raw_candidate_guarded(name: &str) -> bool {
 /// Generation-CAS cleanup of an observed session.
 ///
 /// node: src/sessions.ts:769-790
-pub(crate) fn cleanup_observed_session(session: &SessionInfo) -> bool {
+fn cleanup_observed_session(session: &SessionInfo) -> bool {
     let Some(observed) = &session.metadata else {
         return false;
     };

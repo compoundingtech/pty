@@ -3,19 +3,20 @@
 //! A daemon started with a window sweeps its root once, off its serving
 //! loop, and removes `exited` and `vanished` records that have been dead for
 //! longer than the window. It removes only what `pty gc`'s sweep would
-//! remove ([`removable_finished`]), proves it again under both locks, and
-//! never signals, respawns or abandons anything. Retention is off unless the
-//! variable sets a window.
+//! remove ([`removable_finished`]), decides again under both locks from the
+//! record as it is then, and never signals, respawns or abandons anything.
+//! Retention is off unless the variable sets a window.
 
 use std::sync::Mutex;
 
 use pty_core::registry::{
     self, DEFAULT_KEEP_MAX_AGE_MS, RETENTION_LOST_AT_TAG, SessionInfo, SessionMetadata, TagMap,
-    apply_metadata_diff, is_keep_requested, iso8601_from_epoch_ms, metadata_matches_observation,
-    now_epoch_ms, parse_iso8601_ms, read_metadata_map, with_both_locks, write_metadata_map,
+    apply_metadata_diff, cleanup_all_while_locked, is_keep_requested, iso8601_from_epoch_ms,
+    metadata_matches_observation, now_epoch_ms, parse_iso8601_ms, read_metadata_map,
+    with_both_locks, write_metadata_map,
 };
 
-use crate::gc::{cleanup_observed_session, daemon_identity, known_owner_lost, removable_finished};
+use crate::gc::{daemon_identity, is_permanent, known_owner_lost, removable_finished};
 
 /// At most this many records are stamped or removed by one sweep, so a
 /// large backlog is worked down over several daemon starts.
@@ -81,31 +82,47 @@ fn sweep_finished_gated(
         let Some(metadata) = removable_finished(&session) else {
             continue;
         };
-        let window = if is_keep_requested(metadata.tags.as_ref()) {
-            window_ms.max(keep_max_age_ms)
-        } else {
-            window_ms
+        let Some(action) = decide(metadata, now_ms, window_ms, keep_max_age_ms) else {
+            continue;
         };
-        let stamp = match loss_anchor(metadata) {
-            Anchor::Unstamped => true,
-            Anchor::At(lost_at) if now_ms - lost_at >= window => false,
-            Anchor::At(_) | Anchor::Unaged => continue,
-        };
-        let done = gated(gate, || {
-            if stamp {
-                stamp_lost(&session, now_ms)
-            } else {
-                cleanup_observed_session(&session)
-            }
-        });
-        match done {
+        match gated(gate, || act(&session, action, now_ms, window_ms, keep_max_age_ms)) {
             None => break,
-            Some(true) if stamp => result.stamped.push(session.name.clone()),
+            Some(true) if action == Action::Stamp => result.stamped.push(session.name.clone()),
             Some(true) => result.removed.push(session.name.clone()),
             Some(false) => {}
         }
     }
     result
+}
+
+/// What retention does to one finished record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// A vanished record's first sighting.
+    Stamp,
+    /// Dead for longer than its window.
+    Remove,
+}
+
+/// The decision from one reading of a finished record. Owner loss and
+/// `strategy=permanent` are the callers' tests: [`removable_finished`] on
+/// the scan, [`act`] again under the locks.
+fn decide(
+    metadata: &SessionMetadata,
+    now_ms: i64,
+    window_ms: i64,
+    keep_max_age_ms: i64,
+) -> Option<Action> {
+    let window = if is_keep_requested(metadata.tags.as_ref()) {
+        window_ms.max(keep_max_age_ms)
+    } else {
+        window_ms
+    };
+    match loss_anchor(metadata) {
+        Anchor::Unstamped => Some(Action::Stamp),
+        Anchor::At(lost_at) if now_ms - lost_at >= window => Some(Action::Remove),
+        Anchor::At(_) | Anchor::Unaged => None,
+    }
 }
 
 /// When a finished record's owner was lost, as far as pty knows.
@@ -151,9 +168,18 @@ fn gated<T>(gate: &Mutex<bool>, work: impl FnOnce() -> T) -> Option<T> {
     Some(work())
 }
 
-/// Record the sweep's first sighting of a vanished record's loss, under
-/// both locks and only while the record is still the one observed.
-fn stamp_lost(observed: &SessionInfo, now_ms: i64) -> bool {
+/// Stamp or remove one record under both locks. The record must still be
+/// the one observed, its owner still proven lost, and its current tags must
+/// still call for `action`. A `keep` or `strategy=permanent` tag added after
+/// the scan leaves the generation unchanged, so the decision is made again
+/// from the record as it is now.
+fn act(
+    observed: &SessionInfo,
+    action: Action,
+    now_ms: i64,
+    window_ms: i64,
+    keep_max_age_ms: i64,
+) -> bool {
     let Some(seen) = &observed.metadata else {
         return false;
     };
@@ -162,21 +188,31 @@ fn stamp_lost(observed: &SessionInfo, now_ms: i64) -> bool {
         let Some(mut raw) = read_metadata_map(name) else {
             return false;
         };
-        let Some(before) = SessionMetadata::from_map(raw.clone()) else {
+        let Some(current) = SessionMetadata::from_map(raw.clone()) else {
             return false;
         };
-        if !metadata_matches_observation(seen, &before)
-            || !known_owner_lost(daemon_identity(name, &before))
+        if !metadata_matches_observation(seen, &current)
+            || !known_owner_lost(daemon_identity(name, &current))
+            || is_permanent(&current)
+            || decide(&current, now_ms, window_ms, keep_max_age_ms) != Some(action)
         {
             return false;
         }
-        let mut after = before.clone();
-        after
-            .tags
-            .get_or_insert_with(TagMap::new)
-            .insert(RETENTION_LOST_AT_TAG.into(), iso8601_from_epoch_ms(now_ms));
-        apply_metadata_diff(&before, &after, &mut raw);
-        write_metadata_map(name, &raw).is_ok()
+        match action {
+            Action::Remove => {
+                cleanup_all_while_locked(name);
+                true
+            }
+            Action::Stamp => {
+                let mut after = current.clone();
+                after
+                    .tags
+                    .get_or_insert_with(TagMap::new)
+                    .insert(RETENTION_LOST_AT_TAG.into(), iso8601_from_epoch_ms(now_ms));
+                apply_metadata_diff(&current, &after, &mut raw);
+                write_metadata_map(name, &raw).is_ok()
+            }
+        }
     })
     .unwrap_or(false)
 }
@@ -354,6 +390,54 @@ mod tests {
             write_metadata("unaged", &metadata).unwrap();
             assert_eq!(sweep(DAY_MS), RetentionResult::default());
             assert_eq!(stamp_of("unaged"), None);
+        });
+    }
+
+    /// Add `key=value` the way `pty tag` does: the generation is unchanged,
+    /// so an observation from before still matches.
+    fn tag_in_place(name: &str, key: &str, value: &str) {
+        let mut current = read_metadata(name).unwrap();
+        current
+            .tags
+            .get_or_insert_with(TagMap::new)
+            .insert(key.into(), value.into());
+        write_metadata(name, &current).unwrap();
+    }
+
+    #[test]
+    fn a_protective_tag_added_after_the_scan_stops_the_sweep() {
+        let root = root("late-tag");
+        in_root(&root, || {
+            let now_ms = now_epoch_ms();
+            let act_on = |name: &str, action| {
+                let observed = registry::get_session_by_name(name).expect("observed");
+                (observed, action)
+            };
+            for (name, key, value) in [("kept", "keep", "true"), ("perm", "strategy", "permanent")] {
+                gone(name, -3 * DAY_MS, Some(-2 * DAY_MS), &[]);
+                let (observed, action) = act_on(name, Action::Remove);
+                let seen = observed.metadata.as_ref().unwrap();
+                assert_eq!(
+                    decide(seen, now_ms, DAY_MS, DEFAULT_KEEP_MAX_AGE_MS),
+                    Some(action)
+                );
+                tag_in_place(name, key, value);
+                assert!(
+                    !act(&observed, action, now_ms, DAY_MS, DEFAULT_KEEP_MAX_AGE_MS),
+                    "{name}"
+                );
+                assert!(metadata_path(name).exists(), "{name}");
+            }
+            gone("lost", -30 * DAY_MS, None, &[]);
+            let (observed, action) = act_on("lost", Action::Stamp);
+            tag_in_place("lost", "strategy", "permanent");
+            assert!(!act(&observed, action, now_ms, DAY_MS, DEFAULT_KEEP_MAX_AGE_MS));
+            assert_eq!(stamp_of("lost"), None);
+            // Untouched since the scan, the same kind of observation is acted on.
+            gone("plain", -3 * DAY_MS, Some(-2 * DAY_MS), &[]);
+            let (observed, action) = act_on("plain", Action::Remove);
+            assert!(act(&observed, action, now_ms, DAY_MS, DEFAULT_KEEP_MAX_AGE_MS));
+            assert!(!metadata_path("plain").exists());
         });
     }
 
