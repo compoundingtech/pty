@@ -455,6 +455,7 @@ fn settle_reactively(
     verdict: &str,
     kind: Option<&str>,
 ) -> Value {
+    let mut last = Value::Null;
     for _ in 0..20 {
         let out = rig.run(&[
             "operation",
@@ -479,8 +480,9 @@ fn settle_reactively(
         for pid in pids {
             wait_gone(pid);
         }
+        last = v;
     }
-    panic!("settle never became {verdict}/{kind:?}");
+    panic!("settle never became {verdict}/{kind:?}; the last verdict: {last:#}");
 }
 
 /// Every process a settle verdict names as not yet exited: live, caught
