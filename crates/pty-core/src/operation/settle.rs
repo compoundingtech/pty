@@ -264,6 +264,9 @@ fn snapshot_argv_scan(uid: u32) -> ArgvScan {
     scan
 }
 
+/// How often settle tries the lock again when its holder is already gone.
+const WRITER_RELEASE_RETRIES: usize = 8;
+
 /// `pty operation settle`: observe only, never an effect.
 pub fn settle(
     store: &OperationStore,
@@ -278,27 +281,42 @@ pub fn settle(
         request,
     };
     let digest = operation_digest(operation_id);
-    let lock = match OperationLock::shared_now(store, &digest) {
-        Ok(lock) => lock,
-        // No lock: no reservation was ever made here (reserve creates it
-        // before the record). Nothing is created by looking.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let component = Component {
-                name: "record",
-                status: Status::Unknown,
-                detail: json!({"reason": "record-missing", "path": store.record_path(&digest)}),
-            };
-            return snap.finish("unknown", Some("record-missing"), false, None, &[component]);
+    // A writer that lets go between a refused lock and the holder lookup
+    // leaves nobody to name, and "live" would describe a moment already
+    // over: try the lock again. Only a holder still there is reported.
+    let mut holder = None;
+    let mut lock = None;
+    for _ in 0..WRITER_RELEASE_RETRIES {
+        lock = match OperationLock::shared_now(store, &digest) {
+            Ok(lock) => lock,
+            // No lock: no reservation was ever made here (reserve creates it
+            // before the record). Nothing is created by looking.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = Component {
+                    name: "record",
+                    status: Status::Unknown,
+                    detail: json!({"reason": "record-missing", "path": store.record_path(&digest)}),
+                };
+                return snap.finish("unknown", Some("record-missing"), false, None, &[component]);
+            }
+            Err(error) => {
+                let component = Component {
+                    name: "writer",
+                    status: Status::Unknown,
+                    detail: json!({"lock": "unavailable", "error": error.to_string()}),
+                };
+                return snap.finish("unknown", Some("writer"), false, None, &[component]);
+            }
+        };
+        if lock.is_some() {
+            break;
         }
-        Err(error) => {
-            let component = Component {
-                name: "writer",
-                status: Status::Unknown,
-                detail: json!({"lock": "unavailable", "error": error.to_string()}),
-            };
-            return snap.finish("unknown", Some("writer"), false, None, &[component]);
+        crate::operation::barrier::barrier("settle-writer-lock-refused");
+        holder = OperationLock::holder(store, &digest);
+        if holder.is_some() {
+            break;
         }
-    };
+    }
     let read = store.read(&digest);
     let record = match &read {
         Ok(Some(record)) => Some(record),
@@ -343,7 +361,7 @@ pub fn settle(
             detail: json!({
                 "holdsLock": true,
                 "role": record.map(|r| r.writer.role),
-                "holderPid": OperationLock::holder(store, &digest),
+                "holderPid": holder,
             }),
         };
         return snap.finish(

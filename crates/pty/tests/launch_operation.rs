@@ -455,6 +455,7 @@ fn settle_reactively(
     verdict: &str,
     kind: Option<&str>,
 ) -> Value {
+    let mut last = Value::Null;
     for _ in 0..20 {
         let out = rig.run(&[
             "operation",
@@ -479,8 +480,9 @@ fn settle_reactively(
         for pid in pids {
             wait_gone(pid);
         }
+        last = v;
     }
-    panic!("settle never became {verdict}/{kind:?}");
+    panic!("settle never became {verdict}/{kind:?}; the last verdict: {last:#}");
 }
 
 /// Every process a settle verdict names as not yet exited: live, caught
@@ -685,6 +687,51 @@ fn retire_withdraws_an_unclaimed_reservation_so_no_launcher_can_claim_it() {
 }
 
 // ── The successful launch ────────────────────────────────────────────────
+
+/// A writer that lets go between settle's refused lock and its holder lookup
+/// leaves nobody to name. Settle tries the lock again rather than report a
+/// writer that is already gone, which would give a caller no process to wait
+/// for.
+#[test]
+fn a_writer_that_lets_go_while_settle_looks_for_it_is_not_reported_live() {
+    let rig = Rig::new();
+    let mut owner = Owner::start(&rig, "let-go", Plan::default());
+    let ready = owner.wait_for("ready");
+    assert_eq!(owner.launcher_exit(), 0);
+    let incarnation = ready["incarnation"].clone();
+    // The held daemon is the writer: stop a settle just after its lock is refused.
+    std::fs::write(owner.barriers.join("settle-writer-lock-refused.hold"), "").unwrap();
+    let settle = rig
+        .cmd(&[
+            "operation",
+            "settle",
+            &owner.operation_id,
+            "--envelope-sha256",
+            &owner.sha,
+            "--json",
+        ])
+        .env("PTY_TEST_OPERATION_BARRIERS", &owner.barriers)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    owner.wait_reached("settle-writer-lock-refused");
+    // After the transfer the record has no writer, and the daemon lets go.
+    owner.transfer("t1", &incarnation);
+    owner.wait_for("transferred");
+    wait_until("the writer to let go of the lock", || {
+        verdict(&owner.settle(&rig)).0 == "transferred"
+    });
+    owner.release("settle-writer-lock-refused");
+    let out = settle.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "settle: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(verdict(&v), ("transferred".into(), None), "{v:#}");
+}
 
 #[test]
 fn the_command_runs_only_after_transfer() {
