@@ -474,6 +474,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     });
 
     readiness.notify();
+    pty_lifecycle::spawn_retention_sweep();
     Ok(daemon.serve())
 }
 
@@ -1705,6 +1706,7 @@ impl Daemon {
             } else {
                 registry::cleanup_owned_socket(&name, &owner);
             }
+            pty_lifecycle::stop_retention();
             std::process::exit(code);
         });
     }

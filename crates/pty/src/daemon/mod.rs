@@ -47,6 +47,13 @@ pub(crate) use daemon_warn;
 ///
 /// node: src/server.ts:1458-1478
 pub fn daemon_main(args: &[String]) -> i32 {
+    let code = run_daemon(args);
+    // The process exits next; finish the retention sweep's record in hand.
+    pty_lifecycle::stop_retention();
+    code
+}
+
+fn run_daemon(args: &[String]) -> i32 {
     // A launch operation's daemon carries its birth marker in its argv.
     if let [flag, digest] = args
         && flag == "--launch-operation"

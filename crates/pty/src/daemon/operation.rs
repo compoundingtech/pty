@@ -682,6 +682,7 @@ impl Worker {
                             ended: false,
                         }),
                     });
+                    pty_lifecycle::spawn_retention_sweep();
                     return daemon.serve();
                 }
                 WorkerCmd::Stop(code) => return code,

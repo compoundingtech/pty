@@ -207,6 +207,7 @@ impl Daemon {
             .env("PTY_SERVER_CONFIG", config.to_string())
             .env_remove("PTY_SESSION")
             .env_remove("PTY_REAP_ON_EXIT")
+            .env_remove("PTY_RETAIN_FINISHED")
             .env_remove("PTY_SPAWNER_PID")
             .env_remove("PTY_SHUTDOWN_DEADLINE_MS")
             .env_remove("PTY_REDRAW_SETTLE_MS")
@@ -570,6 +571,7 @@ pub fn run_pty(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, Str
         .env("PTY_ROOT", root)
         .env_remove("PTY_SESSION")
         .env_remove("PTY_REAP_ON_EXIT")
+        .env_remove("PTY_RETAIN_FINISHED")
         .env_remove("PTY_SPAWNER_PID")
         .stdin(Stdio::null());
     for (k, v) in env {

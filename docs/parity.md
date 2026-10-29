@@ -221,6 +221,7 @@ gap is in what the daemon does with the frames.
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |
 | Behavioral tags: `strategy=permanent`, `keep`, `parent`, `role=agent`, `strategy.*` bookkeeping, `:l<pid>-*` | partial (`keep`, `permanent` only) |
+| `retention.lost-at` bookkeeping tag | Rust-only. Only the opt-in retention sweep (`PTY_RETAIN_FINISHED`) writes it, and only on a vanished record: when the sweep first saw the owner lost, the time the record's age counts from. A stamp older than `createdAt` does not count. `restart` and `up` drop it with gc's bookkeeping. |
 
 ## 6. Terminal emulation: libghostty in place of xterm
 

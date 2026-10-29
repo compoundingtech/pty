@@ -99,8 +99,9 @@ pub use root::{
 pub use revocation::{PublicationBinding, PublicationRevocation, RevocationInstall};
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,
-    extract_filter_tags, is_keep_expired, is_keep_requested, is_reserved_tag_key, matches_all_tags,
-    reap_on_exit_default, should_reap_at_exit, strip_gc_bookkeeping,
+    RETAIN_FINISHED_ENV, RETENTION_LOST_AT_TAG, extract_filter_tags, is_keep_expired,
+    is_keep_requested, is_reserved_tag_key, matches_all_tags, parse_retain_finished,
+    reap_on_exit_default, retain_finished_window, should_reap_at_exit, strip_gc_bookkeeping,
 };
 pub use time::{
     iso8601, iso8601_from_epoch_ms, local_hms, now_epoch_ms, now_iso8601, parse_iso8601_ms,

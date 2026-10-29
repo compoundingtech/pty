@@ -218,6 +218,7 @@ pub fn spawn_daemon(
         cmd.env_remove(key);
     }
     cmd.env_remove("PTY_REAP_ON_EXIT");
+    cmd.env_remove("PTY_RETAIN_FINISHED");
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
