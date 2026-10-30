@@ -155,13 +155,17 @@ fn serialize_inventory_path<S: serde::Serializer>(
     serializer.serialize_str(&path.to_string_lossy())
 }
 
-struct Scanner {
+mod metadata_cache;
+pub use metadata_cache::RegistryListCache;
+
+struct Scanner<'a> {
     strict: bool,
     full_metadata: bool,
     errors: Vec<InventoryError>,
+    cache: Option<&'a RegistryListCache>,
 }
 
-impl Scanner {
+impl Scanner<'_> {
     fn error(&mut self, path: &Path, kind: InventoryErrorKind, detail: impl ToString) {
         if self.strict {
             self.errors.push(InventoryError {
@@ -217,6 +221,15 @@ impl Scanner {
     }
 
     fn metadata(&mut self, path: &Path, observed: bool) -> Option<SessionMetadata> {
+        if let Some(cache) = self.cache {
+            return match cache.metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err((kind, detail)) => {
+                    self.error(path, kind, detail);
+                    None
+                }
+            };
+        }
         let bytes = self.read_optional(path, InventoryErrorKind::MetadataUnreadable, observed)?;
         let result = super::list_metadata::parse_with_payloads(&bytes, self.full_metadata);
         match result {
@@ -263,6 +276,7 @@ pub(super) fn read_identity_record(
         strict: true,
         full_metadata: true,
         errors: Vec::new(),
+        cache: None,
     };
     let metadata = scanner.metadata(&root.join(format!("{name}.json")), false)?;
     let sidecar = scanner.pid(&root.join(format!("{name}.pid")), false);
@@ -740,6 +754,7 @@ fn read_explicit_control_authority_in(
         strict: true,
         full_metadata: true,
         errors: Vec::new(),
+        cache: None,
     };
     let owned;
     let retained = match metadata {
@@ -1047,7 +1062,7 @@ pub fn list_sessions() -> Vec<SessionInfo> {
 /// generation-less records as whole metadata. Ordinary observers should use
 /// [`list_sessions`] to avoid reading retained output and environment payloads.
 pub fn list_sessions_full() -> Vec<SessionInfo> {
-    scan_sessions(&session_dir(), &ListOptions::default(), false, None, true).entries
+    scan_sessions(&session_dir(), &ListOptions::default(), false, None, true, None).entries
 }
 
 /// [`list_sessions`] with an explicit probe budget.
@@ -1058,7 +1073,7 @@ pub fn list_sessions_with(options: &ListOptions) -> Vec<SessionInfo> {
 
 /// One bounded, read-only observation of `root`, sorted by session name.
 pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-    scan_sessions(root, options, false, None, false).entries
+    scan_sessions(root, options, false, None, false, None).entries
 }
 
 /// Observe `root` without creating or repairing it, reporting every incomplete
@@ -1069,14 +1084,14 @@ pub fn list_sessions_in(root: &Path, options: &ListOptions) -> Vec<SessionInfo> 
 /// sessions. Strict PID validation requires a complete, positive decimal i32;
 /// tolerant classification retains the legacy leading-integer parse.
 pub fn list_sessions_strict_in(root: &Path, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, None, false)
+    scan_sessions(root, options, true, None, false, None)
 }
 
 /// [`list_sessions_strict_in`] for one session id: that id's companions are
 /// read and classified exactly as a whole-root strict scan would classify
 /// them, and no other entry is touched.
 pub fn observe_session_strict_in(root: &Path, name: &str, options: &ListOptions) -> Inventory {
-    scan_sessions(root, options, true, Some(name), false)
+    scan_sessions(root, options, true, Some(name), false, None)
 }
 
 fn scan_sessions(
@@ -1085,15 +1100,34 @@ fn scan_sessions(
     strict: bool,
     only: Option<&str>,
     full_metadata: bool,
+    cache: Option<&RegistryListCache>,
+) -> Inventory {
+    scan_sessions_with_probe(root, options, strict, only, full_metadata, cache, |paths, budget| {
+        probe_socket_outcomes(paths, budget, |result| result)
+    })
+}
+
+fn scan_sessions_with_probe(
+    root: &Path,
+    options: &ListOptions,
+    strict: bool,
+    only: Option<&str>,
+    full_metadata: bool,
+    cache: Option<&RegistryListCache>,
+    probe: impl FnOnce(&[PathBuf], Duration) -> HashMap<PathBuf, std::io::Result<()>>,
 ) -> Inventory {
     let mut scanner = Scanner {
         strict,
         full_metadata,
         errors: Vec::new(),
+        cache,
     };
     let dir = match std::fs::read_dir(root) {
         Ok(dir) => dir,
         Err(error) => {
+            if let Some(cache) = cache {
+                cache.retain(root, &BTreeSet::new());
+            }
             let kind = if error.kind() == std::io::ErrorKind::NotFound {
                 InventoryErrorKind::RootMissing
             } else {
@@ -1201,6 +1235,9 @@ fn scan_sessions(
         })
         .chain(socket_ids.iter().copied())
         .collect();
+    if let Some(cache) = cache {
+        cache.retain(root, &names);
+    }
     let mut sessions = Vec::new();
     let mut uncertain_sockets = Vec::new();
     for name in names {
@@ -1274,10 +1311,7 @@ fn scan_sessions(
             metadata,
         });
     }
-    let diagnostics =
-        probe_socket_outcomes(&uncertain_sockets, options.socket_probe_budget, |result| {
-            result
-        });
+    let diagnostics = probe(&uncertain_sockets, options.socket_probe_budget);
     for path in uncertain_sockets {
         match diagnostics.get(&path) {
             None => scanner.error(
@@ -1310,7 +1344,7 @@ fn scan_sessions(
 ///
 /// node: src/sessions.ts:1345-1347
 pub fn get_session_by_name(name: &str) -> Option<SessionInfo> {
-    scan_sessions(&session_dir(), &ListOptions::default(), false, Some(name), true)
+    scan_sessions(&session_dir(), &ListOptions::default(), false, Some(name), true, None)
         .entries.into_iter().next()
 }
 
