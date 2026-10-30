@@ -61,17 +61,19 @@ fn sets_a_colour(body: &str) -> bool {
 
 fn picker(root: &std::path::Path) -> Session {
     // `build_spawn_env` scrubs PTY_SESSION for us, so the nesting guard does
-    // not fire, and honours an explicit PTY_ROOT.
+    // not fire, and honours an explicit PTY_ROOT. crossterm paints no colour
+    // while NO_COLOR is non-empty, so an inherited one would blind both checks
+    // here; an empty value is unset by the NO_COLOR convention.
     Session::spawn(
         env!("CARGO_BIN_EXE_pty"),
         &[],
         SpawnOptions {
             rows: Some(24),
             cols: Some(80),
-            env: vec![(
-                "PTY_ROOT".to_string(),
-                root.to_string_lossy().into_owned(),
-            )],
+            env: vec![
+                ("PTY_ROOT".to_string(), root.to_string_lossy().into_owned()),
+                ("NO_COLOR".to_string(), String::new()),
+            ],
             ..Default::default()
         },
     )

@@ -107,6 +107,21 @@ fn token(pid: i32) -> String {
     )
 }
 
+/// Whether this machine cannot read a process start token, said aloud. A Mac
+/// reads it from `/bin/ps -o lstart=`, and the darwin build sandbox has no
+/// `ps` (see the check phase in flake.nix), so a test that needs one stops
+/// there rather than blame the code for its environment. Linux reads `/proc`
+/// and never skips.
+fn skip_without_start_token() -> bool {
+    if cfg!(target_os = "linux")
+        || pty_core::registry::read_process_start_token(std::process::id() as i32).is_some()
+    {
+        return false;
+    }
+    eprintln!("skipped: no process start token here (`/bin/ps -o lstart=` cannot answer)");
+    true
+}
+
 #[test]
 fn reused_pid_token_mismatch_refuses_stop() {
     let mut fixture = Fixture::new(child());
@@ -117,6 +132,9 @@ fn reused_pid_token_mismatch_refuses_stop() {
 
 #[test]
 fn boot_mismatch_refuses_stop() {
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some("previous-boot".into()));
@@ -125,24 +143,80 @@ fn boot_mismatch_refuses_stop() {
 
 #[test]
 fn missing_identity_refuses_stop() {
-    for missing_boot in [false, true] {
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, None, Some(boot()));
+    fixture.refused();
+}
+
+#[test]
+fn live_legacy_missing_boot_lists_unknown_but_explicit_stop_works() {
+    if skip_without_start_token() {
+        return;
+    }
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, Some(token(pid)), None);
+    let sessions = pty_core::registry::list_sessions_in(
+        &fixture.root,
+        &pty_core::registry::ListOptions::default(),
+    );
+    assert_eq!(sessions[0].status, pty_core::registry::SessionStatus::Running);
+    assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
+    assert!(matches!(
+        pty_client::remove_in(&fixture.root, "owner"),
+        Err(pty_client::RemoveError::StillRunning { .. })
+    ));
+    assert!(pty_client::stop_in(&fixture.root, "owner", Some("original"))
+        .unwrap()
+        .verified_empty());
+    fixture.child.wait().unwrap();
+    pty_client::remove_in(&fixture.root, "owner").unwrap();
+}
+
+#[test]
+fn legacy_sidecar_without_a_recorded_start_token_stays_refused() {
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, None, None);
+    assert!(matches!(
+        pty_client::signal_in(&fixture.root, "owner", libc::SIGTERM, Some("original")),
+        Err(pty_client::SignalError::NotRunning { .. })
+    ));
+    assert_unknown_listing_and_refusal(&mut fixture, pid);
+}
+
+#[test]
+fn a_legacy_verified_stop_is_distinguishable_from_a_match() {
+    if skip_without_start_token() {
+        return;
+    }
+    for boot_evidence in [true, false] {
         let mut fixture = Fixture::new(child());
         let pid = fixture.child.id() as i32;
-        let _socket = fixture.record(
-            pid,
-            (!missing_boot).then(|| token(pid)),
-            missing_boot.then(boot),
+        let _socket = fixture.record(pid, Some(token(pid)), boot_evidence.then(boot));
+        let stopped = pty_client::stop_in(&fixture.root, "owner", Some("original")).unwrap();
+        assert!(stopped.verified_empty(), "{stopped:?}");
+        assert_eq!(
+            stopped.identity,
+            if boot_evidence {
+                pty_core::registry::ControlIdentityCheck::Match
+            } else {
+                pty_core::registry::ControlIdentityCheck::LegacyVerified
+            },
+            "only full identity proof may report Match",
         );
-        fixture.refused();
+        fixture.child.wait().unwrap();
     }
 }
 
 #[test]
-fn b1_live_legacy_missing_boot_lists_running_and_refuses_stop_remove() {
+fn legacy_recorded_pid_without_sidecar_or_recovery_token_cannot_stop() {
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
-    let _socket = fixture.record(pid, Some(token(pid)), None);
-    assert_unknown_listing_and_refusal(&mut fixture, pid);
+    let _socket = fixture.record(pid, None, None);
+    std::fs::remove_file(fixture.root.join("owner.pid")).unwrap();
+    fixture.refused();
 }
 
 fn assert_unknown_listing_and_refusal(fixture: &mut Fixture, pid: i32) {
@@ -163,6 +237,9 @@ fn assert_unknown_listing_and_refusal(fixture: &mut Fixture, pid: i32) {
 
 #[test]
 fn matching_owner_remains_stoppable() {
+    if skip_without_start_token() {
+        return;
+    }
     let fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some(boot()));
@@ -221,6 +298,9 @@ fn unreadable_identity_child() {
     if std::env::var_os("PTY_IDENTITY_UNREADABLE_CHILD").is_none() {
         return;
     }
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some(boot()));
@@ -264,6 +344,9 @@ fn b1_transient_unreadable_boot_lists_running_and_refuses_stop_remove() {
 
 #[test]
 fn exit_evidence_keeps_unknown_owner_exited_with_named_pid() {
+    if skip_without_start_token() {
+        return;
+    }
     for (field, value) in [
         ("exitCode", serde_json::json!(0)),
         ("exitedAt", serde_json::json!("2026-10-15T00:00:00.000Z")),
@@ -285,8 +368,10 @@ fn exit_evidence_keeps_unknown_owner_exited_with_named_pid() {
         assert_eq!(sessions[0].pid, Some(pid));
         assert_eq!(sessions[0].identity, pty_core::registry::DaemonIdentityCheck::Unknown);
         fixture.refused();
-        assert!(pty_client::remove_in(&fixture.root, "owner").is_err());
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        pty_client::remove_in(&fixture.root, "owner").unwrap();
+        assert!(!path.exists());
     }
 }
 
@@ -343,4 +428,167 @@ fn pidless_metadata_with_companions_remains_unknown_and_not_removable() {
         assert!(path.exists());
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn legacy_token_mismatch_and_dead_pid_refuse_explicit_controls() {
+    if skip_without_start_token() {
+        return;
+    }
+    for dead in [false, true] {
+        let mut fixture = Fixture::new(child());
+        let pid = fixture.child.id() as i32;
+        let recorded_token = if dead { token(pid) } else { "stale:owner".into() };
+        let _socket = fixture.record(pid, Some(recorded_token), None);
+        if dead {
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+        }
+        assert!(pty_client::stop_in(&fixture.root, "owner", None).is_err());
+        assert!(matches!(
+            pty_client::signal_in(&fixture.root, "owner", libc::SIGTERM, None),
+            Err(pty_client::SignalError::NotRunning { .. })
+        ));
+        assert!(fixture.root.join("owner.sock").exists());
+        if !dead {
+            assert!(fixture.child.try_wait().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn modern_wrong_boot_and_missing_token_refuse_signal_before_socket_query() {
+    if skip_without_start_token() {
+        return;
+    }
+    for missing_token in [false, true] {
+        let mut fixture = Fixture::new(child());
+        let pid = fixture.child.id() as i32;
+        let socket = fixture.record(
+            pid,
+            (!missing_token).then(|| token(pid)),
+            Some(if missing_token { boot() } else { "previous-boot".into() }),
+        );
+        socket.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            pty_client::signal_in(&fixture.root, "owner", libc::SIGTERM, None),
+            Err(pty_client::SignalError::NotRunning { .. })
+        ));
+        assert_eq!(socket.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(fixture.child.try_wait().unwrap().is_none());
+    }
+}
+
+#[test]
+fn pre_141_records_signal_owned_child_without_upgrading_inventory_identity() {
+    if skip_without_start_token() {
+        return;
+    }
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    for recorded_token in [true, false] {
+        let mut fixture = Fixture::new(child());
+        let mut program = Fixture::new(child());
+        let daemon_pid = fixture.child.id() as i32;
+        let program_pid = program.child.id() as i32;
+        let socket = fixture.record(
+            daemon_pid,
+            recorded_token.then(|| token(daemon_pid)),
+            None,
+        );
+        // Old producers omitted the boot field entirely, not merely JSON null.
+        let path = fixture.root.join("owner.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("daemonBootId");
+        if !recorded_token {
+            record.as_object_mut().unwrap().remove("daemonStartToken");
+        }
+        let original = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        if !recorded_token {
+            assert!(matches!(
+                pty_client::signal_in(&fixture.root, "owner", libc::SIGTERM, Some("original")),
+                Err(pty_client::SignalError::NotRunning { .. })
+            ));
+            assert_eq!(socket.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert!(program.child.try_wait().unwrap().is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            continue;
+        }
+        let responder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match socket.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "control never queried STATUS");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept STATUS: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0_u8; 64];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let body = serde_json::json!({
+                "name": "example-legacy-control",
+                "terminal": {"cols":80,"rows":24,"cursorX":0,"cursorY":0,
+                    "scrollbackUsed":0,"scrollbackCapacity":0},
+                "process": {"alive":true,"pid":program_pid},
+                "daemon": {"pid":daemon_pid},
+                "clients": {"total":0,"attached":0,"readOnly":0},
+                "modes": {"sgrMouse":false,"cursorHidden":false,
+                    "kittyKeyboard":false,"kittyKeyboardFlags":[]}
+            });
+            stream.write_all(&pty_core::protocol::encode_status_response(&body.to_string())).unwrap();
+        });
+        let sent = pty_client::signal_in(
+            &fixture.root, "owner", libc::SIGTERM, Some("original"),
+        ).unwrap();
+        responder.join().unwrap();
+        assert_eq!(sent.pid, program_pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while program.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "child did not receive SIGTERM");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fixture.child.try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(
+            pty_core::registry::list_sessions_in(
+                &fixture.root, &pty_core::registry::ListOptions::default(),
+            )[0].identity,
+            pty_core::registry::DaemonIdentityCheck::Unknown,
+        );
+    }
+}
+
+#[test]
+fn exited_legacy_record_waits_for_owned_daemon_before_removal() {
+    if skip_without_start_token() {
+        return;
+    }
+    let mut fixture = Fixture::new(child());
+    let pid = fixture.child.id() as i32;
+    let _socket = fixture.record(pid, Some(token(pid)), None);
+    let path = fixture.root.join("owner.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["exitCode"] = serde_json::json!(0);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::thread::scope(|scope| {
+        let child = &mut fixture.child;
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        pty_client::remove_in(&fixture.root, "owner").unwrap();
+    });
+    assert!(!path.exists());
+    assert!(!fixture.root.join("owner.sock").exists());
+    assert!(!fixture.root.join("owner.pid").exists());
 }

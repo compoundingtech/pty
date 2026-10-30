@@ -24,6 +24,42 @@ caller thread
 
 Both entry points compute one absolute deadline at entry (`now + budget`) and run rounds until every socket has an outcome or the deadline passes (`PTY.REG-R04`, `PTY.REG-R06`). No thread is spawned (`PTY.REG-R01`). Every socket is owned by a local of the call and is closed when the call returns (`PTY.REG-R02`).
 
+### Metadata projection
+
+Registry scans deserialize metadata directly from bytes. The list projection
+consumes `lastLines`, `extraEnv`, and `sessionEnv` without retaining their
+strings or containers, while validating their original optional string-array
+and string-map shapes. All other fields, including unknown provenance and scope
+fields, remain available in `SessionInfo.metadata`. Syntax/type errors still
+omit metadata in tolerant scans and report `MetadataMalformed` in strict scans;
+non-object records remain malformed and absent defaulted fields remain accepted.
+
+Object entries are buffered as borrowed raw JSON slices, not `Value` trees, so
+duplicate keys retain their historical last-key-wins behavior before typed
+validation. This also applies recursively to tags, environment maps, publication
+bindings and unknown fields. Only the effective `lastLines`, `extraEnv`, and
+`sessionEnv` values are shape-validated; overwritten values cannot invalidate
+an otherwise valid record. Arrays stream their elements.
+Overwritten values receive a syntax-only visitor walk to preserve numeric,
+Unicode and nesting-limit checks without a payload tree. Effective values are
+decoded by their typed visitors, with the original nesting limit carried across
+borrowed raw slices; ordinary non-duplicate records need no extra syntax walk.
+
+Ordinary `list_sessions`, `list_sessions_with`, `list_sessions_in`, and strict
+observations return this projection (the three omitted fields are `None`);
+their Rust signatures are unchanged. The additive `list_sessions_full` API
+retains all fields, also deserializing directly from bytes. GC and the picker
+use it because they reconstruct persisted environments and compare whole
+generation-less legacy records. `get_session` uses a full listing for reference
+resolution; `get_session_by_name` scans only the named record with full payloads.
+`read_metadata*` remains full metadata. Consumers needing retained output,
+restart environments, or legacy whole-record comparison must use a full path.
+
+`registry::list_metadata::tests` covers projection equivalence, malformed input,
+duplicate-key equivalence on both paths, legacy whole-record identity, and a
+printed old/new parsing comparison over 500 approximately 15 KB records,
+without a timing threshold.
+
 ## Non-blocking connect
 
 `unix_connect::connect(path)` opens an AF_UNIX stream socket that is non-blocking and close-on-exec, then issues one `connect(2)`.
@@ -85,12 +121,15 @@ Strict inventory probes transport only when daemon identity is unconfirmed; a pr
 
 Repeated embedders may retain `pty_core::registry::list::RegistryListCache`
 (or the `pty_client::list` facade). Stateless listing remains unchanged.
-The cache retains successful parsed regular-file `SessionMetadata` only,
+The cache retains successful parsed regular-file light `SessionMetadata` only,
 keyed by path, device/inode, size, and nanosecond mtime/ctime. Every lookup
 opens the file to check readability and compares descriptor metadata; reads
 are retained only when fstat identity is stable before and after reading.
 Missing entries are evicted per observed root, and read/parse failures and
 nonregular companions are never cached.
+Cache misses use the typed light parser, omitting retained output and environment
+payloads just like ordinary listing. Full listings, reference lookups, restart
+readers and identity-record readers bypass this cache and retain full metadata.
 
 Every call still discovers directory entries, reads PID sidecars, checks
 current boot/start-token/leader evidence and classifies identity. Neither

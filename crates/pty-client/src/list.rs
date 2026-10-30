@@ -5,7 +5,8 @@
 //!
 //! **Unstable.** This API will move onto `SessionRef` / `PtyRoot` with
 //! compoundingtech/pty-rust#1 and #3. Until then [`SessionInfo`] exposes the
-//! on-disk session metadata as-is.
+//! registry list projection: retained scrollback and environment payloads
+//! (`lastLines`, `extraEnv`, `sessionEnv`) require a full metadata read.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Serialize, Serializer};
 
 use pty_core::protocol::AttachedClient;
-use pty_core::registry::{self, SessionInfo};
+use pty_core::registry::{self, KeyedSession, SessionInfo};
 
 use super::stats::query_attached_clients;
 
@@ -116,6 +117,15 @@ fn with_clients(sessions: Vec<SessionInfo>, options: &ListOptions) -> Vec<Listed
             info,
         })
         .collect()
+}
+
+/// Observe one immutable session id without enumerating the registry.
+pub fn observe(
+    root: &Path,
+    name: &str,
+    options: &registry::KeyedSessionOptions,
+) -> KeyedSession {
+    registry::observe_session_in(root, name, options)
 }
 
 /// Attached clients for each of `sessions`, index-aligned. Rows that are not

@@ -74,6 +74,9 @@ fn json_only_with_exit_record_is_exited() {
 /// node: tests/list-filters.test.ts:170-192 (live pid, missing socket -> running)
 #[test]
 fn json_with_live_pid_and_no_socket_is_running_and_untouched() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let _ = root();
     let name = unique_name("livepid");
     std::fs::write(registry::pid_path(&name), std::process::id().to_string()).unwrap();
@@ -181,6 +184,9 @@ fn socket_with_unreadable_pid_is_unknown_not_gone() {
 /// node: src/sessions.ts:940-947
 #[test]
 fn live_socket_with_exit_record_is_exited() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let _ = root();
     let name = unique_name("exiting");
     let _listener = UnixListener::bind(registry::socket_path(&name)).unwrap();
@@ -498,6 +504,9 @@ fn strict_root() -> std::path::PathBuf {
 
 #[test]
 fn strict_clean_inventory_matches_default_and_preserves_root() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let dir = strict_root();
     std::fs::write(
         dir.join("retained.json"),
@@ -527,6 +536,9 @@ fn strict_clean_inventory_matches_default_and_preserves_root() {
 
 #[test]
 fn strict_retains_proven_ended_sockets_alongside_a_healthy_session() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let dir = strict_root();
     let live = UnixListener::bind(dir.join("live.sock")).unwrap();
     let mut live_record = base("live");
@@ -617,6 +629,9 @@ fn strict_missing_root_is_incomplete_without_creating_it() {
 
 #[test]
 fn strict_checks_malformed_metadata_and_orphan_pids_without_losing_good_records() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     use registry::InventoryErrorKind::{MetadataMalformed, PidMalformed};
     let dir = strict_root();
     std::fs::write(
@@ -849,6 +864,9 @@ fn saturated_or_refused_socket_cannot_rescue_a_gone_identity() {
 
 #[test]
 fn sidecar_reuse_is_vanished_even_with_a_reachable_socket() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let dir = strict_root();
     registry::with_root(&dir, || {
         let pid = std::process::id() as i32;
@@ -921,6 +939,9 @@ fn b1_unknown_identity_retains_running_pid_and_makes_strict_inventory_incomplete
 
 #[test]
 fn b3_missing_boot_stale_token_proves_mismatch() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let pid = std::process::id() as i32;
     let metadata = SessionMetadata {
         daemon_pid: Some(pid),
@@ -1100,6 +1121,9 @@ fn startup_retirement_removes_stale_exited_history_but_not_live_unknown_or_own_n
 
 #[test]
 fn retirement_revalidates_generation_sidecar_and_both_locks() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let dir = strict_root();
     registry::with_root(&dir, || {
         let pid = std::process::id() as i32;

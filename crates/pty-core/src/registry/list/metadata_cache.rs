@@ -51,7 +51,7 @@ impl RegistryListCache {
     /// Observe the registry with the same semantics and probe budget as
     /// [`super::list_sessions_in`], reusing unchanged parsed metadata.
     pub fn list(&self, root: &Path, options: &ListOptions) -> Vec<SessionInfo> {
-        super::scan_sessions(root, options, false, None, Some(self)).entries
+        super::scan_sessions(root, options, false, None, false, Some(self)).entries
     }
 
     fn entries(&self) -> MutexGuard<'_, HashMap<PathBuf, Entry>> {
@@ -122,13 +122,7 @@ impl RegistryListCache {
 pub(super) fn parse_metadata(bytes: &[u8]) -> Result<SessionMetadata, serde_json::Error> {
     #[cfg(test)]
     PARSES.with(|count| count.set(count.get() + 1));
-    let value = serde_json::from_slice::<serde_json::Value>(bytes)?;
-    if !value.is_object() {
-        return Err(<serde_json::Error as serde::de::Error>::custom(
-            "metadata must be a JSON object",
-        ));
-    }
-    serde_json::from_value(value)
+    super::super::list_metadata::parse_with_payloads(bytes, false)
 }
 
 #[cfg(test)]
@@ -180,6 +174,35 @@ mod tests {
     }
 
     #[test]
+    fn cache_keeps_light_projection_while_full_readers_retain_payloads() {
+        let root = Root::new();
+        let mut metadata: serde_json::Value = serde_json::from_slice(&record("label")).unwrap();
+        metadata["lastLines"] = serde_json::json!(["retained output"]);
+        metadata["extraEnv"] = serde_json::json!({"TOKEN": "synthetic"});
+        metadata["sessionEnv"] = serde_json::json!({"TERM": "screen"});
+        std::fs::write(root.0.join("first.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let cache = RegistryListCache::default();
+        let before = parses();
+        for _ in 0..2 {
+            let cached = cache.list(&root.0, &ListOptions::default());
+            let light = cached[0].metadata.as_ref().unwrap().to_map();
+            for field in ["lastLines", "extraEnv", "sessionEnv"] {
+                assert!(!light.contains_key(field));
+            }
+        }
+        assert_eq!(parses() - before, 1);
+        let full = super::super::scan_sessions(
+            &root.0, &ListOptions::default(), false, None, true, None,
+        );
+        let retained = full.entries[0].metadata.as_ref().unwrap().to_map();
+        for field in ["lastLines", "extraEnv", "sessionEnv"] {
+            assert_eq!(retained[field], metadata[field]);
+        }
+        let (identity, _) = super::super::read_identity_record(&root.0, "first").unwrap();
+        assert_eq!(identity.to_map()["sessionEnv"], metadata["sessionEnv"]);
+    }
+
+    #[test]
     // The probe is deliberately held until the second observer has completed.
     // The timeout only bounds a broken test; channels establish the ordering.
     fn concurrent_probe_does_not_hold_cache_lock() {
@@ -197,7 +220,7 @@ mod tests {
             let cache = &cache;
             let first = scope.spawn(move || {
                 super::super::scan_sessions_with_probe(
-                    root, &ListOptions::default(), true, None, Some(cache),
+                    root, &ListOptions::default(), true, None, false, Some(cache),
                     |paths, _| {
                         assert_eq!(paths.len(), 1);
                         entered_tx.send(()).unwrap();

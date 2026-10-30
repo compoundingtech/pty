@@ -179,7 +179,7 @@ gap is in what the daemon does with the frames.
 | Reap vs preserve precedence (`keep` > `ephemeral` > `permanent` > `PTY_REAP_ON_EXIT`) | have | Rust accepts only `keep=true`; Node accepts any value except `false/0/no/off`. |
 | On preserve: `exitCode`, `exitedAt`, `lastLines` (≤ 200) | partial | Rust keeps 50 lines and writes a Rust-only `<name>.screen` file. |
 | Scrollback 10000, `scrollbackCapacity = rows + 10000` | have | |
-| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | partial | Rust writes all of these except `cursor_visible`, which is Node-only and optional. A TUI can toggle the cursor on every redraw, and those records filled the event history, so Rust daemons stopped writing them in #172. Node's `docs/disk-layout.md` still lists `cursor_visible` in its tier-1 `events.jsonl` table. A reader must not wait for it or filter on it to learn anything about a session. Rust still reads and formats existing `cursor_visible` records. |
+| Terminal events to the event log: `bell`, `title_change`, `notification` (OSC 9/99/777), `focus_request`, `cursor_visible`, `session_start`, `session_exit` | partial | Rust does not persist `cursor_visible` or `title_change`: cursor redraws and animated title frames are live terminal state, not durable history. The actor retains the current title and attached clients receive original OSC output. A reader must not wait for these optional Node events to learn a session's state. Rust still reads and formats historical records of both types. |
 | Live recovery request handling (`.recovery/`) | deferred | |
 
 ## 5. Registry on disk (`$PTY_ROOT`)
@@ -221,6 +221,7 @@ gap is in what the daemon does with the frames.
 | `gc` steps and messages | missing (see section 12) |
 | Reserved tags hidden by default: `ptyfile*`, `strategy`, `:*` | missing |
 | Behavioral tags: `strategy=permanent`, `keep`, `parent`, `role=agent`, `strategy.*` bookkeeping, `:l<pid>-*` | partial (`keep`, `permanent` only) |
+| `retention.lost-at` bookkeeping tag | Rust-only. Only the opt-in retention sweep (`PTY_RETAIN_FINISHED`) writes it, and only on a vanished record: when the sweep first saw the owner lost, the time the record's age counts from. A stamp older than `createdAt` does not count. `restart` and `up` drop it with gc's bookkeeping. |
 
 ## 6. Terminal emulation: libghostty in place of xterm
 

@@ -100,12 +100,43 @@ lose the current buffered window. One-shot writers (`pty emit`, metadata, tags,
 display name, `pty exec`, and gc) retain their existing event-lock behavior, so
 their records can land before daemon records from up to one window earlier.
 
-Cursor visibility is terminal state, not durable event history: TUI redraws
-can toggle it dozens of times per second, so daemons do not persist
-`cursor_visible` transitions. Existing cursor-visible records remain readable
-and formattable. GC removes recognized atomic `.tmp.<pid>.<16hex>` files in
-the registry and activity/recovery directories only after their writer PID
-dies; live or reused PIDs, malformed names and symlinks are left alone.
+`pty events NAME --wait session_exit --timeout SECONDS` checks recorded exit
+state before and after subscribing, so an already-exited retained session
+returns immediately (exit status 0), even if its event log was removed.
+Other event types wait for a new matching event. A missing session returns a
+not-found error (exit status 1); a vanished target with no recorded exit also
+fails promptly, including a launcher that never started. A session removed
+while waiting without an observed matching event returns 1. The timeout is an independent deadline
+and returns 1 even when no filesystem events arrive. Followers ignore read-only
+filesystem notifications and coalesce change notifications, avoiding feedback
+from their own registry reads.
+
+Cursor visibility and window titles are live terminal state, not durable event
+history: TUI redraws and title spinners can change them dozens of times per
+second, so daemons do not persist `cursor_visible` or `title_change` transitions.
+The actor retains the current title, and attached clients still receive the
+original OSC output. Existing records remain readable and formattable.
+Daemons automatically remove recognized atomic `.tmp.<pid>.<16hex>` files on
+entering their serving loop and every 30 seconds thereafter; explicit GC runs
+the same narrow sweep. Cleanup covers the registry and activity/recovery
+directories only after the writer PID dies; live or reused PIDs, malformed
+names, directories and symlinks are left alone. Automatic cleanup does not run
+full session GC.
+
+Finished records stay until `pty gc` removes them, unless a daemon starts with
+`PTY_RETAIN_FINISHED` set to a window such as `7d` (`Ns`, `Nm`, `Nh` or `Nd`).
+Such a daemon then sweeps its root once, on a background thread after it has
+published its own session. It removes `exited` and `vanished` records that have
+been dead for longer than the window, together with their event logs. It removes
+only what `pty gc`'s sweep would remove: the recorded owner must be proven gone,
+and `strategy=permanent` records are left to gc. It never signals, respawns or
+abandons anything, and it skips any record whose locks are held. An exited
+record's age counts from `exitedAt`. A vanished record has no exit time, so the
+first sweep that sees it stamps the tag `retention.lost-at`, and the record goes
+one window after that stamp. A `keep` tag holds a record for the longer of the
+window and gc's keep window. Unset, empty, `off`, and any value that is not a
+positive duration all mean off, which is the default. If daemons on one root
+set different windows, the shortest wins. `pty gc` is unchanged.
 
 Keep the current protocol as the baseline. Add a protocol feature only after a
 real failing use case shows that the current byte-framed messages cannot express

@@ -19,7 +19,9 @@ pub mod activity;
 pub mod atomic;
 pub mod cleanup;
 pub mod evidence;
+pub mod keyed;
 pub mod list;
+mod list_metadata;
 pub mod lock;
 pub mod metadata;
 pub mod mutate;
@@ -45,14 +47,22 @@ pub use evidence::{
     SessionExitEvidenceResult, SessionExitEvidenceTail, SessionExitStatus,
     get_session_exit_evidence, remove_session_generation,
 };
+pub use keyed::{
+    KeyedSession, KeyedSessionError, KeyedSessionErrorKind, KeyedSessionOptions,
+    observe_session_in,
+};
 pub use list::{
-    DEFAULT_SOCKET_PROBE_BUDGET, DaemonIdentityCheck, DaemonIdentityCounters, Inventory,
-    InventoryError, InventoryErrorKind, ListOptions, SessionInfo, SessionStatus, all_session_names,
-    ambiguous_reference_message, check_daemon_identity, check_record_identity, check_record_identity_in,
-    daemon_identity_counters, get_session, get_session_by_name, has_process_exited_for_reap,
-    list_sessions, list_sessions_in, list_sessions_strict_in, list_sessions_with,
-    observe_session_strict_in, pid_alive, probe_sockets_within_budget, read_boot_id, read_pid,
-    read_pid_with, read_process_start_token, read_session_pid, read_signal_target_with,
+    ControlIdentityCheck, DEFAULT_SOCKET_PROBE_BUDGET, DaemonIdentityCheck, DaemonIdentityCounters,
+    Inventory, InventoryError, InventoryErrorKind, ListOptions, SessionInfo, SessionStatus,
+    all_session_names, ambiguous_reference_message, check_control_identity, check_daemon_identity,
+    check_record_identity, check_record_identity_in, daemon_identity_counters, get_session,
+    get_session_by_name, has_process_exited_for_reap,
+    list_sessions, list_sessions_full, list_sessions_in, list_sessions_strict_in, list_sessions_with,
+    observe_session_strict_in, pid_alive, probe_sockets_within_budget, read_boot_id,
+    read_control_signal_target_with, read_control_target_authority_with, read_control_target_with,
+    read_pid, read_pid_with,
+    read_process_start_token, read_session_pid,
+    read_signal_target_with,
     record_daemon_identity_check, resolve_ref, session_exists, socket_reachable,
     wait_for_process_exit,
 };
@@ -89,8 +99,9 @@ pub use root::{
 pub use revocation::{PublicationBinding, PublicationRevocation, RevocationInstall};
 pub use tags::{
     DEFAULT_KEEP_MAX_AGE_MS, EXACT_RESERVED_TAG_KEYS, GC_BOOKKEEPING_KEYS, KEEP_FALSEY, KEEP_TAG,
-    extract_filter_tags, is_keep_expired, is_keep_requested, is_reserved_tag_key, matches_all_tags,
-    reap_on_exit_default, should_reap_at_exit, strip_gc_bookkeeping,
+    RETAIN_FINISHED_ENV, RETENTION_LOST_AT_TAG, extract_filter_tags, is_keep_expired,
+    is_keep_requested, is_reserved_tag_key, matches_all_tags, parse_retain_finished,
+    reap_on_exit_default, retain_finished_window, should_reap_at_exit, strip_gc_bookkeeping,
 };
 pub use time::{
     iso8601, iso8601_from_epoch_ms, local_hms, now_epoch_ms, now_iso8601, parse_iso8601_ms,

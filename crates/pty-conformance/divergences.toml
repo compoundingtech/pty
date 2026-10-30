@@ -50,6 +50,22 @@
 # 2026-09-06: pty-rust 660/660, the Node pty 659/660.
 
 [[divergence]]
+test = "events::animated_titles_do_not_fill_event_history"
+side = "node"
+kind = "intended"
+reason = """
+Rust keeps the current OSC 0/2 title in terminal state and forwards the \
+original output to attached clients, but no longer persists title_change \
+records. Animated titles are redraw state, not durable session facts; \
+writing every spinner frame replaces the event log and evicts useful \
+history. The pinned Node daemon still persists distinct title frames. \
+The fixture emits 40 animated OSC 0 titles, a final OSC 2 title and a BEL \
+processing barrier, then requires no title_change record. Old title records \
+remain readable and formattable. Remove this entry when Node stops \
+persisting titles, or if Rust resumes it.
+"""
+
+[[divergence]]
 test = "events::cursor_redraws_do_not_fill_event_history"
 side = "node"
 kind = "intended"
@@ -99,6 +115,22 @@ temporary behind. The Node on-disk layout gives these files no tier and \
 tells readers to ignore them, so collecting them changes nothing a reader \
 sees. Remove this entry when Node collects the same leftovers, or if Rust \
 stops.
+"""
+
+[[divergence]]
+test = "gc::daemon_automatically_removes_only_dead_writer_atomic_temporaries"
+side = "node"
+kind = "intended"
+reason = """
+pty-rust daemons run the existing conservative dead-writer atomic-temp \
+sweep on entering the serving loop and every 30 seconds thereafter, \
+including while idle. This does not run full session GC or alter canonical \
+event history. The fixture covers event-lock and event-log temporaries in \
+the registry, `.activity`, and `.recovery`, preserving live writers, malformed \
+names, directories and symlinks. The existing explicit-GC divergence above \
+records that pinned Node leaves these ignored leftovers in place; automatic \
+collection is Rust-specific too. Remove this entry when Node provides the \
+same automatic cleanup, or if Rust removes it.
 """
 
 [[divergence]]
@@ -206,4 +238,62 @@ registry-sidecar diagnostic and no metadata. This is the deliberate Rust \
 boundary, not an assertion that Node accepted the overflow. The reference \
 is not changed for this extension. Remove this entry when Node supports \
 the same boundary behavior or Rust removes it.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_on_metadata_without_a_started_daemon_returns_vanished_without_waiting"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust rejects a vanished metadata-only launcher with status 1 rather than \
+waiting for an exit event from a daemon that never started (#196). Against \
+pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22, CI run \
+40986814385 exhausted the five-second harness deadline. Remove when Node \
+rejects this vanished target promptly.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_reconstructs_an_already_exited_session_event_when_the_log_is_missing"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust completes session_exit waits from terminal metadata when the event log \
+has been removed (#196). Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 \
+on Node 22 timed out at the five-second harness deadline in CI run \
+40986814385. Remove when Node completes this recorded-exit wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_returns_success_when_a_live_session_exits"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust accepts session-first options and observes exit state across follower \
+startup (#196). Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node \
+22 exceeded the five-second harness deadline after the input-gated session \
+exited in CI run 40986814385. Remove when Node returns success for this wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_returns_the_retained_exit_event_for_an_already_exited_session"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust returns the retained session_exit event for an already-exited session \
+instead of starting at EOF and waiting forever (#196). Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 exceeded the five-second \
+harness deadline in CI run 40986814385. Remove when Node completes the \
+already-recorded exit wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_times_out_when_the_event_never_occurs"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust parses events NAME --wait session_exit --timeout 1 and enforces its \
+deadline without incoming events (#196). Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 exceeded the five-second \
+harness deadline in CI run 40986814385. Remove when Node honors the quiet \
+session-first timeout.
 """

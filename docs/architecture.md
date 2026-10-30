@@ -114,16 +114,34 @@ never both win. See `crates/pty-core/src/registry/lock.rs` and
 Native records publish `daemonStartToken` and `daemonBootId` on Linux and macOS.
 If either kernel identity cannot be read, startup fails before publication
 or child launch; it does not create an unmanageable Unknown-owned session.
-Both recorded identities must match; a recovery start token alone does not
-authorize legacy records. Linux also requires `/proc/<pid>/status` to identify
-the PID as its own thread-group leader. Missing boot identity or start token
-is Unknown, never Match, and grants no signal authority. A reachable socket
+Both recorded identities must match for inventory to report Match. Linux also
+requires `/proc/<pid>/status` to identify the PID as its own thread-group leader.
+Missing boot identity or start token is Unknown, never Match. A reachable socket
 cannot rescue a mismatched or absent identity. Unknown keeps the named PID and
 conservatively lists as running unless an exit record proves the child exited;
-strict inventory remains incomplete. The separate identity field still blocks
-signals, removal and replacement. Metadata with no named PID and no PID/socket
-companions is Gone and removable. Run, up, down, restart, attach and the
-interactive picker recheck identity before cleanup or replacement.
+strict inventory remains incomplete. Unknown is not replacement or retirement
+authority. Metadata with no named PID and no PID/socket companions is Gone and
+removable.
+
+**Legacy controls do not upgrade inventory proof.** Records without
+`daemonBootId` retain operation-specific pre-boot-publication checks, and every
+legacy control needs a recorded start token. Stop may select a PID from its
+sidecar; metadata-only fallback requires a matching `recovery.processStartToken`.
+A child signal always requires a recorded daemon PID and matching recorded start
+token, even with a sidecar. Removal sends no signal: it refuses running sessions,
+waits for an exited record's owner to leave, then checks generation ownership
+before unlinking. The selected live PID must agree with any recorded PID, and
+the recorded start token must be present and match. A legacy record without a
+start token is refused, and cleaning it up is manual: a numeric PID alone cannot
+tell its daemon from a reused PID. This separate `LegacyVerified` outcome is not
+Match and cannot clear publication fences or authorize automatic retirement.
+`Stopped::identity` reports whether a stop was authorized by `Match` or by
+`LegacyVerified`, so a caller treats only a `Match` stop as retirement proof.
+Present boot evidence always takes the strict full-tuple path, including refusal
+when the evidence mismatches or cannot be read. There is no historical producer
+version marker: removing boot evidence from a modern record selects the same
+legacy check, never a check weaker than the pre-boot producer used. No boot
+evidence is synthesized and no creation-time threshold is used.
 Manifest stop and restart use the same pinned stop path as `pty kill`.
 `registry::daemon_identity_counters()` exposes process-local match, mismatch,
 gone and unknown observations without logging every scan.

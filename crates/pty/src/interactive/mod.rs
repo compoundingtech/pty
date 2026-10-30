@@ -140,7 +140,8 @@ impl Picker {
     /// the same session where that session is still listed.
     fn refresh(&mut self) {
         let selected_name = self.selected_session_name();
-        self.all = registry::list_sessions();
+        // Restart must retain environments and whole-record legacy identity.
+        self.all = registry::list_sessions_full();
         if !self.filter_tags.is_empty() {
             self.all.retain(|s| {
                 registry::matches_all_tags(

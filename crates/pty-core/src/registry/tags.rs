@@ -152,7 +152,9 @@ pub fn should_reap_at_exit(tags: Option<&TagMap>, ephemeral: bool, default_reap:
     default_reap
 }
 
-/// `pty gc`'s flapping bookkeeping; a manual `restart` / `up` strips them.
+/// Bookkeeping pty writes on a dead record: `pty gc`'s flapping keys and the
+/// retention sweep's [`RETENTION_LOST_AT_TAG`]. A manual `restart` / `up`
+/// strips them.
 ///
 /// node: src/cli.ts:3667-3672, 4081-4100
 pub const GC_BOOKKEEPING_KEYS: &[&str] = &[
@@ -160,7 +162,35 @@ pub const GC_BOOKKEEPING_KEYS: &[&str] = &[
     "strategy.consecutive-fast-fails",
     "strategy.last-respawn-at",
     "strategy.command-hash",
+    RETENTION_LOST_AT_TAG,
 ];
+
+/// When the retention sweep first saw a `vanished` record's owner lost.
+///
+/// A vanished daemon writes no exit record, so this stamp is the earliest
+/// time of death pty knows, and retention counts a vanished record's age
+/// from it. A stamp older than the record's `createdAt` belongs to an
+/// earlier run of the same id and does not count.
+pub const RETENTION_LOST_AT_TAG: &str = "retention.lost-at";
+
+/// How long daemons keep finished (`exited` / `vanished`) records before
+/// their retention sweep removes them. Unset means off.
+pub const RETAIN_FINISHED_ENV: &str = "PTY_RETAIN_FINISHED";
+
+/// The retention window in milliseconds, or `None` when retention is off.
+///
+/// Off is the default: unset, empty, `false|0|no|off`, and any value that
+/// is not a positive `Ns|Nm|Nh|Nd` duration. A value that cannot be read
+/// never turns into "remove now".
+pub fn retain_finished_window() -> Option<i64> {
+    parse_retain_finished(std::env::var(RETAIN_FINISHED_ENV).ok().as_deref())
+}
+
+/// [`retain_finished_window`] for one raw value.
+pub fn parse_retain_finished(raw: Option<&str>) -> Option<i64> {
+    let raw = raw.filter(|raw| !reads_as_no(raw))?;
+    crate::duration::parse_duration(raw).filter(|ms| *ms > 0)
+}
 
 /// Remove the [`GC_BOOKKEEPING_KEYS`] from `tags`; `None` when nothing is
 /// left (so callers skip the `tags` field entirely, as Node does).

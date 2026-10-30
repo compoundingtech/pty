@@ -128,14 +128,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let mut result = GcResult::default();
 
     if !dry_run {
-        let root = session_dir();
-        cleanup_dead_atomic_temps(&root);
-        for sidecar in [".activity", ".recovery"] {
-            let directory = root.join(sidecar);
-            if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
-                cleanup_dead_atomic_temps(&directory);
-            }
-        }
+        cleanup_dead_registry_temps();
     }
 
     // Raw debris: runtime files whose metadata is missing or malformed.
@@ -149,7 +142,8 @@ pub fn gc(options: GcOptions) -> GcResult {
             }
         }
     }
-    let initial = registry::list_sessions();
+    // GC also reconstructs environments and compares whole legacy records.
+    let initial = registry::list_sessions_full();
 
     // STEP 1: orphan children, in name order so cycles resolve
     // deterministically.
@@ -210,7 +204,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step1 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &after_step1 {
@@ -262,7 +256,7 @@ pub fn gc(options: GcOptions) -> GcResult {
     let after_step15 = if dry_run {
         initial.clone()
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     for s in &after_step15 {
         let Some(meta) = s.metadata.as_ref() else {
@@ -349,25 +343,15 @@ pub fn gc(options: GcOptions) -> GcResult {
     let final_list = if dry_run {
         initial
     } else {
-        registry::list_sessions()
+        registry::list_sessions_full()
     };
     let now_ms = now_epoch_ms();
     for s in &final_list {
-        if !s.is_gone() {
+        let Some(metadata) = removable_finished(s) else {
             continue;
-        }
-        if s.metadata
-            .as_ref()
-            .is_none_or(|metadata| !known_owner_lost(daemon_identity(&s.name, metadata)))
-        {
-            continue;
-        }
-        let tags = s.metadata.as_ref().and_then(|m| m.tags.as_ref());
-        if tags.and_then(|t| t.get("strategy")).map(String::as_str) == Some("permanent") {
-            continue;
-        }
-        let keep_requested = is_keep_requested(tags);
-        if keep_requested && !is_keep_expired(s.metadata.as_ref(), now_ms, keep_max_age_ms) {
+        };
+        let keep_requested = is_keep_requested(metadata.tags.as_ref());
+        if keep_requested && !is_keep_expired(Some(metadata), now_ms, keep_max_age_ms) {
             result.kept.push(s.name.clone());
             continue;
         }
@@ -389,7 +373,17 @@ struct AbandonDecision {
     idle_days: Option<i64>,
 }
 
-fn is_permanent(meta: &SessionMetadata) -> bool {
+/// A finished record pty may remove: `exited` or `vanished`, its recorded
+/// owner proven lost, and not `strategy=permanent` (gc respawns or abandons
+/// those). gc's sweep and the retention sweep both start from this test, and
+/// each proves it again under both locks before removing anything.
+pub(crate) fn removable_finished(s: &SessionInfo) -> Option<&SessionMetadata> {
+    let metadata = s.metadata.as_ref().filter(|_| s.is_gone())?;
+    (known_owner_lost(daemon_identity(&s.name, metadata)) && !is_permanent(metadata))
+        .then_some(metadata)
+}
+
+pub(crate) fn is_permanent(meta: &SessionMetadata) -> bool {
     meta.tags
         .as_ref()
         .and_then(|t| t.get("strategy"))
@@ -848,7 +842,7 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bo
 
 /// A zombie is gone only after its recorded identity has matched. Socket
 /// existence/reachability and a missing read_pid_with result are never proof.
-fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
+pub(crate) fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
     let sidecar = read_session_pid(name);
     let check = registry::check_record_identity_in(
         &registry::session_dir(), name, sidecar, Some(metadata),
@@ -864,7 +858,7 @@ fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityChec
     }
 }
 
-fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
+pub(crate) fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
     matches!(
         check,
         DaemonIdentityCheck::Gone | DaemonIdentityCheck::Mismatch
@@ -878,6 +872,21 @@ fn parent_of(s: &SessionInfo) -> Option<String> {
         .and_then(|t| t.get("parent"))
         .filter(|p| !p.is_empty())
         .cloned()
+}
+
+/// Sweep atomic-publication leftovers without reconciling sessions.
+///
+/// Daemons run this narrow maintenance pass automatically; explicit GC shares
+/// the same conservative writer-liveness and file-type checks.
+pub fn cleanup_dead_registry_temps() {
+    let root = session_dir();
+    cleanup_dead_atomic_temps(&root);
+    for sidecar in [".activity", ".recovery"] {
+        let directory = root.join(sidecar);
+        if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+            cleanup_dead_atomic_temps(&directory);
+        }
+    }
 }
 
 /// Reclaim only regular atomic-publication leftovers whose writer has exited.

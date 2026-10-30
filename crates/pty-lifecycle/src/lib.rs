@@ -9,12 +9,13 @@ mod gc;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod image_ancestry;
 mod launch;
+mod retention;
 mod startup;
 
 pub use config::DaemonConfig;
 pub use gc::{
     Abandoned, Flapped, GcOptions, GcResult, OrphanKill, PrunedTags, ReapSkip, RespawnFailed,
-    Respawned, gc, prune_orphan_layout_tags,
+    Respawned, cleanup_dead_registry_temps, gc, prune_orphan_layout_tags,
 };
 pub use launch::{
     DEFAULT_START_TIMEOUT, GATE_FD_ENV, GatedDaemon, OPERATION_FD_ENV, OperationLaunch,
@@ -22,6 +23,7 @@ pub use launch::{
     PreparedDaemon, apply_persisted_launch_options, config_for, prepare_daemon, set_process_title,
     spawn_daemon, spawn_gated_daemon,
 };
+pub use retention::{RetentionResult, spawn_retention_sweep, stop_retention, sweep_finished};
 pub use pty_core::registry::{
     LockBusy, SessionGenerationOwner, cleanup_all, cleanup_owned_all, cleanup_owned_socket,
     cleanup_socket, wait_for_process_exit,

@@ -48,6 +48,9 @@ fn snapshot_preserves_bounded_combined_exit_evidence() {
 
 #[test]
 fn snapshot_ignores_a_live_pid_from_another_daemon_generation() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     root();
     let name = unique_name("evidence-pid-reuse");
     let mut metadata = terminal_metadata("generation-a");

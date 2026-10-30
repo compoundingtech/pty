@@ -14,14 +14,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecursiveMode, Watcher};
 
 use super::Event;
-use crate::registry::root::{events_path, session_dir};
+use crate::registry;
+use crate::registry::root::{events_path, metadata_path, session_dir};
 
 /// The poll fallback interval.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -120,6 +122,7 @@ struct Tracked {
     offset: u64,
     snapshot: Vec<u8>,
     identity: Option<(u64, u64)>,
+    registry_seen: bool,
 }
 
 impl Tracked {
@@ -130,12 +133,70 @@ impl Tracked {
             offset: snapshot.len() as u64,
             identity: None,
             snapshot,
+            registry_seen: false,
         }
     }
 }
 
 fn name_of(file_name: &str) -> Option<&str> {
     file_name.strip_suffix(EVENTS_SUFFIX)
+}
+
+// Read/open/close-read notifications must never feed back into another scan.
+fn wake_on_change(tx: &SyncSender<()>, result: notify::Result<notify::Event>) {
+    if let Ok(event) = result
+        && matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Modify(_)
+                | EventKind::Remove(_)
+                | EventKind::Access(AccessKind::Close(AccessMode::Write))
+        )
+    {
+        let _ = tx.try_send(());
+    }
+}
+
+// A removed/renamed registry is no longer watched, even if it is recreated.
+// Retire a broken backend instead of leaving its worker alive indefinitely;
+// polling continues to discover logs in the replacement directory.
+fn watch_event(
+    dir: &Path,
+    wake: &SyncSender<()>,
+    retire: &SyncSender<()>,
+    result: notify::Result<notify::Event>,
+) {
+    let invalidated = match &result {
+        Err(_) => true,
+        Ok(event) => {
+            matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+            ) && event.paths.iter().any(|path| path == dir)
+        }
+    };
+    if invalidated {
+        let _ = retire.try_send(());
+    } else {
+        wake_on_change(wake, result);
+    }
+}
+
+fn wait_for_change(wake: &Receiver<()>, interval: Duration, sleep: impl FnOnce(Duration)) {
+    if matches!(
+        wake.recv_timeout(interval),
+        Err(RecvTimeoutError::Disconnected)
+    ) {
+        // A failed watcher disconnects immediately, not after the timeout.
+        sleep(interval);
+    }
+}
+
+fn registry_entry_removed(name: &str) -> bool {
+    // Permanent respawn holds a creation claim across cleanup and replacement
+    // publication. Observe its live owner without creating, stealing, or
+    // removing a writer's claim: followers must never make a creator Busy.
+    !registry::is_creation_lock_held(name) && !metadata_path(name).exists()
 }
 
 fn run(
@@ -153,7 +214,9 @@ fn run(
         Some(names) => {
             for name in names {
                 let path = events_path(name);
-                tracked.insert(name.clone(), Tracked::existing(path));
+                let mut entry = Tracked::existing(path);
+                entry.registry_seen = metadata_path(name).exists();
+                tracked.insert(name.clone(), entry);
             }
         }
         None => {
@@ -175,22 +238,27 @@ fn run(
     // re-scans everything tracked. The watcher starts on its own thread:
     // starting an FSEvents stream took 3.5 s on a busy macOS host, and the
     // poll below has to keep delivering meanwhile. That thread holds the
-    // watcher until this function returns.
-    let (wake_tx, wake_rx) = channel::<()>();
-    let (release_tx, release_rx) = channel::<()>();
+    // watcher until shutdown, a backend error, or registry removal.
+    // A bounded signal coalesces bursts without an unbounded drain that can
+    // prevent shutdown while another process keeps changing the directory.
+    let (wake_tx, wake_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
     let watch_dir = dir.clone();
+    let retire_tx = release_tx.clone();
     let _ = std::thread::Builder::new()
         .name("events-follow-watch".to_string())
         .spawn(move || {
-            let mut watcher =
-                notify::recommended_watcher(move |_res: notify::Result<notify::Event>| {
-                    let _ = wake_tx.send(());
-                })
-                .ok();
-            if let Some(w) = watcher.as_mut() {
-                let _ = w.watch(&watch_dir, RecursiveMode::NonRecursive);
+            let callback_dir = watch_dir.clone();
+            let Ok(mut watcher) = notify::recommended_watcher(move |result| {
+                watch_event(&callback_dir, &wake_tx, &retire_tx, result);
+            }) else {
+                return;
+            };
+            if watcher.watch(&watch_dir, RecursiveMode::NonRecursive).is_err() {
+                return;
             }
-            // Disconnected when the follower stops.
+            // Both the follower and callback can retire the watcher. Never
+            // block its callback: dropping the watcher joins its worker.
             let _ = release_rx.recv();
             drop(watcher);
         });
@@ -200,21 +268,33 @@ fn run(
         if follow_all {
             discover_new(&dir, &mut tracked);
         }
-        for t in tracked.values_mut() {
-            read_new_lines(t, &mut on_event);
-        }
-        match wake_rx.recv_timeout(options.poll_interval) {
-            Ok(()) => {
-                // Drain coalesced wake-ups so a burst costs one scan.
-                while wake_rx.try_recv().is_ok() {}
+        tracked.retain(|name, t| {
+            let mut exited = false;
+            read_new_lines(t, &mut |event| {
+                exited |= event.r#type == super::event_type::SESSION_EXIT;
+                on_event(event);
+            });
+            if follow_all {
+                return true;
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(options.poll_interval);
+            let present = metadata_path(name).exists();
+            let removed = t.registry_seen && !present && registry_entry_removed(name);
+            t.registry_seen |= present;
+            let retained_exit = registry::read_metadata(name)
+                .is_some_and(|metadata| metadata.has_exited() || metadata.exit_code.is_some());
+            if retained_exit {
+                // finalize_exit flushes session_exit before saving terminal
+                // metadata. It may have done both after our first log read.
+                read_new_lines(t, &mut on_event);
             }
+            !exited && !removed && !retained_exit
+        });
+        if !follow_all && tracked.is_empty() {
+            break;
         }
+        wait_for_change(&wake_rx, options.poll_interval, std::thread::sleep);
     }
-    drop(release_tx);
+    let _ = release_tx.try_send(());
 }
 
 /// Newly created logs replay from offset 0.
@@ -237,6 +317,7 @@ fn discover_new(dir: &Path, tracked: &mut BTreeMap<String, Tracked>) {
                     offset: 0,
                     snapshot: Vec::new(),
                     identity: None,
+                    registry_seen: false,
                 },
             );
         }
@@ -289,7 +370,148 @@ fn read_new_lines(t: &mut Tracked, on_event: &mut impl FnMut(Event)) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn another_process_reading_logs_does_not_wake_the_follower() {
+        let dir = std::env::temp_dir()
+            .join(format!("pty-follower-access-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idle.events.jsonl");
+        std::fs::write(&path, "history\n").unwrap();
+        let (tx, rx) = sync_channel(1);
+        let mut watcher = notify::recommended_watcher(move |result| {
+            wake_on_change(&tx, result);
+        }).unwrap();
+        watcher.watch(&dir, RecursiveMode::NonRecursive).unwrap();
+        // Establish that the watch is delivering changes before measuring
+        // silence. In particular, FSEvents may attach asynchronously.
+        std::fs::write(&path, "canary\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        let status = std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ \"$i\" -lt 100 ]; do cat \"$1\" >/dev/null; i=$((i + 1)); done", "read-logs"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wake = rx.recv_timeout(Duration::from_millis(300));
+        assert!(matches!(wake, Err(RecvTimeoutError::Timeout)), "read caused a scan: {wake:?}");
+        // A silent or broken watcher must not make the idle assertion pass.
+        std::fs::write(&path, "changed\n").unwrap();
+        let changed = rx.recv_timeout(Duration::from_secs(2));
+        drop(watcher);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(changed.is_ok(), "a real write must wake the follower: {changed:?}");
+    }
+
+    #[test]
+    fn only_changes_and_close_write_wake_and_signals_are_coalesced() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        let (tx, rx) = sync_channel(1);
+        for kind in [
+            EventKind::Any,
+            EventKind::Other,
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            wake_on_change(&tx, Ok(notify::Event::new(kind)));
+            assert!(rx.try_recv().is_err(), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Create(CreateKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            for _ in 0..100 {
+                wake_on_change(&tx, Ok(notify::Event::new(kind)));
+            }
+            assert_eq!(rx.try_iter().count(), 1, "{kind:?}");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn read_notifications_never_feed_back_even_after_each_scan() {
+        let dir = Path::new("/registry");
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let (retire_tx, retire_rx) = sync_channel(1);
+        for _ in 0..100 {
+            for kind in [
+                EventKind::Access(AccessKind::Open(AccessMode::Read)),
+                EventKind::Access(AccessKind::Read),
+                EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            ] {
+                watch_event(dir, &wake_tx, &retire_tx, Ok(notify::Event::new(kind)));
+            }
+            // An empty queue after every synthetic scan, rather than only
+            // after a burst, catches a self-sustaining read/scan cycle.
+            assert!(matches!(wake_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            assert!(matches!(retire_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn watcher_errors_and_registry_removal_retire_without_scan_storms() {
+        use notify::event::{ModifyKind, RemoveKind, RenameMode};
+        let dir = Path::new("/registry");
+        for event in [
+            None,
+            Some(notify::Event::new(EventKind::Remove(RemoveKind::Folder))
+                .add_path(dir.to_path_buf())),
+            Some(notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                .add_path(dir.to_path_buf())),
+            Some(notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(dir.to_path_buf())
+                .add_path(PathBuf::from("/old-registry"))),
+        ] {
+            let (wake_tx, wake_rx) = sync_channel(1);
+            let (retire_tx, retire_rx) = sync_channel(1);
+            for _ in 0..100 {
+                let result = event.clone().ok_or_else(|| notify::Error::generic("backend failed"));
+                watch_event(dir, &wake_tx, &retire_tx, result);
+            }
+            assert_eq!(retire_rx.try_iter().count(), 1);
+            assert!(matches!(wake_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            // Already-retired holders must not block their callback either.
+            drop(retire_rx);
+            let result = event.ok_or_else(|| notify::Error::generic("backend failed"));
+            watch_event(dir, &wake_tx, &retire_tx, result);
+        }
+    }
+
+    #[test]
+    fn removing_a_log_does_not_retire_the_registry_watcher() {
+        use notify::event::RemoveKind;
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let (retire_tx, retire_rx) = sync_channel(1);
+        watch_event(
+            Path::new("/registry"),
+            &wake_tx,
+            &retire_tx,
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(PathBuf::from("/registry/session.events.jsonl"))),
+        );
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        assert!(matches!(retire_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn disconnected_watcher_sleeps_once_per_poll_but_notifications_do_not() {
+        let interval = Duration::from_millis(250);
+        let (tx, rx) = sync_channel(1);
+        tx.try_send(()).unwrap();
+        wait_for_change(&rx, interval, |_| panic!("a notification must not sleep"));
+        wait_for_change(&rx, Duration::ZERO, |_| panic!("a timeout already waited"));
+        drop(tx);
+        for _ in 0..100 {
+            let mut slept = None;
+            wait_for_change(&rx, interval, |duration| slept = Some(duration));
+            assert_eq!(slept, Some(interval));
+        }
+    }
 
     #[test]
     fn coalesced_retention_and_regrowth_replays_every_retained_new_record() {

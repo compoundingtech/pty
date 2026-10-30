@@ -124,6 +124,8 @@ const DESCENDANT_HUP_WAIT: Duration = Duration::from_millis(1_000);
 const CHILD_KILL_WAIT: Duration = Duration::from_millis(500);
 /// `SPAWNER_POLL_INTERVAL_MS`.
 const SPAWNER_POLL: Duration = Duration::from_millis(5_000);
+/// Narrow dead-writer temp maintenance, never full session reconciliation.
+const ATOMIC_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// The default `PTY_SHUTDOWN_DEADLINE_MS`.
 const SHUTDOWN_DEADLINE_DEFAULT_MS: f64 = 5_000.0;
 
@@ -157,6 +159,7 @@ pub(crate) struct Daemon {
     exit_drain_deadline: Option<Instant>,
     exit_shutdown_at: Option<Instant>,
     exit_meta_retry: Option<(Instant, Instant)>,
+    atomic_temp_sweep_at: Instant,
     /// Unix milliseconds for the newest child output, in memory. `None`
     /// until the child prints something.
     last_output_at_ms: Option<i64>,
@@ -340,6 +343,7 @@ fn install_ordinary_child_test_hook() -> Result<(), String> {
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
 pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
+    let mut kill_signals = catch_kill_signals()?;
     let name = cfg.name.clone();
     let generation = cfg
         .generation
@@ -368,6 +372,14 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         .map_err(|e| format!("Failed to open a PTY for session \"{name}\": {e}"))?;
 
     let publication_lock = prepare_publication(&cfg)?;
+    // A kill that arrived before publication ends the daemon unpublished, as
+    // the default action did. One arriving from here on is served as an
+    // ordinary external kill once the actor runs.
+    if kill_signals.pending().next().is_some() {
+        return Err(format!(
+            "Session \"{name}\" was terminated before it was published"
+        ));
+    }
     let (listener, metadata) = publish_session(&Publication {
         cfg: &cfg,
         generation: &generation,
@@ -444,7 +456,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
 
     let listener_fd = listener.as_raw_fd();
     spawn_acceptor(listener, tx.clone());
-    spawn_signal_listener(tx.clone());
+    spawn_signal_listener(kill_signals, tx.clone());
     install_spawner_watchdog(tx);
 
     let daemon = Daemon::assemble(DaemonParts {
@@ -462,6 +474,7 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
     });
 
     readiness.notify();
+    pty_lifecycle::spawn_retention_sweep();
     Ok(daemon.serve())
 }
 
@@ -850,16 +863,23 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
     }
 }
 
-/// SIGTERM and SIGINT are external kills.
+/// Catch SIGTERM and SIGINT before anything is published.
+///
+/// Any process that reads the pid sidecar can signal a published session.
+/// Under the default action that signal killed the daemon outright, with no
+/// exit record and no cleanup, and orphaned a child it had already forked
+/// (compoundingtech/pty#184). A signal caught here waits in `Signals` until
+/// [`spawn_signal_listener`] reads it.
+fn catch_kill_signals() -> Result<signal_hook::iterator::Signals, String> {
+    signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT])
+        .map_err(|e| format!("Failed to catch SIGTERM and SIGINT: {e}"))
+}
+
+/// SIGTERM and SIGINT are external kills, including any caught since
+/// [`catch_kill_signals`].
 ///
 /// node: src/server.ts:1598-1603
-pub(crate) fn spawn_signal_listener(tx: Sender<Msg>) {
-    let Ok(mut signals) = signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-    ]) else {
-        return;
-    };
+pub(crate) fn spawn_signal_listener(mut signals: signal_hook::iterator::Signals, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         for _ in signals.forever() {
             if tx.send(Msg::ExternalKill).is_err() {
@@ -954,6 +974,7 @@ impl Daemon {
             exit_drain_deadline: None,
             exit_shutdown_at: None,
             exit_meta_retry: None,
+            atomic_temp_sweep_at: Instant::now(),
             last_output_at_ms: None,
             activity_persist_at: None,
             client_generation: 0,
@@ -1009,6 +1030,7 @@ impl Daemon {
                 self.activity_persist_at,
                 self.client_meta_retry.map(|(next, _)| next),
                 self.startup_lease_timer,
+                Some(self.atomic_temp_sweep_at),
             ]
             .into_iter()
             .flatten()
@@ -1432,6 +1454,10 @@ impl Daemon {
 
     fn service_timers(&mut self, now: Instant) {
         self.service_cuts(now);
+        if self.atomic_temp_sweep_at <= now {
+            pty_lifecycle::cleanup_dead_registry_temps();
+            self.atomic_temp_sweep_at = Instant::now() + ATOMIC_TEMP_SWEEP_INTERVAL;
+        }
         if let Some(at) = self.activity_persist_at
             && at <= now
         {
@@ -1680,6 +1706,7 @@ impl Daemon {
             } else {
                 registry::cleanup_owned_socket(&name, &owner);
             }
+            pty_lifecycle::stop_retention();
             std::process::exit(code);
         });
     }

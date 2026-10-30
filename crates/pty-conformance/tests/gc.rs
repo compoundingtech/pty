@@ -103,6 +103,65 @@ fn removes_only_dead_writer_atomic_temporaries() {
     assert!(symlink_temp.is_symlink());
 }
 
+#[test]
+fn daemon_automatically_removes_only_dead_writer_atomic_temporaries() {
+    let rig = Rig::new();
+    let dead_pid = find_dead_pid();
+    let live_pid = std::process::id();
+    let directories = [
+        rig.root().to_path_buf(),
+        rig.root().join(".activity"),
+        rig.root().join(".recovery"),
+    ];
+    let dead = [
+        format!("orphan.events.lock.tmp.{dead_pid}.0123456789abcdef"),
+        format!("orphan.events.jsonl.tmp.{dead_pid}.0123456789abcdef"),
+    ];
+    let preserved = [
+        format!("orphan.events.lock.tmp.{live_pid}.0123456789abcdef"),
+        format!("orphan.events.jsonl.tmp.{live_pid}.0123456789abcdef"),
+        format!("malformed.events.lock.tmp.{dead_pid}.not-hex"),
+        "orphan.events.jsonl".into(),
+        // Full session GC would remove this malformed metadata. Automatic
+        // maintenance must only sweep temporaries, not reconcile sessions.
+        "unrelated.json".into(),
+    ];
+    for directory in &directories {
+        std::fs::create_dir_all(directory).unwrap();
+        for filename in &dead {
+            std::fs::write(directory.join(filename), b"incomplete").unwrap();
+        }
+        for filename in &preserved {
+            std::fs::write(directory.join(filename), b"preserve").unwrap();
+        }
+    }
+    let directory_temp = rig.root().join(format!("directory.tmp.{dead_pid}.0123456789abcdef"));
+    std::fs::create_dir(&directory_temp).unwrap();
+    let symlink_temp = rig.root().join(format!("symlink.tmp.{dead_pid}.0123456789abcdef"));
+    std::os::unix::fs::symlink(rig.root().join("unrelated.json"), &symlink_temp).unwrap();
+    let _daemon = start(&rig, "auto-temp-gc", &[]);
+    let swept = || directories.iter().all(|directory| {
+        dead.iter().all(|filename| !directory.join(filename).exists())
+    });
+    assert!(poll_for(Duration::from_secs(5), swept), "startup sweep left dead temporaries");
+
+    // Introduce new leftovers after startup: even an idle daemon must wake
+    // for the periodic pass, without another CLI invocation or child output.
+    for directory in &directories {
+        for filename in &dead {
+            std::fs::write(directory.join(filename), b"incomplete").unwrap();
+        }
+    }
+    assert!(poll_for(Duration::from_secs(35), swept), "periodic sweep left dead temporaries");
+    for directory in &directories {
+        for filename in &preserved {
+            assert_eq!(std::fs::read(directory.join(filename)).unwrap(), b"preserve");
+        }
+    }
+    assert!(directory_temp.is_dir());
+    assert!(symlink_temp.is_symlink());
+}
+
 /// node: tests/gc.test.ts:121
 #[test]
 fn removes_vanished_sessions() {

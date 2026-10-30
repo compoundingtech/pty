@@ -116,7 +116,7 @@ _pty() {
             '--json[Emit JSON]' \
             '--type[Print all retained events of exact type]:event type:' \
             '--wait[Wait for a specific event type]' \
-            '(t --timeout){t,--timeout}[Timeout (seconds) for --wait]' \
+            '(t --timeout){t,--timeout}[Timeout (seconds) for --wait or follow]' \
             '1:session:_pty_sessions'
           ;;
         list|ls)
