@@ -613,6 +613,20 @@ thread_local! {
 }
 
 
+/// Whether this machine cannot read a process start token, said aloud. A Mac
+/// reads it from `/bin/ps -o lstart=`, and the darwin build sandbox has no
+/// `ps` (see the check phase in flake.nix), so a test that needs a live
+/// process's identity stops there rather than blame the code for its
+/// environment. Linux reads `/proc` and never skips.
+#[cfg(test)]
+pub(crate) fn skip_without_start_token() -> bool {
+    if cfg!(target_os = "linux") || read_process_start_token(std::process::id() as i32).is_some() {
+        return false;
+    }
+    eprintln!("skipped: no process start token here (`/bin/ps -o lstart=` cannot answer)");
+    true
+}
+
 /// The token that proves an OS process identity: Linux `linux:<starttime>`
 /// (`/proc/<pid>/stat` field 22), macOS `darwin:<ps -o lstart=>`.
 ///
@@ -1506,6 +1520,9 @@ mod control_identity_tests {
 
     #[test]
     fn legacy_matching_token_is_control_only_not_inventory_match() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let pid = std::process::id() as i32;
         let token = read_process_start_token(pid).expect("test process has a readable start token");
         let mut recovery = legacy_record();
@@ -1523,6 +1540,9 @@ mod control_identity_tests {
 
     #[test]
     fn legacy_mismatched_or_empty_recorded_token_is_not_authority() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let pid = std::process::id() as i32;
         for token in ["test:another-process", ""] {
             let mut metadata = legacy_record();
@@ -1564,6 +1584,9 @@ mod control_identity_tests {
 
     #[test]
     fn present_boot_evidence_never_falls_back_to_legacy() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let pid = std::process::id() as i32;
         let mut metadata = legacy_record();
         metadata.daemon_start_token =
@@ -1586,6 +1609,9 @@ mod control_identity_tests {
 
     #[test]
     fn control_target_requires_consistent_readable_pid_companions() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "pty-control-target-{}-{}",
             std::process::id(),

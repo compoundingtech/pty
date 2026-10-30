@@ -1211,6 +1211,9 @@ mod tests {
 
     #[test]
     fn stable_fixed_inputs_match_the_full_snapshot_oracle() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         use DaemonIdentityCheck::{Gone, Match, Mismatch, Unknown};
         let boot = super::super::list::read_boot_id().expect("this host reports a boot identity");
         for (label, value, expected, identity) in [
@@ -1278,6 +1281,9 @@ mod tests {
 
     #[test]
     fn stable_socket_inputs_match_the_full_snapshot_oracle() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         for metadata in [None, Some(live_metadata())] {
             let root = Root::new(if metadata.is_some() {
                 "socket-with-metadata"
@@ -1425,6 +1431,9 @@ mod tests {
 
     #[test]
     fn operator_configured_symlink_root_is_followed_but_entry_symlinks_are_not() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("symlink-root");
         root.metadata("target", live_metadata());
         let link = root.0.with_extension("configured-link");
@@ -1437,6 +1446,9 @@ mod tests {
     }
     #[test]
     fn overlong_configured_symlink_reports_the_usable_pinned_address() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("long-configured-root");
         root.metadata("target", live_metadata());
         let link = std::env::temp_dir().join(format!(
@@ -1886,6 +1898,9 @@ mod tests {
 
     #[test]
     fn explicit_root_lookup_does_not_consult_the_ambient_registry() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("explicit-root");
         root.metadata("target", live_metadata());
         let unrelated = PathBuf::from(format!("/tmp/{}", "x".repeat(SUN_PATH_MAX)));
@@ -1899,6 +1914,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn keyed_lookup_uses_native_birth_identity_without_spawning_ps() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("native-birth-no-spawn");
         root.metadata("target", live_metadata());
         let before =
@@ -1915,6 +1933,9 @@ mod tests {
 
     #[test]
     fn unrelated_registry_growth_does_not_change_actual_work() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let mut expected = None;
         for unrelated in [0, 10, 1000] {
             let root = Root::new(&format!("growth-{unrelated}"));
@@ -1973,6 +1994,9 @@ mod tests {
 
     #[test]
     fn record_changed_mid_read_is_found_only_after_a_stable_retry() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("rewrite");
         root.metadata("target", live_metadata());
         let mut replacement = live_metadata();
@@ -1997,6 +2021,9 @@ mod tests {
 
     #[test]
     fn process_birth_replaced_between_reads_never_returns_found() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("birth-replaced");
         root.metadata("target", live_metadata());
         let access = Mutating::recycle_between_reads();
@@ -2026,6 +2053,9 @@ mod tests {
 
     #[test]
     fn observation_keeps_metadata_fields_for_authority() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new("fields");
         root.metadata("target", live_metadata());
         let KeyedSession::Found(session) = observe_session_in(&root.0, "target", &fast()) else {

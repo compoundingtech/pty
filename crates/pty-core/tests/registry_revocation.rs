@@ -214,6 +214,9 @@ fn durable_replay_never_replaces_record_and_conflicts_do_not_clear_it() {
 
 #[test]
 fn install_reports_existing_live_occupancy_without_mutating_any_session_file() {
+    if registry_support::skip_without_start_token() {
+        return;
+    }
     let root = Root::new();
     root.run(|| {
         let metadata = SessionMetadata {

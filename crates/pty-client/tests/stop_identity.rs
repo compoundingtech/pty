@@ -107,6 +107,21 @@ fn token(pid: i32) -> String {
     )
 }
 
+/// Whether this machine cannot read a process start token, said aloud. A Mac
+/// reads it from `/bin/ps -o lstart=`, and the darwin build sandbox has no
+/// `ps` (see the check phase in flake.nix), so a test that needs one stops
+/// there rather than blame the code for its environment. Linux reads `/proc`
+/// and never skips.
+fn skip_without_start_token() -> bool {
+    if cfg!(target_os = "linux")
+        || pty_core::registry::read_process_start_token(std::process::id() as i32).is_some()
+    {
+        return false;
+    }
+    eprintln!("skipped: no process start token here (`/bin/ps -o lstart=` cannot answer)");
+    true
+}
+
 #[test]
 fn reused_pid_token_mismatch_refuses_stop() {
     let mut fixture = Fixture::new(child());
@@ -117,6 +132,9 @@ fn reused_pid_token_mismatch_refuses_stop() {
 
 #[test]
 fn boot_mismatch_refuses_stop() {
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some("previous-boot".into()));
@@ -133,6 +151,9 @@ fn missing_identity_refuses_stop() {
 
 #[test]
 fn live_legacy_missing_boot_lists_unknown_but_explicit_stop_works() {
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), None);
@@ -167,6 +188,9 @@ fn legacy_sidecar_without_a_recorded_start_token_stays_refused() {
 
 #[test]
 fn a_legacy_verified_stop_is_distinguishable_from_a_match() {
+    if skip_without_start_token() {
+        return;
+    }
     for boot_evidence in [true, false] {
         let mut fixture = Fixture::new(child());
         let pid = fixture.child.id() as i32;
@@ -213,6 +237,9 @@ fn assert_unknown_listing_and_refusal(fixture: &mut Fixture, pid: i32) {
 
 #[test]
 fn matching_owner_remains_stoppable() {
+    if skip_without_start_token() {
+        return;
+    }
     let fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some(boot()));
@@ -271,6 +298,9 @@ fn unreadable_identity_child() {
     if std::env::var_os("PTY_IDENTITY_UNREADABLE_CHILD").is_none() {
         return;
     }
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), Some(boot()));
@@ -314,6 +344,9 @@ fn b1_transient_unreadable_boot_lists_running_and_refuses_stop_remove() {
 
 #[test]
 fn exit_evidence_keeps_unknown_owner_exited_with_named_pid() {
+    if skip_without_start_token() {
+        return;
+    }
     for (field, value) in [
         ("exitCode", serde_json::json!(0)),
         ("exitedAt", serde_json::json!("2026-10-15T00:00:00.000Z")),
@@ -399,6 +432,9 @@ fn pidless_metadata_with_companions_remains_unknown_and_not_removable() {
 
 #[test]
 fn legacy_token_mismatch_and_dead_pid_refuse_explicit_controls() {
+    if skip_without_start_token() {
+        return;
+    }
     for dead in [false, true] {
         let mut fixture = Fixture::new(child());
         let pid = fixture.child.id() as i32;
@@ -422,6 +458,9 @@ fn legacy_token_mismatch_and_dead_pid_refuse_explicit_controls() {
 
 #[test]
 fn modern_wrong_boot_and_missing_token_refuse_signal_before_socket_query() {
+    if skip_without_start_token() {
+        return;
+    }
     for missing_token in [false, true] {
         let mut fixture = Fixture::new(child());
         let pid = fixture.child.id() as i32;
@@ -442,6 +481,9 @@ fn modern_wrong_boot_and_missing_token_refuse_signal_before_socket_query() {
 
 #[test]
 fn pre_141_records_signal_owned_child_without_upgrading_inventory_identity() {
+    if skip_without_start_token() {
+        return;
+    }
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
@@ -526,6 +568,9 @@ fn pre_141_records_signal_owned_child_without_upgrading_inventory_identity() {
 
 #[test]
 fn exited_legacy_record_waits_for_owned_daemon_before_removal() {
+    if skip_without_start_token() {
+        return;
+    }
     let mut fixture = Fixture::new(child());
     let pid = fixture.child.id() as i32;
     let _socket = fixture.record(pid, Some(token(pid)), None);
