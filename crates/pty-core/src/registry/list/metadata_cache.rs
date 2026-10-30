@@ -100,7 +100,7 @@ impl RegistryListCache {
         match read {
             Ok(Ok(metadata)) => Ok(metadata),
             Ok(Err((bytes, identity))) => {
-                let metadata = parse_metadata(&bytes).map_err(|error| {
+                let metadata = super::super::list_metadata::parse_with_payloads(&bytes, false).map_err(|error| {
                     (InventoryErrorKind::MetadataMalformed, error.to_string())
                 })?;
                 if let Some(identity) = identity {
@@ -119,16 +119,6 @@ impl RegistryListCache {
     }
 }
 
-pub(super) fn parse_metadata(bytes: &[u8]) -> Result<SessionMetadata, serde_json::Error> {
-    #[cfg(test)]
-    PARSES.with(|count| count.set(count.get() + 1));
-    super::super::list_metadata::parse_with_payloads(bytes, false)
-}
-
-#[cfg(test)]
-thread_local! {
-    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 #[cfg(test)]
 mod tests {
@@ -170,7 +160,7 @@ mod tests {
     }
 
     fn parses() -> usize {
-        PARSES.with(std::cell::Cell::get)
+        super::super::super::list_metadata::PARSES.with(std::cell::Cell::get)
     }
 
     #[test]
@@ -313,7 +303,7 @@ mod tests {
         let options = ListOptions::default();
         let cache = RegistryListCache::default();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
         let cached = cache.list(&root.0, &options);
         let ordinary = super::super::list_sessions_in(&root.0, &options);
         assert_eq!(cached, ordinary);

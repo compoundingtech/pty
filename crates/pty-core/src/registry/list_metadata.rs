@@ -12,10 +12,17 @@ use super::metadata::SessionMetadata;
 
 type Fields<'de> = IndexMap<Cow<'de, str>, &'de RawValue>;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn parse_with_payloads(
     bytes: &[u8],
     full: bool,
 ) -> serde_json::Result<SessionMetadata> {
+    #[cfg(test)]
+    PARSES.with(|count| count.set(count.get() + 1));
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let metadata = deserializer.deserialize_map(MetadataVisitor { full })?;
     deserializer.end()?;
