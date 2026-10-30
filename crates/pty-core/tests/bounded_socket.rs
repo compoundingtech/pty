@@ -6,6 +6,17 @@ use pty_core::registry::{
     observe_session_strict_in, read_boot_id, read_process_start_token, socket_path_in, with_root,
 };
 
+/// Whether this machine cannot read a process start token, said aloud: the
+/// darwin build sandbox has no `ps`, which a Mac reads it from. Linux reads
+/// `/proc` and never skips.
+fn skip_without_start_token() -> bool {
+    if cfg!(target_os = "linux") || read_process_start_token(std::process::id() as i32).is_some() {
+        return false;
+    }
+    eprintln!("skipped: no process start token here (`/bin/ps -o lstart=` cannot answer)");
+    true
+}
+
 struct Root(PathBuf);
 
 impl Root {
@@ -35,6 +46,9 @@ impl Drop for Root {
 
 #[test]
 fn bounded_address_preserves_logical_id_in_inventory_lookup_and_cleanup() {
+    if skip_without_start_token() {
+        return;
+    }
     let root = Root::new();
     let id = "n".repeat(63);
     let socket = socket_path_in(&root.0, &id);
@@ -87,6 +101,9 @@ fn an_unmapped_bounded_socket_is_an_incomplete_observation_not_a_session_id() {
 
 #[test]
 fn noncanonical_socket_debris_does_not_alias_the_live_session() {
+    if skip_without_start_token() {
+        return;
+    }
     let root = Root::new();
     let id = "d".repeat(63);
     let socket = socket_path_in(&root.0, &id);

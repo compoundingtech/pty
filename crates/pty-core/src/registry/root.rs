@@ -321,6 +321,9 @@ mod tests {
 
     #[test]
     fn published_socket_survives_differently_sized_root_aliases() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         use std::os::unix::fs::symlink;
         use std::os::unix::net::{UnixListener, UnixStream};
 

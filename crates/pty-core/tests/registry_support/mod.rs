@@ -308,6 +308,20 @@ pub fn ps_cannot_answer(fields: &str) -> Option<String> {
     }
 }
 
+/// Whether this machine cannot read a process start token, as a test guard.
+/// A Mac reads it from `/bin/ps -o lstart=`, which the darwin build sandbox
+/// does not have; Linux reads `/proc` and never skips. This asks the reader
+/// itself, so it skips exactly when the code under test would get no token.
+pub fn skip_without_start_token() -> bool {
+    if cfg!(target_os = "linux")
+        || pty_core::registry::read_process_start_token(std::process::id() as i32).is_some()
+    {
+        return false;
+    }
+    eprintln!("skipped: no process start token here (`/bin/ps -o lstart=` cannot answer)");
+    true
+}
+
 /// `ps_cannot_answer`, as a test guard: prints the reason and says whether to
 /// stop. Only meaningful off Linux, which reads `/proc` instead.
 pub fn skip_without_ps(fields: &str) -> bool {
