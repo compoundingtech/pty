@@ -239,3 +239,61 @@ boundary, not an assertion that Node accepted the overflow. The reference \
 is not changed for this extension. Remove this entry when Node supports \
 the same boundary behavior or Rust removes it.
 """
+
+[[divergence]]
+test = "peek_wait::events_wait_on_metadata_without_a_started_daemon_returns_vanished_without_waiting"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust rejects a vanished metadata-only launcher with status 1 rather than \
+waiting for an exit event from a daemon that never started (#196). Against \
+pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22, CI run \
+40986814385 exhausted the five-second harness deadline. Remove when Node \
+rejects this vanished target promptly.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_reconstructs_an_already_exited_session_event_when_the_log_is_missing"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust completes session_exit waits from terminal metadata when the event log \
+has been removed (#196). Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 \
+on Node 22 timed out at the five-second harness deadline in CI run \
+40986814385. Remove when Node completes this recorded-exit wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_returns_success_when_a_live_session_exits"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust accepts session-first options and observes exit state across follower \
+startup (#196). Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node \
+22 exceeded the five-second harness deadline after the input-gated session \
+exited in CI run 40986814385. Remove when Node returns success for this wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_returns_the_retained_exit_event_for_an_already_exited_session"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust returns the retained session_exit event for an already-exited session \
+instead of starting at EOF and waiting forever (#196). Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 exceeded the five-second \
+harness deadline in CI run 40986814385. Remove when Node completes the \
+already-recorded exit wait.
+"""
+
+[[divergence]]
+test = "peek_wait::events_wait_times_out_when_the_event_never_occurs"
+side = "node"
+kind = "node-defect"
+reason = """
+Rust parses events NAME --wait session_exit --timeout 1 and enforces its \
+deadline without incoming events (#196). Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 exceeded the five-second \
+harness deadline in CI run 40986814385. Remove when Node honors the quiet \
+session-first timeout.
+"""
