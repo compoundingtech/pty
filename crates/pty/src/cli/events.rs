@@ -68,10 +68,13 @@ fn print_recorded_exit(name: &str, wait_type: &str, json: bool) -> bool {
     true
 }
 
-fn check_wait_target(name: &str) -> Result<(), CliError> {
+fn check_wait_target(name: &str, wait_type: &str) -> Result<(), CliError> {
     match registry::get_session(name).map_err(CliError)? {
         None => Err(CliError(format!("Session \"{name}\" not found."))),
-        Some(session) if session.status == registry::SessionStatus::Vanished => {
+        Some(session)
+            if wait_type == pty_core::events::event_type::SESSION_EXIT
+                && session.status == registry::SessionStatus::Vanished =>
+        {
             Err(CliError(format!("Session \"{name}\" vanished without a recorded exit.")))
         }
         Some(_) => Ok(()),
@@ -185,7 +188,7 @@ fn cmd_events(
         if print_recorded_exit(name, wait_type, json) {
             return Ok(0);
         }
-        check_wait_target(name)?;
+        check_wait_target(name, wait_type)?;
         exit_zero_on_sigint();
         let (_follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.to_string()]));
         // Close the state-read/subscribe race, including removal before the
@@ -193,7 +196,7 @@ fn cmd_events(
         if print_recorded_exit(name, wait_type, json) {
             return Ok(0);
         }
-        check_wait_target(name)?;
+        check_wait_target(name, wait_type)?;
         loop {
             let recv = match deadline {
                 Some(d) => {
