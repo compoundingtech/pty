@@ -43,6 +43,41 @@ fn exit_zero_on_sigint() {
     }
 }
 
+/// Lifecycle waits also observe durable exit state: the follower deliberately
+/// starts existing logs at EOF, so a completed exit is not a new event.
+fn print_recorded_exit(name: &str, wait_type: &str, json: bool) -> bool {
+    if wait_type != pty_core::events::event_type::SESSION_EXIT {
+        return false;
+    }
+    let Some(metadata) = registry::read_metadata(name) else {
+        return false;
+    };
+    if !metadata.has_exited() && metadata.exit_code.is_none() {
+        return false;
+    }
+    if let Some(event) = read_retained_events_of_type(name, wait_type).pop() {
+        println!("{}", render(&event, json));
+    } else if let Some(code) = metadata.exit_code {
+        // Retention or cleanup can remove the log while exit metadata remains.
+        let mut event = Event::session_exit(name, code, None);
+        if let Some(timestamp) = metadata.exited_at {
+            event.ts = timestamp;
+        }
+        println!("{}", render(&event, json));
+    }
+    true
+}
+
+fn check_wait_target(name: &str) -> Result<(), CliError> {
+    match registry::get_session(name).map_err(CliError)? {
+        None => Err(CliError(format!("Session \"{name}\" not found."))),
+        Some(session) if session.status == registry::SessionStatus::Vanished => {
+            Err(CliError(format!("Session \"{name}\" vanished without a recorded exit.")))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// Parse and run.
 pub fn run(args: &[String]) -> CliResult {
     let mut all = false;
@@ -147,8 +182,18 @@ fn cmd_events(
         let Some(name) = name else {
             return Err("--wait requires a session name.".into());
         };
+        if print_recorded_exit(name, wait_type, json) {
+            return Ok(0);
+        }
+        check_wait_target(name)?;
         exit_zero_on_sigint();
         let (_follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.to_string()]));
+        // Close the state-read/subscribe race, including removal before the
+        // follower observed the registry entry.
+        if print_recorded_exit(name, wait_type, json) {
+            return Ok(0);
+        }
+        check_wait_target(name)?;
         loop {
             let recv = match deadline {
                 Some(d) => {
@@ -175,7 +220,13 @@ fn cmd_events(
                     );
                     return Ok(1);
                 }
-                Err(RecvTimeoutError::Disconnected) => return Ok(1),
+                Err(RecvTimeoutError::Disconnected) => {
+                    if print_recorded_exit(name, wait_type, json) {
+                        return Ok(0);
+                    }
+                    eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
+                    return Ok(1);
+                }
             }
         }
     }

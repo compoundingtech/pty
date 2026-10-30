@@ -3,6 +3,8 @@
 //! `events --wait`.
 
 use pty_conformance::*;
+use serde_json::Value;
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// node: tests/peek-wait.test.ts:81
@@ -144,9 +146,161 @@ fn events_wait_times_out_when_the_event_never_occurs() {
     let rig = Rig::new();
     let name = unique_id("pw");
     rig.daemon(&name, &["cat"], DaemonOpts::no_display_name());
-    let r = rig.pty(&["events", "--wait", "bell", "-t", "1", &name]);
+    let start = Instant::now();
+    let r = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit", "--timeout", "1"]),
+        None,
+        Duration::from_secs(5),
+    );
+    let elapsed = start.elapsed();
     expect_status(&r, 1);
+    assert!(!r.timed_out, "events ignored its timeout: {}", r.summary());
     expect_contains(&r.stderr(), "Timed out");
+    expect_contains(&r.stderr(), "session_exit");
+    assert!(elapsed >= Duration::from_millis(900), "returned before timeout: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}
+
+fn wait_for_events_command(mut child: Child) -> Out {
+    let finished = poll_for(Duration::from_secs(5), || {
+        child.try_wait().expect("poll events --wait").is_some()
+    });
+    if !finished {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("collect events --wait");
+    Out {
+        status: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: !finished,
+    }
+}
+
+fn exit_event(out: &Out, name: &str, code: i32) -> Value {
+    expect_status(out, 0);
+    assert!(!out.timed_out, "events --wait hung: {}", out.summary());
+    let event: Value = serde_json::from_str(out.stdout().trim()).expect("one session_exit JSON event");
+    assert_eq!(event["type"], "session_exit");
+    assert_eq!(event["session"], name);
+    assert_eq!(event["exitCode"], code);
+    assert!(event["ts"].as_str().is_some_and(|ts| !ts.is_empty()), "{event}");
+    event
+}
+
+#[test]
+fn events_wait_returns_success_when_a_live_session_exits() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    rig.daemon(
+        &name,
+        &["sh", "-c", "printf 'EXIT_GATE_READY\\n'; read -r gate; exit 23"],
+        DaemonOpts::keep(),
+    );
+    rig.wait_for_screen(&name, "EXIT_GATE_READY");
+    let mut input = rig.connect(&name);
+    input.attach(24, 80);
+    let child = rig
+        .command(&["events", &name, "--wait", "session_exit", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn events --wait before releasing the live child");
+    // Release only after the waiter has been launched. Exit may race follower
+    // setup: both the subscription path and its metadata recheck must work.
+    input.data(b"go\n");
+    exit_event(&wait_for_events_command(child), &name, 23);
+}
+
+#[test]
+fn events_wait_returns_the_retained_exit_event_for_an_already_exited_session() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    let daemon = rig.daemon(&name, &["sh", "-c", "exit 37"], DaemonOpts::keep());
+    rig.wait_for_exit(&name);
+    let metadata = daemon.meta();
+    wait_for_process_gone(metadata["daemonPid"].as_i64().expect("daemonPid") as i32);
+    let log = std::fs::read_to_string(rig.root().join(format!("{name}.events.jsonl")))
+        .expect("retained event log");
+    let retained = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event JSON"))
+        .find(|event| event["type"] == "session_exit")
+        .expect("retained session_exit");
+    let out = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit", "--json"]),
+        None,
+        Duration::from_secs(5),
+    );
+    assert_eq!(exit_event(&out, &name, 37), retained);
+}
+
+#[test]
+fn events_wait_reconstructs_an_already_exited_session_event_when_the_log_is_missing() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    let daemon = rig.daemon(&name, &["sh", "-c", "exit 41"], DaemonOpts::keep());
+    rig.wait_for_exit(&name);
+    let metadata = daemon.meta();
+    wait_for_process_gone(metadata["daemonPid"].as_i64().expect("daemonPid") as i32);
+    std::fs::remove_file(rig.root().join(format!("{name}.events.jsonl")))
+        .expect("remove retained event log after the daemon has stopped");
+    let out = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit", "--json"]),
+        None,
+        Duration::from_secs(5),
+    );
+    let event = exit_event(&out, &name, 41);
+    assert_eq!(event["ts"], metadata["exitedAt"]);
+}
+
+#[test]
+fn events_wait_on_a_removed_session_returns_not_found_without_waiting() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    rig.daemon(&name, &["cat"], DaemonOpts::no_display_name());
+    expect_status(&rig.pty(&["rm", &name]), 0);
+    rig.wait_for_gone(&name);
+    let out = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit"]),
+        None,
+        Duration::from_secs(5),
+    );
+    expect_status(&out, 1);
+    assert!(!out.timed_out, "removed session wait hung: {}", out.summary());
+    expect_contains(&out.stderr(), &name);
+    expect_contains(&out.stderr(), "not found");
+}
+
+#[test]
+fn events_wait_on_a_never_started_session_returns_not_found_without_waiting() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    let out = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit"]),
+        None,
+        Duration::from_secs(5),
+    );
+    expect_status(&out, 1);
+    assert!(!out.timed_out, "nonexistent session wait hung: {}", out.summary());
+    expect_contains(&out.stderr(), &name);
+    expect_contains(&out.stderr(), "not found");
+}
+
+#[test]
+fn events_wait_on_metadata_without_a_started_daemon_returns_vanished_without_waiting() {
+    let rig = Rig::new();
+    let name = unique_id("pw");
+    write_fake_metadata(rig.root(), &name, FakeMeta::created(0));
+    let out = rig.run_with_timeout(
+        rig.command(&["events", &name, "--wait", "session_exit"]),
+        None,
+        Duration::from_secs(5),
+    );
+    expect_status(&out, 1);
+    assert!(!out.timed_out, "vanished session wait hung: {}", out.summary());
+    expect_contains(&out.stderr(), &name);
+    expect_contains(&out.stderr(), "vanished");
 }
 
 /// `--timeout inf` used to end the command with a Rust panic. It is an
