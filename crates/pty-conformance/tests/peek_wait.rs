@@ -258,7 +258,8 @@ fn events_wait_reconstructs_an_already_exited_session_event_when_the_log_is_miss
 fn events_wait_on_a_removed_session_returns_not_found_without_waiting() {
     let rig = Rig::new();
     let name = unique_id("pw");
-    rig.daemon(&name, &["cat"], DaemonOpts::no_display_name());
+    rig.daemon(&name, &["sh", "-c", "exit 0"], DaemonOpts::keep());
+    rig.wait_for_exit(&name);
     expect_status(&rig.pty(&["rm", &name]), 0);
     rig.wait_for_gone(&name);
     let out = rig.run_with_timeout(
