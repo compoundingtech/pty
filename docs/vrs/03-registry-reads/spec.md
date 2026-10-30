@@ -124,7 +124,13 @@ Repeated embedders may retain `pty_core::registry::list::RegistryListCache`
 The cache retains successful parsed regular-file light `SessionMetadata` only,
 keyed by path, device/inode, size, and nanosecond mtime/ctime. Every lookup
 opens the file to check readability and compares descriptor metadata; reads
-are retained only when fstat identity is stable before and after reading.
+are retained only when fstat identity is stable before and after reading,
+and only once the record's ctime is older than the filesystem clock's tick
+(50 ms, or 2 s for times without nanoseconds). File times are stamped from a
+coarse clock, so a record replaced twice within one tick, at its length, on a
+reused inode number, would match every other field; once the clock is past the
+retained ctime's tick, every later change is stamped later (pty#199). A younger
+record is parsed on each call.
 Missing entries are evicted per observed root, and read/parse failures and
 nonregular companions are never cached.
 Cache misses use the typed light parser, omitting retained output and environment
@@ -231,3 +237,4 @@ The one intended difference (`PTY.REG-T02`): the single read issues a blocking c
 | `PTY.REG-R06`, `PTY.REG-R08` | `crates/pty-client/tests/observation_roots.rs::batch_stats_bound_every_session_by_one_deadline`, `batch_stats_bound_a_peer_that_floods_data` |
 | `PTY.REG-T01` | `crates/pty-client/tests/observation_roots.rs::batch_stats_throttle_busy_retries_beside_a_flooding_peer`, `batch_stats_never_retry_a_busy_connect_at_the_deadline`, `socket_probe_never_retries_a_busy_connect_at_the_deadline` |
 | `PTY.REG-R09` with parsed metadata reuse | `crates/pty-core/src/registry/list/metadata_cache.rs::tests::cached_metadata_preserves_unknown_owner_and_fresh_identity_classification`, `reachable_socket_cannot_rescue_gone_identity_with_cached_metadata`, `fallback_process_start_token_is_not_cached` |
+| Parsed metadata reuse waits out the clock tick (pty#199) | `crates/pty-core/src/registry/list/metadata_cache.rs::tests::a_record_changed_within_a_tick_is_parsed_until_it_settles`, `settled_needs_the_ctime_tick_to_have_passed` |

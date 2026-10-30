@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use super::{InventoryErrorKind, ListOptions, SessionInfo, SessionMetadata};
 
@@ -27,7 +28,27 @@ impl Identity {
             ctime: (stat.ctime(), stat.ctime_nsec()),
         }))
     }
+
+    /// Whether no later write can carry this ctime. File times come from a coarse clock, so a
+    /// record replaced twice inside one tick, at its length, on a reused inode number, matches
+    /// every other field (pty#199). Once `now`, read before the open, is past the ctime's tick,
+    /// every later change is stamped later. Userspace cannot set ctime, and a match needs it.
+    fn settled(&self, now: SystemTime) -> bool {
+        let tick = if self.mtime.1 == 0 && self.ctime.1 == 0 {
+            COARSE_TICK_MARGIN
+        } else {
+            TICK_MARGIN
+        };
+        let ctime = i128::from(self.ctime.0) * 1_000_000_000 + i128::from(self.ctime.1);
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .is_ok_and(|now| now.as_nanos() as i128 - ctime > tick.as_nanos() as i128)
+    }
 }
+
+/// Two ticks of the slowest common kernel clock (`CONFIG_HZ=100`).
+const TICK_MARGIN: Duration = Duration::from_millis(50);
+/// For times without nanoseconds: filesystems that stamp whole seconds, or two.
+const COARSE_TICK_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct Entry {
@@ -40,8 +61,10 @@ struct Entry {
 /// Keep this handle between calls. Only regular-file JSON metadata is cached;
 /// directory discovery, PID reads, process identity and socket probes run anew.
 /// Each hit opens the file to observe current readability and descriptor identity.
-/// Errors are never retained. Concurrent calls share only short cache operations;
-/// no cache lock is held during file reads, parsing or live observations.
+/// A record changed within the filesystem clock's last tick is parsed on every call
+/// until it is older. Errors are never retained. Concurrent calls share only short
+/// cache operations; no cache lock is held during file reads, parsing or live
+/// observations.
 #[derive(Debug, Default)]
 pub struct RegistryListCache {
     entries: Mutex<HashMap<PathBuf, Entry>>,
@@ -71,6 +94,7 @@ impl RegistryListCache {
         path: &Path,
     ) -> Result<SessionMetadata, (InventoryErrorKind, String)> {
         let unreadable = |error: io::Error| (InventoryErrorKind::MetadataUnreadable, error.to_string());
+        let now = SystemTime::now();
         let read = (|| {
             let mut file = File::options()
                 .read(true)
@@ -95,7 +119,10 @@ impl RegistryListCache {
                 bytes = std::fs::read(path)?;
             }
             let after = Identity::of(&file)?;
-            Ok(Err((bytes, before.filter(|identity| Some(identity) == after.as_ref()))))
+            Ok(Err((
+                bytes,
+                before.filter(|identity| Some(identity) == after.as_ref() && identity.settled(now)),
+            )))
         })();
         match read {
             Ok(Ok(metadata)) => Ok(metadata),
@@ -159,6 +186,11 @@ mod tests {
         })).unwrap()
     }
 
+    /// Wait until a record just written is old enough to be retained.
+    fn settle() {
+        std::thread::sleep(TICK_MARGIN + std::time::Duration::from_millis(10));
+    }
+
     fn parses() -> usize {
         super::super::super::list_metadata::PARSES.with(std::cell::Cell::get)
     }
@@ -171,6 +203,7 @@ mod tests {
         metadata["extraEnv"] = serde_json::json!({"TOKEN": "synthetic"});
         metadata["sessionEnv"] = serde_json::json!({"TERM": "screen"});
         std::fs::write(root.0.join("first.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        settle();
         let cache = RegistryListCache::default();
         let before = parses();
         for _ in 0..2 {
@@ -235,6 +268,7 @@ mod tests {
     fn unchanged_changed_new_removed_and_same_size_replacement() {
         let root = Root::new();
         root.write("first", "before");
+        settle();
         let options = ListOptions::default();
         let cache = RegistryListCache::default();
         let before = parses();
@@ -256,6 +290,7 @@ mod tests {
 
         root.write("first", "changed in place");
         root.write("second", "new");
+        settle();
         let rows = cache.list(&root.0, &options);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].display_name(), Some("changed in place"));
@@ -278,14 +313,18 @@ mod tests {
         assert_eq!(parses() - before, 2);
         assert!(cache.entries().is_empty());
         root.write("first", "valid");
+        settle();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
+        assert_eq!(cache.entries().len(), 1);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(cache.list(&root.0, &options).is_empty());
         assert!(cache.entries().is_empty());
         std::fs::remove_dir(&path).unwrap();
         root.write("first", "restored");
+        settle();
         cache.list(&root.0, &options);
+        assert_eq!(cache.entries().len(), 1);
         let moved = root.0.with_extension("moved");
         std::fs::rename(&root.0, &moved).unwrap();
         let missing = cache.list(&root.0, &options);
@@ -299,10 +338,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = Root::new();
         root.write("first", "label");
+        settle();
         let path = root.0.join("first.json");
         let options = ListOptions::default();
         let cache = RegistryListCache::default();
         assert_eq!(cache.list(&root.0, &options).len(), 1);
+        assert_eq!(cache.entries().len(), 1);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
         let cached = cache.list(&root.0, &options);
         let ordinary = super::super::list_sessions_in(&root.0, &options);
@@ -319,6 +360,7 @@ mod tests {
     fn process_death_with_unchanged_metadata_is_observed_next_pass() {
         let root = Root::new();
         root.write("first", "live");
+        settle();
         let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         std::fs::write(root.0.join("first.pid"), child.id().to_string()).unwrap();
         let cache = RegistryListCache::default();
@@ -338,6 +380,7 @@ mod tests {
     fn reachable_socket_cannot_rescue_gone_identity_with_cached_metadata() {
         let root = Root::new();
         root.write("first", "label");
+        settle();
         std::fs::write(root.0.join("first.pid"), "2147483647").unwrap();
         let socket = super::super::socket_path_in(&root.0, "first");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -371,6 +414,7 @@ mod tests {
         metadata["futureField"] = serde_json::json!({"retained": true});
         let path = root.0.join("first.json");
         std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        settle();
         let cache = RegistryListCache::default();
         let options = ListOptions::default();
         let before = parses();
@@ -386,6 +430,7 @@ mod tests {
 
         metadata["daemonBootId"] = read_boot_id().unwrap().into();
         std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        settle();
         assert_eq!(cache.list(&root.0, &options)[0].identity, DaemonIdentityCheck::Match);
         // Companion disagreement changes identity even with unchanged cached JSON.
         let sidecar = root.0.join("first.pid");
@@ -421,6 +466,7 @@ mod tests {
         metadata["daemonPid"] = child.id().into();
         metadata["recovery"] = serde_json::json!({"processStartToken": token});
         std::fs::write(root.0.join("first.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        settle();
         let options = ListOptions::default();
         let cache = RegistryListCache::default();
         let before = parses();
@@ -439,6 +485,7 @@ mod tests {
     fn pid_sidecar_and_exit_metadata_changes_are_observed_next_pass() {
         let root = Root::new();
         root.write("first", "label");
+        settle();
         let cache = RegistryListCache::default();
         let options = ListOptions::default();
         assert_eq!(cache.list(&root.0, &options)[0].status, SessionStatus::Vanished);
@@ -458,11 +505,58 @@ mod tests {
     }
 
     #[test]
+    fn a_record_changed_within_a_tick_is_parsed_until_it_settles() {
+        let root = Root::new();
+        root.write("first", "label");
+        let options = ListOptions::default();
+        let cache = RegistryListCache::default();
+        let label = || {
+            let rows = cache.list(&root.0, &options);
+            rows[0].display_name().map(str::to_owned)
+        };
+        let before = parses();
+        for _ in 0..2 {
+            assert_eq!(label().as_deref(), Some("label"));
+        }
+        // A record written within this tick is parsed on each call.
+        assert_eq!(parses() - before, 2);
+        assert!(cache.entries().is_empty());
+        settle();
+        for _ in 0..2 {
+            assert_eq!(label().as_deref(), Some("label"));
+        }
+        // Once older than a tick, it is retained.
+        assert_eq!(parses() - before, 3);
+        assert_eq!(cache.entries().len(), 1);
+    }
+
+    #[test]
+    fn settled_needs_the_ctime_tick_to_have_passed() {
+        let at = |seconds: i64, nanos: i64| Identity {
+            dev: 1,
+            ino: 1,
+            size: 1,
+            mtime: (seconds, nanos),
+            ctime: (seconds, nanos),
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(at(999_999, 900_000_000).settled(now), "100 ms old");
+        assert!(!at(999_999, 960_000_000).settled(now), "40 ms old");
+        assert!(!at(1_000_000, 0).settled(now), "now, whole seconds");
+        assert!(!at(1_000_001, 1).settled(now), "the clock stepped back");
+        assert!(!at(999_999, 0).settled(now), "1 s old, whole seconds");
+        assert!(at(999_997, 0).settled(now), "3 s old, whole seconds");
+        let before_1970 = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        assert!(!at(-2, 0).settled(before_1970), "a clock before 1970");
+    }
+
+    #[test]
     fn metadata_cache_200_session_measurement() {
         let root = Root::new();
         for index in 0..200 {
             root.write(&format!("session-{index:03}"), "label");
         }
+        settle();
         let options = ListOptions::default();
         let before = parses();
         let started = Instant::now();
