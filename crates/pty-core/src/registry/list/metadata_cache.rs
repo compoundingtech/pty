@@ -358,6 +358,9 @@ mod tests {
 
     #[test]
     fn cached_metadata_preserves_unknown_owner_and_fresh_identity_classification() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         use super::super::{DaemonIdentityCheck, read_boot_id, read_process_start_token};
         let root = Root::new();
         let pid = std::process::id() as i32;
@@ -408,6 +411,9 @@ mod tests {
 
     #[test]
     fn fallback_process_start_token_is_not_cached() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
         let root = Root::new();
         let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         let token = super::super::read_process_start_token(child.id() as i32).unwrap();
