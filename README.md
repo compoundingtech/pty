@@ -105,8 +105,9 @@ state before and after subscribing, so an already-exited retained session
 returns immediately (exit status 0), even if its event log was removed.
 Other event types wait for a new matching event. A missing session returns a
 not-found error (exit status 1); a vanished target with no recorded exit also
-fails promptly, including a launcher that never started. A session removed
-while waiting without an observed matching event returns 1. The timeout is an independent deadline
+fails promptly, including a launcher that never started or a daemon that
+vanishes after subscribing. A session removed while waiting without an
+observed matching event returns 1. The timeout is an independent deadline
 and returns 1 even when no filesystem events arrive. Followers ignore read-only
 filesystem notifications and coalesce change notifications, avoiding feedback
 from their own registry reads.
