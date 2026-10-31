@@ -37,6 +37,8 @@ pub struct FollowerOptions {
     pub names: Option<Vec<String>>,
     /// How often to re-check files regardless of watcher notifications.
     pub poll_interval: Duration,
+    /// End named lifecycle waits when a daemon vanishes without exit metadata.
+    pub stop_on_vanished: bool,
 }
 
 impl Default for FollowerOptions {
@@ -44,6 +46,7 @@ impl Default for FollowerOptions {
         FollowerOptions {
             names: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            stop_on_vanished: false,
         }
     }
 }
@@ -287,7 +290,11 @@ fn run(
                 // metadata. It may have done both after our first log read.
                 read_new_lines(t, &mut on_event);
             }
-            !exited && !removed && !retained_exit
+            let vanished = options.stop_on_vanished
+                && !registry::is_creation_lock_held(name)
+                && registry::get_session_by_name(name)
+                    .is_some_and(|session| session.status == registry::SessionStatus::Vanished);
+            !exited && !removed && !retained_exit && !vanished
         });
         if !follow_all && tracked.is_empty() {
             break;
