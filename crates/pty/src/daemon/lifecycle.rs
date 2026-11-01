@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use pty_core::events::{Event, EventWriter};
 use pty_core::protocol::{
     AcceptedSocketOwnershipResult, LifecycleCompareAndSetRequest, LifecycleCompareAndSetResult,
-    Packet, PacketReader, decode_accepted_socket_ownership_request,
+    MessageType, Packet, PacketReader, decode_accepted_socket_ownership_request,
     decode_lifecycle_compare_and_set_request, encode_accepted_socket_ownership_response,
     encode_data, encode_exit, encode_lifecycle_compare_and_set_response,
 };
@@ -36,6 +36,7 @@ use super::DaemonConfig;
 use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE, Role};
 use super::daemon_warn;
 use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
+use super::input_budget::{INPUT_BUDGET, InputBudget, InputHold};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
     freeze_descendants, signal_process_identities, terminate_process_group,
@@ -61,6 +62,8 @@ pub(crate) enum Msg {
     Packet {
         id: u64,
         packet: Packet,
+        /// A DATA packet's bytes, held against the daemon's input budget.
+        input: Option<InputHold>,
     },
     Closed {
         id: u64,
@@ -138,8 +141,9 @@ pub(crate) struct Daemon {
     _owner: SessionOwner,
     pub(crate) session: pty_spawn::substrate::SessionClient,
     /// Input for the child, written in order by [`spawn_input_writer`]'s
-    /// thread. `None` when that thread could not start.
-    input: Option<Sender<Vec<u8>>>,
+    /// thread, each with the budget it holds until the kernel takes it.
+    /// `None` when that thread could not start.
+    input: Option<Sender<(Vec<u8>, Option<InputHold>)>>,
     pub(crate) child_pid: i32,
     child_identity: Option<ProcessIdentity>,
     pub(crate) clients: BTreeMap<u64, Client>,
@@ -678,13 +682,16 @@ fn terminal_actor(rows: u16, cols: u16) -> TerminalActor {
 /// must never wait there: one large paste into a program that is not
 /// reading would stop the daemon serving every client, STATUS included,
 /// until the program read it or exited.
-fn spawn_input_writer(session: pty_spawn::substrate::SessionClient) -> Option<Sender<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+fn spawn_input_writer(
+    session: pty_spawn::substrate::SessionClient,
+) -> Option<Sender<(Vec<u8>, Option<InputHold>)>> {
+    let (tx, rx) = mpsc::channel::<(Vec<u8>, Option<InputHold>)>();
     let spawned = std::thread::Builder::new()
         .name("pty-input".into())
         .spawn(move || {
-            for bytes in rx {
+            for (bytes, hold) in rx {
                 let _ = session.input(bytes);
+                drop(hold);
             }
         });
     match spawned {
@@ -757,6 +764,7 @@ pub(crate) fn accept_failure_passes(e: &std::io::Error) -> bool {
 pub(crate) fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let ids = Arc::new(AtomicU64::new(1));
+        let budget = InputBudget::new(INPUT_BUDGET);
         let mut consecutive = 0u32;
         for stream in listener.incoming() {
             let stream = match stream {
@@ -781,14 +789,15 @@ pub(crate) fn spawn_acceptor(listener: UnixListener, tx: Sender<Msg>) {
                 }
             };
             let id = ids.fetch_add(1, Ordering::Relaxed);
-            spawn_client(id, stream, tx.clone());
+            spawn_client(id, stream, tx.clone(), Arc::clone(&budget));
         }
     });
 }
 
 /// One writer thread (packets → socket) and one reader thread (socket →
-/// [`Msg`]) per connection.
-fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
+/// [`Msg`]) per connection. The reader waits for `budget` before it hands
+/// on a DATA packet, so a child that is not reading stops the sender.
+fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>, budget: Arc<InputBudget>) {
     let (out_tx, out_rx) = mpsc::channel::<Out>();
     let write_lock = Arc::new(Mutex::new(()));
     let writer_lock = Arc::clone(&write_lock);
@@ -838,7 +847,10 @@ fn spawn_client(id: u64, stream: UnixStream, tx: Sender<Msg>) {
                 Ok(n) => match parser.feed(&buf[..n]) {
                     Ok(packets) => {
                         for packet in packets {
-                            if reader_tx.send(Msg::Packet { id, packet }).is_err() {
+                            let input = (packet.type_ == MessageType::Data
+                                && !packet.payload.is_empty())
+                            .then(|| budget.hold(packet.payload.len()));
+                            if reader_tx.send(Msg::Packet { id, packet, input }).is_err() {
                                 return;
                             }
                         }
@@ -1005,15 +1017,22 @@ impl Daemon {
     }
 
     pub(crate) fn write_pty(&mut self, bytes: &[u8]) {
+        self.write_input(bytes.to_vec(), None);
+    }
+
+    /// Client input for the child, with the budget it was accepted under.
+    /// The hold goes with the bytes until the kernel has taken them, or is
+    /// released here when they will never be written.
+    pub(crate) fn write_input(&mut self, bytes: Vec<u8>, hold: Option<InputHold>) {
         if bytes.is_empty() || self.child_status.is_some() {
             return;
         }
         match &self.input {
             Some(input) => {
-                let _ = input.send(bytes.to_vec());
+                let _ = input.send((bytes, hold));
             }
             None => {
-                let _ = self.session.input(bytes.to_vec());
+                let _ = self.session.input(bytes);
             }
         }
     }
@@ -1106,7 +1125,7 @@ impl Daemon {
                     ),
                 );
             }
-            Msg::Packet { id, packet } => self.on_packet(id, packet),
+            Msg::Packet { id, packet, input } => self.on_packet(id, packet, input),
             Msg::Closed { id } => self.on_closed(id),
             Msg::ExternalKill => {
                 if let Some(operation) = &self.operation

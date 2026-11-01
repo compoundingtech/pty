@@ -26,6 +26,7 @@ use pty_core::protocol::{
 use pty_core::registry::{self, MutateOptions, MutateStatus};
 use pty_terminal::{Range, SerializeOpts};
 
+use super::input_budget::InputHold;
 use super::lifecycle::Daemon;
 
 /// Node's `REDRAW_SETTLE_MS`: how long after a resize the child gets to
@@ -229,13 +230,14 @@ fn attached_clients(clients: &BTreeMap<u64, Client>) -> Vec<&AttachedClient> {
 }
 
 impl Daemon {
-    /// A packet from client `id`.
-    pub(crate) fn on_packet(&mut self, id: u64, packet: Packet) {
+    /// A packet from client `id`. `input` holds a DATA packet's share of the
+    /// input budget; dropping it unwritten releases it.
+    pub(crate) fn on_packet(&mut self, id: u64, packet: Packet, input: Option<InputHold>) {
         match packet.type_ {
             MessageType::Attach => self.on_attach(id, &packet.payload),
             MessageType::Peek => self.on_peek(id, &packet.payload),
             MessageType::History => self.on_history(id, &packet.payload),
-            MessageType::Data => self.on_data(id, &packet.payload),
+            MessageType::Data => self.on_data(id, packet.payload, input),
             MessageType::Resize => self.on_resize(id, &packet.payload),
             MessageType::Detach => self.on_detach(id),
             MessageType::Status => self.on_status(id, &packet.payload),
@@ -362,12 +364,12 @@ impl Daemon {
     }
 
     /// node: src/server.ts:1022-1027
-    fn on_data(&mut self, id: u64, payload: &[u8]) {
+    fn on_data(&mut self, id: u64, payload: Vec<u8>, input: Option<InputHold>) {
         let Some(c) = self.clients.get(&id) else {
             return;
         };
         if !self.exited && c.role != Role::Readonly {
-            self.write_pty(payload);
+            self.write_input(payload, input);
         }
     }
 
