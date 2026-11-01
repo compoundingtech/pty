@@ -230,6 +230,10 @@ whether the build that failed could ever have met the number.
 - **Frame size.** A declared length above 32 MiB drops the connection, on
   both sides. `PacketReader::feed` returns `InvalidData`; the daemon closes
   the socket and keeps serving everyone else.
+- **Pending input.** The daemon holds at most 1 MiB of client input that the
+  child has not read, or one larger packet on its own. Past that it stops
+  reading the sending client, whose writes then block; nothing is dropped
+  (`crates/pty/tests/daemon_input_stall.rs`).
 - **Socket path length.** A `PTY_ROOT` whose session socket path would
   exceed the kernel's `sun_path` limit—103 pathname bytes on macOS, 104 on
   Linux—is refused before anything is created, with the path and limit in

@@ -52,6 +52,18 @@ Writing to the terminal is synchronous, so a `SCREEN` cut always reflects every
 byte received before it. There is no `Arc<Mutex<Terminal>>`, and the
 libghostty `Terminal`, which is not `Send`, never leaves that thread.
 
+Client input goes to the child from a thread of its own, so a child that is
+not reading never stops the loop. It is bounded too. The daemon holds at most
+`INPUT_BUDGET` (1 MiB) of input that it accepted from clients and the kernel
+has not yet taken, shared by every client
+(`crates/pty/src/daemon/input_budget.rs`). A client's reader thread waits for
+budget before it hands on a DATA packet, so it stops reading that socket and
+the sender's own writes block. Nothing is dropped, and every other client is
+still served. The waiting client's later packets, DETACH included, wait
+behind its DATA, and its disconnection is noticed only once its input fits.
+A single packet larger than the budget goes through when nothing else is
+pending.
+
 Client output queues are bounded by 64 MiB of queued and in-flight buffer
 capacity plus 64 bytes of metadata per item, not packet count. A large initial
 `SCREEN` and live output can wait behind a socket write without small writes
