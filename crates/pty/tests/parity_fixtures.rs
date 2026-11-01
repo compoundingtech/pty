@@ -147,6 +147,10 @@ fn shared_json_shape_fixtures_pass() {
                         assert_field(&format!("[{id}/{sid}]"), entry, key, policy);
                     }
                 }
+                // Removing the root does not stop a session that is still running.
+                for s in sessions {
+                    let _ = pty(&root, &["kill", s["id"].as_str().unwrap()]);
+                }
             }
             "stats-clients" => {
                 let run_args: Vec<String> = fx["run"]
