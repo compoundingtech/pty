@@ -33,17 +33,88 @@ fn delayed_status_does_not_allow_unforced_attach() {
 }
 
 #[test]
-fn auto_restart_preserves_missing_boot_live_child() {
+fn auto_restart_accepts_verified_missing_boot_without_restarting() {
     let rig = Rig::new();
     let mut fixture = cli_common::MissingBootSession::new(&rig, "unknown", serde_json::json!({}));
     // --auto-restart is this CLI's noninteractive restart policy (-r).
-    // Unknown stays conservatively running; the independent identity result
-    // must refuse before any restart or transport-based ownership fallback.
+    // Legacy token verification admits the record, but the independent
+    // nesting guard still refuses a daemon that cannot answer STATUS.
     let out = rig.run(&["attach", "--auto-restart", "unknown"]);
     assert_eq!(out.code, 1, "{out:?}");
-    assert!(out.stderr.contains("identity is unknown"), "{out:?}");
+    assert!(out.stderr.contains("cannot verify the current session"), "{out:?}");
     assert!(!out.stdout.contains("Restarting"), "{out:?}");
     fixture.assert_preserved(&rig);
+}
+
+#[test]
+fn legacy_attach_reaches_transport_without_upgrading_metadata() {
+    for sidecar in [false, true] {
+        let rig = Rig::new();
+        let listener = UnixListener::bind(rig.path("legacy.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let pid = std::process::id() as i32;
+        rig.write_meta("legacy", json!({
+            "generation": "063ff7f9-style",
+            "daemonPid": pid,
+            "daemonStartToken": pty_core::registry::read_process_start_token(pid).unwrap(),
+        }));
+        if sidecar {
+            std::fs::write(rig.path("legacy.pid"), pid.to_string()).unwrap();
+        }
+        let before = std::fs::read(rig.path("legacy.json")).unwrap();
+        // Closing each accepted connection lets attach finish without a real
+        // terminal or daemon. A connection proves admission reached do_attach.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((socket, _)) => { accepted += 1; drop(socket); }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept legacy attach: {error}"),
+                }
+            }
+            accepted
+        });
+        let out = rig.run(&["attach", "--force", "--no-restart", "legacy"]);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(server.join().unwrap() > 0, "{out:?}");
+        assert!(!out.stderr.contains("identity is unknown"), "{out:?}");
+        assert_eq!(std::fs::read(rig.path("legacy.json")).unwrap(), before);
+    }
+}
+
+#[test]
+fn legacy_attach_without_matching_token_never_reaches_transport_even_with_force() {
+    for token in [None, Some("mismatching:token")] {
+        for force in [false, true] {
+            let rig = Rig::new();
+            let listener = UnixListener::bind(rig.path("unverified.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let pid = std::process::id() as i32;
+            rig.write_meta("unverified", json!({
+                "daemonPid": pid,
+                "daemonStartToken": token,
+            }));
+            std::fs::write(rig.path("unverified.pid"), pid.to_string()).unwrap();
+            let before = std::fs::read(rig.path("unverified.json")).unwrap();
+            let args = if force {
+                vec!["attach", "--force", "--no-restart", "unverified"]
+            } else {
+                vec!["attach", "--no-restart", "unverified"]
+            };
+            let out = rig.run(&args);
+            assert_eq!(out.code, 1, "{out:?}");
+            if token.is_none() {
+                assert!(out.stderr.contains("identity is unknown"), "{out:?}");
+            }
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(std::fs::read(rig.path("unverified.json")).unwrap(), before);
+        }
+    }
 }
 
 #[test]

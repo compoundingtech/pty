@@ -433,7 +433,7 @@ pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIden
     result
 }
 
-/// Identity evidence for explicit stop, signal and remove controls only.
+/// Identity evidence for explicit attach, stop, signal and remove controls only.
 /// `LegacyVerified` is not full daemon identity proof: it must never authorize
 /// inventory liveness, generation replacement, launch or retirement. A stop
 /// reports which of `Match` and `LegacyVerified` authorized it.
@@ -740,7 +740,7 @@ pub fn read_control_target_authority_with(
     read_explicit_control_authority_in(&session_dir(), name, metadata, false)
 }
 
-/// Resolve an explicit child-signal target. Unlike legacy stop, signals
+/// Resolve an explicit child-signal or attach target. Unlike legacy stop, these
 /// always require a recorded daemon PID and start token, even with a sidecar.
 pub fn read_control_signal_target_with(name: &str, metadata: Option<&SessionMetadata>) -> Option<i32> {
     read_explicit_control_target_in(&session_dir(), name, metadata, true)

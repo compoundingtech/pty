@@ -488,6 +488,12 @@ Node one. A script that captures only standard output sees an empty result
 and can mistake that for success, which is what happens if you forget
 `--force`; the exit code tells you the truth.
 
+`attach` also accepts live pre-boot-ID daemons when their recorded daemon PID
+and start token verify against the live leader, using the same legacy authority
+as explicit controls such as `kill`. Missing, unreadable or mismatching tokens
+remain refused; `--force` never bypasses identity verification. This does not
+write a synthetic `daemonBootId` or upgrade the session's inventory identity.
+
 `run` and `restart` are different and deliberately so: from inside a session
 `run` runs the command directly and `restart` restarts without attaching.
 Both did what was asked, so both exit 0.

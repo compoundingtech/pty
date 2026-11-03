@@ -143,7 +143,14 @@ fn attach_session(
         eprintln!("Session \"{name}\" not found.");
         return Ok(1);
     };
-    if session.identity == registry::DaemonIdentityCheck::Unknown {
+    // Reuse explicit controls' recorded-PID/token policy for pre-boot-ID
+    // daemons. This does not upgrade inventory identity or rewrite metadata.
+    let legacy_verified = session.identity == registry::DaemonIdentityCheck::Unknown
+        && session.metadata.as_ref().is_some_and(|metadata| {
+            metadata.daemon_boot_id.is_none()
+                && registry::read_control_signal_target_with(name, Some(metadata)).is_some()
+        });
+    if session.identity == registry::DaemonIdentityCheck::Unknown && !legacy_verified {
         eprintln!("pty attach: refusing session \"{name}\": daemon identity is unknown.");
         return Ok(1);
     }
