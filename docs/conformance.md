@@ -175,9 +175,9 @@ use a known absent PID for an exited fixture. A socket or PID sidecar alone
 does not prove a live Rust session or authorize deletion of unknown runtime
 debris. Recipe-replacement tests wait for published exit metadata, not PID
 absence: an exited session must be recreated even while its matching daemon
-finishes shutdown or remains an adopted zombie. Production zombie identity
-behavior is unchanged; a birth-identity Match alone does not imply that the
-session's child is still running.
+finishes shutdown or remains an adopted zombie. An adopted zombie daemon reads
+as Gone, not Match (see architecture.md). Even a birth-identity Match alone does
+not imply that the session's child is still running.
 Typed publication fixtures must also reflect publication defaults, including
 `ephemeral: Some(false)`, when comparing records read back from disk.
 
