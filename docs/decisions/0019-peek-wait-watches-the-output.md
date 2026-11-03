@@ -16,7 +16,15 @@ matches the pattern against that screen, and against the output's visible
 text as it arrives:
 - Escape sequences (CSI, OSC, DCS and the like) are dropped, also when a chunk
   boundary splits one.
-- A pattern split across two chunks still matches.
+- A pattern split across two chunks still matches, and so does one split by a
+  style change.
+- Text either side of anything that can move the cursor is not joined: every
+  CSI but SGR, and the single-byte escapes such as `ESC 8`. `END \e[2;1H004`
+  never formed "END 004" on the terminal, so it does not match. Text drawn
+  that way is left to the screen read.
+- After its look is due, the watch reads at most one more chunk. A session
+  that prints without pause cannot hold the wait past its screen read or its
+  timeout.
 
 On a timeout the wait reads the full scrollback once. If the pattern is there,
 it was printed before the wait began, and the error says so on a second line
@@ -48,8 +56,14 @@ the output or to keep waiting.
   printed and scrolled away by one write while the wait runs, and a marker
   from before the wait next to a pattern that never appeared.
 - `crates/pty-client/tests/client_peek.rs` covers the same two cases against a
-  fake daemon, with the marker split across output chunks and styles.
-- The visible-text scanner's unit tests are in `crates/pty-client/src/peek.rs`.
+  fake daemon, with the marker split across output chunks and styles. It also
+  checks that a 1 s wait on output that never pauses still times out in about
+  1 s.
+- `crates/pty-client/src/peek.rs` holds the unit tests:
+  - the visible-text scanner, including that text either side of a cursor
+    move is not joined;
+  - that a watch past its deadline reads one chunk of a full socket and
+    returns.
 
 All four behavior tests fail on the screen-only wait. There is no gated Node
 half: the Node pty is not installed where these ran, and it is deprecated.

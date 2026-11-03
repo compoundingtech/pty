@@ -354,6 +354,45 @@ fn peek_wait_tells_a_missed_pattern_from_one_that_never_appeared() {
     );
 }
 
+/// Output that never pauses, like `yes`, must not hold the wait past its
+/// bound: the watch keeps finding data ready, and the wait has to stop
+/// reading to look at the screen and the clock.
+#[test]
+fn peek_wait_keeps_its_bound_under_output_that_never_pauses() {
+    let d = FakeDaemon::bind("flood");
+    let listener = d.listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let (mut watch, _) = listener.accept().unwrap();
+        let _ = read_chunk(&mut watch);
+        std::thread::spawn(move || {
+            let flood = encode_data(&b"y\r\n".repeat(64 * 1024));
+            if watch.write_all(&encode_screen(b"y")).is_ok() {
+                while watch.write_all(&flood).is_ok() {}
+            }
+        });
+        while let Ok((mut s, _)) = listener.accept() {
+            let _ = read_chunk(&mut s);
+            let _ = s.write_all(&encode_screen(b"y"));
+        }
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = d.name.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = peek_wait(&name, &["NEVER".into()], 1.0, true);
+        let _ = tx.send((result, started.elapsed()));
+    });
+    let (result, elapsed) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the wait ran past its 1 s bound");
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Timed out after 1s waiting for \"NEVER\"."
+    );
+    assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
+}
+
 fn write_exited_metadata(name: &str, last_lines: &[&str], exit_code: Option<i32>) {
     let json = serde_json::json!({
         "command": "sh",

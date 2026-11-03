@@ -593,6 +593,8 @@ impl OutputWatch {
     }
 
     /// Read what arrives until `until`, stopping as soon as a pattern shows.
+    /// It returns by `until` even while output keeps coming, so the caller
+    /// still reaches its screen look and its timeout.
     fn wait_until(&mut self, until: Instant, patterns: &[String]) -> Watched {
         use std::os::fd::AsRawFd;
         let mut buf = [0u8; 16384];
@@ -632,6 +634,11 @@ impl OutputWatch {
                     _ => {}
                 }
             }
+            // Under output that never pauses, poll reports ready every time,
+            // and only this check ends the read.
+            if Instant::now() >= until {
+                return Watched::Quiet;
+            }
         }
     }
 }
@@ -667,27 +674,42 @@ enum Escape {
 
 impl VisibleText {
     /// Add `chunk` and say whether any pattern now appears.
+    ///
+    /// Text is joined across a style change, a charset designation or an
+    /// escape string, which leave the cursor where it was. It is not joined
+    /// across anything that can move the cursor or change the text around
+    /// it: every other CSI, and the single-byte escapes such as `ESC 8`.
+    /// Text drawn that way is left to the screen read.
     fn feed(&mut self, chunk: &[u8], patterns: &[String]) -> bool {
+        let mut found = false;
         for &b in chunk {
-            self.state = match (self.state, b) {
-                (Escape::Ground, 0x1b) => Escape::Esc,
+            let (state, breaks) = match (self.state, b) {
+                (Escape::Ground, 0x1b) => (Escape::Esc, false),
                 (Escape::Ground, _) => {
                     self.tail.push(b);
-                    Escape::Ground
+                    (Escape::Ground, false)
                 }
-                (Escape::Esc, b'[') => Escape::Csi,
-                (Escape::Esc, b']' | b'P' | b'X' | b'^' | b'_') => Escape::Text,
-                (Escape::Esc | Escape::Intermediate, 0x20..=0x2f) => Escape::Intermediate,
-                (Escape::Esc | Escape::Intermediate, _) => Escape::Ground,
-                (Escape::Csi, 0x40..=0x7e) => Escape::Ground,
-                (Escape::Csi, _) => Escape::Csi,
-                (Escape::Text, 0x07) => Escape::Ground,
-                (Escape::Text, 0x1b) => Escape::TextEsc,
-                (Escape::Text, _) => Escape::Text,
-                (Escape::TextEsc, _) => Escape::Ground,
+                (Escape::Esc, b'[') => (Escape::Csi, false),
+                (Escape::Esc, b']' | b'P' | b'X' | b'^' | b'_') => (Escape::Text, false),
+                (Escape::Esc | Escape::Intermediate, 0x20..=0x2f) => (Escape::Intermediate, false),
+                (Escape::Intermediate, _) => (Escape::Ground, false),
+                (Escape::Esc, _) => (Escape::Ground, true),
+                (Escape::Csi, b'm') => (Escape::Ground, false),
+                (Escape::Csi, 0x40..=0x7e) => (Escape::Ground, true),
+                (Escape::Csi, _) => (Escape::Csi, false),
+                (Escape::Text, 0x07) => (Escape::Ground, false),
+                (Escape::Text, 0x1b) => (Escape::TextEsc, false),
+                (Escape::Text, _) => (Escape::Text, false),
+                (Escape::TextEsc, _) => (Escape::Ground, false),
             };
+            self.state = state;
+            if breaks {
+                // A pattern completed before the move still counts.
+                found |= contains_any(&self.tail, patterns);
+                self.tail.clear();
+            }
         }
-        let found = contains_any(&self.tail, patterns);
+        found |= contains_any(&self.tail, patterns);
         let keep = patterns
             .iter()
             .map(String::len)
@@ -729,6 +751,15 @@ mod visible_text_tests {
     }
 
     #[test]
+    fn text_either_side_of_a_cursor_move_is_not_joined() {
+        assert!(!feed_all(&[b"END \x1b[2;1H004"], "END 004"));
+        assert!(!feed_all(&[b"END \x1b[1A", b"004"], "END 004"));
+        assert!(!feed_all(&[b"END \x1b8004"], "END 004"));
+        // A pattern completed before the move still counts.
+        assert!(feed_all(&[b"END 004\x1b[2J"], "END 004"));
+    }
+
+    #[test]
     fn only_a_pattern_length_of_text_is_kept() {
         let mut text = VisibleText::default();
         let patterns = ["END 004".to_string()];
@@ -736,5 +767,53 @@ mod visible_text_tests {
         assert_eq!(text.tail.len(), "END 004".len() - 1);
         assert!(!text.feed(b"END 00", &patterns));
         assert!(text.feed(b"4", &patterns));
+    }
+}
+
+#[cfg(test)]
+mod output_watch_tests {
+    use super::*;
+    use pty_core::protocol::encode_data;
+
+    /// Once its deadline has passed the watch reads one chunk and returns,
+    /// however much output is waiting, so a flood cannot hold the wait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn past_its_deadline_the_watch_reads_one_chunk_and_returns() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        let packet = encode_data(&[b'y'; 1000]);
+        let mut written = 0;
+        while daemon.write_all(&packet).is_ok() {
+            written += packet.len();
+        }
+        assert!(
+            written > 4 * 16384,
+            "only {written} bytes fit in the socket"
+        );
+        let mut watch = OutputWatch {
+            socket: client,
+            reader: PacketReader::new(),
+            text: VisibleText::default(),
+            screen: String::new(),
+        };
+        assert_eq!(
+            watch.wait_until(Instant::now(), &["NEVER".to_string()]),
+            Watched::Quiet
+        );
+        watch.socket.set_nonblocking(true).unwrap();
+        let mut left = 0;
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = watch.socket.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            left += n;
+        }
+        assert!(
+            left >= written - 16384,
+            "read {} of {written} bytes",
+            written - left
+        );
     }
 }
