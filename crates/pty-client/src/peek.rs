@@ -311,6 +311,14 @@ pub fn strip_ansi(text: &str) -> String {
 pub enum PeekWaitError {
     /// `Timed out after <sec>s waiting for "<p>".`
     TimedOut { timeout_secs: f64, patterns: String },
+    /// The timeout, for a pattern that is in the session's scrollback but was
+    /// never seen while the wait watched: it was printed before the wait
+    /// began, or while the output stream was lost (`watched` false).
+    Missed {
+        timeout_secs: f64,
+        patterns: String,
+        watched: bool,
+    },
     /// `Session "<name>" exited (code <c|?>) without matching "<p>".` plus
     /// `Last output:` and the indented lines when there are any.
     Exited {
@@ -328,6 +336,24 @@ impl fmt::Display for PeekWaitError {
                 timeout_secs,
                 patterns,
             } => write!(f, "Timed out after {timeout_secs}s waiting for {patterns}."),
+            PeekWaitError::Missed {
+                timeout_secs,
+                patterns,
+                watched,
+            } => {
+                write!(f, "Timed out after {timeout_secs}s waiting for {patterns}.")?;
+                if *watched {
+                    write!(
+                        f,
+                        "\nIt is in the scrollback from before the wait began, no longer on screen."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "\nIt is in the scrollback, but the wait lost the output stream and did not see it printed."
+                    )
+                }
+            }
             PeekWaitError::Exited {
                 name,
                 exit_code,
@@ -368,11 +394,19 @@ pub fn describe_patterns(patterns: &[String]) -> String {
 /// Poll interval of `peek --wait`.
 pub const PEEK_WAIT_INTERVAL: Duration = Duration::from_millis(200);
 
-/// `peek --wait`: poll the plain screen every 200 ms until any pattern is a
-/// substring. Returns the text to print (the plain screen, or a fresh ANSI
+/// `peek --wait`: wait until any pattern is a substring of what the session
+/// shows. Returns the text to print (the plain screen, or a fresh ANSI
 /// screen when `plain` is false; the CLI appends `"\n"`). When the session
 /// has exited, `lastLines` from the metadata is matched instead.
 /// A `timeout_secs` that is not a finite positive number waits forever.
+///
+/// Two looks, and either one ends the wait. The plain screen is read every
+/// 200 ms, as the Node tool does, which finds text drawn anywhere on it. The
+/// output is also watched as it arrives, on one read-only peek connection,
+/// which finds a pattern printed and scrolled away between two reads of the
+/// screen. Reading the screen alone missed that, and the wait ran on to the
+/// timeout or to the session's exit. On a timeout the full scrollback tells
+/// such a miss apart from a pattern that never appeared.
 ///
 /// node: tests/peek-wait.test.ts:111-188
 pub fn peek_wait(
@@ -393,15 +427,44 @@ pub fn peek_wait(
     };
     let matches_any = |text: &str| patterns.iter().any(|p| text.contains(p.as_str()));
     let desc = describe_patterns(patterns);
+    // The watch's own screen is the first look, so a pattern already on
+    // screen costs no more connections than it did.
+    let mut watch = OutputWatch::open(name);
+    let mut watched = watch.is_some();
+    let mut next_look = if watched {
+        start + PEEK_WAIT_INTERVAL
+    } else {
+        start
+    };
+    let mut last_screen = String::new();
     loop {
         if let Some(t) = timeout
             && start.elapsed() > t
         {
-            return Err(PeekWaitError::TimedOut {
-                timeout_secs,
-                patterns: desc,
-            });
+            // Output that arrived since the last look still counts.
+            if let Some(w) = watch.as_mut()
+                && w.wait_until(Instant::now(), patterns) == Watched::Seen
+            {
+                return Ok(screen_now(name, plain, &last_screen, &w.screen));
+            }
+            return Err(timed_out(name, patterns, timeout_secs, desc, watched));
         }
+        if let Some(w) = watch.as_mut() {
+            match w.wait_until(next_look, patterns) {
+                Watched::Seen => return Ok(screen_now(name, plain, &last_screen, &w.screen)),
+                Watched::Quiet => {}
+                Watched::Lost => {
+                    watch = None;
+                    watched = false;
+                }
+            }
+        } else {
+            std::thread::sleep(next_look.saturating_duration_since(Instant::now()));
+        }
+        if Instant::now() < next_look {
+            continue;
+        }
+        next_look = Instant::now() + PEEK_WAIT_INTERVAL;
         match peek_screen(
             name,
             PeekScreenOptions {
@@ -428,6 +491,7 @@ pub fn peek_wait(
                     // plain screen, which did match.
                     return Ok(screen);
                 }
+                last_screen = screen;
             }
             Err(_) => {
                 // Session might have exited — check metadata for lastLines.
@@ -449,6 +513,307 @@ pub fn peek_wait(
                 // No exitedAt — might be a transient connection error, retry.
             }
         }
-        std::thread::sleep(PEEK_WAIT_INTERVAL);
+    }
+}
+
+/// The screen to print once the watch saw a pattern. It may have scrolled
+/// away by now; the wait was satisfied when it was printed.
+fn screen_now(name: &str, plain: bool, last_screen: &str, watch_screen: &str) -> String {
+    peek_screen(name, PeekScreenOptions { plain, full: false }).unwrap_or_else(|_| {
+        if last_screen.is_empty() {
+            watch_screen
+        } else {
+            last_screen
+        }
+        .to_string()
+    })
+}
+
+/// The timeout, telling a pattern that is in the scrollback, so was printed
+/// before the wait could see it, apart from one that never appeared.
+fn timed_out(
+    name: &str,
+    patterns: &[String],
+    timeout_secs: f64,
+    patterns_text: String,
+    watched: bool,
+) -> PeekWaitError {
+    let in_scrollback = peek_screen(
+        name,
+        PeekScreenOptions {
+            plain: true,
+            full: true,
+        },
+    )
+    .is_ok_and(|text| patterns.iter().any(|p| text.contains(p.as_str())));
+    if in_scrollback {
+        PeekWaitError::Missed {
+            timeout_secs,
+            patterns: patterns_text,
+            watched,
+        }
+    } else {
+        PeekWaitError::TimedOut {
+            timeout_secs,
+            patterns: patterns_text,
+        }
+    }
+}
+
+/// What the output watch saw before its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watched {
+    Seen,
+    Quiet,
+    /// The connection ended or failed; the wait goes on reading the screen.
+    Lost,
+}
+
+/// A read-only peek connection held open for a whole `peek --wait`. The
+/// daemon sends it the screen and then every byte of output after it, so
+/// nothing printed while it is open goes unseen.
+struct OutputWatch {
+    socket: UnixStream,
+    reader: PacketReader,
+    text: VisibleText,
+    /// The plain screen the connection started with.
+    screen: String,
+}
+
+impl OutputWatch {
+    fn open(name: &str) -> Option<Self> {
+        let mut socket = connect_session(name).ok()?;
+        socket.write_all(&encode_peek(true, false)).ok()?;
+        Some(OutputWatch {
+            socket,
+            reader: PacketReader::new(),
+            text: VisibleText::default(),
+            screen: String::new(),
+        })
+    }
+
+    /// Read what arrives until `until`, stopping as soon as a pattern shows.
+    /// It returns by `until` even while output keeps coming, so the caller
+    /// still reaches its screen look and its timeout.
+    fn wait_until(&mut self, until: Instant, patterns: &[String]) -> Watched {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; 16384];
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let mut fds = [libc::pollfd {
+                fd: self.socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            match poll(&mut fds, left.as_millis().min(i32::MAX as u128) as i32) {
+                Ok(0) => return Watched::Quiet,
+                Ok(_) => {}
+                Err(_) => return Watched::Lost,
+            }
+            let n = match self.socket.read(&mut buf) {
+                Ok(0) | Err(_) => return Watched::Lost,
+                Ok(n) => n,
+            };
+            let Ok(packets) = self.reader.feed(&buf[..n]) else {
+                return Watched::Lost;
+            };
+            for p in packets {
+                match p.type_ {
+                    MessageType::Screen => {
+                        self.screen = String::from_utf8_lossy(&p.payload).into_owned();
+                        if contains_any(&p.payload, patterns) {
+                            return Watched::Seen;
+                        }
+                    }
+                    MessageType::Data => {
+                        if self.text.feed(&p.payload, patterns) {
+                            return Watched::Seen;
+                        }
+                    }
+                    MessageType::Exit | MessageType::ConnectionError => return Watched::Lost,
+                    _ => {}
+                }
+            }
+            // Under output that never pauses, poll reports ready every time,
+            // and only this check ends the read.
+            if Instant::now() >= until {
+                return Watched::Quiet;
+            }
+        }
+    }
+}
+
+fn contains_any(haystack: &[u8], patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        let p = p.as_bytes();
+        p.is_empty() || haystack.windows(p.len()).any(|w| w == p)
+    })
+}
+
+/// The visible text of an output stream. Escape sequences are dropped, also
+/// when a chunk boundary splits one, and the newest text is kept only as
+/// long as a pattern could still end in the next chunk.
+#[derive(Default)]
+struct VisibleText {
+    state: Escape,
+    tail: Vec<u8>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    #[default]
+    Ground,
+    Esc,
+    /// `ESC` and intermediates, waiting for the final byte.
+    Intermediate,
+    Csi,
+    /// OSC, DCS, SOS, PM or APC: a string ended by BEL or ST.
+    Text,
+    TextEsc,
+}
+
+impl VisibleText {
+    /// Add `chunk` and say whether any pattern now appears.
+    ///
+    /// Text is joined across a style change, a charset designation or an
+    /// escape string, which leave the cursor where it was. It is not joined
+    /// across anything that can move the cursor or change the text around
+    /// it: every other CSI, and the single-byte escapes such as `ESC 8`.
+    /// Text drawn that way is left to the screen read.
+    fn feed(&mut self, chunk: &[u8], patterns: &[String]) -> bool {
+        let mut found = false;
+        for &b in chunk {
+            let (state, breaks) = match (self.state, b) {
+                (Escape::Ground, 0x1b) => (Escape::Esc, false),
+                (Escape::Ground, _) => {
+                    self.tail.push(b);
+                    (Escape::Ground, false)
+                }
+                (Escape::Esc, b'[') => (Escape::Csi, false),
+                (Escape::Esc, b']' | b'P' | b'X' | b'^' | b'_') => (Escape::Text, false),
+                (Escape::Esc | Escape::Intermediate, 0x20..=0x2f) => (Escape::Intermediate, false),
+                (Escape::Intermediate, _) => (Escape::Ground, false),
+                (Escape::Esc, _) => (Escape::Ground, true),
+                (Escape::Csi, b'm') => (Escape::Ground, false),
+                (Escape::Csi, 0x40..=0x7e) => (Escape::Ground, true),
+                (Escape::Csi, _) => (Escape::Csi, false),
+                (Escape::Text, 0x07) => (Escape::Ground, false),
+                (Escape::Text, 0x1b) => (Escape::TextEsc, false),
+                (Escape::Text, _) => (Escape::Text, false),
+                (Escape::TextEsc, _) => (Escape::Ground, false),
+            };
+            self.state = state;
+            if breaks {
+                // A pattern completed before the move still counts.
+                found |= contains_any(&self.tail, patterns);
+                self.tail.clear();
+            }
+        }
+        found |= contains_any(&self.tail, patterns);
+        let keep = patterns
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let drop = self.tail.len().saturating_sub(keep);
+        self.tail.drain(..drop);
+        found
+    }
+}
+
+#[cfg(test)]
+mod visible_text_tests {
+    use super::VisibleText;
+
+    fn feed_all(chunks: &[&[u8]], pattern: &str) -> bool {
+        let mut text = VisibleText::default();
+        let patterns = [pattern.to_string()];
+        chunks.iter().any(|chunk| text.feed(chunk, &patterns))
+    }
+
+    #[test]
+    fn a_pattern_split_across_chunks_and_styles_is_seen() {
+        assert!(feed_all(
+            &[b"\x1b[1mEND ", b"0", b"\x1b[0m04\r\n"],
+            "END 004"
+        ));
+        assert!(feed_all(&[b"END 0\x1b", b"[32", b"m04"], "END 004"));
+    }
+
+    #[test]
+    fn escape_strings_and_their_payloads_are_not_text() {
+        // A window title, a DCS and a charset designation carry no text.
+        assert!(!feed_all(&[b"\x1b]0;END 004\x07"], "END 004"));
+        assert!(!feed_all(&[b"\x1b]2;END ", b"004\x1b\\"], "END 004"));
+        assert!(!feed_all(&[b"\x1bPEND 004\x1b\\"], "END 004"));
+        assert!(feed_all(&[b"\x1b(BEND 004"], "END 004"));
+    }
+
+    #[test]
+    fn text_either_side_of_a_cursor_move_is_not_joined() {
+        assert!(!feed_all(&[b"END \x1b[2;1H004"], "END 004"));
+        assert!(!feed_all(&[b"END \x1b[1A", b"004"], "END 004"));
+        assert!(!feed_all(&[b"END \x1b8004"], "END 004"));
+        // A pattern completed before the move still counts.
+        assert!(feed_all(&[b"END 004\x1b[2J"], "END 004"));
+    }
+
+    #[test]
+    fn only_a_pattern_length_of_text_is_kept() {
+        let mut text = VisibleText::default();
+        let patterns = ["END 004".to_string()];
+        assert!(!text.feed(&[b'x'; 10_000], &patterns));
+        assert_eq!(text.tail.len(), "END 004".len() - 1);
+        assert!(!text.feed(b"END 00", &patterns));
+        assert!(text.feed(b"4", &patterns));
+    }
+}
+
+#[cfg(test)]
+mod output_watch_tests {
+    use super::*;
+    use pty_core::protocol::encode_data;
+
+    /// Once its deadline has passed the watch reads one chunk and returns,
+    /// however much output is waiting, so a flood cannot hold the wait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn past_its_deadline_the_watch_reads_one_chunk_and_returns() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        let packet = encode_data(&[b'y'; 1000]);
+        let mut written = 0;
+        while daemon.write_all(&packet).is_ok() {
+            written += packet.len();
+        }
+        assert!(
+            written > 4 * 16384,
+            "only {written} bytes fit in the socket"
+        );
+        let mut watch = OutputWatch {
+            socket: client,
+            reader: PacketReader::new(),
+            text: VisibleText::default(),
+            screen: String::new(),
+        };
+        assert_eq!(
+            watch.wait_until(Instant::now(), &["NEVER".to_string()]),
+            Watched::Quiet
+        );
+        watch.socket.set_nonblocking(true).unwrap();
+        let mut left = 0;
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = watch.socket.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            left += n;
+        }
+        assert!(
+            left >= written - 16384,
+            "read {} of {written} bytes",
+            written - left
+        );
     }
 }

@@ -380,6 +380,7 @@ Decided on 2026-08-29. Each row records the decision.
 | Registry files written owner-only (0600), temp files created 0600 at open | S | Kept as an extension. Records persist `extraEnv`/`sessionEnv` values; the file mode is set by the creating open (no create-then-chmod window). An existing session root keeps the mode its owner gave it — even a symlinked one — while a root this code creates is 0700. |
 | `up`/`down` and `pty.toml` | S | Kept. Already ported; the binding rule needs the tag pair. |
 | `queryStats` waiting out its 2 s timeout on a daemon that closes without STATUS, and `peek -f` hanging on a plain close | S | Not reproduced, on purpose. Both end promptly instead. Deliberate improvements, not gaps — accepted, decision 0006. |
+| `peek --wait` missing a pattern that scrolls off between two 200 ms screen reads | S | Not reproduced, on purpose. The wait also watches the output stream, and a timeout says when the pattern is in the scrollback from before the wait. Accepted, decision 0019. |
 
 ## 12c. What differs because the kernel differs
 
