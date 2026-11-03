@@ -279,6 +279,81 @@ fn peek_wait_times_out_with_the_exact_text() {
     );
 }
 
+/// The wait's first connection is its output watch. The marker arrives there
+/// in pieces, between styles, and no screen any connection is sent ever
+/// shows it, as when it is printed and scrolled away between two looks.
+#[test]
+fn peek_wait_sees_a_marker_that_only_the_output_carried() {
+    let d = FakeDaemon::bind("stream");
+    let listener = d.listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let (mut watch, _) = listener.accept().unwrap();
+        let first = packets(&read_chunk(&mut watch));
+        assert_eq!(decode_peek(&first[0].payload), (true, false));
+        std::thread::spawn(move || {
+            watch.write_all(&encode_screen(b"before")).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            watch.write_all(&encode_data(b"\x1b[1mEND ")).unwrap();
+            watch
+                .write_all(&encode_data(b"004\x1b[0m\r\nmore\r\n"))
+                .unwrap();
+            let _ = std::io::Read::read(&mut watch, &mut [0u8; 64]);
+        });
+        // Every other connection is a look at the screen.
+        while let Ok((mut s, _)) = listener.accept() {
+            let _ = read_chunk(&mut s);
+            let _ = s.write_all(&encode_screen(b"after"));
+        }
+    });
+    let started = std::time::Instant::now();
+    let got = peek_wait(&d.name, &["END 004".into()], 5.0, true).unwrap();
+    assert_eq!(got, "after");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A pattern in the scrollback but never seen while waiting was printed
+/// before the wait began; one that is nowhere never appeared.
+#[test]
+fn peek_wait_tells_a_missed_pattern_from_one_that_never_appeared() {
+    let d = FakeDaemon::bind("missed");
+    let listener = d.listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let (mut watch, _) = listener.accept().unwrap();
+        let _ = read_chunk(&mut watch);
+        watch.write_all(&encode_screen(b"on screen")).unwrap();
+        std::thread::spawn(move || {
+            let _ = std::io::Read::read(&mut watch, &mut [0u8; 64]);
+        });
+        while let Ok((mut s, _)) = listener.accept() {
+            let first = packets(&read_chunk(&mut s));
+            let (_, full) = decode_peek(&first[0].payload);
+            let screen: &[u8] = if full {
+                b"EARLY\non screen"
+            } else {
+                b"on screen"
+            };
+            let _ = s.write_all(&encode_screen(screen));
+        }
+    });
+    let err = peek_wait(&d.name, &["EARLY".into()], 0.5, true).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Timed out after 0.5s waiting for \"EARLY\".\n\
+         It is in the scrollback from before the wait began, no longer on screen."
+    );
+    let err = peek_wait(&d.name, &["NEVER".into()], 0.5, true).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Timed out after 0.5s waiting for \"NEVER\"."
+    );
+}
+
 fn write_exited_metadata(name: &str, last_lines: &[&str], exit_code: Option<i32>) {
     let json = serde_json::json!({
         "command": "sh",
