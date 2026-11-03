@@ -128,12 +128,15 @@ If either kernel identity cannot be read, startup fails before publication
 or child launch; it does not create an unmanageable Unknown-owned session.
 Both recorded identities must match for inventory to report Match. Linux also
 requires `/proc/<pid>/status` to identify the PID as its own thread-group leader.
-Missing boot identity or start token is Unknown, never Match. A reachable socket
-cannot rescue a mismatched or absent identity. Unknown keeps the named PID and
-conservatively lists as running unless an exit record proves the child exited;
-strict inventory remains incomplete. Unknown is not replacement or retirement
-authority. Metadata with no named PID and no PID/socket companions is Gone and
-removable.
+A PID held by a zombie (`Z` or `X` there, `SZOMB` on macOS) is Gone, whatever
+its start token says. The daemon has exited, and the PID cannot be reused until
+its parent reaps it, so the listing, `pty gc` and `pty kill` all treat it as a
+lost owner. Missing boot identity or start token is Unknown, never Match. A
+reachable socket cannot rescue a mismatched or absent identity. Unknown keeps
+the named PID and conservatively lists as running unless an exit record proves
+the child exited; strict inventory remains incomplete. Unknown is not
+replacement or retirement authority. Metadata with no named PID and no
+PID/socket companions is Gone and removable.
 
 **Legacy controls do not upgrade inventory proof.** Records without
 `daemonBootId` retain operation-specific pre-boot-publication checks, and every

@@ -11,11 +11,10 @@ use pty_core::ptyfile;
 use pty_core::registry::{
     self, DEFAULT_KEEP_MAX_AGE_MS, DaemonIdentityCheck, SessionInfo, SessionMetadata, TagMap,
     apply_metadata_diff, cleanup_all_while_locked, cleanup_socket, event_lock_path, events_path,
-    has_process_exited_for_reap, is_keep_expired, is_keep_requested, lock_or_refusal,
-    metadata_matches_observation, metadata_path, now_epoch_ms, output_activity_path,
-    parse_iso8601_ms, pid_alive, read_metadata, read_metadata_map, read_session_pid,
-    recovery_revision_path, session_dir, socket_path, update_tags, with_both_locks, write_metadata,
-    write_metadata_map,
+    is_keep_expired, is_keep_requested, lock_or_refusal, metadata_matches_observation,
+    metadata_path, now_epoch_ms, output_activity_path, parse_iso8601_ms, pid_alive, read_metadata,
+    read_metadata_map, read_session_pid, recovery_revision_path, session_dir, socket_path,
+    update_tags, with_both_locks, write_metadata, write_metadata_map,
 };
 use sha2::{Digest, Sha256};
 
@@ -840,22 +839,16 @@ fn respawn_params(name: &str, meta: &SessionMetadata) -> Result<(SpawnParams, bo
     Ok((params, ptyfile_reread))
 }
 
-/// A zombie is gone only after its recorded identity has matched. Socket
-/// existence/reachability and a missing read_pid_with result are never proof.
+/// The same identity `pty list` shows, so gc and the listing agree: a zombie
+/// daemon is already Gone there. Socket existence/reachability and a missing
+/// read_pid_with result are never proof.
 pub(crate) fn daemon_identity(name: &str, metadata: &SessionMetadata) -> DaemonIdentityCheck {
-    let sidecar = read_session_pid(name);
-    let check = registry::check_record_identity_in(
-        &registry::session_dir(), name, sidecar, Some(metadata),
-    );
-    if check == DaemonIdentityCheck::Match
-        && sidecar
-            .or(metadata.daemon_pid)
-            .is_some_and(has_process_exited_for_reap)
-    {
-        DaemonIdentityCheck::Gone
-    } else {
-        check
-    }
+    registry::check_record_identity_in(
+        &registry::session_dir(),
+        name,
+        read_session_pid(name),
+        Some(metadata),
+    )
 }
 
 pub(crate) fn known_owner_lost(check: DaemonIdentityCheck) -> bool {
@@ -1299,6 +1292,64 @@ mod tests {
                     .expect("owned child status")
                     .is_none()
             );
+        });
+    }
+
+    /// A daemon killed before it could write an exit record, whose parent
+    /// never reaps it. The listing called it running and gc never reached it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_sweeps_a_daemon_that_exited_unreaped() {
+        struct Fixture {
+            child: std::process::Child,
+            root: PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn owned child");
+        let pid = child.id() as i32;
+        let root = std::env::temp_dir().join(format!("ptygc-zombie-{}-{pid}", std::process::id()));
+        std::fs::create_dir(&root).expect("isolated registry");
+        let mut fixture = Fixture { child, root };
+        registry::with_root(&fixture.root, || {
+            let metadata = SessionMetadata {
+                generation: Some("killed-unreaped".into()),
+                daemon_pid: Some(pid),
+                daemon_start_token: registry::read_process_start_token(pid),
+                daemon_boot_id: registry::read_boot_id(),
+                cwd: "/".into(),
+                ..SessionMetadata::default()
+            };
+            registry::write_pid("killed", fixture.child.id()).expect("pid");
+            write_metadata("killed", &metadata).expect("metadata");
+            // The socket outlives the daemon, and nothing answers it.
+            drop(std::os::unix::net::UnixListener::bind(socket_path("killed")).expect("socket"));
+            let observed = registry::get_session_by_name("killed").expect("session");
+            assert!(observed.is_running(), "the live daemon is running");
+
+            fixture.child.kill().expect("kill owned child");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !registry::has_process_exited_for_reap(pid) {
+                assert!(Instant::now() < deadline, "the child never became a zombie");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let observed = registry::get_session_by_name("killed").expect("session");
+            assert_eq!(observed.status, registry::SessionStatus::Vanished);
+            assert_eq!(observed.identity, DaemonIdentityCheck::Gone);
+            assert_eq!(observed.pid, None);
+
+            let outcome = gc(GcOptions::default());
+            assert_eq!(outcome.removed, vec!["killed".to_string()]);
+            assert!(!metadata_path("killed").exists() && !socket_path("killed").exists());
+            assert!(registry::get_session_by_name("killed").is_none());
         });
     }
 

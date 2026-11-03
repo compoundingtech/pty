@@ -373,10 +373,19 @@ pub(super) fn current_boot_id() -> Option<String> {
 }
 
 pub(super) fn linux_thread_group(pid: i32) -> std::io::Result<Option<i32>> {
+    linux_leader_status(pid).map(|(tgid, _)| tgid)
+}
+
+/// The thread group and whether the process has exited unreaped: `Z`, or `X`
+/// while it is being reaped. One `/proc/<pid>/status` read answers both.
+fn linux_leader_status(pid: i32) -> std::io::Result<(Option<i32>, bool)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
-    Ok(status
-        .lines()
-        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok()))
+    let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name));
+    let tgid = field("Tgid:").and_then(|value| value.trim().parse().ok());
+    let exited = field("State:")
+        .map(str::trim_start)
+        .is_some_and(|state| state.starts_with('Z') || state.starts_with('X'));
+    Ok((tgid, exited))
 }
 
 // Caller has already proved Tgid == pid. Keep the common identity path to one
@@ -390,15 +399,24 @@ fn read_linux_leader_start_token(pid: i32) -> Option<String> {
 
 /// Prove a positive process-leader PID, start token, and boot identity.
 /// Missing evidence is never liveness or authority to replace a generation.
+///
+/// A zombie is Gone. Its parent has not reaped it yet, so it still holds the
+/// PID and still shows the start token, but whatever held that PID has exited
+/// and no daemon is left to serve the session. Read as a match, it kept a
+/// killed daemon listed as running and out of gc's reach for as long as its
+/// parent never waited for it.
 pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIdentityCheck {
     if pid <= 0 {
         record_daemon_identity_check(DaemonIdentityCheck::Gone);
         return DaemonIdentityCheck::Gone;
     }
     #[cfg(target_os = "linux")]
-    let result = match linux_thread_group(pid) {
-        Ok(Some(tgid)) if tgid != pid => DaemonIdentityCheck::Mismatch,
-        Ok(Some(_)) => check_daemon_identity_with(pid, metadata, read_linux_leader_start_token),
+    let result = match linux_leader_status(pid) {
+        Ok((Some(tgid), _)) if tgid != pid => DaemonIdentityCheck::Mismatch,
+        Ok((Some(_), true)) => DaemonIdentityCheck::Gone,
+        Ok((Some(_), false)) => {
+            check_daemon_identity_with(pid, metadata, read_linux_leader_start_token)
+        }
         Err(error) if process_status_is_gone(&error) => DaemonIdentityCheck::Gone,
         _ => DaemonIdentityCheck::Unknown,
     };
@@ -406,6 +424,7 @@ pub fn check_daemon_identity(pid: i32, metadata: &SessionMetadata) -> DaemonIden
     let result = match crate::proctable::process(pid) {
         crate::proctable::Answer::NotPresent => DaemonIdentityCheck::Gone,
         crate::proctable::Answer::Unknown(_) => DaemonIdentityCheck::Unknown,
+        crate::proctable::Answer::Known(row) if row.is_zombie() => DaemonIdentityCheck::Gone,
         crate::proctable::Answer::Known(_) => {
             check_daemon_identity_with(pid, metadata, read_process_start_token)
         }
@@ -1527,6 +1546,55 @@ mod identity_observation_tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn a_daemon_that_exited_unreaped_is_gone_not_a_match() {
+        if skip_without_start_token() {
+            return;
+        }
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let metadata = SessionMetadata {
+            daemon_pid: Some(pid),
+            daemon_start_token: read_process_start_token(pid),
+            daemon_boot_id: read_boot_id(),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_daemon_identity(pid, &metadata),
+            DaemonIdentityCheck::Match
+        );
+
+        // Killed and never waited for: the zombie keeps the PID and the token.
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            crate::proctable::has_exited(pid),
+            crate::proctable::Answer::Known(true)
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            check_daemon_identity(pid, &metadata),
+            DaemonIdentityCheck::Gone
+        );
+        assert_eq!(
+            check_record_identity(Some(pid), Some(&metadata)),
+            DaemonIdentityCheck::Gone,
+        );
+        child.wait().unwrap();
+        assert_eq!(
+            check_daemon_identity(pid, &metadata),
+            DaemonIdentityCheck::Gone
+        );
     }
 
     #[test]
