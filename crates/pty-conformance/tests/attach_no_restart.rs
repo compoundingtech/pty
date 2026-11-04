@@ -221,7 +221,10 @@ fn auto_restart_relaunches_without_prompting() {
 fn expect_unanswered(rig: &Rig, out: &Out, id: &str, marker: &Path) {
     expect_status(out, 1);
     expect_contains(&out.stdout(), "Restart? [Y/n]");
-    expect_contains(&out.stderr(), &format!("Session \"{id}\" was not restarted"));
+    expect_contains(
+        &out.stderr(),
+        &format!("Session \"{id}\" was not restarted"),
+    );
     expect_contains(&out.stderr(), "pass -r");
     assert_eq!(invocation_count(marker), 1);
     let kept = rig.meta(id).expect("the exited record is kept");

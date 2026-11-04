@@ -105,13 +105,23 @@ pub fn run(args: &[String]) -> CliResult {
         return Ok(1);
     }
 
-    if session.status == SessionStatus::Running
-        && !yes
-        && ask::declined(&ask::ask(&format!(
+    if session.status == SessionStatus::Running && !yes {
+        match ask::ask_consent(&format!(
             "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        )))
-    {
-        return Ok(0);
+        )) {
+            ask::Consent::Yes => {}
+            ask::Consent::No => return Ok(0),
+            // Nobody said yes, so the running session is left alone
+            // (decision 0020).
+            ask::Consent::NoAnswer => {
+                println!();
+                eprintln!(
+                    "pty restart: Session \"{name}\" was not restarted: the restart prompt got no answer."
+                );
+                eprintln!("  Answer y, or pass -y to restart it without asking.");
+                return Ok(1);
+            }
+        }
     }
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
