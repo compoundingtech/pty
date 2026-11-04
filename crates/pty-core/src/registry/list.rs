@@ -449,6 +449,8 @@ pub enum ControlIdentityCheck {
 /// Keep modern records on the full identity check. Only absent boot evidence
 /// permits the pre-boot-ID control policy, never present but invalid evidence,
 /// and that policy needs a recorded start token: a PID alone is not authority.
+/// A zombie is Gone under either policy, as in [`check_daemon_identity`]: it
+/// still shows the recorded start token, but no daemon is left behind it.
 pub fn check_control_identity(pid: i32, metadata: &SessionMetadata) -> ControlIdentityCheck {
     if metadata.daemon_boot_id.is_some() {
         return match check_daemon_identity(pid, metadata) {
@@ -465,9 +467,10 @@ pub fn check_control_identity(pid: i32, metadata: &SessionMetadata) -> ControlId
         return ControlIdentityCheck::Mismatch;
     }
     #[cfg(target_os = "linux")]
-    match linux_thread_group(pid) {
-        Ok(Some(tgid)) if tgid != pid => ControlIdentityCheck::Mismatch,
-        Ok(Some(_)) => {
+    match linux_leader_status(pid) {
+        Ok((Some(tgid), _)) if tgid != pid => ControlIdentityCheck::Mismatch,
+        Ok((Some(_), true)) => ControlIdentityCheck::Gone,
+        Ok((Some(_), false)) => {
             check_legacy_control_identity_with(pid, metadata, read_linux_leader_start_token)
         }
         Err(error) if process_status_is_gone(&error) => ControlIdentityCheck::Gone,
@@ -477,6 +480,7 @@ pub fn check_control_identity(pid: i32, metadata: &SessionMetadata) -> ControlId
     match crate::proctable::process(pid) {
         crate::proctable::Answer::NotPresent => ControlIdentityCheck::Gone,
         crate::proctable::Answer::Unknown(_) => ControlIdentityCheck::Unknown,
+        crate::proctable::Answer::Known(row) if row.is_zombie() => ControlIdentityCheck::Gone,
         crate::proctable::Answer::Known(_) => {
             check_legacy_control_identity_with(pid, metadata, read_process_start_token)
         }
@@ -1682,6 +1686,57 @@ mod control_identity_tests {
         let pid = std::process::id() as i32;
         metadata.daemon_pid = Some(pid + 1);
         assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Mismatch);
+    }
+
+    #[test]
+    fn a_legacy_daemon_that_exited_unreaped_is_gone_not_verified() {
+        if crate::registry::list::skip_without_start_token() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pty-legacy-zombie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut metadata = legacy_record();
+        metadata.daemon_pid = Some(pid);
+        metadata.daemon_start_token = read_process_start_token(pid);
+        assert_eq!(
+            check_control_identity(pid, &metadata),
+            ControlIdentityCheck::LegacyVerified
+        );
+        // The target attach and child signals resolve.
+        assert_eq!(
+            read_explicit_control_target_in(&root, "legacy", Some(&metadata), true),
+            Some(pid)
+        );
+
+        // Killed and never waited for: the zombie keeps the PID and the token.
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            crate::proctable::has_exited(pid),
+            crate::proctable::Answer::Known(true)
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(read_process_start_token(pid), metadata.daemon_start_token);
+        assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Gone);
+        assert_eq!(
+            read_explicit_control_target_in(&root, "legacy", Some(&metadata), true),
+            None
+        );
+        child.wait().unwrap();
+        assert_eq!(check_control_identity(pid, &metadata), ControlIdentityCheck::Gone);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
