@@ -297,3 +297,40 @@ f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22 exceeded the five-second \
 harness deadline in CI run 40986814385. Remove when Node honors the quiet \
 session-first timeout.
 """
+
+[[divergence]]
+test = "attach_no_restart::a_restart_prompt_at_eof_declines"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0020: attach's dead-session prompt at EOF declines, exits 1 and \
+names -r. Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 restarts \
+nothing there either, but its readline question never resolves and it exits \
+0 after the prompt, measured on Node 22.23.2 and 24.18.0 on Linux. Remove \
+this entry if Node exits 1 there, or if Rust drops the decision.
+"""
+
+[[divergence]]
+test = "attach_no_restart::a_restart_prompt_off_a_terminal_needs_a_yes"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0020: with stdin not a terminal, only y or yes restarts a dead \
+session from attach's prompt. Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 restarts on any line but a lone n, \
+so a piped empty line or relayed input reruns the stored command, measured \
+on Node 22.23.2 on Linux. Remove this entry if Node requires an explicit \
+answer, or if Rust drops the decision.
+"""
+
+[[divergence]]
+test = "attach_no_restart::force_is_not_an_answer_to_the_restart_prompt"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0020: --force answers nothing, so attach --force at EOF declines, \
+exits 1 and names -r. Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 \
+also restarts nothing there but exits 0 after the prompt, measured on Node \
+22.23.2 on Linux. The test's piped-y half restarts on both. Remove this \
+entry with the EOF entry above.
+"""
