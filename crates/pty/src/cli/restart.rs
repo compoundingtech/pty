@@ -105,11 +105,24 @@ pub fn run(args: &[String]) -> CliResult {
         return Ok(1);
     }
 
+    let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
+    params.display_command = meta.display_command.clone();
+    params.cwd = meta.cwd.clone();
+    // An explicit retry drops flapping bookkeeping, never launch provenance.
+    params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
+    params.display_name = meta.display_name.clone();
+    apply_persisted_launch_options(&mut params, &meta);
+    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
+    // Refuse a revoked or unverifiable launch before asking, and so before
+    // stopping the survivor.
+    pty_lifecycle::config_for(&params).check_publication()?;
+
     if session.status == SessionStatus::Running && !yes {
         match ask::ask_consent(&format!(
             "Session \"{name}\" is running. Kill and restart? [Y/n] "
         )) {
-            ask::Consent::Yes => {}
+            // An answer can take any time, so check again before the stop.
+            ask::Consent::Yes => pty_lifecycle::config_for(&params).check_publication()?,
             ask::Consent::No => return Ok(0),
             // Nobody said yes, so the running session is left alone
             // (decision 0020).
@@ -123,16 +136,6 @@ pub fn run(args: &[String]) -> CliResult {
             }
         }
     }
-    let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
-    params.display_command = meta.display_command.clone();
-    params.cwd = meta.cwd.clone();
-    // An explicit retry drops flapping bookkeeping, never launch provenance.
-    params.tags = registry::strip_gc_bookkeeping(meta.tags.as_ref()).unwrap_or_default();
-    params.display_name = meta.display_name.clone();
-    apply_persisted_launch_options(&mut params, &meta);
-    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    // Refuse a revoked or unverifiable launch before stopping the survivor.
-    pty_lifecycle::config_for(&params).check_publication()?;
     let publisher = super::prepare_daemon(&mut params)?;
 
     if session.status == SessionStatus::Running {

@@ -70,6 +70,11 @@ and `  Answer y, or pass -y to restart it without asking.`, and exits 1.
 the worse case of the two, so the same rule applies. The old `ask`, which
 proceeded at EOF, is gone.
 
+A revoked or unverifiable managed launch is refused before the prompt, so
+`restart` never asks a question whose yes it would then refuse. After a yes it
+checks again before it stops the session, because the answer can take any
+time.
+
 **Test.** `crates/pty-conformance/tests/attach_no_restart.rs`:
 - `a_restart_prompt_at_eof_declines`,
   `a_restart_prompt_off_a_terminal_needs_a_yes` and
