@@ -383,6 +383,7 @@ Decided on 2026-08-29. Each row records the decision.
 | `peek --wait` missing a pattern that scrolls off between two 200 ms screen reads | S | Not reproduced, on purpose. The wait also watches the output stream, and a timeout says when the pattern is in the scrollback from before the wait. Accepted, decision 0019. |
 | `attach`'s dead-session prompt restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. Off a terminal only `y` or `yes` restarts, and EOF never does. With no answer, attach exits 1 and names `-r`, where Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
 | `restart`'s running-session prompt stopping and restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. The same rule as `attach`'s prompt: with no answer, `restart` exits 1 and leaves the session running, and names `-y`. Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
+| `no` at a restart prompt counting as yes | S | Not reproduced, on purpose. A lone `n` or `no`, in any case, declines `attach`'s and `restart`'s prompts and exits 0. Node declines only on a lone `n`. Accepted, decision 0020. |
 
 ## 12c. What differs because the kernel differs
 

@@ -302,3 +302,31 @@ fn force_is_not_an_answer_to_the_restart_prompt() {
     expect_contains(&out.stdout(), &format!("Session \"{id}\" restarted."));
     wait_until("second invocation", || invocation_count(&marker) == 2);
 }
+
+/// Decision 0020: `no` declines, at a terminal and off one, and exits 0 as
+/// `n` does. Node restarts on any line but a lone `n`.
+#[test]
+fn no_declines_the_restart_prompt() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "no-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    let mut t = rig.pty_tty_raw(&[], &[], &["attach", id], 30, 100);
+    assert!(
+        t.wait_for_text("Restart? [Y/n]", deadline()),
+        "no prompt: {}",
+        t.output_str()
+    );
+    t.write(b"no\r");
+    let code = t.wait_exit(Duration::from_secs(10)).expect("attach exits");
+    assert_eq!(code, 0, "{}", t.output_str());
+
+    let out = rig.pty_stdin(b"No\n", &["attach", id]);
+    expect_status(&out, 0);
+    expect_contains(&out.stdout(), "Restart? [Y/n]");
+
+    assert_eq!(invocation_count(&marker), 1);
+    let kept = rig.meta(id).expect("the exited record is kept");
+    assert_eq!(kept["exitCode"], 42, "{kept}");
+}

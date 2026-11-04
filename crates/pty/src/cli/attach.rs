@@ -228,6 +228,19 @@ fn handle_dead_session(name: &str, meta: Option<SessionMetadata>, auto_restart: 
     println!("Command was: {command}");
     println!();
 
+    // The record is checked unchanged under the locks below, so these
+    // parameters still describe it there.
+    let mut params = SpawnParams::new(name, &meta.command, &meta.args);
+    params.display_command = meta.display_command.clone();
+    params.cwd = meta.cwd.clone();
+    params.tags = meta.tags.clone().unwrap_or_default();
+    params.display_name = meta.display_name.clone();
+    apply_persisted_launch_options(&mut params, &meta);
+    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
+    // Refuse a revoked or unverifiable launch before asking, as `restart`
+    // does (decision 0020).
+    pty_lifecycle::config_for(&params).check_publication()?;
+
     if !auto_restart {
         match ask::ask_consent("Restart? [Y/n] ") {
             ask::Consent::Yes => {}
@@ -259,13 +272,7 @@ fn handle_dead_session(name: &str, meta: Option<SessionMetadata>, auto_restart: 
     if !registry::metadata_matches_observation(&meta, &current) {
         return Err(format!("Session \"{name}\" changed before restart.").into());
     }
-    let mut params = SpawnParams::new(name, &meta.command, &meta.args);
-    params.display_command = meta.display_command.clone();
-    params.cwd = meta.cwd.clone();
-    params.tags = meta.tags.clone().unwrap_or_default();
-    params.display_name = meta.display_name.clone();
-    apply_persisted_launch_options(&mut params, &meta);
-    params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
+    // Again under the locks: the answer can take any time.
     pty_lifecycle::config_for(&params).check_publication()?;
     let publisher = super::prepare_daemon(&mut params)?;
     params.creation_lock_delegate = Some(creation_guard.delegate().map_err(|error| error.to_string())?);

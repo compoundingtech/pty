@@ -75,6 +75,17 @@ A revoked or unverifiable managed launch is refused before the prompt, so
 checks again before it stops the session, because the answer can take any
 time.
 
+**Addendum: `no` declines.** At either prompt, a lone `n` or `no`, in any case,
+declines, at a terminal and off one, and exits 0. Node declines only on a lone
+`n`, so its `no` restarts the session; so did Rust's until this addendum.
+Someone who types `no` means no.
+
+**Addendum: `attach` checks publication first.** `attach` refuses a revoked
+or unverifiable managed launch before its `Restart? [Y/n]`, as `restart` does,
+so it never asks a question whose yes it would then refuse. With `-r`, with no
+answer and with `y`, the refusal is the same. The check runs again under the
+locks before the restart, after the answer.
+
 **Test.** `crates/pty-conformance/tests/attach_no_restart.rs`:
 - `a_restart_prompt_at_eof_declines`,
   `a_restart_prompt_off_a_terminal_needs_a_yes` and
@@ -91,6 +102,13 @@ time.
 - `a_piped_yes_restarts_a_running_session` and
   `yes_flag_restarts_without_a_terminal` pass on both.
 
+`no_declines_the_restart_prompt` (attach) and
+`no_leaves_the_running_session_alone` (restart) type `no` at a terminal and
+pipe it off one. Both fail on Node and are recorded as intended.
+`crates/pty/tests/publication_fence.rs`:
+`attach_refuses_a_revoked_dead_session_before_asking` and
+`attach_still_restarts_a_dead_managed_session_that_is_not_revoked`.
+
 The unit test `consent_needs_an_answer_and_off_a_terminal_a_yes` in
 `crates/pty/src/cli/ask.rs` covers each answer at a terminal and off one.
 
@@ -102,4 +120,5 @@ answer. That covers stdin at EOF, and stdin that is not a terminal unless it
 gives `y` or `yes`. They exit 1 instead: `attach` without running the stored
 command, `restart` without stopping the running session. Any script or seat
 that relied on either restarting non-interactively must pass `-r` to
-`attach` or `-y` to `restart` now.
+`attach` or `-y` to `restart` now. `no` now declines either prompt, as `n`
+does.
