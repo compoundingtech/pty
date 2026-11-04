@@ -190,7 +190,11 @@ fn cmd_events(
         }
         check_wait_target(name, wait_type)?;
         exit_zero_on_sigint();
-        let (_follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.to_string()]));
+        let options = FollowerOptions {
+            stop_on_vanished: wait_type == pty_core::events::event_type::SESSION_EXIT,
+            ..FollowerOptions::names(vec![name.to_string()])
+        };
+        let (_follower, rx) = EventFollower::channel(options);
         // Close the state-read/subscribe race, including removal before the
         // follower observed the registry entry.
         if print_recorded_exit(name, wait_type, json) {
@@ -227,6 +231,7 @@ fn cmd_events(
                     if print_recorded_exit(name, wait_type, json) {
                         return Ok(0);
                     }
+                    check_wait_target(name, wait_type)?;
                     eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
                     return Ok(1);
                 }

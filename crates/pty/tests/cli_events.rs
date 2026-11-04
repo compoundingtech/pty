@@ -334,3 +334,47 @@ fn follower_exits_after_a_real_session_ends() {
     let out = finish_within(child, Duration::from_secs(3));
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+#[test]
+fn lifecycle_wait_returns_promptly_when_a_live_daemon_vanishes() {
+    let rig = Rig::new();
+    rig.spawn_cat("vanishing", &[]);
+    let pid: i32 = std::fs::read_to_string(rig.path("vanishing.pid"))
+        .unwrap().trim().parse().unwrap();
+    let mut child = rig.cmd(&[
+        "events", "vanishing", "--wait", "session_exit", "--timeout", "3600",
+    ]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // Let the wait subscribe while the source-built test daemon is alive.
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(child.try_wait().unwrap().is_none());
+    pty_core::kill::process(pid, libc::SIGKILL).unwrap();
+    let started = Instant::now();
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("vanished without a recorded exit"));
+    // A wall-clock bound far below --timeout also bounds the duration of
+    // any possible scan loop after the daemon disappears.
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let child = rig.cmd(&[
+        "events", "vanishing", "--wait", "session_exit", "--timeout", "3600",
+    ]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("vanished without a recorded exit"));
+}
+
+#[test]
+fn lifecycle_wait_deadline_fires_while_a_real_session_keeps_running() {
+    let rig = Rig::new();
+    rig.spawn_cat("never-exits", &[]);
+    let started = Instant::now();
+    let child = rig.cmd(&[
+        "events", "never-exits", "--wait", "session_exit", "--timeout", "0.5",
+    ]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("Timed out after 0.5s waiting for \"session_exit\" event."));
+}
