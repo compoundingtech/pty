@@ -166,6 +166,60 @@ fn restart_refuses_revoked_binding_before_stopping_survivor() {
     before.assert_unchanged(&rig, "survivor");
 }
 
+/// A managed session that ran once, appending a line to `marker`, and ended
+/// with its record kept.
+fn ended_managed(rig: &Rig, name: &str, root: &str, operation: &str, digest: &str, marker: &std::path::Path) {
+    let started = rig.run(&["run", "-d", "--force", "--id", name,
+        "--publication-operation", operation, "--publication-binding", digest,
+        "--publication-root-id", root, "--tag", "keep=true",
+        "--tag", &format!("st3.start-operation={operation}"),
+        "--", "/bin/sh", "-c", "printf 'ran\\n' >> \"$1\"", "sh", marker.to_str().unwrap()]);
+    assert_eq!(started.code, 0, "{}", started.stderr);
+    wait_until("the session to end", || {
+        rig.read_meta(name).is_some_and(|meta| meta.get("exitedAt").is_some())
+            && !rig.exists(&format!("{name}.sock"))
+    });
+}
+
+fn runs(marker: &std::path::Path) -> usize {
+    std::fs::read_to_string(marker).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+#[test]
+fn attach_refuses_a_revoked_dead_session_before_asking() {
+    let rig = rig();
+    let root = identity(&rig);
+    let marker = rig.scratch.join("ended-runs");
+    ended_managed(&rig, "ended", &root, OLD, DIGEST, &marker);
+    assert_eq!(runs(&marker), 1);
+    rig.ok(&install_args("ended", &root));
+    let before = std::fs::read(rig.path("ended.json")).unwrap();
+    for (label, out) in [
+        ("no answer", rig.run(&["attach", "ended"])),
+        ("y", rig.run_stdin(&["attach", "ended"], "y\n")),
+        ("-r", rig.run(&["attach", "-r", "ended"])),
+    ] {
+        assert_eq!(out.code, 1, "{label}: {}", out.stderr);
+        assert!(out.stderr.contains("operation-revoked"), "{label}: {}", out.stderr);
+        assert!(!out.stdout.contains("Restart?"), "{label} was asked: {}", out.stdout);
+        assert_eq!(std::fs::read(rig.path("ended.json")).unwrap(), before, "{label}");
+        assert!(!rig.exists("ended.sock"), "{label} started a daemon");
+    }
+    assert_eq!(runs(&marker), 1);
+}
+
+#[test]
+fn attach_still_restarts_a_dead_managed_session_that_is_not_revoked() {
+    let rig = rig();
+    let root = identity(&rig);
+    let marker = rig.scratch.join("ended-runs");
+    ended_managed(&rig, "ended", &root, NEW, NEW_DIGEST, &marker);
+    let out = rig.run_stdin(&["attach", "ended"], "y\n");
+    assert!(out.stdout.contains("Restart? [Y/n]"), "{}", out.stdout);
+    assert!(out.stdout.contains("Session \"ended\" restarted."), "{}\n{}", out.stdout, out.stderr);
+    wait_until("the second run", || runs(&marker) == 2);
+}
+
 #[test]
 fn immutable_launch_provenance_cannot_be_forged_through_metadata_or_tags() {
     let rig = rig();

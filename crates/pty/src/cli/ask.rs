@@ -2,9 +2,9 @@
 //! stdout, read one line from stdin, and count only an answer someone gave
 //! (decision 0020).
 //!
-//! Node's `readline` prompt has no tty check, and only a lone `n` declines.
-//! At EOF its question never resolves, and the process exits 0 having done
-//! nothing.
+//! Node's `readline` prompt has no tty check, and only a lone `n` declines;
+//! here `no` declines too. At EOF Node's question never resolves, and the
+//! process exits 0 having done nothing.
 //!
 //! node: src/cli.ts:4069-4078 (`ask`), 3922-3926 and 1836-1840 (callers).
 
@@ -12,25 +12,24 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 
-/// Did the answer decline? Node compares `answer.toLowerCase() === "n"`
-/// (the restart prompts) — only a lone `n`/`N` says no; anything else,
-/// including an empty line, proceeds.
+/// Did the answer decline? A lone `n` or `no`, in any case. Node compares
+/// `answer.toLowerCase() === "n"`, so its `no` proceeds (decision 0020).
 pub fn declined(answer: &str) -> bool {
-    answer.to_lowercase() == "n"
+    matches!(answer.to_lowercase().as_str(), "n" | "no")
 }
 
 /// What a restart prompt was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consent {
     Yes,
-    /// A lone `n`.
+    /// A lone `n` or `no`.
     No,
     /// Stdin was at EOF, or is not a terminal and did not say `y` or `yes`.
     NoAnswer,
 }
 
 /// Print `prompt` (no newline) and read one line, counting only an answer.
-/// At a terminal, as in Node, anything but a lone `n` says yes, an empty line
+/// At a terminal, as in Node, anything but a decline says yes, an empty line
 /// included. Anywhere else only `y` or `yes` does. EOF is never an answer.
 pub fn ask_consent(prompt: &str) -> Consent {
     let answer = read_answer(prompt);
@@ -72,14 +71,17 @@ mod tests {
     use super::{Consent, consent, declined};
 
     #[test]
-    fn only_a_lone_n_declines() {
-        assert!(declined("n"));
-        assert!(declined("N"));
-        assert!(!declined(""));
-        assert!(!declined("y"));
-        assert!(!declined("no"));
+    fn a_lone_n_or_no_declines() {
+        for no in ["n", "N", "no", "No", "NO"] {
+            assert!(declined(no), "{no:?}");
+        }
+        for other in ["", "y", "nope", "no thanks", " n"] {
+            assert!(!declined(other), "{other:?}");
+        }
     }
 
+    /// `attach`'s dead-session prompt and `restart`'s running-session prompt
+    /// both ask through [`super::ask_consent`], so this covers both.
     #[test]
     fn consent_needs_an_answer_and_off_a_terminal_a_yes() {
         for terminal in [true, false] {
@@ -88,7 +90,7 @@ mod tests {
                 Consent::NoAnswer,
                 "terminal={terminal}"
             );
-            for no in ["n", "N"] {
+            for no in ["n", "N", "no", "No", "NO"] {
                 assert_eq!(
                     consent(Some(no), terminal),
                     Consent::No,
@@ -103,7 +105,7 @@ mod tests {
                 );
             }
         }
-        for other in ["", "no", "future-relay-input"] {
+        for other in ["", "nope", "future-relay-input"] {
             assert_eq!(
                 consent(Some(other), true),
                 Consent::Yes,

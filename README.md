@@ -498,12 +498,14 @@ is refused the same way, before any restart prompt: a restart waits for proof
 that the daemon is gone, and a live legacy daemon cannot give it.
 
 **A dead session restarts only on an answer.** `attach` on a session that has
-exited shows its last lines and asks `Restart? [Y/n]`. At a terminal, Enter
-restarts it. Without one, only `y` or `yes` does. At EOF, or on any other
+exited shows its last lines and asks `Restart? [Y/n]`. A lone `n` or `no`
+declines, and attach exits 0. At a terminal any other line restarts it, Enter
+included. Without a terminal only `y` or `yes` does. At EOF, or on any other
 input, attach exits 1 and the stored command does not run. `-r` restarts
 without asking, `--no-restart` never restarts, and `--force` answers nothing.
+A revoked managed launch is refused before the question is asked.
 `restart` asks `Kill and restart? [Y/n]` before it stops a running session,
-by the same rule: with no answer it exits 1 and leaves the session running,
+by the same rules: with no answer it exits 1 and leaves the session running,
 and `-y` restarts without asking. The Node tool differs here
 ([decision 0020](docs/decisions/0020-an-unanswered-restart-prompt-does-not-restart.md)).
 

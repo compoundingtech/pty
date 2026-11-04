@@ -359,3 +359,27 @@ and restarts it on any line but a lone n, a piped empty line included, \
 measured on Node 22.23.2 on Linux. Remove this entry if Node requires an \
 explicit answer, or if Rust drops the decision.
 """
+
+[[divergence]]
+test = "attach_no_restart::no_declines_the_restart_prompt"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0020: a lone n or no, in any case, declines attach's dead-session \
+prompt at a terminal and off one, and exits 0. Pinned Node \
+f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 declines only on a lone n \
+(answer.toLowerCase() === "n"), so no restarts the session. Remove this entry \
+if Node declines on no, or if Rust drops the decision.
+"""
+
+[[divergence]]
+test = "restart_prompt::no_leaves_the_running_session_alone"
+side = "node"
+kind = "intended"
+reason = """
+Decision 0020: a lone n or no, in any case, declines restart's running-session \
+prompt at a terminal and off one, exits 0 and leaves the session running. \
+Pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 declines only on a lone \
+n, so no stops and restarts the session. Remove this entry if Node declines \
+on no, or if Rust drops the decision.
+"""

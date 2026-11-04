@@ -9,6 +9,7 @@
 
 use pty_conformance::*;
 use std::path::Path;
+use std::time::Duration;
 
 const OUTER: (&str, &str) = ("PTY_SESSION", "outer");
 
@@ -103,4 +104,32 @@ fn yes_flag_restarts_without_a_terminal() {
     expect_not_contains(&out.stdout(), "Kill and restart?");
     expect_contains(&out.stdout(), &format!("Session \"{id}\" restarted."));
     wait_until("second start", || start_count(&marker) == 2);
+}
+
+/// Decision 0020: `no` declines, at a terminal and off one, exits 0 and
+/// leaves the session running. Node restarts on any line but a lone `n`.
+#[test]
+fn no_leaves_the_running_session_alone() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("starts");
+    let id = "no-running";
+    let pid = spawn_running(&rig, id, &marker);
+
+    let mut t = rig.pty_tty_raw(&[OUTER], &[], &["restart", id], 30, 100);
+    assert!(
+        t.wait_for_text("Kill and restart? [Y/n]", deadline()),
+        "no prompt: {}",
+        t.output_str()
+    );
+    t.write(b"no\r");
+    let code = t.wait_exit(Duration::from_secs(10)).expect("restart exits");
+    assert_eq!(code, 0, "{}", t.output_str());
+
+    let out = rig.pty_stdin_env(b"NO\n", &[OUTER], &["restart", id]);
+    expect_status(&out, 0);
+    expect_contains(&out.stdout(), "Kill and restart? [Y/n]");
+
+    assert!(pid_alive(pid), "daemon {pid} was stopped");
+    assert_eq!(rig.pid(id), Some(pid), "the session has a new daemon");
+    assert_eq!(start_count(&marker), 1);
 }
