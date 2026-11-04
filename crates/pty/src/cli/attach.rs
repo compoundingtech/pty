@@ -228,8 +228,21 @@ fn handle_dead_session(name: &str, meta: Option<SessionMetadata>, auto_restart: 
     println!("Command was: {command}");
     println!();
 
-    if !auto_restart && super::ask::declined(&ask::ask("Restart? [Y/n] ")) {
-        return Ok(0);
+    if !auto_restart {
+        match ask::ask_consent("Restart? [Y/n] ") {
+            ask::Consent::Yes => {}
+            ask::Consent::No => return Ok(0),
+            // Nobody said yes, so the stored command does not run again
+            // (decision 0020).
+            ask::Consent::NoAnswer => {
+                println!();
+                eprintln!(
+                    "pty attach: Session \"{name}\" was not restarted: the restart prompt got no answer."
+                );
+                eprintln!("  Answer y, or pass -r to restart it without asking.");
+                return Ok(1);
+            }
+        }
     }
 
     // An exited session's daemon can still be finishing, and it needs the

@@ -4,6 +4,8 @@
 //! default policy prompts `Restart? [Y/n]` and `--auto-restart` re-launches
 //! without asking. The terminal cases run the CLI inside a real pty
 //! (`Rig::pty_tty_raw`) with the same 30×100 geometry the Node test uses.
+//! The cases after them have no terminal: there the prompt restarts only on a
+//! `y`, which departs from Node (decision 0020).
 
 use pty_conformance::*;
 use serde_json::Value;
@@ -212,4 +214,88 @@ fn auto_restart_relaunches_without_prompting() {
     wait_until("second invocation", || invocation_count(&marker) == 2);
     assert_eq!(invocation_count(&marker), 2);
     assert_eq!(event_count(&rig, id, "session_start"), 1);
+}
+
+/// An attach that the prompt declined for want of an answer: exit 1, a way to
+/// restart named, and the old record left in place for a later answer.
+fn expect_unanswered(rig: &Rig, out: &Out, id: &str, marker: &Path) {
+    expect_status(out, 1);
+    expect_contains(&out.stdout(), "Restart? [Y/n]");
+    expect_contains(&out.stderr(), &format!("Session \"{id}\" was not restarted"));
+    expect_contains(&out.stderr(), "pass -r");
+    assert_eq!(invocation_count(marker), 1);
+    let kept = rig.meta(id).expect("the exited record is kept");
+    assert_eq!(kept["exitCode"], 42, "{kept}");
+}
+
+/// Decision 0020: stdin at EOF answers nothing, so the stored command does
+/// not run again.
+#[test]
+fn a_restart_prompt_at_eof_declines() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "eof-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    let out = rig.pty(&["attach", id]);
+    expect_unanswered(&rig, &out, id, &marker);
+}
+
+/// Decision 0020: off a terminal, only `y` or `yes` restarts. An empty line,
+/// which says yes at a terminal, does not.
+#[test]
+fn a_restart_prompt_off_a_terminal_needs_a_yes() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "piped-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    for input in [&b"\n"[..], b"future-relay-input\n"] {
+        let out = rig.pty_stdin(input, &["attach", id]);
+        expect_unanswered(&rig, &out, id, &marker);
+    }
+}
+
+/// A piped `y` is an answer: the session restarts, as at a terminal.
+#[test]
+fn a_piped_yes_restarts() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "yes-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    let out = rig.pty_stdin(b"y\n", &["attach", id]);
+    expect_contains(&out.stdout(), &format!("Session \"{id}\" restarted."));
+    wait_until("second invocation", || invocation_count(&marker) == 2);
+}
+
+/// `-r` restarts without a terminal and without asking.
+#[test]
+fn auto_restart_needs_no_terminal() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "auto-piped-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    let out = rig.pty(&["attach", "-r", id]);
+    expect_not_contains(&out.stdout(), "Restart?");
+    expect_contains(&out.stdout(), &format!("Session \"{id}\" restarted."));
+    wait_until("second invocation", || invocation_count(&marker) == 2);
+}
+
+/// `--force` only allows nesting. It answers nothing, and a `y` after it still
+/// restarts.
+#[test]
+fn force_is_not_an_answer_to_the_restart_prompt() {
+    let rig = Rig::new();
+    let marker = rig.tmp().join("invocations");
+    let id = "force-target";
+    spawn_retained_once(&rig, id, &marker);
+
+    let out = rig.pty(&["attach", "--force", id]);
+    expect_unanswered(&rig, &out, id, &marker);
+
+    let out = rig.pty_stdin(b"y\n", &["attach", "--force", id]);
+    expect_contains(&out.stdout(), &format!("Session \"{id}\" restarted."));
+    wait_until("second invocation", || invocation_count(&marker) == 2);
 }
