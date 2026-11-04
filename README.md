@@ -493,6 +493,9 @@ and start token verify against the live leader, using the same legacy authority
 as explicit controls such as `kill`. Missing, unreadable or mismatching tokens
 remain refused; `--force` never bypasses identity verification. This does not
 write a synthetic `daemonBootId` or upgrade the session's inventory identity.
+A legacy record that already has an exit while its daemon is still finishing
+is refused the same way, before any restart prompt: a restart waits for proof
+that the daemon is gone, and a live legacy daemon cannot give it.
 
 `run` and `restart` are different and deliberately so: from inside a session
 `run` runs the command directly and `restart` restarts without attaching.

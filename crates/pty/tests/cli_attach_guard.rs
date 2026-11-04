@@ -118,6 +118,47 @@ fn legacy_attach_without_matching_token_never_reaches_transport_even_with_force(
 }
 
 #[test]
+fn legacy_exit_with_a_live_daemon_is_refused_before_the_restart_prompt() {
+    let rig = Rig::new();
+    let pid = std::process::id() as i32;
+    let rerun = rig.scratch.join("rerun");
+    // The exit is written and the verified legacy daemon is still finishing.
+    rig.write_meta(
+        "finishing",
+        json!({
+            "generation": "063ff7f9-style",
+            "daemonPid": pid,
+            "daemonStartToken": pty_core::registry::read_process_start_token(pid).unwrap(),
+            "command": "sh",
+            "args": ["-c", "touch \"$1\"", "rerun", rerun],
+            "exitedAt": "2026-11-04T00:00:00.000Z",
+            "exitCode": 0,
+        }),
+    );
+    std::fs::write(rig.path("finishing.pid"), pid.to_string()).unwrap();
+    let before = std::fs::read(rig.path("finishing.json")).unwrap();
+    // A closed stdin reads as yes to the prompt, and -r never asks.
+    for out in [
+        rig.run(&["attach", "finishing"]),
+        rig.run_stdin(&["attach", "finishing"], "y\n"),
+        rig.run(&["attach", "-r", "finishing"]),
+        rig.run(&["attach", "--force", "finishing"]),
+    ] {
+        assert_eq!(out.code, 1, "{out:?}");
+        assert!(
+            out.stderr
+                .contains("refusing session \"finishing\": daemon identity is unknown"),
+            "{out:?}"
+        );
+        let shown = format!("{}{}", out.stdout, out.stderr);
+        assert!(!shown.contains("Restart?"), "{out:?}");
+        assert!(!shown.contains("exited with code"), "{out:?}");
+    }
+    assert!(!rerun.exists());
+    assert_eq!(std::fs::read(rig.path("finishing.json")).unwrap(), before);
+}
+
+#[test]
 fn auto_restart_revoked_binding_preserves_retained_artifacts_without_running_child() {
     for retained_socket in [false, true] {
         let rig = Rig::new();
