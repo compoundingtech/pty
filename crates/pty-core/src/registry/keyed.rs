@@ -1309,6 +1309,41 @@ mod tests {
         }
     }
 
+    /// A socket that refuses every connect, as `registry_support::stale_socket`
+    /// makes for the integration tests: bound and never listened on. A dropped
+    /// `UnixListener` can still accept, because a child that another test
+    /// thread is spawning holds a copy of it from its fork until its exec.
+    fn stale_socket(path: &Path) {
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+        // SAFETY: plain socket calls on a descriptor this function owns and
+        // closes; `addr` is zeroed and `bytes` fits with its terminating NUL.
+        let (rc, err) = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert!(
+                bytes.len() < addr.sun_path.len(),
+                "{} is too long",
+                path.display()
+            );
+            for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            let rc = libc::bind(
+                fd,
+                (&raw const addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            (rc, err)
+        };
+        assert_eq!(rc, 0, "bind {}: {err}", path.display());
+        let refused = std::os::unix::net::UnixStream::connect(path).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
     fn listed(root: &Root) -> SessionInfo {
         super::super::list::list_sessions_in(&root.0, &ListOptions::default())
             .into_iter()
@@ -1368,6 +1403,9 @@ mod tests {
             (SessionStatus::Running, DaemonIdentityCheck::Unknown)
         );
         drop(listener);
+        let socket = socket_path_in(&root.0, "target");
+        std::fs::remove_file(&socket).unwrap();
+        stale_socket(&socket);
         // A refusing socket still lists as Running; this observer cannot
         // prove the record either way, so it fails closed.
         assert_eq!(listed(&root).status, SessionStatus::Running);
