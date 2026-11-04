@@ -975,18 +975,21 @@ mod tests {
         let token = id.start_token.clone();
         let cap = Duration::from_millis(5);
 
+        // How many reads fit in the cap is up to the scheduler: a loaded core
+        // can sleep past all of it after the first. The next case shows that
+        // it reads again.
         let started = Instant::now();
-        let reads = std::cell::Cell::new(0);
         let still_exiting = id.liveness_after_exit_with(Some("boot"), cap, || {
-            reads.set(reads.get() + 1);
             ProcTable::from_rows(vec![row("E", &token)])
         });
         assert_eq!(still_exiting, Liveness::Unknown("exiting"));
         assert!(started.elapsed() >= cap, "it waited out the cap");
-        assert!(reads.get() > 1, "and read again in between");
 
+        // This case is about stopping at the zombie, not about the cap. On a
+        // loaded core one of the sleeps between reads can outlast a short cap.
+        let ample = Duration::from_secs(10);
         let reads = std::cell::Cell::new(0);
-        let zombie_in_time = id.liveness_after_exit_with(Some("boot"), cap, || {
+        let zombie_in_time = id.liveness_after_exit_with(Some("boot"), ample, || {
             reads.set(reads.get() + 1);
             let state = if reads.get() < 3 { "E" } else { "Z" };
             ProcTable::from_rows(vec![row(state, &token)])
