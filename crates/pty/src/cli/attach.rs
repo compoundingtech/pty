@@ -145,7 +145,11 @@ fn attach_session(
     };
     // Reuse explicit controls' recorded-PID/token policy for pre-boot-ID
     // daemons. This does not upgrade inventory identity or rewrite metadata.
+    // Only while running: a restart needs proof that the daemon is gone, which
+    // a live legacy daemon can't give, so an exit it is still finishing is
+    // refused here rather than offered a restart that would then be refused.
     let legacy_verified = session.identity == registry::DaemonIdentityCheck::Unknown
+        && session.status == SessionStatus::Running
         && session.metadata.as_ref().is_some_and(|metadata| {
             metadata.daemon_boot_id.is_none()
                 && registry::read_control_signal_target_with(name, Some(metadata)).is_some()
