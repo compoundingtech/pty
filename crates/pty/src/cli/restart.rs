@@ -105,14 +105,6 @@ pub fn run(args: &[String]) -> CliResult {
         return Ok(1);
     }
 
-    if session.status == SessionStatus::Running
-        && !yes
-        && ask::declined(&ask::ask(&format!(
-            "Session \"{name}\" is running. Kill and restart? [Y/n] "
-        )))
-    {
-        return Ok(0);
-    }
     let mut params = SpawnParams::new(&name, &meta.command, &meta.args);
     params.display_command = meta.display_command.clone();
     params.cwd = meta.cwd.clone();
@@ -121,8 +113,29 @@ pub fn run(args: &[String]) -> CliResult {
     params.display_name = meta.display_name.clone();
     apply_persisted_launch_options(&mut params, &meta);
     params.scrub_env = RESTART_SCRUBBED_ENV.iter().map(|s| s.to_string()).collect();
-    // Refuse a revoked or unverifiable launch before stopping the survivor.
+    // Refuse a revoked or unverifiable launch before asking, and so before
+    // stopping the survivor.
     pty_lifecycle::config_for(&params).check_publication()?;
+
+    if session.status == SessionStatus::Running && !yes {
+        match ask::ask_consent(&format!(
+            "Session \"{name}\" is running. Kill and restart? [Y/n] "
+        )) {
+            // An answer can take any time, so check again before the stop.
+            ask::Consent::Yes => pty_lifecycle::config_for(&params).check_publication()?,
+            ask::Consent::No => return Ok(0),
+            // Nobody said yes, so the running session is left alone
+            // (decision 0020).
+            ask::Consent::NoAnswer => {
+                println!();
+                eprintln!(
+                    "pty restart: Session \"{name}\" was not restarted: the restart prompt got no answer."
+                );
+                eprintln!("  Answer y, or pass -y to restart it without asking.");
+                return Ok(1);
+            }
+        }
+    }
     let publisher = super::prepare_daemon(&mut params)?;
 
     if session.status == SessionStatus::Running {

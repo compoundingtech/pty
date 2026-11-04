@@ -1,25 +1,16 @@
-//! The `[Y/n]` prompts: write the question to stdout, read one line from
-//! stdin.
+//! The `[Y/n]` prompts in `attach` and `restart`: write the question to
+//! stdout, read one line from stdin, and count only an answer someone gave
+//! (decision 0020).
 //!
-//! [`ask`] has no tty check, like Node's `readline` prompt, and only a lone
-//! `n` declines. A closed stdin reads as an empty answer, which proceeds.
-//! Node differs there: its question never resolves at EOF, and the process
-//! exits 0 having done nothing. `pty restart` still asks this way.
-//!
-//! [`ask_consent`] asks for the dead-session restart in `attach`, where only an
-//! answer someone gave counts (decision 0020).
+//! Node's `readline` prompt has no tty check, and only a lone `n` declines.
+//! At EOF its question never resolves, and the process exits 0 having done
+//! nothing.
 //!
 //! node: src/cli.ts:4069-4078 (`ask`), 3922-3926 and 1836-1840 (callers).
 
 #![allow(dead_code)] // callers: the restart / dead-session prompts
 
 use std::io::{BufRead, IsTerminal, Write};
-
-/// Print `prompt` (no newline) and return the answer line without its
-/// line terminator.
-pub fn ask(prompt: &str) -> String {
-    read_answer(prompt).unwrap_or_default()
-}
 
 /// Did the answer decline? Node compares `answer.toLowerCase() === "n"`
 /// (the restart prompts) — only a lone `n`/`N` says no; anything else,
@@ -28,7 +19,7 @@ pub fn declined(answer: &str) -> bool {
     answer.to_lowercase() == "n"
 }
 
-/// What the dead-session restart prompt was told.
+/// What a restart prompt was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consent {
     Yes,
@@ -38,7 +29,7 @@ pub enum Consent {
     NoAnswer,
 }
 
-/// Print `prompt` and read one line, like [`ask`], but count only an answer.
+/// Print `prompt` (no newline) and read one line, counting only an answer.
 /// At a terminal, as in Node, anything but a lone `n` says yes, an empty line
 /// included. Anywhere else only `y` or `yes` does. EOF is never an answer.
 pub fn ask_consent(prompt: &str) -> Consent {
@@ -58,7 +49,8 @@ fn consent(answer: Option<&str>, terminal: bool) -> Consent {
     }
 }
 
-/// Print `prompt` and read one line. `None` at EOF or on a read error.
+/// Print `prompt` and read one line without its line terminator. `None` at
+/// EOF or on a read error.
 fn read_answer(prompt: &str) -> Option<String> {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(prompt.as_bytes());

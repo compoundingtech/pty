@@ -382,6 +382,7 @@ Decided on 2026-08-29. Each row records the decision.
 | `queryStats` waiting out its 2 s timeout on a daemon that closes without STATUS, and `peek -f` hanging on a plain close | S | Not reproduced, on purpose. Both end promptly instead. Deliberate improvements, not gaps — accepted, decision 0006. |
 | `peek --wait` missing a pattern that scrolls off between two 200 ms screen reads | S | Not reproduced, on purpose. The wait also watches the output stream, and a timeout says when the pattern is in the scrollback from before the wait. Accepted, decision 0019. |
 | `attach`'s dead-session prompt restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. Off a terminal only `y` or `yes` restarts, and EOF never does. With no answer, attach exits 1 and names `-r`, where Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
+| `restart`'s running-session prompt stopping and restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. The same rule as `attach`'s prompt: with no answer, `restart` exits 1 and leaves the session running, and names `-y`. Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
 
 ## 12c. What differs because the kernel differs
 

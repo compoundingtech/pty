@@ -502,7 +502,10 @@ exited shows its last lines and asks `Restart? [Y/n]`. At a terminal, Enter
 restarts it. Without one, only `y` or `yes` does. At EOF, or on any other
 input, attach exits 1 and the stored command does not run. `-r` restarts
 without asking, `--no-restart` never restarts, and `--force` answers nothing.
-The Node tool differs here ([decision 0020](docs/decisions/0020-an-unanswered-restart-prompt-does-not-restart.md)).
+`restart` asks `Kill and restart? [Y/n]` before it stops a running session,
+by the same rule: with no answer it exits 1 and leaves the session running,
+and `-y` restarts without asking. The Node tool differs here
+([decision 0020](docs/decisions/0020-an-unanswered-restart-prompt-does-not-restart.md)).
 
 `run` and `restart` are different and deliberately so: from inside a session
 `run` runs the command directly and `restart` restarts without attaching.

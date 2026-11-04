@@ -53,10 +53,27 @@ happened and what to do.
 - Off a terminal, any line but `y`, `yes` or `n` exits 1 where Node restarts.
 - At a terminal nothing changes, except that EOF (Ctrl+D) exits 1.
 
-**Not changed.** `pty restart` asks `Kill and restart? [Y/n]` through the old
-`ask`, so at EOF it still stops a running session and starts it again. Node
-exits 0 there and leaves the session running. That is a parity defect outside
-this decision and is left for a separate change.
+**Addendum: `pty restart`.** The same rule covers `restart`'s prompt for a
+running session, `Session "<name>" is running. Kill and restart? [Y/n]`.
+Node's `cmdRestart` asks it through the same `ask`. Measured the same way:
+
+| stdin | Node | Rust before |
+| --- | --- | --- |
+| `</dev/null` | exit 0, left running | stopped and restarted |
+| an empty line | stopped and restarted | stopped and restarted |
+| `n` | exit 0, left running | exit 0, left running |
+
+With no answer, `restart` leaves the session running, prints
+`pty restart: Session "<name>" was not restarted: the restart prompt got no answer.`
+and `  Answer y, or pass -y to restart it without asking.`, and exits 1.
+`-y` restarts without asking, as before. Stopping live work without consent is
+the worse case of the two, so the same rule applies. The old `ask`, which
+proceeded at EOF, is gone.
+
+A revoked or unverifiable managed launch is refused before the prompt, so
+`restart` never asks a question whose yes it would then refuse. After a yes it
+checks again before it stops the session, because the answer can take any
+time.
 
 **Test.** `crates/pty-conformance/tests/attach_no_restart.rs`:
 - `a_restart_prompt_at_eof_declines`,
@@ -66,13 +83,23 @@ this decision and is left for a separate change.
 - `a_piped_yes_restarts` and `auto_restart_needs_no_terminal` pass on both.
 - The terminal cases before them are unchanged and pass on both.
 
+`crates/pty-conformance/tests/restart_prompt.rs`:
+- `a_running_session_is_left_running_at_eof` and
+  `a_running_session_is_left_running_without_a_yes` fail on Node and are
+  recorded as intended. Each checks that the same daemon still runs and the
+  command did not start again.
+- `a_piped_yes_restarts_a_running_session` and
+  `yes_flag_restarts_without_a_terminal` pass on both.
+
 The unit test `consent_needs_an_answer_and_off_a_terminal_a_yes` in
 `crates/pty/src/cli/ask.rs` covers each answer at a terminal and off one.
 
 **Migration / negotiation.** Pass `-r` to restart a dead session without a
-terminal, or `--no-restart` never to restart one. Release note: `pty attach`
-no longer restarts a dead session when the restart prompt gets no answer.
-That covers stdin at EOF, and stdin that is not a terminal unless it gives `y`
-or `yes`. It exits 1 instead, without running the stored command. Any
-script or seat that relied on `attach` restarting a dead session
-non-interactively must pass `-r` now.
+terminal, or `--no-restart` never to restart one. Pass `-y` to `restart` a
+running session without a terminal. Release note: `pty attach` and `pty
+restart` no longer restart a session when their restart prompt gets no
+answer. That covers stdin at EOF, and stdin that is not a terminal unless it
+gives `y` or `yes`. They exit 1 instead: `attach` without running the stored
+command, `restart` without stopping the running session. Any script or seat
+that relied on either restarting non-interactively must pass `-r` to
+`attach` or `-y` to `restart` now.
