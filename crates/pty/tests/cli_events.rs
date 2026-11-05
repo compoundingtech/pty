@@ -334,3 +334,59 @@ fn follower_exits_after_a_real_session_ends() {
     let out = finish_within(child, Duration::from_secs(3));
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+#[test]
+fn an_unexpected_argument_is_refused_rather_than_dropping_the_options_after_it() {
+    let rig = Rig::new();
+    rig.write_meta("strict", json!({}));
+    for (args, unexpected) in [
+        (vec!["events", "strict", "--wait", "user.never", "--timeout=1"], "--timeout=1"),
+        (vec!["events", "strict", "--wait", "user.never", "-t=1"], "-t=1"),
+        (vec!["events", "strict", "--wait=user.never", "-t", "1"], "--wait=user.never"),
+        (vec!["events", "strict", "--wait", "user.never", "--bogus", "-t", "1"], "--bogus"),
+        (vec!["events", "--wait", "user.never", "-t", "1", "strict", "other"], "other"),
+        (vec!["events", "strict", "--json", "--wait"], "--wait"),
+        (vec!["events", "--timeout=1", "strict"], "--timeout=1"),
+    ] {
+        let child = rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let out = finish_within(child, Duration::from_secs(2));
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("Unexpected argument: {unexpected}\n"),
+            "{args:?}"
+        );
+    }
+}
+
+/// A daemon that recorded itself and died without recording an exit can
+/// append nothing more, so waits and named follows on it end, whether they
+/// started before it died or after. A record no daemon claimed keeps waiting
+/// (`wait_prints_the_first_matching_event_or_times_out`).
+#[test]
+fn waits_and_follows_end_when_their_daemon_vanishes() {
+    let rig = Rig::new();
+    rig.spawn_cat("doomed", &[]);
+    let pid: i32 = std::fs::read_to_string(rig.path("doomed.pid"))
+        .unwrap().trim().parse().unwrap();
+    let spawn = |args: &[&str]| {
+        rig.cmd(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let user_wait = ["events", "doomed", "--wait", "user.never", "-t", "3600"];
+    let exit_wait = ["events", "doomed", "--wait", "session_exit", "-t", "3600"];
+    let follow = ["events", "doomed", "--json"];
+    let before = [spawn(&user_wait), spawn(&exit_wait), spawn(&follow)];
+    pty_core::kill::process(pid, libc::SIGKILL).unwrap();
+    let after = [spawn(&user_wait), spawn(&exit_wait), spawn(&follow)];
+    for (i, child) in before.into_iter().chain(after).enumerate() {
+        let out = finish_within(child, Duration::from_secs(3));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let (code, message) = match i % 3 {
+            0 => (1, "Session \"doomed\" vanished before a \"user.never\" event was observed.\n"),
+            1 => (1, "Session \"doomed\" vanished without a recorded exit.\n"),
+            _ => (0, ""),
+        };
+        assert_eq!(out.status.code(), Some(code), "{i}: {out:?}");
+        assert_eq!(stderr, message, "{i}");
+    }
+}

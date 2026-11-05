@@ -6,11 +6,16 @@
 //!
 //! Change detection is the `notify` crate on the registry directory plus a
 //! poll every 250 ms, so delivery is deterministic even when the watcher
-//! misses or coalesces an event, or is still starting.
+//! misses or coalesces an event, or is still starting. A notification wakes
+//! the follower only for the files it reads.
+//!
+//! A named source ends when its session exits, its registry entry is
+//! removed, or its daemon vanishes without recording an exit.
 //!
 //! node: src/events.ts:430-546
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +28,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 
 use super::Event;
 use crate::registry;
-use crate::registry::root::{events_path, metadata_path, session_dir};
+use crate::registry::root::{events_path, metadata_path, pid_path, session_dir};
 
 /// The poll fallback interval.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -66,6 +71,8 @@ impl FollowerOptions {
 /// A running follower; `stop` (or drop) ends the background thread.
 pub struct EventFollower {
     stop: Arc<AtomicBool>,
+    // Interrupts the poll wait, so a stop does not wait out the interval.
+    wake: SyncSender<()>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -82,13 +89,18 @@ impl EventFollower {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
         let (ready_tx, ready_rx) = channel();
+        // A bounded signal coalesces bursts without an unbounded drain that
+        // can prevent shutdown while another process keeps changing the
+        // directory.
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let wake = wake_tx.clone();
         let handle = std::thread::Builder::new()
             .name("events-follow".to_string())
-            .spawn(move || run(options, on_event, stop_flag, ready_tx))
+            .spawn(move || run(options, on_event, stop_flag, ready_tx, wake_tx, wake_rx))
             .ok();
         // Disconnected when the thread could not start: nothing to wait for.
         let _ = ready_rx.recv();
-        EventFollower { stop, handle }
+        EventFollower { stop, wake, handle }
     }
 
     /// Start following and receive events on a channel.
@@ -105,6 +117,7 @@ impl EventFollower {
     /// node: src/events.ts:451-458
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let _ = self.wake.try_send(());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -142,6 +155,39 @@ fn name_of(file_name: &str) -> Option<&str> {
     file_name.strip_suffix(EVENTS_SUFFIX)
 }
 
+/// The registry files a follower reads. Every session writes into the one
+/// watched directory, so a named follower ignores the other sessions' files.
+enum Interest {
+    /// `--all`: every session's log.
+    Logs,
+    /// Named sessions: their logs and metadata.
+    Files(BTreeSet<OsString>),
+}
+
+impl Interest {
+    fn new(names: Option<&[String]>) -> Self {
+        let Some(names) = names else {
+            return Interest::Logs;
+        };
+        Interest::Files(
+            names
+                .iter()
+                .flat_map(|name| [events_path(name), metadata_path(name)])
+                .filter_map(|path| path.file_name().map(OsStr::to_os_string))
+                .collect(),
+        )
+    }
+
+    // A notification without paths names nothing, so it may concern anything.
+    fn covers(&self, event: &notify::Event) -> bool {
+        event.paths.is_empty()
+            || event.paths.iter().filter_map(|path| path.file_name()).any(|file| match self {
+                Interest::Logs => file.to_str().is_some_and(|f| f.ends_with(EVENTS_SUFFIX)),
+                Interest::Files(files) => files.contains(file),
+            })
+    }
+}
+
 // Read/open/close-read notifications must never feed back into another scan.
 fn wake_on_change(tx: &SyncSender<()>, result: notify::Result<notify::Event>) {
     if let Ok(event) = result
@@ -162,6 +208,7 @@ fn wake_on_change(tx: &SyncSender<()>, result: notify::Result<notify::Event>) {
 // polling continues to discover logs in the replacement directory.
 fn watch_event(
     dir: &Path,
+    interest: &Interest,
     wake: &SyncSender<()>,
     retire: &SyncSender<()>,
     result: notify::Result<notify::Event>,
@@ -177,7 +224,7 @@ fn watch_event(
     };
     if invalidated {
         let _ = retire.try_send(());
-    } else {
+    } else if result.as_ref().is_ok_and(|event| interest.covers(event)) {
         wake_on_change(wake, result);
     }
 }
@@ -199,11 +246,25 @@ fn registry_entry_removed(name: &str) -> bool {
     !registry::is_creation_lock_held(name) && !metadata_path(name).exists()
 }
 
+// A daemon records its pid when it starts. One that did and is now gone
+// without recording an exit can append nothing more. A record no daemon has
+// claimed may be a launcher yet to start, and a held creation lock is a
+// respawn in progress.
+fn daemon_vanished(name: &str) -> bool {
+    registry::get_session_by_name(name).is_some_and(|session| {
+        session.status == registry::SessionStatus::Vanished
+            && (session.metadata.as_ref().is_some_and(|record| record.daemon_pid.is_some())
+                || pid_path(name).exists())
+    }) && !registry::is_creation_lock_held(name)
+}
+
 fn run(
     options: FollowerOptions,
     mut on_event: impl FnMut(Event),
     stop: Arc<AtomicBool>,
     ready: Sender<()>,
+    wake_tx: SyncSender<()>,
+    wake_rx: Receiver<()>,
 ) {
     let dir = session_dir();
     let mut tracked: BTreeMap<String, Tracked> = BTreeMap::new();
@@ -239,18 +300,16 @@ fn run(
     // starting an FSEvents stream took 3.5 s on a busy macOS host, and the
     // poll below has to keep delivering meanwhile. That thread holds the
     // watcher until shutdown, a backend error, or registry removal.
-    // A bounded signal coalesces bursts without an unbounded drain that can
-    // prevent shutdown while another process keeps changing the directory.
-    let (wake_tx, wake_rx) = sync_channel(1);
     let (release_tx, release_rx) = sync_channel(1);
     let watch_dir = dir.clone();
     let retire_tx = release_tx.clone();
+    let interest = Interest::new(options.names.as_deref());
     let _ = std::thread::Builder::new()
         .name("events-follow-watch".to_string())
         .spawn(move || {
             let callback_dir = watch_dir.clone();
             let Ok(mut watcher) = notify::recommended_watcher(move |result| {
-                watch_event(&callback_dir, &wake_tx, &retire_tx, result);
+                watch_event(&callback_dir, &interest, &wake_tx, &retire_tx, result);
             }) else {
                 return;
             };
@@ -287,7 +346,15 @@ fn run(
                 // metadata. It may have done both after our first log read.
                 read_new_lines(t, &mut on_event);
             }
-            !exited && !removed && !retained_exit
+            if exited || removed || retained_exit {
+                return false;
+            }
+            let vanished = daemon_vanished(name);
+            if vanished {
+                // Its last records may have landed after our first read.
+                read_new_lines(t, &mut on_event);
+            }
+            !vanished
         });
         if !follow_all && tracked.is_empty() {
             break;
@@ -444,7 +511,7 @@ mod tests {
                 EventKind::Access(AccessKind::Read),
                 EventKind::Access(AccessKind::Close(AccessMode::Read)),
             ] {
-                watch_event(dir, &wake_tx, &retire_tx, Ok(notify::Event::new(kind)));
+                watch_event(dir, &Interest::Logs, &wake_tx, &retire_tx, Ok(notify::Event::new(kind)));
             }
             // An empty queue after every synthetic scan, rather than only
             // after a burst, catches a self-sustaining read/scan cycle.
@@ -471,14 +538,14 @@ mod tests {
             let (retire_tx, retire_rx) = sync_channel(1);
             for _ in 0..100 {
                 let result = event.clone().ok_or_else(|| notify::Error::generic("backend failed"));
-                watch_event(dir, &wake_tx, &retire_tx, result);
+                watch_event(dir, &Interest::Logs, &wake_tx, &retire_tx, result);
             }
             assert_eq!(retire_rx.try_iter().count(), 1);
             assert!(matches!(wake_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
             // Already-retired holders must not block their callback either.
             drop(retire_rx);
             let result = event.ok_or_else(|| notify::Error::generic("backend failed"));
-            watch_event(dir, &wake_tx, &retire_tx, result);
+            watch_event(dir, &Interest::Logs, &wake_tx, &retire_tx, result);
         }
     }
 
@@ -489,6 +556,7 @@ mod tests {
         let (retire_tx, retire_rx) = sync_channel(1);
         watch_event(
             Path::new("/registry"),
+            &Interest::Logs,
             &wake_tx,
             &retire_tx,
             Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
@@ -496,6 +564,35 @@ mod tests {
         );
         assert_eq!(wake_rx.try_recv(), Ok(()));
         assert!(matches!(retire_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn only_changes_to_followed_files_wake_the_follower() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+        let dir = Path::new("/registry");
+        let change = |kind, file: &str| notify::Event::new(kind).add_path(dir.join(file));
+        let write = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        let rename = EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        let named = Interest::new(Some(&["mine".to_string()]));
+        for (interest, event, wakes) in [
+            (&named, change(write, "other.events.jsonl"), false),
+            (&named, change(EventKind::Create(CreateKind::File), "other.json"), false),
+            (&named, change(write, "mine.events.jsonl.tmp.7.0123456789abcdef"), false),
+            (&named, change(write, "mine.pid"), false),
+            (&named, change(rename, "mine.events.jsonl"), true),
+            (&named, change(rename, "mine.json"), true),
+            (&named, change(EventKind::Remove(RemoveKind::File), "mine.json"), true),
+            (&named, notify::Event::new(write), true),
+            (&Interest::Logs, change(rename, "other.events.jsonl"), true),
+            (&Interest::Logs, change(write, "other.json"), false),
+            (&Interest::Logs, change(write, "other.events.jsonl.tmp.7.0123456789abcdef"), false),
+        ] {
+            let (wake_tx, wake_rx) = sync_channel(1);
+            let (retire_tx, _retire_rx) = sync_channel(1);
+            let description = format!("{:?}", event.paths);
+            watch_event(dir, interest, &wake_tx, &retire_tx, Ok(event));
+            assert_eq!(wake_rx.try_recv().is_ok(), wakes, "{description}");
+        }
     }
 
     #[test]

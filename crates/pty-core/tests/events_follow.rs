@@ -88,6 +88,25 @@ fn an_event_appended_right_after_start_is_delivered() {
     }
 }
 
+/// A stop interrupts the poll wait rather than waiting out the interval, so
+/// a wait that matched exits at once.
+#[test]
+fn stop_does_not_wait_for_the_next_poll() {
+    let _ = root();
+    let name = unique_name("stop");
+    events::clear_events(&name).unwrap();
+    let (mut follower, _rx) = EventFollower::channel(FollowerOptions {
+        poll_interval: Duration::from_secs(30),
+        ..FollowerOptions::names(vec![name.clone()])
+    });
+    // Let the thread reach its poll wait, where only a wake-up interrupts it.
+    // A stop before that is seen at the top of the loop without one.
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    follower.stop();
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
 #[test]
 fn follower_sees_retained_new_records_when_a_batch_shrinks_and_regrows() {
     let _ = root();
