@@ -117,7 +117,10 @@ pub fn run(args: &[String]) -> CliResult {
                 timeout = js_parse_float(cur.take_value().unwrap_or_default());
             }
             _ if reference.is_none() => reference = cur.next(),
-            _ => break,
+            // Ignoring it would also drop every option after it, such as a
+            // deadline (`--timeout=60`) or the wait itself (`--wait=<type>`).
+            Some(unexpected) => return Err(format!("Unexpected argument: {unexpected}").into()),
+            None => break,
         }
     }
 
@@ -227,7 +230,15 @@ fn cmd_events(
                     if print_recorded_exit(name, wait_type, json) {
                         return Ok(0);
                     }
-                    eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
+                    let vanished = registry::get_session_by_name(name)
+                        .is_some_and(|session| session.status == registry::SessionStatus::Vanished);
+                    if vanished && wait_type == pty_core::events::event_type::SESSION_EXIT {
+                        eprintln!("Session \"{name}\" vanished without a recorded exit.");
+                    } else if vanished {
+                        eprintln!("Session \"{name}\" vanished before a \"{wait_type}\" event was observed.");
+                    } else {
+                        eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
+                    }
                     return Ok(1);
                 }
             }

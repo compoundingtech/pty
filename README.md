@@ -106,10 +106,19 @@ returns immediately (exit status 0), even if its event log was removed.
 Other event types wait for a new matching event. A missing session returns a
 not-found error (exit status 1); a vanished target with no recorded exit also
 fails promptly, including a launcher that never started. A session removed
-while waiting without an observed matching event returns 1. The timeout is an independent deadline
-and returns 1 even when no filesystem events arrive. Followers ignore read-only
-filesystem notifications and coalesce change notifications, avoiding feedback
-from their own registry reads.
+while waiting without an observed matching event returns 1. So does any wait
+whose daemon dies without recording an exit, before or after the wait starts;
+a named follow ends there with 0. A record no daemon has claimed yet keeps
+other waits waiting, since its launcher may still start it. The timeout is an
+independent deadline and returns 1 even when no filesystem events arrive.
+Options may follow the session reference, and any other argument is an error
+(exit status 1) rather than silently dropping the options after it.
+
+Followers ignore read-only filesystem notifications and coalesce change
+notifications, avoiding feedback from their own registry reads. Every session
+writes into the one registry directory, so a named follower wakes only for its
+own sessions' logs and metadata, and `--all` only for logs; the 250 ms poll
+covers anything a notification misses.
 
 Cursor visibility and window titles are live terminal state, not durable event
 history: TUI redraws and title spinners can change them dozens of times per
