@@ -119,7 +119,12 @@ pub fn run(args: &[String]) -> CliResult {
             _ if reference.is_none() => reference = cur.next(),
             // Ignoring it would also drop every option after it, such as a
             // deadline (`--timeout=60`) or the wait itself (`--wait=<type>`).
-            Some(unexpected) => return Err(format!("Unexpected argument: {unexpected}").into()),
+            // An unknown dash token taken as the reference is the stray one
+            // when a name follows it (`--timeout=60 NAME`).
+            Some(unexpected) => {
+                let stray = reference.filter(|r| r.starts_with('-')).unwrap_or(unexpected);
+                return Err(format!("Unexpected argument: {stray}").into());
+            }
             None => break,
         }
     }

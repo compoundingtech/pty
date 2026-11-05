@@ -346,6 +346,7 @@ fn an_unexpected_argument_is_refused_rather_than_dropping_the_options_after_it()
         (vec!["events", "strict", "--wait", "user.never", "--bogus", "-t", "1"], "--bogus"),
         (vec!["events", "--wait", "user.never", "-t", "1", "strict", "other"], "other"),
         (vec!["events", "strict", "--json", "--wait"], "--wait"),
+        (vec!["events", "--timeout=1", "strict"], "--timeout=1"),
     ] {
         let child = rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let out = finish_within(child, Duration::from_secs(2));

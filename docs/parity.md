@@ -384,6 +384,7 @@ Decided on 2026-08-29. Each row records the decision.
 | `attach`'s dead-session prompt restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. Off a terminal only `y` or `yes` restarts, and EOF never does. With no answer, attach exits 1 and names `-r`, where Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
 | `restart`'s running-session prompt stopping and restarting with no terminal on any line but `n` | S | Not reproduced, on purpose. The same rule as `attach`'s prompt: with no answer, `restart` exits 1 and leaves the session running, and names `-y`. Node exits 0 at EOF and restarts on any other line. Accepted, decision 0020. |
 | `no` at a restart prompt counting as yes | S | Not reproduced, on purpose. A lone `n` or `no`, in any case, declines `attach`'s and `restart`'s prompts and exits 0. Node declines only on a lone `n`. Accepted, decision 0020. |
+| `pty events` ignoring an argument it does not know, and every option after it | S | Not reproduced, on purpose. After the session name, an unknown argument or a second name exits 1 with `Unexpected argument: <token>`, so `--timeout=60` or `--wait=<type>` can no longer drop the deadline or the wait. Node reads no options after the name at all. Accepted, decision 0021. |
 
 ## 12c. What differs because the kernel differs
 
