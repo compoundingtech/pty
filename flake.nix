@@ -56,6 +56,29 @@
           hash = ghosttyContract.sourceHash;
         };
 
+        # Keep transport mirrors separate from Zig's package content pins.
+        # Upstream's manifest supplies both archive byte hashes and cache names.
+        ghosttyGithubArchives = map
+          (package:
+            let
+              archiveUrl = builtins.match
+                "https://github.com/([^/]+/[^/]+)/archive/(.+)\\.tar\\.gz"
+                package.url;
+            in package // {
+              archive = pkgs.fetchurl {
+                urls = [
+                  package.url
+                  "https://codeload.github.com/${builtins.elemAt archiveUrl 0}/tar.gz/${builtins.elemAt archiveUrl 1}"
+                ];
+                sha256 = package.sha256;
+              };
+            })
+          (builtins.filter
+            (package: package.type == "archive" && builtins.match
+              "https://github.com/([^/]+/[^/]+)/archive/(.+)\\.tar\\.gz"
+              package.url != null)
+            (builtins.fromJSON (builtins.readFile "${ghosttySrc}/flatpak/zig-packages.json")));
+
         # Ghostty's zig package cache, in the layout `zig build --system <dir>`
         # reads (one directory per package, named by its content hash). Fetched
         # with Ghostty's own script because `zig build --fetch` skips transitive
@@ -79,6 +102,10 @@
           buildPhase = ''
             runHook preBuild
             export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            ${lib.concatMapStringsSep "\n" (package: ''
+              substituteInPlace build.zig.zon.txt \
+                --replace-fail ${lib.escapeShellArg package.url} ${lib.escapeShellArg (toString package.archive)}
+            '') ghosttyGithubArchives}
             ./nix/build-support/fetch-zig-cache.sh
             runHook postBuild
           '';

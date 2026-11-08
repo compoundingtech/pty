@@ -180,6 +180,11 @@ transport; its revision and unpacked source hash are pinned in
 also verifies the native compatibility contract and runtime closure, runs
 the package tests, and checks installed completions. `nix develop` supplies
 the Rust toolchain and the same native artifact, without Zig.
+GitHub-hosted Zig dependency archives use fixed-output downloads with the original
+URL followed by an equivalent `codeload.github.com` fallback. URLs and archive
+checksums come from Ghostty's pinned package manifest; the Zig package-cache
+output hash is unchanged. This improves cold-cache build reliability without
+changing runtime behavior or dependency contents.
 
 With Cargo (see the build requirements below):
 
