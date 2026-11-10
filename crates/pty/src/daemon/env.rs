@@ -233,6 +233,25 @@ pub fn invalid_cwd_error(reason: &str, name: &str, command: &str) -> String {
     format!("{reason}\nCannot start session \"{name}\" for command \"{command}\".")
 }
 
+/// Validate the caller's spelling before fixing the cwd shared by child and
+/// metadata. Lexical absolutization preserves symlinks and existing errors.
+pub fn prepare_cwd(cfg: &mut DaemonConfig) -> Result<String, String> {
+    let cwd = cfg.cwd();
+    if let Some(reason) = describe_invalid_cwd(&cwd) {
+        return Err(invalid_cwd_error(&reason, &cfg.name, &cfg.command));
+    }
+    let cwd = if std::path::Path::new(&cwd).is_absolute() {
+        cwd
+    } else {
+        std::path::absolute(&cwd)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned()
+    };
+    cfg.cwd = Some(cwd.clone());
+    Ok(cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +424,20 @@ mod tests {
             build_child_env_from(&c, "g", &[]).unwrap_err(),
             env_exclusive_error()
         );
+    }
+
+    #[test]
+    fn preparing_cwd_preserves_validation_errors_and_input() {
+        for cwd in ["", "/no/such/dir", "/bin/sh", "no-such-cwd/child"] {
+            let mut cfg = cfg();
+            cfg.cwd = Some(cwd.into());
+            let reason = describe_invalid_cwd(cwd).unwrap();
+            assert_eq!(
+                prepare_cwd(&mut cfg).unwrap_err(),
+                invalid_cwd_error(&reason, &cfg.name, &cfg.command)
+            );
+            assert_eq!(cfg.cwd.as_deref(), Some(cwd));
+        }
     }
 
     #[test]

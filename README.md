@@ -643,6 +643,11 @@ shell arguments. Such changes require a new operation/binding, not an ordinary
 respawn under the old request digest. Unbound legacy sessions retain manifest
 reload and operation-tag mutation behavior.
 
+Session launch validates the requested working directory, then stores an absolute
+cwd in run metadata before starting the child. Relative paths are resolved
+against the launching process's current directory without resolving symlinks;
+absolute paths retain their spelling. Existing records are not rewritten.
+
 Rust callers use `pty_core::registry::revocation::{root_id, install, read, check,
 PublicationBinding, PublicationRevocation, RevocationInstall}`. `root_id()` returns
 `io::Result<String>` for prelaunch enrollment. `install(name,
