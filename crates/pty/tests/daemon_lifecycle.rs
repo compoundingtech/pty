@@ -119,12 +119,13 @@ fn publication_order_and_shapes() {
 fn launch_stores_an_absolute_cwd_without_resolving_symlinks() {
     skip_without_a_real_machine!();
     let _s = serial();
-    let root = short_root();
     let current = std::env::current_dir().unwrap();
-    let link = root.join("cwd-link");
-    std::os::unix::fs::symlink(&current, &link).unwrap();
 
-    for cwd in [".", link.to_str().unwrap()] {
+    for relative in [true, false] {
+        let root = short_root();
+        let link = root.join("cwd-link");
+        std::os::unix::fs::symlink(&current, &link).unwrap();
+        let cwd = if relative { "." } else { link.to_str().unwrap() };
         let name = unique_name("absolute-cwd");
         let marker = root.join(format!("{name}.started"));
         let script = format!("pwd -P > '{}'; exec sleep 30", marker.display());
@@ -135,12 +136,11 @@ fn launch_stores_an_absolute_cwd_without_resolving_symlinks() {
         let metadata = d.meta().unwrap();
         let stored = std::path::Path::new(metadata["cwd"].as_str().unwrap());
         assert!(stored.is_absolute());
-        let expected = if cwd == "." { &current } else { &link };
+        let expected = if relative { &current } else { &link };
         assert_eq!(stored, expected);
         assert!(wait_until(T, || std::fs::read_to_string(&marker)
             .is_ok_and(|value| value.trim() == current.to_str().unwrap())));
     }
-    std::fs::remove_file(link).unwrap();
 }
 
 /// The owner record is published before the child starts.
