@@ -432,7 +432,7 @@ impl Worker {
     }
 
     fn run(
-        self,
+        mut self,
         commands: Receiver<WorkerCmd>,
         rx: Receiver<Msg>,
         readiness: super::ReadyNotifier,
