@@ -35,7 +35,7 @@ fn recent_type_filter_returns_every_retained_exact_match_in_order_without_writes
     const RECENT_BOUND: usize = 50;
 
     let rig = Rig::new();
-    rig.write_meta("query", json!({}));
+    rig.write_meta("query", json!({"createdAt": "2026-01-01T00:00:00.000Z"}));
     let mut matching = vec![
         json!({
             "session": "query",
@@ -121,7 +121,9 @@ fn recent_type_filter_returns_every_retained_exact_match_in_order_without_writes
 #[test]
 fn recent_and_usage() {
     let rig = Rig::new();
-    rig.write_meta("s", json!({"displayName": "Friendly"}));
+    rig.write_meta("s", json!({
+        "displayName": "Friendly", "createdAt": "2026-01-01T00:00:00.000Z"
+    }));
     assert_eq!(rig.ok(&["events", "--recent", "s"]).stdout, "No recent events for \"s\".\n");
     append_event(&rig, "s", r#"{"session":"s","type":"session_start","ts":"2026-01-02T03:04:05.000Z","tags":{"role":"web"}}"#);
     append_event(&rig, "s", r#"{"session":"s","type":"user.note","ts":"2026-01-02T03:04:06.000Z","text":"hi"}"#);
@@ -170,7 +172,7 @@ fn recent_and_usage() {
 #[test]
 fn wait_prints_the_first_matching_event_or_times_out() {
     let rig = Rig::new();
-    rig.write_meta("w", json!({}));
+    rig.write_meta("w", json!({"createdAt": "2026-01-01T00:00:00.000Z"}));
     let out = rig.run(&["events", "--wait", "bell", "-t", "1", "w"]);
     assert_eq!(out.code, 1);
     assert_eq!(out.stderr, "Timed out after 1s waiting for \"bell\" event.\n");
@@ -382,11 +384,222 @@ fn waits_and_follows_end_when_their_daemon_vanishes() {
         let out = finish_within(child, Duration::from_secs(3));
         let stderr = String::from_utf8_lossy(&out.stderr);
         let (code, message) = match i % 3 {
-            0 => (1, "Session \"doomed\" vanished before a \"user.never\" event was observed.\n"),
-            1 => (1, "Session \"doomed\" vanished without a recorded exit.\n"),
+            0 | 1 => (2, "Session \"doomed\" vanished without a recorded exit.\n"),
             _ => (0, ""),
         };
         assert_eq!(out.status.code(), Some(code), "{i}: {out:?}");
         assert_eq!(stderr, message, "{i}");
+    }
+}
+
+fn spawn_wait(rig: &Rig, name: &str, event_type: &str, json: bool) -> std::process::Child {
+    let mut args = vec!["events", name, "--wait", event_type, "--timeout", "10"];
+    if json {
+        args.push("--json");
+    }
+    rig.cmd(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+}
+
+#[test]
+fn wait_replays_a_recorded_exit_before_subscription_in_json_and_text() {
+    let rig = Rig::new();
+    let event = json!({
+        "session": "already-exited", "type": "session_exit",
+        "ts": "2026-01-02T03:04:06.000Z", "exitCode": 17
+    });
+    rig.write_meta("already-exited", json!({
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "exitedAt": "2026-01-02T03:04:06.000Z", "exitCode": 17
+    }));
+    append_event(&rig, "already-exited", &event.to_string());
+    for json in [true, false] {
+        let out = finish_within(
+            spawn_wait(&rig, "already-exited", "session_exit", json),
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        if json {
+            assert_eq!(parse_json_lines(&stdout), vec![event.clone()]);
+        } else {
+            assert_eq!(stdout.lines().count(), 1, "{stdout}");
+            assert!(stdout.ends_with("] already-exited: exited (code 17)\n"), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn wait_observes_exit_published_after_the_wait_process_starts() {
+    let rig = Rig::new();
+    rig.write_meta("exit-during-wait", json!({"createdAt": "2026-01-01T00:00:00.000Z"}));
+    let child = spawn_wait(&rig, "exit-during-wait", "session_exit", true);
+    // No readiness event is printed by --wait. Publishing after spawn covers
+    // both a live notification and the subscribe/snapshot race without relying
+    // on an arbitrary sleep to decide when the subscriber is ready.
+    let event = json!({
+        "session": "exit-during-wait", "type": "session_exit",
+        "ts": "2026-01-02T03:04:06.000Z", "exitCode": 23
+    });
+    append_event(&rig, "exit-during-wait", &event.to_string());
+    rig.write_meta("exit-during-wait", json!({
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "exitedAt": "2026-01-02T03:04:06.000Z", "exitCode": 23
+    }));
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert_eq!(parse_json_lines(&String::from_utf8(out.stdout).unwrap()), vec![event]);
+}
+
+#[test]
+fn wait_replays_arbitrary_exact_types_beyond_the_recent_tail() {
+    let rig = Rig::new();
+    for event_type in ["bell", "user.note", "display_name_change"] {
+        rig.write_meta("retained", json!({"createdAt": "2026-01-01T00:00:00.000Z"}));
+        std::fs::write(rig.path("retained.events.jsonl"), "").unwrap();
+        append_event(&rig, "retained", &json!({
+            "session": "retained", "type": format!("{event_type}.suffix"),
+            "ts": "2026-01-02T03:04:05.000Z"
+        }).to_string());
+        let first = json!({
+            "session": "retained", "type": event_type,
+            "ts": "2026-01-02T03:04:06.000Z", "data": {"sequence": 1}
+        });
+        append_event(&rig, "retained", &first.to_string());
+        let latest = json!({
+            "session": "retained", "type": event_type,
+            "ts": "2026-01-02T03:04:06.500Z", "data": {"sequence": 2}
+        });
+        append_event(&rig, "retained", &latest.to_string());
+        for sequence in 0..60 {
+            append_event(&rig, "retained", &json!({
+                "session": "retained", "type": "user.distractor",
+                "ts": "2026-01-02T03:04:07.000Z", "data": {"sequence": sequence}
+            }).to_string());
+        }
+        let before = std::fs::read(rig.path("retained.events.jsonl")).unwrap();
+        let out = finish_within(
+            spawn_wait(&rig, "retained", event_type, true),
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.status.code(), Some(0), "{event_type}: {out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        assert_eq!(parse_json_lines(&String::from_utf8(out.stdout).unwrap()), vec![latest]);
+        assert_eq!(std::fs::read(rig.path("retained.events.jsonl")).unwrap(), before);
+    }
+}
+
+#[test]
+fn wait_ignores_previous_generation_events_and_accepts_the_creation_boundary() {
+    let rig = Rig::new();
+    for event_type in ["user.note", "session_exit"] {
+        rig.write_meta("reused", json!({
+            "createdAt": "2026-01-02T03:04:06.000Z", "generation": "current"
+        }));
+        std::fs::write(rig.path("reused.events.jsonl"), "").unwrap();
+        append_event(&rig, "reused", &json!({
+            "session": "reused", "type": event_type,
+            "ts": "2026-01-02T03:04:05.999Z", "exitCode": 99
+        }).to_string());
+        let out = finish_within(
+            rig.cmd(&["events", "reused", "--wait", event_type, "-t", "0.2", "--json"])
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.status.code(), Some(1), "{event_type}: {out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("Timed out after 0.2s waiting for \"{event_type}\" event.\n"),
+        );
+        let current = json!({
+            "session": "reused", "type": event_type,
+            "ts": "2026-01-02T03:04:06.000Z", "exitCode": 0
+        });
+        append_event(&rig, "reused", &current.to_string());
+        let out = finish_within(
+            spawn_wait(&rig, "reused", event_type, true),
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.status.code(), Some(0), "{event_type}: {out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        assert_eq!(parse_json_lines(&String::from_utf8(out.stdout).unwrap()), vec![current]);
+    }
+}
+
+#[test]
+fn wait_reports_registry_removal_as_vanished_not_timeout() {
+    let rig = Rig::new();
+    for event_type in ["user.never", "session_exit"] {
+        rig.write_meta("removed-wait", json!({}));
+        let mut child = spawn_wait(&rig, "removed-wait", event_type, true);
+        // Unlike followers, waits have no stdout readiness marker. Keep the
+        // process alive through several follower polling intervals before
+        // removing the registry entry; all completion waits remain bounded.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            assert!(child.try_wait().unwrap().is_none(), "wait ended before removal");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_file(rig.path("removed-wait.json")).unwrap();
+        let out = finish_within(child, Duration::from_secs(2));
+        assert_eq!(out.status.code(), Some(2), "{event_type}: {out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "Session \"removed-wait\" vanished without a recorded exit.\n",
+        );
+    }
+}
+
+#[test]
+fn idle_follow_exits_zero_when_its_stdout_reader_closes_in_json_and_text() {
+    let rig = Rig::new();
+    for json in [true, false] {
+        rig.write_meta("idle-pipe", json!({}));
+        let mut args = vec!["events", "idle-pipe"];
+        if json {
+            args.push("--json");
+        }
+        let mut child = rig.cmd(&args)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            tx.send((reader, line)).ok();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (pipe, line) = loop {
+            append_event(&rig, "idle-pipe", &json!({
+                "session": "idle-pipe", "type": "user.ready",
+                "ts": "2026-01-02T03:04:05.000Z"
+            }).to_string());
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => break value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                result => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    reader.join().unwrap();
+                    panic!("idle follower never became ready: {result:?}");
+                }
+            }
+        };
+        reader.join().unwrap();
+        if json {
+            assert_eq!(parse_json_lines(&line)[0]["type"], "user.ready");
+        } else {
+            assert!(line.ends_with("] idle-pipe: user.ready\n"), "{line}");
+        }
+        // No event is appended after readiness: a broken-pipe-on-write-only
+        // implementation would hang here instead of observing reader closure.
+        drop(pipe);
+        let out = finish_within(child, Duration::from_secs(2));
+        assert_eq!(out.status.code(), Some(0), "json={json}: {out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
     }
 }

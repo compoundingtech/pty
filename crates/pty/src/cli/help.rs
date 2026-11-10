@@ -1,12 +1,12 @@
 //! Help text for the `pty` binary.
 //!
-//! Every text here is vendored verbatim from the Node `pty` at `e6c1cd4`. The
-//! fixtures under `crates/pty/tests/fixtures/help/` are the bytes that binary
-//! printed (`pty help`, `pty <cmd> --help`, ...), captured by running it under a
-//! scratch `PTY_ROOT`, trailing newline included. Nothing is generated or
-//! reformatted here; a text changes only when its fixture is re-captured.
-//! One edit since the capture: the `--remote` examples in `attach`, `list`,
-//! `peek` and `send` name an invented peer, `example-host`.
+//! Help text starts from the Node `pty` at `e6c1cd4`. The fixtures under
+//! `crates/pty/tests/fixtures/help/` are included directly as the help source,
+//! with their trailing newline. They were captured under a scratch `PTY_ROOT`
+//! and are updated where the Rust contract differs: the `--remote` examples
+//! in `attach`, `list`, `peek` and `send` name an invented peer, `example-host`,
+//! and `events` documents durable current-generation observation, wait statuses,
+//! and clean streaming reader closure.
 //!
 //! The two deferred commands (`recover`, `test`) keep the Node help so the
 //! binary stays a drop-in; the commands themselves report that they are not

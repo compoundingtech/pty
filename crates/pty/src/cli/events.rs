@@ -5,6 +5,7 @@
 //!
 //! node: src/cli.ts:1219-1248 (parsing), 3965-4051 (`cmdEvents`)
 
+use std::io::{self, Write};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -43,42 +44,74 @@ fn exit_zero_on_sigint() {
     }
 }
 
-/// Lifecycle waits also observe durable exit state: the follower deliberately
-/// starts existing logs at EOF, so a completed exit is not a new event.
-fn print_recorded_exit(name: &str, wait_type: &str, json: bool) -> bool {
-    if wait_type != pty_core::events::event_type::SESSION_EXIT {
-        return false;
-    }
-    let Some(metadata) = registry::read_metadata(name) else {
-        return false;
-    };
-    if !metadata.has_exited() && metadata.exit_code.is_none() {
-        return false;
-    }
-    if let Some(event) = read_retained_events_of_type(name, wait_type).pop() {
-        println!("{}", render(&event, json));
-    } else if let Some(code) = metadata.exit_code {
-        // Retention or cleanup can remove the log while exit metadata remains.
-        let mut event = Event::session_exit(name, code, None);
-        if let Some(timestamp) = metadata.exited_at {
-            event.ts = timestamp;
-        }
-        println!("{}", render(&event, json));
-    }
-    true
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const VANISHED_EXIT_CODE: i32 = 2;
+
+/// Polling with no requested events still reports a pipe's lost reader.
+/// Unlike a zero-byte write, this detects closure even while events are idle.
+fn output_closed() -> bool {
+    let mut fd = libc::pollfd { fd: libc::STDOUT_FILENO, events: 0, revents: 0 };
+    // SAFETY: `fd` points to one initialized poll descriptor.
+    (unsafe { libc::poll(&mut fd, 1, 0) }) > 0
+        && fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
 }
 
-fn check_wait_target(name: &str, wait_type: &str) -> Result<(), CliError> {
-    match registry::get_session(name).map_err(CliError)? {
-        None => Err(CliError(format!("Session \"{name}\" not found."))),
-        Some(session)
-            if wait_type == pty_core::events::event_type::SESSION_EXIT
-                && session.status == registry::SessionStatus::Vanished =>
-        {
-            Err(CliError(format!("Session \"{name}\" vanished without a recorded exit.")))
-        }
-        Some(_) => Ok(()),
+fn print_event(event: &Event, json: bool) -> Result<bool, CliError> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    match writeln!(output, "{}", render(event, json)).and_then(|()| output.flush()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(CliError(format!("Could not write events: {error}"))),
     }
+}
+
+fn current_event(event: &Event, metadata: &registry::SessionMetadata) -> bool {
+    event.ts >= metadata.created_at
+}
+
+/// Logs are cleared on replacement publication; the creation timestamp also
+/// fences retained legacy records. Pin the opaque generation across reads so a
+/// replacement with the same stable name cannot satisfy an old observer.
+fn recorded_event(
+    name: &str,
+    wait_type: &str,
+    fence: &registry::SessionMetadata,
+) -> Option<Event> {
+    let metadata = registry::read_metadata(name)?;
+    if metadata.generation != fence.generation || metadata.created_at != fence.created_at {
+        return None;
+    }
+    let event = read_retained_events_of_type(name, wait_type)
+        .into_iter()
+        .rev()
+        .find(|event| current_event(event, fence))
+        .or_else(|| {
+            if wait_type != pty_core::events::event_type::SESSION_EXIT {
+                return None;
+            }
+            let code = metadata.exit_code?;
+            let timestamp = metadata.exited_at.as_ref()?;
+            let event = Event::session_exit(name, code, None).with_ts(timestamp);
+            current_event(&event, fence).then_some(event)
+        });
+    let after = registry::read_metadata(name)?;
+    (after.generation == fence.generation && after.created_at == fence.created_at)
+        .then_some(event)
+        .flatten()
+}
+
+fn target_vanished(name: &str, fence: &registry::SessionMetadata) -> bool {
+    registry::get_session_by_name(name).is_none_or(|session| {
+        session.metadata.as_ref().is_none_or(|metadata| {
+            metadata.generation != fence.generation || metadata.created_at != fence.created_at
+        }) || session.status == registry::SessionStatus::Vanished
+    })
+}
+
+fn vanished(name: &str) -> CliResult {
+    eprintln!("Session \"{name}\" vanished without a recorded exit.");
+    Ok(VANISHED_EXIT_CODE)
 }
 
 /// Parse and run.
@@ -168,12 +201,18 @@ fn cmd_events(
             Some(expected) => read_retained_events_of_type(name, expected),
             None => read_recent_events(name, DEFAULT_RECENT_EVENTS),
         };
+        let metadata = registry::read_metadata(name);
+        let events: Vec<_> = events.into_iter().filter(|event| {
+            metadata.as_ref().is_none_or(|metadata| current_event(event, metadata))
+        }).collect();
         if events.is_empty() && event_type.is_none() {
             println!("No recent events for \"{name}\".");
             return Ok(0);
         }
         for event in &events {
-            println!("{}", render(event, json));
+            if !print_event(event, json)? {
+                return Ok(0);
+            }
         }
         return Ok(0);
     }
@@ -193,57 +232,69 @@ fn cmd_events(
         let Some(name) = name else {
             return Err("--wait requires a session name.".into());
         };
-        if print_recorded_exit(name, wait_type, json) {
-            return Ok(0);
-        }
-        check_wait_target(name, wait_type)?;
+        let Some(fence) = registry::read_metadata(name) else {
+            return vanished(name);
+        };
         exit_zero_on_sigint();
+        // The channel constructor waits for the follower to establish its EOF
+        // offsets. Checking durable history only after this handshake leaves no
+        // gap between replay and subscription.
         let (_follower, rx) = EventFollower::channel(FollowerOptions::names(vec![name.to_string()]));
-        // Close the state-read/subscribe race, including removal before the
-        // follower observed the registry entry.
-        if print_recorded_exit(name, wait_type, json) {
+        if let Some(event) = recorded_event(name, wait_type, &fence) {
+            print_event(&event, json)?;
             return Ok(0);
         }
-        check_wait_target(name, wait_type)?;
         loop {
-            let recv = match deadline {
-                Some(d) => {
-                    let now = Instant::now();
-                    if now >= d {
-                        Err(RecvTimeoutError::Timeout)
-                    } else {
-                        rx.recv_timeout(d - now)
+            if output_closed() {
+                return Ok(0);
+            }
+            if target_vanished(name, &fence) {
+                if let Some(event) = recorded_event(name, wait_type, &fence) {
+                    print_event(&event, json)?;
+                    return Ok(0);
+                }
+                return vanished(name);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                // Recheck durable history before declaring a timeout:
+                // filesystem notifications can be delayed.
+                if let Some(event) = recorded_event(name, wait_type, &fence) {
+                    print_event(&event, json)?;
+                    return Ok(0);
+                }
+                if target_vanished(name, &fence) {
+                    return vanished(name);
+                }
+                eprintln!(
+                    "Timed out after {}s waiting for \"{wait_type}\" event.",
+                    js_number(timeout)
+                );
+                return Ok(1);
+            }
+            let interval = deadline.map_or(OUTPUT_POLL_INTERVAL, |deadline| {
+                deadline.saturating_duration_since(Instant::now()).min(OUTPUT_POLL_INTERVAL)
+            });
+            match rx.recv_timeout(interval) {
+                Ok(event) if event.r#type == wait_type && current_event(&event, &fence) => {
+                    // A stable name may have been republished while the
+                    // event was queued. Never satisfy the original waiter
+                    // with a replacement incarnation.
+                    if target_vanished(name, &fence) {
+                        return vanished(name);
                     }
+                    print_event(&event, json)?;
+                    return Ok(0);
                 }
-                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            };
-            match recv {
-                Ok(event) => {
-                    if event.r#type == wait_type {
-                        println!("{}", render(&event, json));
-                        return Ok(0);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    eprintln!(
-                        "Timed out after {}s waiting for \"{wait_type}\" event.",
-                        js_number(timeout)
-                    );
-                    return Ok(1);
-                }
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    if print_recorded_exit(name, wait_type, json) {
+                    if let Some(event) = recorded_event(name, wait_type, &fence) {
+                        print_event(&event, json)?;
                         return Ok(0);
                     }
-                    let vanished = registry::get_session_by_name(name)
-                        .is_some_and(|session| session.status == registry::SessionStatus::Vanished);
-                    if vanished && wait_type == pty_core::events::event_type::SESSION_EXIT {
-                        eprintln!("Session \"{name}\" vanished without a recorded exit.");
-                    } else if vanished {
-                        eprintln!("Session \"{name}\" vanished before a \"{wait_type}\" event was observed.");
-                    } else {
-                        eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
+                    if target_vanished(name, &fence) {
+                        return vanished(name);
                     }
+                    eprintln!("Session \"{name}\" ended before a \"{wait_type}\" event was observed.");
                     return Ok(1);
                 }
             }
@@ -257,23 +308,23 @@ fn cmd_events(
     };
     let (_follower, rx) = EventFollower::channel(options);
     loop {
-        let recv = match deadline {
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    Err(RecvTimeoutError::Timeout)
-                } else {
-                    rx.recv_timeout(d - now)
+        if output_closed() {
+            return Ok(0);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            eprintln!("Timed out after {}s following events.", js_number(timeout));
+            return Ok(1);
+        }
+        let interval = deadline.map_or(OUTPUT_POLL_INTERVAL, |deadline| {
+            deadline.saturating_duration_since(Instant::now()).min(OUTPUT_POLL_INTERVAL)
+        });
+        match rx.recv_timeout(interval) {
+            Ok(event) => {
+                if !print_event(&event, json)? {
+                    return Ok(0);
                 }
             }
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-        };
-        match recv {
-            Ok(event) => println!("{}", render(&event, json)),
-            Err(RecvTimeoutError::Timeout) => {
-                eprintln!("Timed out after {}s following events.", js_number(timeout));
-                return Ok(1);
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(0),
         }
     }
