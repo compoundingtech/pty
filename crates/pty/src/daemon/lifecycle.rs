@@ -35,7 +35,7 @@ use pty_terminal::{TerminalActor, serialize};
 use super::DaemonConfig;
 use super::clients::{Client, ClientFacts, Out, REDRAW_SETTLE, Role};
 use super::daemon_warn;
-use super::env::{build_child_env, describe_invalid_cwd, invalid_cwd_error, permanent_respawn_env};
+use super::env::{build_child_env, permanent_respawn_env};
 use super::input_budget::{INPUT_BUDGET, InputBudget, InputHold};
 use pty_core::process_tree::{
     KILL_WAIT, ProcTable, ProcessIdentity, TERM_WAIT, TreeSnapshot, complete_snapshot_from_table,
@@ -346,7 +346,7 @@ fn install_ordinary_child_test_hook() -> Result<(), String> {
 
 /// Run the daemon for `cfg` to completion; the return value is the process
 /// exit status (the child's code after a natural exit, 0 after a kill).
-pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
+pub(crate) fn run(mut cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<i32, String> {
     let mut kill_signals = catch_kill_signals()?;
     let name = cfg.name.clone();
     let generation = cfg
@@ -364,12 +364,10 @@ pub(crate) fn run(cfg: DaemonConfig, readiness: super::ReadyNotifier) -> Result<
         published_tags.insert(lease.lifecycle_tag.clone(), lease.starting_value.clone());
     }
     let events = EventWriter::new(&name);
-    let (rows, cols, cwd) = (cfg.rows(), cfg.cols(), cfg.cwd());
+    let (rows, cols) = (cfg.rows(), cfg.cols());
 
     let child_env = build_child_env(&cfg, &generation)?;
-    if let Some(reason) = describe_invalid_cwd(&cwd) {
-        return Err(invalid_cwd_error(&reason, &name, &cfg.command));
-    }
+    let cwd = super::env::prepare_cwd(&mut cfg)?;
 
     // The PTY pair first: opening it fails before anything is published.
     let pair = pty_spawn::open(rows, cols)

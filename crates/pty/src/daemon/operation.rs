@@ -432,7 +432,7 @@ impl Worker {
     }
 
     fn run(
-        self,
+        mut self,
         commands: Receiver<WorkerCmd>,
         rx: Receiver<Msg>,
         readiness: super::ReadyNotifier,
@@ -692,7 +692,7 @@ impl Worker {
 
     /// Everything publication needs that is not itself an effect.
     fn prepare(
-        &self,
+        &mut self,
         generation: &str,
     ) -> Result<
         (
@@ -702,14 +702,7 @@ impl Worker {
         String,
     > {
         let child_env = super::env::build_child_env(&self.cfg, generation)?;
-        let cwd = self.cfg.cwd();
-        if let Some(reason) = super::env::describe_invalid_cwd(&cwd) {
-            return Err(super::env::invalid_cwd_error(
-                &reason,
-                &self.cfg.name,
-                &self.cfg.command,
-            ));
-        }
+        super::env::prepare_cwd(&mut self.cfg)?;
         let pair = pty_spawn::open(self.cfg.rows(), self.cfg.cols()).map_err(|e| {
             format!(
                 "Failed to open a PTY for session \"{}\": {e}",

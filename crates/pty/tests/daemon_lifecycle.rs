@@ -115,6 +115,34 @@ fn publication_order_and_shapes() {
     }
 }
 
+#[test]
+fn launch_stores_an_absolute_cwd_without_resolving_symlinks() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    let current = std::env::current_dir().unwrap();
+
+    for relative in [true, false] {
+        let root = short_root();
+        let link = root.join("cwd-link");
+        std::os::unix::fs::symlink(&current, &link).unwrap();
+        let cwd = if relative { "." } else { link.to_str().unwrap() };
+        let name = unique_name("absolute-cwd");
+        let marker = root.join(format!("{name}.started"));
+        let script = format!("pwd -P > '{}'; exec sleep 30", marker.display());
+        let mut cfg = config(&name, "sh", &["-c", &script]);
+        cfg["cwd"] = json!(cwd);
+        let d = Daemon::start(&root, cfg);
+        assert!(wait_until(T, || marker.exists()));
+        let metadata = d.meta().unwrap();
+        let stored = std::path::Path::new(metadata["cwd"].as_str().unwrap());
+        assert!(stored.is_absolute());
+        let expected = if relative { &current } else { &link };
+        assert_eq!(stored, expected);
+        assert!(wait_until(T, || std::fs::read_to_string(&marker)
+            .is_ok_and(|value| value.trim() == current.to_str().unwrap())));
+    }
+}
+
 /// The owner record is published before the child starts.
 ///
 /// compoundingtech/pty#180: the daemon spawned its child before publishing,
