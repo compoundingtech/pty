@@ -172,7 +172,10 @@ fn recent_and_usage() {
 #[test]
 fn wait_prints_the_first_matching_event_or_times_out() {
     let rig = Rig::new();
-    rig.write_meta("w", json!({"createdAt": "2026-01-01T00:00:00.000Z"}));
+    rig.spawn_cat("w", &[]);
+    let mut metadata = rig.read_meta("w").unwrap();
+    metadata["createdAt"] = json!("2026-01-01T00:00:00.000Z");
+    rig.write_meta("w", metadata);
     let out = rig.run(&["events", "--wait", "bell", "-t", "1", "w"]);
     assert_eq!(out.code, 1);
     assert_eq!(out.stderr, "Timed out after 1s waiting for \"bell\" event.\n");
@@ -232,7 +235,7 @@ fn finish_within(mut child: std::process::Child, limit: Duration) -> std::proces
 #[test]
 fn timeout_applies_after_the_reference_for_wait_and_follow() {
     let rig = Rig::new();
-    rig.write_meta("deadline", json!({}));
+    rig.spawn_cat("deadline", &[]);
     for args in [
         vec!["events", "deadline", "--wait", "user.never", "--timeout", "1", "--json"],
         vec!["events", "deadline", "--wait", "user.never", "-t", "1", "--json"],
@@ -363,8 +366,8 @@ fn an_unexpected_argument_is_refused_rather_than_dropping_the_options_after_it()
 
 /// A daemon that recorded itself and died without recording an exit can
 /// append nothing more, so waits and named follows on it end, whether they
-/// started before it died or after. A record no daemon claimed keeps waiting
-/// (`wait_prints_the_first_matching_event_or_times_out`).
+/// started before it died or after. Timeout tests use a live daemon so they
+/// exercise deadlines rather than this distinct vanished outcome.
 #[test]
 fn waits_and_follows_end_when_their_daemon_vanishes() {
     let rig = Rig::new();
@@ -492,11 +495,12 @@ fn wait_replays_arbitrary_exact_types_beyond_the_recent_tail() {
 
 #[test]
 fn wait_ignores_previous_generation_events_and_accepts_the_creation_boundary() {
-    let rig = Rig::new();
     for event_type in ["user.note", "session_exit"] {
-        rig.write_meta("reused", json!({
-            "createdAt": "2026-01-02T03:04:06.000Z", "generation": "current"
-        }));
+        let rig = Rig::new();
+        rig.spawn_cat("reused", &[]);
+        let mut metadata = rig.read_meta("reused").unwrap();
+        metadata["createdAt"] = json!("2026-01-02T03:04:06.000Z");
+        rig.write_meta("reused", metadata);
         std::fs::write(rig.path("reused.events.jsonl"), "").unwrap();
         append_event(&rig, "reused", &json!({
             "session": "reused", "type": event_type,
@@ -530,9 +534,9 @@ fn wait_ignores_previous_generation_events_and_accepts_the_creation_boundary() {
 
 #[test]
 fn wait_reports_registry_removal_as_vanished_not_timeout() {
-    let rig = Rig::new();
     for event_type in ["user.never", "session_exit"] {
-        rig.write_meta("removed-wait", json!({}));
+        let rig = Rig::new();
+        rig.spawn_cat("removed-wait", &[]);
         let mut child = spawn_wait(&rig, "removed-wait", event_type, true);
         // Unlike followers, waits have no stdout readiness marker. Keep the
         // process alive through several follower polling intervals before
