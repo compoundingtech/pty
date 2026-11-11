@@ -395,6 +395,58 @@ fn waits_and_follows_end_when_their_daemon_vanishes() {
     }
 }
 
+/// Regression from #201: lose a daemon only after the lifecycle waiter has
+/// subscribed, without removing its registry entry or publishing an exit.
+#[test]
+fn lifecycle_wait_returns_promptly_when_a_live_daemon_vanishes() {
+    let rig = Rig::new();
+    rig.spawn_cat("vanishing", &[]);
+    let pid: i32 = std::fs::read_to_string(rig.path("vanishing.pid"))
+        .unwrap().trim().parse().unwrap();
+    let mut child = rig.cmd(&[
+        "events", "vanishing", "--wait", "session_exit", "--timeout", "3600",
+    ]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // The Linux watcher is installed after the follower's subscription-ready
+    // handshake. Observe that installation rather than relying on a sleep.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(child.try_wait().unwrap().is_none(), "wait ended before daemon loss");
+            let subscribed = std::fs::read_dir(format!("/proc/{}/fdinfo", child.id()))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .any(|info| info.lines().any(|line| line.starts_with("inotify wd:")));
+            if subscribed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "wait did not install its registry watch");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Match the original regression's bounded startup allowance on platforms
+    // without Linux's observable inotify descriptor.
+    #[cfg(not(target_os = "linux"))]
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(child.try_wait().unwrap().is_none());
+    pty_core::kill::process(pid, libc::SIGKILL).unwrap();
+    let started = Instant::now();
+    let out = finish_within(child, Duration::from_secs(2));
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Session \"vanishing\" vanished without a recorded exit.\n",
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let metadata = rig.read_meta("vanishing").expect("vanished metadata must remain");
+    assert!(metadata.get("exitCode").is_none(), "{metadata}");
+    assert!(metadata.get("exitedAt").is_none(), "{metadata}");
+    let events = std::fs::read_to_string(rig.path("vanishing.events.jsonl")).unwrap();
+    assert!(parse_json_lines(&events).iter().all(|event| event["type"] != "session_exit"));
+}
+
 fn spawn_wait(rig: &Rig, name: &str, event_type: &str, json: bool) -> std::process::Child {
     let mut args = vec!["events", name, "--wait", event_type, "--timeout", "10"];
     if json {
