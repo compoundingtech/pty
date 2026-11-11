@@ -7,16 +7,29 @@ Flags:
   --recent             Print recent events and exit (don't follow)
   --json               Emit raw JSONL
   --type <type>         With --recent, print every retained event of this exact type
-  --wait <type>        Block until an event of <type> appears
+  --wait <type>        Replay current-generation retained matches, then wait for a match
   -t, --timeout <sec>  Timeout (seconds) for --wait or follow; exit 1 on timeout
 
 Options may appear before or after <ref>; any other argument is an error. A named
 follow exits when the session exits, its daemon vanishes without recording an
 exit, or its registry entry is removed outside a locked respawn; --all continues
 watching new sessions. Terminal metadata is followed by a final event-log drain.
---wait exits 1 if the session ends before a matching event, or on timeout.
+Waits subscribe before checking durable current-generation events, recheck after
+subscription and before timeout, and follow safely for any event type. session_exit
+also checks recorded exit metadata if the event log is gone.
+--wait exits 0 on a match, 1 on timeout/general failure (including an initially
+missing session), and 2 if the target vanishes without a recorded exit, including
+removal while waiting. Vanished is not successful completion.
+Text and JSON streaming exit cleanly with 0 when the stdout reader closes, even idle.
 
 Examples:
   pty events myserver
   pty events --recent --json myserver
   pty events --recent --json --type user.tests-passed myserver
+
+Durable completion observation (inspect the recorded exit code separately):
+  pty events --recent --type session_exit --json REF
+  pty events --wait session_exit -t SECONDS --json REF
+  pty events --recent --type session_exit --json REF
+Check retained current-generation events first; if none match, use a bounded wait
+and a final durable recheck. An empty --recent result is not proof of completion.

@@ -245,7 +245,7 @@ test = "peek_wait::events_wait_on_metadata_without_a_started_daemon_returns_vani
 side = "node"
 kind = "node-defect"
 reason = """
-Rust rejects a vanished metadata-only launcher with status 1 rather than \
+Rust rejects a vanished metadata-only launcher with distinct status 2 rather than \
 waiting for an exit event from a daemon that never started (#196). Against \
 pinned Node f005432ad5c73b79abd7c5eaa8a0d6eb66ee9194 on Node 22, CI run \
 40986814385 exhausted the five-second harness deadline. Remove when Node \

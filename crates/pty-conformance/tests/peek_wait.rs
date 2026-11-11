@@ -298,10 +298,12 @@ fn events_wait_on_metadata_without_a_started_daemon_returns_vanished_without_wai
         None,
         Duration::from_secs(5),
     );
-    expect_status(&out, 1);
+    expect_status(&out, 2);
     assert!(!out.timed_out, "vanished session wait hung: {}", out.summary());
-    expect_contains(&out.stderr(), &name);
-    expect_contains(&out.stderr(), "vanished");
+    assert_eq!(
+        out.stderr(),
+        format!("Session \"{name}\" vanished without a recorded exit.\n"),
+    );
 }
 
 /// `--timeout inf` used to end the command with a Rust panic. It is an

@@ -100,19 +100,44 @@ lose the current buffered window. One-shot writers (`pty emit`, metadata, tags,
 display name, `pty exec`, and gc) retain their existing event-lock behavior, so
 their records can land before daemon records from up to one window earlier.
 
-`pty events NAME --wait session_exit --timeout SECONDS` checks recorded exit
-state before and after subscribing, so an already-exited retained session
-returns immediately (exit status 0), even if its event log was removed.
-Other event types wait for a new matching event. A missing session returns a
-not-found error (exit status 1); a vanished target with no recorded exit also
-fails promptly, including a launcher that never started. A session removed
-while waiting without an observed matching event returns 1. So does any wait
-whose daemon dies without recording an exit, before or after the wait starts;
-a named follow ends there with 0. A record no daemon has claimed yet keeps
-other waits waiting, since its launcher may still start it. The timeout is an
-independent deadline and returns 1 even when no filesystem events arrive.
-Options may follow the session reference, and any other argument is an error
-(exit status 1) rather than silently dropping the options after it.
+For durable completion checks, first read the retained exit events for the
+current session generation:
+
+```sh
+pty events --recent --type session_exit --json REF
+```
+
+If no matching record is returned, use a bounded wait, then perform one final
+durable recheck:
+
+```sh
+pty events --wait session_exit -t SECONDS --json REF
+pty events --recent --type session_exit --json REF
+```
+
+An empty `--recent` result is not proof of completion. A vanished session is
+not success: require a recorded exit, and inspect its exit code separately
+from the observer command's status.
+
+`--wait TYPE` replays matching retained events from the current generation for
+any event type, rather than requiring a new event. It subscribes before the
+durable check, rechecks after subscription and before reporting a timeout,
+and continues following for a match without a check/subscribe race.
+`session_exit` also checks recorded exit metadata, so an already-exited
+retained session returns immediately even if its event log was removed.
+Wait exit statuses are 0 for a match, 1 for timeout or general failure
+(including an initially missing session), and 2 for a vanished target without
+a recorded exit, including removal while waiting. A launcher that never
+started or a daemon that dies without recording an exit is not successful
+completion. A record no daemon has claimed yet keeps waits waiting, since its
+launcher may still start it. The timeout is an independent deadline even
+when no filesystem events arrive.
+
+A named follow ends with 0 when its session exits, vanishes, or is removed.
+Both text and JSON streaming also exit cleanly with 0 as soon as their stdout
+reader closes, even while idle. Options may follow the session reference, and
+any other argument is an error (exit status 1) rather than silently dropping
+the options after it.
 
 Followers ignore read-only filesystem notifications and coalesce change
 notifications, avoiding feedback from their own registry reads. Every session
