@@ -427,9 +427,9 @@ fn reap_and_preserve_decisions() {
         .flatten()
         .map(|e| e.file_name())
         .collect();
-    assert_eq!(left, vec![std::ffi::OsString::from(pty_core::registry::RETAINED_EXIT_FILE_NAME)]);
+    assert_eq!(left, vec![std::ffi::OsString::from(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME)]);
     let receipts: Vec<pty_core::registry::RetainedSessionExit> = serde_json::from_slice(
-        &std::fs::read(root.join(pty_core::registry::RETAINED_EXIT_FILE_NAME)).unwrap(),
+        &std::fs::read(root.join(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME)).unwrap(),
     ).unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].name, d.name);
