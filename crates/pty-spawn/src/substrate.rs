@@ -156,8 +156,12 @@ pub enum SessionEvent {
     /// Child output. It can follow a lifecycle event when a descendant keeps
     /// the PTY open past the child's exit; it never follows `OutputClosed`.
     Data(Vec<u8>),
-    /// The PTY master reached EOF. No more [`SessionEvent::Data`] follows.
+    /// The PTY master reader ended. No more [`SessionEvent::Data`] follows.
+    /// A read failure is distinguished by a preceding `OutputFailed`.
     OutputClosed,
+    /// The master reader failed before EOF; precedes `OutputClosed`.
+    /// Consumers must not claim complete output after this event.
+    OutputFailed,
     Lifecycle(Lifecycle),
     Geometry(PtySize),
 }
@@ -584,6 +588,7 @@ fn start_owner(
         published: Lifecycle::Running,
         publish_exit_at: None,
         output_closed: false,
+        output_failed: false,
     };
     thread::Builder::new()
         .name("pty-substrate-owner".into())
@@ -630,6 +635,7 @@ enum Command {
     Output(Vec<u8>),
     Reaped(ExitStatus),
     ReaderClosed,
+    ReaderFailed,
     OwnerLost,
 }
 
@@ -701,6 +707,7 @@ struct Actor {
     published: Lifecycle,
     publish_exit_at: Option<Instant>,
     output_closed: bool,
+    output_failed: bool,
 }
 
 impl Actor {
@@ -736,6 +743,9 @@ impl Actor {
             } => {
                 let result = check(&requested, &self.session).map(|_| {
                     let mut live = attachment.0.push(SessionEvent::Lifecycle(self.published));
+                    if self.output_failed {
+                        live = live && attachment.0.push(SessionEvent::OutputFailed);
+                    }
                     if self.output_closed {
                         live = live && attachment.0.push(SessionEvent::OutputClosed);
                     }
@@ -784,6 +794,10 @@ impl Actor {
                         self.publish_exit_at = Some(Instant::now() + EXIT_OUTPUT_DRAIN);
                     }
                 }
+            }
+            Command::ReaderFailed => {
+                self.output_failed = true;
+                self.broadcast(SessionEvent::OutputFailed);
             }
             Command::ReaderClosed => {
                 self.output_closed = true;
@@ -892,7 +906,10 @@ fn read_master(
                 let delay_ms = if end_retries < END_RETRIES { 1 } else { 50 };
                 thread::sleep(Duration::from_millis(delay_ms));
             }
-            Err(_) => break,
+            Err(_) => {
+                let _ = tx.send(Command::ReaderFailed);
+                break;
+            }
         }
     }
     let _ = tx.send(Command::ReaderClosed);
@@ -1404,6 +1421,7 @@ mod tests {
             published: Lifecycle::Running,
             publish_exit_at: None,
             output_closed: false,
+            output_failed: false,
         };
         (actor, queue)
     }
@@ -1459,6 +1477,31 @@ mod tests {
                 None => Ok(0),
             }
         }
+    }
+
+    #[test]
+    fn reader_failure_is_distinct_from_complete_output_for_current_and_late_readers() {
+        let reader = Scripted(VecDeque::from([
+            Ok(&b"prefix"[..]), Err(io::Error::other("fixture read failure")),
+        ]));
+        let (tx, rx) = mpsc::channel();
+        read_master(Box::new(reader), tx, None, Arc::new(ChildSignals::new(None)));
+        let (mut actor, queue) = hand_driven_actor();
+        for command in rx.try_iter() { actor.handle(command); }
+        assert_eq!(take_queued(&queue), vec![
+            SessionEvent::Data(b"prefix".to_vec()),
+            SessionEvent::OutputFailed, SessionEvent::OutputClosed,
+        ]);
+        let late = Queue::new(DEFAULT_ATTACHMENT_CAPACITY, OnFull::Detach);
+        let (reply, result) = mpsc::channel();
+        actor.handle(Command::Attach {
+            session: actor.session.clone(), attachment: Attachment(Arc::clone(&late)), reply,
+        });
+        result.recv().unwrap().unwrap();
+        assert_eq!(take_queued(&late), vec![
+            SessionEvent::Lifecycle(Lifecycle::Running),
+            SessionEvent::OutputFailed, SessionEvent::OutputClosed,
+        ]);
     }
 
     /// PR #31 P1 / PR #32: an end of output that the kernel reports before

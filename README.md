@@ -363,15 +363,26 @@ Its suffix is deliberately outside the legacy Rust and Node session namespaces:
 mixed-version garbage collectors cannot mistake receipts for malformed session
 metadata. Its atomic temporary files use the existing dead-writer cleanup.
 `pty_core::registry::retained_session_exit_in(root, id, daemon_pid, created_at)`
-looks up the exact incarnation's actual child exit code or signal and final
-terminal text. The newest 256 exits are retained across the entire root; each
-tail is bounded to 8 KiB of logical, unwrapped text, dropping a partial leading
-logical line on truncation. This preserves credential-prefix continuity for
-consumer redaction; terminal soft wraps never become token boundaries. Older
-receipts are evicted, not inferred from a replacement. These are raw private
-terminal contents, like session metadata: apply a publication/redaction policy
-before forwarding them. A daemon killed before reaping its child cannot record
-an exit receipt.
+looks up the exact incarnation's actual child exit code or signal and bounded
+output. The newest 256 exits are retained across the entire root. Output is
+captured from the raw PTY byte stream, not a terminal snapshot: scrollback
+eviction, cursor edits and screen switches must not erase redaction context.
+`outputComplete: true` positively proves that every emitted byte through EOF
+was retained within 8 KiB and decoded as valid UTF-8, with no reader/stream loss.
+On overflow, the daemon discards the captured text and stops copying further
+output; incomplete or invalid text is empty and `outputComplete` is false.
+Missing completeness fields in older receipts also decode as false. Consumers
+must withhold output unless completeness is positively true; a safe-looking
+suffix can have lost an earlier `Authorization:` marker across a hard newline.
+Exit code and signal remain useful independently of output completeness.
+
+These are raw private terminal bytes, like session metadata, not sanitized
+screen text. Apply a publication/redaction policy before forwarding them;
+consumers may conservatively withhold ANSI/control-bearing output rather than
+parse it. Ordinary short plain diagnostics remain available, and terminal soft
+wraps never insert token boundaries into the raw stream. Older receipts are
+evicted, not inferred from a replacement. A daemon killed before reaping its
+child cannot record an exit receipt.
 
 Session ids remain independent of Unix socket pathname limits. A socket uses
 `<id>.sock` when that address fits; longer addresses use an `@`-prefixed digest

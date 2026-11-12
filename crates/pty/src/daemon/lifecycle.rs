@@ -50,7 +50,7 @@ use pty_lifecycle::{
 /// What the helper threads tell the actor.
 pub(crate) enum Msg {
     PtyData(Vec<u8>),
-    PtyEof,
+    PtyEof(bool),
     /// The typed child status from the substrate reaper.
     ChildExited(ExitStatus),
     Connect {
@@ -90,7 +90,7 @@ fn next_queued_message(
     // thread can drain the channel. The next turn resumes the scan.
     for _ in 0..8192 {
         match rx.try_recv() {
-            Ok(msg @ (Msg::PtyData(_) | Msg::PtyEof | Msg::ChildExited(_))) => {
+            Ok(msg @ (Msg::PtyData(_) | Msg::PtyEof(_) | Msg::ChildExited(_))) => {
                 deferred.push_back(msg);
             }
             Ok(control) => return Ok(control),
@@ -137,6 +137,8 @@ pub(crate) struct Daemon {
     pub(crate) generation: String,
     created_at: Option<String>,
     exit_receipt_written: bool,
+    exit_output: Vec<u8>,
+    exit_output_complete: bool,
     pub(crate) cfg: DaemonConfig,
     pub(crate) actor: TerminalActor,
     /// The substrate owner is the sole PTY master reader/writer/reaper.
@@ -709,6 +711,7 @@ pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, t
     std::thread::spawn(move || {
         let mut exited = false;
         let mut output_closed = false;
+        let mut output_failed = false;
         loop {
             match stream.recv() {
                 Ok(SessionEvent::Data(bytes)) => {
@@ -718,10 +721,11 @@ pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, t
                 }
                 Ok(SessionEvent::OutputClosed) => {
                     output_closed = true;
-                    if tx.send(Msg::PtyEof).is_err() || exited {
+                    if tx.send(Msg::PtyEof(!output_failed)).is_err() || exited {
                         return;
                     }
                 }
+                Ok(SessionEvent::OutputFailed) => output_failed = true,
                 Ok(SessionEvent::Lifecycle(Lifecycle::Running)) => {}
                 Ok(SessionEvent::Lifecycle(Lifecycle::Exited(status))) => {
                     exited = true;
@@ -731,7 +735,7 @@ pub(crate) fn spawn_session_bridge(stream: pty_spawn::substrate::AttachStream, t
                 }
                 Ok(SessionEvent::Lifecycle(Lifecycle::OwnerLost)) | Err(_) => {
                     if !output_closed {
-                        let _ = tx.send(Msg::PtyEof);
+                        let _ = tx.send(Msg::PtyEof(false));
                     }
                     return;
                 }
@@ -970,6 +974,8 @@ impl Daemon {
             generation,
             created_at,
             exit_receipt_written: false,
+            exit_output: Vec::new(),
+            exit_output_complete: true,
             cfg,
             actor: terminal_actor(rows, cols),
             _owner: owner,
@@ -1091,7 +1097,8 @@ impl Daemon {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::PtyData(bytes) => self.on_pty_data(&bytes),
-            Msg::PtyEof => {
+            Msg::PtyEof(complete) => {
+                self.exit_output_complete &= complete;
                 self.pty_eof = true;
                 if self.child_status.is_some() && !self.exited {
                     self.finalize_exit();
@@ -1170,6 +1177,20 @@ impl Daemon {
     ///
     /// node: src/server.ts:559-569
     fn on_pty_data(&mut self, bytes: &[u8]) {
+        if self.exit_output_complete && !bytes.is_empty() {
+            let limit = registry::retained_exit::RETAINED_EXIT_TAIL_BYTES;
+            if bytes.len() > limit - self.exit_output.len() {
+                // Once context is lost, no suffix is safe to publish. Stop
+                // capturing rather than copying or shifting unusable output.
+                self.exit_output_complete = false;
+                self.exit_output = Vec::new();
+            } else {
+                if self.exit_output.capacity() == 0 {
+                    self.exit_output.reserve_exact(limit);
+                }
+                self.exit_output.extend_from_slice(bytes);
+            }
+        }
         self.stamp_output_activity();
         let answering = answering_client_available(&self.clients);
         self.actor.set_clipboard_client_available(answering);
@@ -1598,6 +1619,10 @@ impl Daemon {
         let (Some(created_at), Some(status)) = (&self.created_at, self.child_status) else {
             return;
         };
+        // A screen snapshot cannot prove complete redaction context: history,
+        // alternate screens and cursor edits can discard earlier output.
+        let output = (self.exit_output_complete && self.pty_eof)
+            .then(|| std::str::from_utf8(&self.exit_output).ok()).flatten();
         let receipt = registry::RetainedSessionExit {
             name: self.name.clone(),
             generation: self.generation.clone(),
@@ -1605,10 +1630,8 @@ impl Daemon {
             created_at: created_at.clone(),
             exit_code: status.code,
             signal: status.signal,
-            // Physical row breaks can split credential prefixes (e.g. "sk-")
-            // and defeat consumer redaction. Preserve logical token continuity;
-            // the receipt writer drops partial logical lines at its byte bound.
-            output_tail: serialize::plain_full(self.actor.terminal()),
+            output_complete: output.is_some(),
+            output_tail: output.unwrap_or_default().to_owned(),
         };
         match registry::retain_session_exit(receipt) {
             Ok(()) => self.exit_receipt_written = true,
@@ -1783,7 +1806,7 @@ impl Daemon {
                 Some(wake.saturating_duration_since(now)),
             ) {
                 Ok(Msg::PtyData(bytes)) => self.on_pty_data(&bytes),
-                Ok(msg @ (Msg::PtyEof | Msg::ChildExited(_))) => self.handle(msg),
+                Ok(msg @ (Msg::PtyEof(_) | Msg::ChildExited(_))) => self.handle(msg),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return self.exited,
@@ -1984,7 +2007,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Msg::PtyData(b"one".to_vec())).unwrap();
         tx.send(Msg::PtyData(b"two".to_vec())).unwrap();
-        tx.send(Msg::PtyEof).unwrap();
+        tx.send(Msg::PtyEof(true)).unwrap();
         tx.send(Msg::ExternalKill).unwrap();
         let mut deferred = VecDeque::new();
         assert!(matches!(
@@ -1993,7 +2016,7 @@ mod tests {
         ));
         assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"one"));
         assert!(matches!(deferred.pop_front(), Some(Msg::PtyData(b)) if b == b"two"));
-        assert!(matches!(deferred.pop_front(), Some(Msg::PtyEof)));
+        assert!(matches!(deferred.pop_front(), Some(Msg::PtyEof(true))));
     }
 
     #[test]
@@ -2038,7 +2061,7 @@ mod tests {
         loop {
             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
                 Msg::PtyData(bytes) => forwarded.extend_from_slice(&bytes),
-                Msg::PtyEof => break,
+                Msg::PtyEof(true) => break,
                 _ => panic!("the bridge sent something other than output before EOF"),
             }
         }

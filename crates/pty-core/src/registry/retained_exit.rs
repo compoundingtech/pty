@@ -1,8 +1,10 @@
 //! Private local exit receipts, independent of reapable session artifacts.
 //!
-//! One atomic, owner-only file retains the newest 256 exits (at most 8 KiB of
-//! terminal text each). Consumers must apply their own publication/redaction
-//! policy before forwarding terminal content outside the private PTY root.
+//! One atomic, owner-only file retains the newest 256 exits. Text is published
+//! only with positive proof of complete raw UTF-8 output through EOF, bounded
+//! to 8 KiB; truncation destroys redaction context across hard as well as soft
+//! lines. Consumers must apply their publication/redaction policy before
+//! forwarding terminal content outside the private PTY root.
 
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -32,7 +34,12 @@ pub struct RetainedSessionExit {
     /// Actual wait status, not the shell convention 128 + signal.
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    /// Raw PTY output, not rendered screen text.
     pub output_tail: String,
+    /// True only when output includes every emitted byte through EOF.
+    /// Older receipts have no completeness proof and must not be published.
+    #[serde(default)]
+    pub output_complete: bool,
 }
 
 fn read_all(root: &Path) -> io::Result<Vec<RetainedSessionExit>> {
@@ -74,11 +81,8 @@ pub fn retain_session_exit(mut record: RetainedSessionExit) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid retained exit identity"));
     }
     if record.output_tail.len() > RETAINED_EXIT_TAIL_BYTES {
-        let mut start = record.output_tail.len() - RETAINED_EXIT_TAIL_BYTES;
-        while !record.output_tail.is_char_boundary(start) { start += 1; }
-        // Drop the partial first line rather than publish a sliced secret token.
-        let tail = &record.output_tail[start..];
-        record.output_tail = tail.find('\n').map_or_else(String::new, |offset| tail[offset + 1..].to_owned());
+        record.output_complete = false;
+        record.output_tail.clear();
     }
     ensure_session_dir()?;
     let root = session_dir();
@@ -103,6 +107,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_receipts_have_no_output_completeness_proof() {
+        let receipt: RetainedSessionExit = serde_json::from_value(serde_json::json!({
+            "name": "work", "generation": "g", "daemonPid": 42, "createdAt": "now",
+            "exitCode": 23, "signal": null, "outputTail": "fixture-secret"
+        })).unwrap();
+        assert!(!receipt.output_complete);
+        assert_eq!(receipt.exit_code, Some(23));
+    }
+
+    #[test]
     fn receipts_survive_cleanup_and_are_incarnation_fenced_and_bounded() {
         let root = std::env::temp_dir().join(format!("pty-retained-exit-{}", super::super::random_hex16()));
         std::fs::create_dir_all(&root).unwrap();
@@ -111,6 +125,7 @@ mod tests {
                 retain_session_exit(RetainedSessionExit {
                     name: "work".into(), generation: format!("g-{index}"), daemon_pid: 42,
                     created_at: index.to_string(), exit_code: Some(23), signal: None,
+                    output_complete: true,
                     output_tail: format!("{}\nfatal: fixture failure\n", "x".repeat(RETAINED_EXIT_TAIL_BYTES)),
                 }).unwrap();
             }
@@ -119,7 +134,8 @@ mod tests {
             assert!(retained_session_exit_in(&root, "work", 43, "256").unwrap().is_none());
             let receipt = retained_session_exit_in(&root, "work", 42, "256").unwrap().unwrap();
             assert_eq!(receipt.exit_code, Some(23));
-            assert_eq!(receipt.output_tail, "fatal: fixture failure\n");
+            assert!(receipt.output_tail.is_empty());
+            assert!(!receipt.output_complete);
             assert_eq!(read_all(&root).unwrap().len(), RETAINED_EXIT_LIMIT);
             let inventory = super::super::list_sessions_strict_in(&root, &Default::default());
             assert!(inventory.complete, "{:?}", inventory.errors);
