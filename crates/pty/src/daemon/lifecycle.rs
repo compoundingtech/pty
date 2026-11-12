@@ -132,6 +132,8 @@ const SHUTDOWN_DEADLINE_DEFAULT_MS: f64 = 5_000.0;
 pub(crate) struct Daemon {
     pub(crate) name: String,
     pub(crate) generation: String,
+    created_at: Option<String>,
+    exit_receipt_written: bool,
     pub(crate) cfg: DaemonConfig,
     pub(crate) actor: TerminalActor,
     /// The substrate owner is the sole PTY master reader/writer/reaper.
@@ -947,9 +949,14 @@ impl Daemon {
             operation,
         } = parts;
         let (rows, cols) = (cfg.rows(), cfg.cols());
+        let created_at = registry::read_metadata(&cfg.name)
+            .filter(|metadata| metadata.generation.as_deref() == Some(generation.as_str()))
+            .map(|metadata| metadata.created_at);
         Daemon {
             name: cfg.name.clone(),
             generation,
+            created_at,
+            exit_receipt_written: false,
             cfg,
             actor: terminal_actor(rows, cols),
             _owner: owner,
@@ -1542,6 +1549,7 @@ impl Daemon {
         self.exited = true;
         self.exit_code = code;
         self.exit_drain_deadline = None;
+        self.retain_exit_evidence();
         // Nothing can answer paste events now, so a later attach's replay
         // must not offer them.
         self.actor.end_stream();
@@ -1560,6 +1568,30 @@ impl Daemon {
         }
         if self.shutdown_code.is_none() {
             self.exit_shutdown_at = Some(Instant::now() + EXIT_GRACE);
+        }
+    }
+
+    fn retain_exit_evidence(&mut self) {
+        if self.exit_receipt_written {
+            return;
+        }
+        let (Some(created_at), Some(status)) = (&self.created_at, self.child_status) else {
+            return;
+        };
+        let receipt = registry::RetainedSessionExit {
+            name: self.name.clone(),
+            generation: self.generation.clone(),
+            daemon_pid: std::process::id(),
+            created_at: created_at.clone(),
+            exit_code: status.code,
+            signal: status.signal,
+            output_tail: self.last_lines().join("\n"),
+        };
+        match registry::retain_session_exit(receipt) {
+            Ok(()) => self.exit_receipt_written = true,
+            Err(error) => crate::daemon::daemon_warn!(
+                "pty daemon: could not retain exit evidence: {error}"
+            ),
         }
     }
 
@@ -1865,6 +1897,7 @@ impl Daemon {
         }
         if self.exited {
             self.save_exit_metadata_until_settled(EXIT_METADATA_SETTLE);
+            self.retain_exit_evidence();
         }
         self.events.flush();
         if self.reap_at_exit() {

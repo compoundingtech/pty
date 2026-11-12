@@ -33,6 +33,39 @@ fn wait_exited(d: &Daemon) -> serde_json::Value {
     d.meta().unwrap()
 }
 
+#[test]
+fn reaped_harness_retains_exact_wait_status_and_terminal_failure_tail() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    for (finish, code, signal) in [
+        ("exit 23", Some(23), None),
+        ("kill -TERM $$", None, Some(libc::SIGTERM)),
+    ] {
+        let root = short_root();
+        let name = unique_name("exit-receipt");
+        let gate = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'fatal: fixture launch failed\\n' >&2; {finish}",
+            gate.display(),
+        );
+        let mut daemon = Daemon::start(&root, config(&name, "sh", &["-c", &command]));
+        let metadata = daemon.meta().unwrap();
+        let created = metadata["createdAt"].as_str().unwrap();
+        std::fs::write(gate, "").unwrap();
+        assert!(daemon.wait_exit(T).is_some());
+        assert!(daemon.meta().is_none(), "ordinary reaping must still remove the registry");
+        let receipt = pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, created,
+        ).unwrap().expect("the receipt must survive registry reaping");
+        assert_eq!(receipt.exit_code, code);
+        assert_eq!(receipt.signal, signal);
+        assert!(receipt.output_tail.contains("fatal: fixture launch failed"));
+        assert!(pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, "another-generation",
+        ).unwrap().is_none());
+    }
+}
+
 /// node: src/server.ts:630-682; tests/events.test.ts:525-543
 #[test]
 fn publication_order_and_shapes() {
