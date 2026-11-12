@@ -302,7 +302,9 @@ The Rust daemon also retains private local exit receipts in the owner-only
 `pty_core::registry::retained_session_exit_in(root, id, daemon_pid, created_at)`
 looks up the exact incarnation's actual child exit code or signal and final
 terminal text. The newest 256 exits are retained across the entire root; each
-tail is bounded to 8 KiB, dropping a partial leading line on truncation. Older
+tail is bounded to 8 KiB of logical, unwrapped text, dropping a partial leading
+logical line on truncation. This preserves credential-prefix continuity for
+consumer redaction; terminal soft wraps never become token boundaries. Older
 receipts are evicted, not inferred from a replacement. These are raw private
 terminal contents, like session metadata: apply a publication/redaction policy
 before forwarding them. A daemon killed before reaping its child cannot record

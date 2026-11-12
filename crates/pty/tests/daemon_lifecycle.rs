@@ -66,6 +66,39 @@ fn reaped_harness_retains_exact_wait_status_and_terminal_failure_tail() {
     }
 }
 
+#[test]
+fn retained_exit_preserves_soft_wrapped_tokens_and_drops_truncated_logical_lines() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    for (print, expected) in [
+        ("printf '%78s' ''; printf 'sk-fixture-secret\\n'", "sk-fixture-secret"),
+        ("printf 'sk-'; printf '%09000d' 0; printf '\\nfatal: safe footer\\n'", "fatal: safe footer"),
+    ] {
+        let root = short_root();
+        let name = unique_name("exit-logical");
+        let gate = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; {print}; exit 23",
+            gate.display(),
+        );
+        let mut cfg = config(&name, "sh", &["-c", &command]);
+        cfg["cols"] = json!(80);
+        let mut daemon = Daemon::start(&root, cfg);
+        let metadata = daemon.meta().unwrap();
+        std::fs::write(gate, "").unwrap();
+        assert!(daemon.wait_exit(T).is_some());
+        let receipt = pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, metadata["createdAt"].as_str().unwrap(),
+        ).unwrap().unwrap();
+        assert!(receipt.output_tail.contains(expected), "{:?}", receipt.output_tail);
+        if expected == "sk-fixture-secret" {
+            assert!(!receipt.output_tail.contains("sk\n-fixture-secret"));
+        } else {
+            assert_eq!(receipt.output_tail, expected);
+        }
+    }
+}
+
 /// node: src/server.ts:630-682; tests/events.test.ts:525-543
 #[test]
 fn publication_order_and_shapes() {

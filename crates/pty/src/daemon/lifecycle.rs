@@ -1585,7 +1585,10 @@ impl Daemon {
             created_at: created_at.clone(),
             exit_code: status.code,
             signal: status.signal,
-            output_tail: self.last_lines().join("\n"),
+            // Physical row breaks can split credential prefixes (e.g. "sk-")
+            // and defeat consumer redaction. Preserve logical token continuity;
+            // the receipt writer drops partial logical lines at its byte bound.
+            output_tail: serialize::plain_full(self.actor.terminal()),
         };
         match registry::retain_session_exit(receipt) {
             Ok(()) => self.exit_receipt_written = true,
