@@ -1098,7 +1098,8 @@ fn scan_sessions(
     for entry in dir {
         match entry {
             Ok(entry) => match entry.file_name().into_string() {
-                Ok(name) if !is_tmp_name(&name) => entries.push(name),
+                Ok(name) if !is_tmp_name(&name)
+                    && name != super::retained_exit::RETAINED_EXIT_FILE_NAME => entries.push(name),
                 Ok(_) => {}
                 Err(_) => scanner.error(
                     &entry.path(),

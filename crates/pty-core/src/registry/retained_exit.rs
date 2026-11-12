@@ -17,7 +17,7 @@ use super::{atomic_write, ensure_session_dir, session_dir, try_acquire_file_lock
 pub const RETAINED_EXIT_LIMIT: usize = 256;
 pub const RETAINED_EXIT_TAIL_BYTES: usize = 8192;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const FILE_NAME: &str = ".retained-exits.json";
+pub const RETAINED_EXIT_FILE_NAME: &str = ".retained-exits.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,7 +34,7 @@ pub struct RetainedSessionExit {
 
 fn read_all(root: &Path) -> io::Result<Vec<RetainedSessionExit>> {
     let mut file = match OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(root.join(FILE_NAME)) {
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(root.join(RETAINED_EXIT_FILE_NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -92,7 +92,7 @@ pub fn retain_session_exit(mut record: RetainedSessionExit) -> io::Result<()> {
         && row.created_at == record.created_at));
     if records.len() == RETAINED_EXIT_LIMIT { records.remove(0); }
     records.push(record);
-    atomic_write(&root.join(FILE_NAME), &serde_json::to_vec(&records)?)
+    atomic_write(&root.join(RETAINED_EXIT_FILE_NAME), &serde_json::to_vec(&records)?)
 }
 
 #[cfg(test)]
@@ -118,6 +118,9 @@ mod tests {
             assert_eq!(receipt.exit_code, Some(23));
             assert_eq!(receipt.output_tail, "fatal: fixture failure\n");
             assert_eq!(read_all(&root).unwrap().len(), RETAINED_EXIT_LIMIT);
+            let inventory = super::super::list_sessions_strict_in(&root, &Default::default());
+            assert!(inventory.complete, "{:?}", inventory.errors);
+            assert!(inventory.entries.is_empty(), "private receipts must not appear as sessions");
         });
         std::fs::remove_dir_all(root).unwrap();
     }

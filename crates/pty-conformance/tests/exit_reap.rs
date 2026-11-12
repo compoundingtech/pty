@@ -107,10 +107,15 @@ fn leaves_nothing_for_gc() {
     let pid = launch(&rig, &name, &["true"], DaemonOpts::no_display_name());
     wait_for_daemon_exit(pid);
     wait_for_gone(&rig, &name);
+    assert_valid_retained_exits(&rig);
+    let receipt_path = rig.root().join(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME);
+    let before = std::fs::read(&receipt_path).ok();
     let gc = rig.pty(&["gc"]);
     let s = gc.stdout();
     expect_not_contains(&s, &name);
     expect_contains(&s, "Nothing to clean up.");
+    assert_eq!(std::fs::read(receipt_path).ok(), before, "GC must preserve durable exit receipts");
+    assert_valid_retained_exits(&rig);
 }
 
 // ── config default = preserve (PTY_REAP_ON_EXIT=false) ──

@@ -934,7 +934,8 @@ fn inventory_raw_cleanup_candidates(only: Option<&str>) -> Vec<String> {
         .collect();
     let mut names: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
-        if registry::is_tmp_name(entry) {
+        if registry::is_tmp_name(entry)
+            || entry == registry::retained_exit::RETAINED_EXIT_FILE_NAME {
             continue;
         }
         let name = entry
