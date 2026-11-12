@@ -298,7 +298,10 @@ isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
 The Rust daemon also retains private local exit receipts in the owner-only
-`.retained-exits.json` file, independently of session reaping and removal.
+`.retained-exits` JSON file, independently of session reaping and removal.
+Its suffix is deliberately outside the legacy Rust and Node session namespaces:
+mixed-version garbage collectors cannot mistake receipts for malformed session
+metadata. Its atomic temporary files use the existing dead-writer cleanup.
 `pty_core::registry::retained_session_exit_in(root, id, daemon_pid, created_at)`
 looks up the exact incarnation's actual child exit code or signal and final
 terminal text. The newest 256 exits are retained across the entire root; each

@@ -17,7 +17,10 @@ use super::{atomic_write, ensure_session_dir, session_dir, try_acquire_file_lock
 pub const RETAINED_EXIT_LIMIT: usize = 256;
 pub const RETAINED_EXIT_TAIL_BYTES: usize = 8192;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-pub const RETAINED_EXIT_FILE_NAME: &str = ".retained-exits.json";
+// No session suffix: legacy Rust and Node GC must not discover this as
+// malformed session metadata. Atomic temporary names also lack such a suffix
+// and remain covered by the existing dead-writer temporary-file cleanup.
+pub const RETAINED_EXIT_FILE_NAME: &str = ".retained-exits";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

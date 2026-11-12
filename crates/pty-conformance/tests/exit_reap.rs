@@ -118,6 +118,42 @@ fn leaves_nothing_for_gc() {
     assert_valid_retained_exits(&rig);
 }
 
+/// The cross-implementation matrix supplies the pinned pre-receipt Node
+/// consumer. Exercise its actual GC against a receipt from the new Rust daemon.
+#[test]
+fn legacy_node_gc_preserves_new_producer_exit_receipts() {
+    if !is_rust() {
+        return;
+    }
+    let Some(node_checkout) = std::env::var_os("PTY_NODE_CHECKOUT") else {
+        eprintln!("cross-version GC regression runs in the dual-binary conformance matrix");
+        return;
+    };
+    let node = std::path::PathBuf::from(node_checkout).join("bin/pty");
+    assert!(node.is_file(), "pinned legacy Node consumer must exist");
+    let rig = Rig::new();
+    let name = unique_id("legacy-receipt");
+    let pid = launch(
+        &rig, &name, &["sh", "-c", "printf 'fatal: fixture failure\\n'; exit 23"],
+        DaemonOpts::no_display_name(),
+    );
+    wait_for_daemon_exit(pid);
+    assert!(wait_for_gone(&rig, &name).is_empty());
+    let path = rig.root().join(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME);
+    let before = std::fs::read(&path).expect("new Rust producer must retain its exit");
+    assert_valid_retained_exits(&rig);
+    let rows: Vec<pty_core::registry::RetainedSessionExit> = serde_json::from_slice(&before).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, name);
+    assert_eq!(rows[0].exit_code, Some(23));
+    assert!(rows[0].output_tail.contains("fatal: fixture failure"));
+    let output = std::process::Command::new(node).arg("gc")
+        .env_clear().envs(rig.base_env()).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(path).unwrap(), before, "legacy GC must not discover the receipt");
+    assert_valid_retained_exits(&rig);
+}
+
 // ── config default = preserve (PTY_REAP_ON_EXIT=false) ──
 
 /// node: tests/exit-reap.test.ts:719

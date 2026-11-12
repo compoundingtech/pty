@@ -92,7 +92,6 @@ fn assert_no_registry_debris(rig: &Rig) {
         .unwrap()
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME)
         .filter(|name| {
             name.ends_with(".json")
                 || name.ends_with(".jsonl")
