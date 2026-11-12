@@ -1173,6 +1173,37 @@ pub fn expect_not_contains(hay: &str, needle: &str) {
     assert!(!hay.contains(needle), "did not expect {needle:?} in:\n{hay}");
 }
 
+/// Retained exit receipts are intentionally durable, not leaked session
+/// resources. Legacy binaries need not write them, but any present store must
+/// satisfy the private bounded receipt contract before a test permits it.
+#[track_caller]
+pub fn assert_valid_retained_exits(rig: &Rig) {
+    use pty_core::registry::retained_exit::{
+        RETAINED_EXIT_FILE_NAME, RETAINED_EXIT_LIMIT, RETAINED_EXIT_TAIL_BYTES,
+        RetainedSessionExit,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let path = rig.root().join(RETAINED_EXIT_FILE_NAME);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("retained exit metadata: {error}"),
+    };
+    assert!(metadata.is_file(), "retained receipts must be a regular file");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert!(metadata.len() <= 16 * 1024 * 1024, "retained receipt store exceeds its byte bound");
+    let rows: Vec<RetainedSessionExit> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(!rows.is_empty() && rows.len() <= RETAINED_EXIT_LIMIT);
+    for row in rows {
+        assert!(!row.name.is_empty() && row.name.len() <= 256);
+        assert!(!row.generation.is_empty() && row.generation.len() <= 256);
+        assert!(!row.created_at.is_empty() && row.created_at.len() <= 128);
+        assert!(row.daemon_pid > 0);
+        assert!(row.exit_code.is_some() ^ row.signal.is_some());
+        assert!(row.output_tail.len() <= RETAINED_EXIT_TAIL_BYTES);
+    }
+}
+
 /// Assert `hay` matches the regex `re`.
 #[track_caller]
 pub fn expect_regex(hay: &str, re: &str) {

@@ -357,6 +357,22 @@ registries apart on machines that share a home directory. Set `PTY_ROOT` to
 isolate a registry, for example in tests. Set it to the former default path if
 you need access to sessions created there.
 
+The Rust daemon also retains private local exit receipts in the owner-only
+`.retained-exits` JSON file, independently of session reaping and removal.
+Its suffix is deliberately outside the legacy Rust and Node session namespaces:
+mixed-version garbage collectors cannot mistake receipts for malformed session
+metadata. Its atomic temporary files use the existing dead-writer cleanup.
+`pty_core::registry::retained_session_exit_in(root, id, daemon_pid, created_at)`
+looks up the exact incarnation's actual child exit code or signal and final
+terminal text. The newest 256 exits are retained across the entire root; each
+tail is bounded to 8 KiB of logical, unwrapped text, dropping a partial leading
+logical line on truncation. This preserves credential-prefix continuity for
+consumer redaction; terminal soft wraps never become token boundaries. Older
+receipts are evicted, not inferred from a replacement. These are raw private
+terminal contents, like session metadata: apply a publication/redaction policy
+before forwarding them. A daemon killed before reaping its child cannot record
+an exit receipt.
+
 Session ids remain independent of Unix socket pathname limits. A socket uses
 `<id>.sock` when that address fits; longer addresses use an `@`-prefixed digest
 filename within the same registry. Metadata, pid files and events keep their

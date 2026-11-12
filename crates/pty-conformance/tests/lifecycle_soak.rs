@@ -87,6 +87,7 @@ fn release_fifo(path: &Path) {
 }
 
 fn assert_no_registry_debris(rig: &Rig) {
+    assert_valid_retained_exits(rig);
     let mut debris: Vec<String> = std::fs::read_dir(rig.root())
         .unwrap()
         .flatten()

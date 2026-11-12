@@ -33,6 +33,72 @@ fn wait_exited(d: &Daemon) -> serde_json::Value {
     d.meta().unwrap()
 }
 
+#[test]
+fn reaped_harness_retains_exact_wait_status_and_terminal_failure_tail() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    for (finish, code, signal) in [
+        ("exit 23", Some(23), None),
+        ("kill -TERM $$", None, Some(libc::SIGTERM)),
+    ] {
+        let root = short_root();
+        let name = unique_name("exit-receipt");
+        let gate = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'fatal: fixture launch failed\\n' >&2; {finish}",
+            gate.display(),
+        );
+        let mut daemon = Daemon::start(&root, config(&name, "sh", &["-c", &command]));
+        let metadata = daemon.meta().unwrap();
+        let created = metadata["createdAt"].as_str().unwrap();
+        std::fs::write(gate, "").unwrap();
+        assert!(daemon.wait_exit(T).is_some());
+        assert!(daemon.meta().is_none(), "ordinary reaping must still remove the registry");
+        let receipt = pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, created,
+        ).unwrap().expect("the receipt must survive registry reaping");
+        assert_eq!(receipt.exit_code, code);
+        assert_eq!(receipt.signal, signal);
+        assert!(receipt.output_tail.contains("fatal: fixture launch failed"));
+        assert!(pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, "another-generation",
+        ).unwrap().is_none());
+    }
+}
+
+#[test]
+fn retained_exit_preserves_soft_wrapped_tokens_and_drops_truncated_logical_lines() {
+    skip_without_a_real_machine!();
+    let _s = serial();
+    for (print, expected) in [
+        ("printf '%78s' ''; printf 'sk-fixture-secret\\n'", "sk-fixture-secret"),
+        ("printf 'sk-'; printf '%09000d' 0; printf '\\nfatal: safe footer\\n'", "fatal: safe footer"),
+    ] {
+        let root = short_root();
+        let name = unique_name("exit-logical");
+        let gate = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; {print}; exit 23",
+            gate.display(),
+        );
+        let mut cfg = config(&name, "sh", &["-c", &command]);
+        cfg["cols"] = json!(80);
+        let mut daemon = Daemon::start(&root, cfg);
+        let metadata = daemon.meta().unwrap();
+        std::fs::write(gate, "").unwrap();
+        assert!(daemon.wait_exit(T).is_some());
+        let receipt = pty_core::registry::retained_session_exit_in(
+            &root, &name, daemon.pid as u32, metadata["createdAt"].as_str().unwrap(),
+        ).unwrap().unwrap();
+        assert!(receipt.output_tail.contains(expected), "{:?}", receipt.output_tail);
+        if expected == "sk-fixture-secret" {
+            assert!(!receipt.output_tail.contains("sk\n-fixture-secret"));
+        } else {
+            assert_eq!(receipt.output_tail, expected);
+        }
+    }
+}
+
 /// node: src/server.ts:630-682; tests/events.test.ts:525-543
 #[test]
 fn publication_order_and_shapes() {
@@ -348,7 +414,7 @@ fn sigterm_records_one_session_exit_and_preserves_the_session() {
 fn reap_and_preserve_decisions() {
     skip_without_a_real_machine!();
     let _s = serial();
-    // Default: reaped on exit (no files left).
+    // Default: session artifacts are reaped; only the bounded exit receipt remains.
     let root = short_root();
     let mut d = Daemon::spawn(
         &root,
@@ -361,7 +427,15 @@ fn reap_and_preserve_decisions() {
         .flatten()
         .map(|e| e.file_name())
         .collect();
-    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left, vec![std::ffi::OsString::from(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME)]);
+    let receipts: Vec<pty_core::registry::RetainedSessionExit> = serde_json::from_slice(
+        &std::fs::read(root.join(pty_core::registry::retained_exit::RETAINED_EXIT_FILE_NAME)).unwrap(),
+    ).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].name, d.name);
+    assert_eq!(receipts[0].daemon_pid, d.pid as u32);
+    assert_eq!(receipts[0].exit_code, Some(3));
+    assert_eq!(receipts[0].signal, None);
 
     // PTY_REAP_ON_EXIT=false preserves.
     let root = short_root();
