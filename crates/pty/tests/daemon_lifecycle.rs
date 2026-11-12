@@ -414,7 +414,7 @@ fn sigterm_records_one_session_exit_and_preserves_the_session() {
 fn reap_and_preserve_decisions() {
     skip_without_a_real_machine!();
     let _s = serial();
-    // Default: reaped on exit (no files left).
+    // Default: session artifacts are reaped; only the bounded exit receipt remains.
     let root = short_root();
     let mut d = Daemon::spawn(
         &root,
@@ -427,7 +427,15 @@ fn reap_and_preserve_decisions() {
         .flatten()
         .map(|e| e.file_name())
         .collect();
-    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left, vec![std::ffi::OsString::from(pty_core::registry::RETAINED_EXIT_FILE_NAME)]);
+    let receipts: Vec<pty_core::registry::RetainedSessionExit> = serde_json::from_slice(
+        &std::fs::read(root.join(pty_core::registry::RETAINED_EXIT_FILE_NAME)).unwrap(),
+    ).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].name, d.name);
+    assert_eq!(receipts[0].daemon_pid, d.pid as u32);
+    assert_eq!(receipts[0].exit_code, Some(3));
+    assert_eq!(receipts[0].signal, None);
 
     // PTY_REAP_ON_EXIT=false preserves.
     let root = short_root();
