@@ -2055,14 +2055,14 @@ mod tests {
         // decides whether that is one read or two. When it is two, the second
         // chunk is still in flight here, so "the next message is EOF" failed
         // 36 runs of this test in 600 on Linux on 2026-09-28. The contract is:
-        // the input's output, then EOF, then nothing, which is what this
-        // checks.
+        // the input's output, then incomplete closure, then nothing. Owner loss
+        // is not proof of the PTY's real EOF, so it must not authorize output publication.
         owner.lose_ownership();
         loop {
             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
                 Msg::PtyData(bytes) => forwarded.extend_from_slice(&bytes),
-                Msg::PtyEof(true) => break,
-                _ => panic!("the bridge sent something other than output before EOF"),
+                Msg::PtyEof(false) => break,
+                _ => panic!("the bridge did not mark owner-loss closure incomplete"),
             }
         }
         assert!(
