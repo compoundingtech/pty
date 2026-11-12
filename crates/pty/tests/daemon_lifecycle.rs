@@ -59,6 +59,7 @@ fn reaped_harness_retains_exact_wait_status_and_terminal_failure_tail() {
         ).unwrap().expect("the receipt must survive registry reaping");
         assert_eq!(receipt.exit_code, code);
         assert_eq!(receipt.signal, signal);
+        assert!(receipt.output_complete);
         assert!(receipt.output_tail.contains("fatal: fixture launch failed"));
         assert!(pty_core::registry::retained_session_exit_in(
             &root, &name, daemon.pid as u32, "another-generation",
@@ -67,12 +68,17 @@ fn reaped_harness_retains_exact_wait_status_and_terminal_failure_tail() {
 }
 
 #[test]
-fn retained_exit_preserves_soft_wrapped_tokens_and_drops_truncated_logical_lines() {
+fn retained_exit_proves_complete_raw_output_or_withholds_it_entirely() {
     skip_without_a_real_machine!();
     let _s = serial();
     for (print, expected) in [
-        ("printf '%78s' ''; printf 'sk-fixture-secret\\n'", "sk-fixture-secret"),
-        ("printf 'sk-'; printf '%09000d' 0; printf '\\nfatal: safe footer\\n'", "fatal: safe footer"),
+        ("printf '%78s' ''; printf 'sk-fixture-secret\\n'", Some("sk-fixture-secret")),
+        ("printf 'sk-'; printf '%09000d' 0; printf '\\nfatal: safe footer\\n'", None),
+        ("printf '%09000d Authorization:\\nfixture-secret\\n' 0", None),
+        ("printf 'Authorization:\\n'; i=0; while [ \"$i\" -lt 12000 ]; do printf '\\n'; i=$((i+1)); done; printf 'fixture-secret\\n'", None),
+        ("printf 'Authorization:\\033[2J\\033[Hfixture-secret\\n'", Some("Authorization:\x1b[2J\x1b[Hfixture-secret")),
+        ("printf 'fatal:\\b fixture failure\\n'", Some("fatal:\x08 fixture failure")),
+        ("printf '\\377fatal: fixture failure\\n'", None),
     ] {
         let root = short_root();
         let name = unique_name("exit-logical");
@@ -90,11 +96,12 @@ fn retained_exit_preserves_soft_wrapped_tokens_and_drops_truncated_logical_lines
         let receipt = pty_core::registry::retained_session_exit_in(
             &root, &name, daemon.pid as u32, metadata["createdAt"].as_str().unwrap(),
         ).unwrap().unwrap();
-        assert!(receipt.output_tail.contains(expected), "{:?}", receipt.output_tail);
-        if expected == "sk-fixture-secret" {
+        assert_eq!(receipt.output_complete, expected.is_some());
+        if let Some(expected) = expected {
+            assert!(receipt.output_tail.contains(expected), "{:?}", receipt.output_tail);
             assert!(!receipt.output_tail.contains("sk\n-fixture-secret"));
         } else {
-            assert_eq!(receipt.output_tail, expected);
+            assert!(receipt.output_tail.is_empty(), "incomplete output must not retain a guessed suffix");
         }
     }
 }
